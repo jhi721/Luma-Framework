@@ -602,6 +602,7 @@
     <ClCompile Include="dlss\DLSS.cpp" />
     <ClCompile Include="core.hpp" />
     <ClCompile Include="fsr\FSR.cpp" />
+    <ClCompile Include="xess\XeSS.cpp" />
     <ClCompile Include="fsr\FSR4.cpp" />
     <ClCompile Include="hooks\DXGIHooks.cpp" />
     <ClCompile Include="hooks\FidelityFXHooks.cpp" />
@@ -612,6 +613,7 @@
   <ItemGroup>
     <ClInclude Include="dlss\DLSS.h" />
     <ClInclude Include="fsr\FSR.h" />
+    <ClInclude Include="xess\XeSS.h" />
     <ClInclude Include="fsr\FSR4.h" />
     <ClInclude Include="hooks\DXGIHooks.h" />
     <ClInclude Include="hooks\FidelityFXHooks.h" />
@@ -630,7 +632,6 @@
     <ClInclude Include="includes\managed_resources.h" />
     <ClInclude Include="includes\overlay_log.h" />
     <ClInclude Include="includes\patch.hpp" />
-    <ClInclude Include="includes\mcp.hpp" />
     <ClInclude Include="includes\trace.hpp" />
     <ClInclude Include="includes\ui\ui.hpp" />
     <ClInclude Include="includes\math.h" />

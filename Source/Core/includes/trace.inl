@@ -3,6 +3,7 @@
 // Included by "core.hpp" after the capture state and the shader caches (see "trace.hpp").
 namespace Trace
 {
+#if DX11
    namespace
    {
       // Entries recorded without the command list's trace at hand (Luma passes, game hooks), moved into it after Core's draw and present hooks
@@ -13,6 +14,9 @@ namespace Trace
       void CaptureState(TraceDrawCallData& trace_draw_call_data, const DeviceData& device_data, ID3D11DeviceContext* native_device_context, reshade::api::shader_stage stage, const CachedShader* reflection, const DrawDispatchData& draw_dispatch_data)
       {
          trace_draw_call_data.command_list = native_device_context;
+         trace_draw_call_data.draw_dispatch_data = draw_dispatch_data;
+         if (stage != reshade::api::shader_stage::compute)
+            native_device_context->IAGetPrimitiveTopology(&trace_draw_call_data.primitive_topology);
 
          // Query D3D11.1 context once for the whole function (used to retrieve CB partial-binding offsets)
          com_ptr<ID3D11DeviceContext1> device_context_1;
@@ -244,7 +248,7 @@ namespace Trace
             for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT && i < TraceDrawCallData::rtvs_size; i++)
             {
                rtvs[i] = RedirectMirroredRVS(rtvs[i].get());
-               trace_draw_call_data.rtvs[i] = rtvs[i].get();
+               trace_draw_call_data.rtvs[i] = reinterpret_cast<uint64_t>(rtvs[i].get());
                if ((rtvs[i] != nullptr || (show_used_unbound_resources && cached_shader->rtvs[i])) && (show_unused_bound || cached_shader->rtvs[i]))
                {
                   D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
@@ -283,7 +287,7 @@ namespace Trace
             for (UINT i = 0; i < device_data.uav_max_count && i < TraceDrawCallData::uavs_size; i++)
             {
                uavs[i] = RedirectMirroredRVS(uavs[i].get());
-               trace_draw_call_data.uavs[i] = uavs[i].get();
+               trace_draw_call_data.uavs[i] = reinterpret_cast<uint64_t>(uavs[i].get());
                if ((uavs[i] != nullptr || (show_used_unbound_resources && cached_shader->uavs[i])) && (show_unused_bound || cached_shader->uavs[i]))
                {
                   D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
@@ -305,7 +309,7 @@ namespace Trace
             for (UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT && i < TraceDrawCallData::srvs_size; i++)
             {
                srvs[i] = RedirectMirroredRVS(srvs[i].get());
-               trace_draw_call_data.srvs[i] = srvs[i].get();
+               trace_draw_call_data.srvs[i] = reinterpret_cast<uint64_t>(srvs[i].get());
                if ((srvs[i] != nullptr || (show_used_unbound_resources && cached_shader->srvs[i])) && (show_unused_bound || cached_shader->srvs[i]))
                {
                   D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
@@ -366,7 +370,7 @@ namespace Trace
             for (UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT && i < TraceDrawCallData::srvs_size; i++)
             {
                srvs[i] = RedirectMirroredRVS(srvs[i].get());
-               trace_draw_call_data.srvs[i] = srvs[i].get();
+               trace_draw_call_data.srvs[i] = reinterpret_cast<uint64_t>(srvs[i].get());
                if ((srvs[i] != nullptr || (show_used_unbound_resources && cached_shader->srvs[i])) && (show_unused_bound || cached_shader->srvs[i]))
                {
                   D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
@@ -382,8 +386,6 @@ namespace Trace
                   trace_draw_call_data.srv_size[i] = GetTextureMipSize(base_size, trace_draw_call_data.srv_mip[i]);
                }
             }
-
-            trace_draw_call_data.draw_dispatch_data = draw_dispatch_data;
 
             com_ptr<ID3D11Buffer> index_buffer;
             native_device_context->IAGetIndexBuffer(&index_buffer, &trace_draw_call_data.index_buffer_format, &trace_draw_call_data.index_buffer_offset);
@@ -405,8 +407,6 @@ namespace Trace
                   trace_draw_call_data.vertex_buffer_hashes.push_back(std::to_string(std::hash<void*>{}(vertex_buffer.get())));
                }
             }
-
-            native_device_context->IAGetPrimitiveTopology(&trace_draw_call_data.primitive_topology);
 
             com_ptr<ID3D11Buffer> cbs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT];
             UINT cbs_first_constant[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
@@ -451,7 +451,7 @@ namespace Trace
             for (UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT && i < TraceDrawCallData::srvs_size; i++)
             {
                srvs[i] = RedirectMirroredRVS(srvs[i].get());
-               trace_draw_call_data.srvs[i] = srvs[i].get();
+               trace_draw_call_data.srvs[i] = reinterpret_cast<uint64_t>(srvs[i].get());
                if ((srvs[i] != nullptr || (show_used_unbound_resources && cached_shader->srvs[i])) && (show_unused_bound || cached_shader->srvs[i]))
                {
                   D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
@@ -473,7 +473,7 @@ namespace Trace
             for (UINT i = 0; i < device_data.uav_max_count && i < TraceDrawCallData::uavs_size; i++)
             {
                uavs[i] = RedirectMirroredRVS(uavs[i].get());
-               trace_draw_call_data.uavs[i] = uavs[i].get();
+               trace_draw_call_data.uavs[i] = reinterpret_cast<uint64_t>(uavs[i].get());
                if ((uavs[i] != nullptr || (show_used_unbound_resources && cached_shader->uavs[i])) && (show_unused_bound || cached_shader->uavs[i]))
                {
                   D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
@@ -489,8 +489,6 @@ namespace Trace
                   trace_draw_call_data.uav_size[i] = GetTextureMipSize(base_size, trace_draw_call_data.uav_mip[i]);
                }
             }
-
-            trace_draw_call_data.draw_dispatch_data = draw_dispatch_data;
 
             com_ptr<ID3D11Buffer> cbs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT];
             UINT cbs_first_constant[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
@@ -789,11 +787,11 @@ namespace Trace
             const std::shared_lock lock_device(device_data->mutex);
             CaptureState(trace_draw_call_data, *device_data, native_device_context, stage, has_reflection ? &reflection : nullptr, draw_dispatch_data);
          }
-         // The pixel shader state doesn't include the draw arguments
-         trace_draw_call_data.draw_dispatch_data = draw_dispatch_data;
          queued_entries.push_back(std::move(trace_draw_call_data));
       }
    }
+
+#endif // DX11
 
    void ReflectShaderSlots(ID3D11ShaderReflection* shader_reflector, const D3D11_SHADER_DESC& shader_desc, CachedShader& cached_shader, bool& found_any_rtvs, bool& found_any_other_bindings)
    {
@@ -850,6 +848,7 @@ namespace Trace
       }
    }
 
+#if DX11
    void CustomDraw(ID3D11DeviceContext* native_device_context, const char* name, UINT vertex_count)
    {
       DrawDispatchData draw_dispatch_data;
@@ -928,6 +927,8 @@ namespace Trace
       queued_entries.push_back(std::move(trace_draw_call_data));
    }
 
+#endif // DX11
+
    void Annotate(CommandListData& cmd_list_data, std::string_view text, std::optional<int64_t> value)
    {
       if (!running) // Cheap early out for the hot path, rechecked under the lock
@@ -988,6 +989,48 @@ namespace Trace
       }
    }
 
+   std::optional<PassTarget> FindPassTarget(const DeviceData& device_data, const CommandListData& cmd_list_data, size_t index, bool by_thread)
+   {
+      if (index >= cmd_list_data.trace_draw_calls_data.size())
+         return std::nullopt;
+      const TraceDrawCallData& entry = cmd_list_data.trace_draw_calls_data[index];
+      PassTarget target;
+      bool is_luma_pass = false;
+      if (entry.type == TraceDrawCallData::TraceDrawCallType::Custom && entry.custom_stage != reshade::api::shader_stage(0))
+      {
+         is_luma_pass = true;
+         target.custom_pass = Math::CompileTimeStringHash(entry.custom_name);
+         target.shader_hash = entry.custom_shader_hash;
+         target.stage = entry.custom_stage;
+      }
+      else if (entry.type == TraceDrawCallData::TraceDrawCallType::Shader)
+      {
+         const auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(entry.pipeline_handle);
+         if (pipeline_pair == device_data.pipeline_cache_by_pipeline_handle.end() || !pipeline_pair->second || pipeline_pair->second->shader_hashes.empty())
+            return std::nullopt;
+         const CachedPipeline* pipeline = pipeline_pair->second;
+         target.pipeline = entry.pipeline_handle;
+         target.shader_hash = pipeline->shader_hashes[0];
+         target.stage = pipeline->HasPixelShader() ? reshade::api::shader_stage::pixel : (pipeline->HasComputeShader() ? reshade::api::shader_stage::compute : reshade::api::shader_stage::vertex);
+      }
+      else
+      {
+         return std::nullopt;
+      }
+      if (by_thread)
+         target.thread = entry.thread_id;
+      for (size_t i = 0; i < index; i++)
+      {
+         const auto& other = cmd_list_data.trace_draw_calls_data[i];
+         if (by_thread && other.thread_id != entry.thread_id)
+            continue;
+         if (is_luma_pass ? (other.type == TraceDrawCallData::TraceDrawCallType::Custom && strcmp(other.custom_name, entry.custom_name) == 0) : (other.type == TraceDrawCallData::TraceDrawCallType::Shader && other.pipeline_handle == entry.pipeline_handle))
+            target.instance++;
+      }
+      return target;
+   }
+
+#if DX11
    bool CopyDebugDrawTexture(DebugDrawMode debug_draw_mode, int32_t debug_draw_view_index, ID3D11DeviceContext* native_device_context, DeviceData& device_data, bool is_dispatch)
    {
       com_ptr<ID3D11Device> native_device_ptr;
@@ -1242,6 +1285,8 @@ namespace Trace
    void Draw(CommandListData& cmd_list_data, DeviceData& device_data, ID3D11DeviceContext* native_device_context, const DrawDispatchData& draw_dispatch_data)
    {
       // TODO: it's not safe to lock global mutexes that might have already been locked by other concurrent functions, while also calling functions in the device or primary device context (in DX11) (because they have their own locks inside that might cause deadlocks!). The solution here would be to cache the data upfront and then lock a mutex to add it to our array. This might be safe if the game threading was already safe though, I'm not 100% sure.
+      if (!running) // Unlocked early out, rechecked under the lock
+         return;
       const std::shared_lock lock_trace(s_mutex);
       if (!running)
          return;
@@ -1259,6 +1304,8 @@ namespace Trace
 
    void Dispatch(CommandListData& cmd_list_data, DeviceData& device_data, ID3D11DeviceContext* native_device_context, const DrawDispatchData& draw_dispatch_data)
    {
+      if (!running) // Unlocked early out, rechecked under the lock
+         return;
       const std::shared_lock lock_trace(s_mutex);
       if (!running)
          return;
@@ -1273,6 +1320,11 @@ namespace Trace
 
    void FinishDrawCallbacks(CommandListData& cmd_list_data, ID3D11DeviceContext* native_device_context, bool draw_went_through)
    {
+      if (!running) // Unlocked early out, rechecked under the lock
+      {
+         queued_entries.clear();
+         return;
+      }
       const std::shared_lock lock_trace(s_mutex);
       if (!running)
       {
@@ -1369,6 +1421,11 @@ namespace Trace
 
    void FlushQueued(CommandListData* cmd_list_data, ID3D11DeviceContext* native_device_context)
    {
+      if (!running) // Unlocked early out, rechecked under the lock
+      {
+         queued_entries.clear();
+         return;
+      }
       const std::shared_lock lock_trace(s_mutex);
       if (!running || !cmd_list_data)
       {
@@ -1390,47 +1447,6 @@ namespace Trace
 #endif
       if (System::CanAllocate(sizeof(TraceDrawCallData) * reserve_size * 2)) // Check for double the space, just to be sure
          cmd_list_data.trace_draw_calls_data.reserve(reserve_size);
-   }
-
-   std::optional<PassTarget> FindPassTarget(const DeviceData& device_data, const CommandListData& cmd_list_data, size_t index, bool by_thread)
-   {
-      if (index >= cmd_list_data.trace_draw_calls_data.size())
-         return std::nullopt;
-      const TraceDrawCallData& entry = cmd_list_data.trace_draw_calls_data[index];
-      PassTarget target;
-      bool is_luma_pass = false;
-      if (entry.type == TraceDrawCallData::TraceDrawCallType::Custom && entry.custom_stage != reshade::api::shader_stage(0))
-      {
-         is_luma_pass = true;
-         target.custom_pass = Math::CompileTimeStringHash(entry.custom_name);
-         target.shader_hash = entry.custom_shader_hash;
-         target.stage = entry.custom_stage;
-      }
-      else if (entry.type == TraceDrawCallData::TraceDrawCallType::Shader)
-      {
-         const auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(entry.pipeline_handle);
-         if (pipeline_pair == device_data.pipeline_cache_by_pipeline_handle.end() || !pipeline_pair->second || pipeline_pair->second->shader_hashes.empty())
-            return std::nullopt;
-         const CachedPipeline* pipeline = pipeline_pair->second;
-         target.pipeline = entry.pipeline_handle;
-         target.shader_hash = pipeline->shader_hashes[0];
-         target.stage = pipeline->HasPixelShader() ? reshade::api::shader_stage::pixel : (pipeline->HasComputeShader() ? reshade::api::shader_stage::compute : reshade::api::shader_stage::vertex);
-      }
-      else
-      {
-         return std::nullopt;
-      }
-      if (by_thread)
-         target.thread = entry.thread_id;
-      for (size_t i = 0; i < index; i++)
-      {
-         const auto& other = cmd_list_data.trace_draw_calls_data[i];
-         if (by_thread && other.thread_id != entry.thread_id)
-            continue;
-         if (is_luma_pass ? (other.type == TraceDrawCallData::TraceDrawCallType::Custom && strcmp(other.custom_name, entry.custom_name) == 0) : (other.type == TraceDrawCallData::TraceDrawCallType::Shader && other.pipeline_handle == entry.pipeline_handle))
-            target.instance++;
-      }
-      return target;
    }
 
    bool IsDebugDrawTarget(const PassTarget& target)
@@ -1607,4 +1623,5 @@ namespace Trace
          cmd_list_data.trace_draw_calls_data[i].cancelled_or_replaced = true;
    }
 
+#endif // DX11
 } // namespace Trace

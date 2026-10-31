@@ -4,6 +4,8 @@
     <UseLumaDXP Condition="'$(UseLumaDXP)'==''">false</UseLumaDXP>
     <UseLumaNGX Condition="'$(UseLumaNGX)'==''">false</UseLumaNGX>
     <UseLumaFSR Condition="'$(UseLumaFSR)'==''">false</UseLumaFSR>
+    <!-- D3D12 only: Intel's signed libxess.dll, loaded at runtime (nothing to link) -->
+    <UseLumaXeSS Condition="'$(UseLumaXeSS)'==''">false</UseLumaXeSS>
     <!-- FSR 4 through DX11->DX12 interop (needs UseLumaFSR, x64 only). The FidelityFX API DX12 dlls are shipped next to the addon. -->
     <UseLumaFSR4 Condition="'$(UseLumaFSR4)'==''">false</UseLumaFSR4>
     <!-- DX11->DX12 interop (see "D3D12Interop.h"), enabled automatically by the features that need it -->
@@ -89,6 +91,11 @@
       <!-- The unity build can exceed the default object file section limit (C1128), especially in Debug. -->
       <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
+    <!-- Core's graphics API is fixed per project at build time ("DX12" in Core "core.hpp"); D3D11 is the default.
+         D3D12 hooks the game's root signature, pipeline and resource creation through MinHook (compiled below). -->
+    <ClCompile Condition="'$(LumaGraphicsAPI)'=='D3D12'">
+      <PreprocessorDefinitions>UNICODE;_UNICODE;DX12=1;ENABLE_MINHOOK=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
     <ClCompile Condition="'$(UseLumaDXP)'=='true'">
       <!-- PreprocessorDefinitions metadata overrides the CharacterSet-derived
            UNICODE defines, so restore them explicitly. -->
@@ -103,6 +110,10 @@
     <ClCompile Condition="'$(UseLumaFSR)'=='true'">
       <AdditionalIncludeDirectories>$(LumaFSRRoot);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>UNICODE;_UNICODE;ENABLE_FIDELITY_SK=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Condition="'$(UseLumaXeSS)'=='true' and '$(LumaGraphicsAPI)'=='D3D12'">
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..\External\XeSS\inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;ENABLE_XESS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Condition="'$(UseLumaFSR)'=='true' and '$(UseLumaFSR4)'=='true'">
       <PreprocessorDefinitions>UNICODE;_UNICODE;ENABLE_FSR4=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -128,7 +139,8 @@
       <AdditionalLibraryDirectories>$(LumaNGXRoot)\libs;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>$(LumaNGXLibName);%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
-    <Link Condition="'$(UseLumaFSR)'=='true'">
+    <!-- D3D12 loads the FidelityFX API dlls at runtime (nothing to link) -->
+    <Link Condition="'$(UseLumaFSR)'=='true' and '$(LumaGraphicsAPI)'!='D3D12'">
       <AdditionalLibraryDirectories>$(LumaFSRRoot)\libs;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>ffx_backend_dx11_x64$(LumaFSRLibSuffix).lib;ffx_fsr3_x64$(LumaFSRLibSuffix).lib;ffx_frameinterpolation_x64$(LumaFSRLibSuffix).lib;ffx_fsr3upscaler_x64$(LumaFSRLibSuffix).lib;ffx_opticalflow_x64$(LumaFSRLibSuffix).lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
@@ -142,7 +154,22 @@
     <Copy SourceFiles="$(LumaNGXRuntimePath)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
   </Target>
 
-  <Target Name="LumaCopyFfxRuntime" AfterTargets="Build" Condition="'$(UseLumaFSR)'=='true' and '$(UseLumaFSR4)'=='true' and '$(Platform)'!='Win32' and Exists('$(TargetDir)')">
+  <!-- MinHook for D3D12 Core (see Core "includes/minhook.h"), compiled once per addon. hde32/hde64 compile to nothing on the other architecture. -->
+  <ItemGroup Condition="'$(LumaGraphicsAPI)'=='D3D12'">
+    <ClCompile Include="$(MSBuildThisFileDirectory)..\External\reshade\deps\minhook\src\buffer.c;$(MSBuildThisFileDirectory)..\External\reshade\deps\minhook\src\hook.c;$(MSBuildThisFileDirectory)..\External\reshade\deps\minhook\src\trampoline.c;$(MSBuildThisFileDirectory)..\External\reshade\deps\minhook\src\hde\hde32.c;$(MSBuildThisFileDirectory)..\External\reshade\deps\minhook\src\hde\hde64.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ForcedIncludeFiles></ForcedIncludeFiles>
+    </ClCompile>
+  </ItemGroup>
+
+  <Target Name="LumaCopyXeSSRuntime" AfterTargets="Build" Condition="'$(UseLumaXeSS)'=='true' and '$(LumaGraphicsAPI)'=='D3D12' and Exists('$(MSBuildThisFileDirectory)..\External\XeSS\bin\libxess.dll') and Exists('$(TargetDir)')">
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\External\XeSS\bin\libxess.dll" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+  </Target>
+
+  <!-- FSR 4 on D3D11 (interop) and every FSR on D3D12 use the FidelityFX API DX12 dlls -->
+  <Target Name="LumaCopyFfxRuntime" AfterTargets="Build" Condition="'$(UseLumaFSR)'=='true' and ('$(UseLumaFSR4)'=='true' or '$(LumaGraphicsAPI)'=='D3D12') and '$(Platform)'!='Win32' and Exists('$(TargetDir)')">
     <ItemGroup>
       <_LumaFfxRuntimeFiles Include="$(MSBuildThisFileDirectory)..\External\FidelityFX\bin\*.dll" />
     </ItemGroup>

@@ -1,25 +1,43 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cfloat>
+#include <cstdint>
 #include <map>
+#include <vector>
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
 struct ID3D11Resource;
+struct ID3D12Device;
+struct ID3D12GraphicsCommandList;
+struct ID3D12Resource;
 struct IDXGIAdapter;
 
 namespace SR
 {
+	// The objects of the API the mod is built for (DLSS, FSR and XeSS have a D3D12 path)
+#if DX12
+	using Device = ID3D12Device;
+	using CommandList = ID3D12GraphicsCommandList;
+	using Resource = ID3D12Resource;
+#else
+	using Device = ID3D11Device;
+	using CommandList = ID3D11DeviceContext;
+	using Resource = ID3D11Resource;
+#endif
+
 	// Note that these don't necessarily match 1:1 with classes, some might be different configurations of the same implementation.
 	enum class UserType
 	{
 		None,
 		Auto,
 		DLSS,
-		FSR_3,
-		FSR_4,
+		FSR_3, // FSR 3 on D3D11, FSR 4 or 3.1 on D3D12
+		FSR_4, // D3D11 only, through DX11->DX12 interop
+		XeSS, // D3D12 only
 	};
 
 	// Put these in order of preference (most preferred first). For automatic selection.
@@ -28,6 +46,7 @@ namespace SR
 		DLSS,
 		FSR,
 		FSR_4, // Least preferred, as it runs through DX11->DX12 interop, so it's only used if manually selected
+		XeSS, // After the others, as the shaders' "SRType" (type + 1) values are fixed
 		None = -1
 	};
 
@@ -43,13 +62,14 @@ namespace SR
 			return type == Type::DLSS;
 		case SR::UserType::FSR_3:
 			return type == Type::FSR;
+		case SR::UserType::XeSS:
+			return type == Type::XeSS;
 		case SR::UserType::FSR_4:
 			return type == Type::FSR_4;
 		}
 		return false;
 	}
 
-#if DEVELOPMENT
 	constexpr const char* GetTypeName(Type type)
 	{
 		switch (type)
@@ -58,6 +78,8 @@ namespace SR
 			return "DLSS";
 		case Type::FSR:
 			return "FSR";
+		case Type::XeSS:
+			return "XeSS";
 		case Type::FSR_4:
 			return "FSR 4";
 		case Type::None:
@@ -65,7 +87,6 @@ namespace SR
 		}
 		return "None";
 	}
-#endif
 	
 	// E.g. use base 2 for x and base 3 for y.
 	// Index should go from 0 to phases-1.
@@ -87,6 +108,16 @@ namespace SR
 
 	// 8 is usually great for native resolution TAA
 	constexpr int GetDefaultJitterPhases() { return 8; }
+	// NVIDIA's suggested formula, from the default at native resolution (Y resolution, as it's generally more reliable)
+	static int GetDlssJitterPhases(unsigned int render_height, unsigned int output_height)
+	{
+		return std::lrintf(float(GetDefaultJitterPhases()) * std::pow((std::max)(float(output_height) / float(render_height), 1.f), 2.f));
+	}
+	// FidelityFX's "ffxFsr3UpscalerGetJitterPhaseCount()", for builds without FSR (x86)
+	static int GetFsrJitterPhases(unsigned int render_width, unsigned int output_width)
+	{
+		return int(8.f * std::pow(float(output_width) / float(render_width), 2.f));
+	}
 	
 	static float GetMipLODBias(float render_height, float output_height)
 	{
@@ -96,6 +127,90 @@ namespace SR
 	{
 		return GetMipLODBias(float(render_height), float(output_height));
 	}
+
+	// The camera an upscaler needs (FSR), from a view projection with an affine view: element (row, column) at m[row * 4 + column] for
+	// column vectors (clip = M * p), at m[column * 4 + row] with "row_vectors" (clip = p * M). Clip z = A * clip w + B, so device
+	// depth = A + B / view depth (A = 1 for an infinite far plane, then B = -near). Each value is 0 when the projection lacks it.
+	struct ViewProjectionCamera
+	{
+		double depth_a = 0.0;
+		double depth_b = 0.0;
+		double vert_fov = 0.0; // Radians: the up axis has length 1 / tan(fov / 2)
+		double near_plane = 0.0;
+		double far_plane = 0.0; // Finite: near x 1e6 for an infinite projection
+	};
+	template <typename T>
+	ViewProjectionCamera GetViewProjectionCamera(const T* m, bool row_vectors)
+	{
+		const auto at = [&](int row, int column) { return double(row_vectors ? m[column * 4 + row] : m[row * 4 + column]); };
+		double dot_23 = 0.0, dot_33 = 0.0;
+		for (int column = 0; column < 3; column++)
+		{
+			dot_23 += at(2, column) * at(3, column);
+			dot_33 += at(3, column) * at(3, column);
+		}
+		ViewProjectionCamera camera;
+		camera.depth_a = (dot_33 > 0.0 ? dot_23 / dot_33 : 1.0);
+		camera.depth_b = at(2, 3) - camera.depth_a * at(3, 3);
+		const double up_length = std::sqrt(at(1, 0) * at(1, 0) + at(1, 1) * at(1, 1) + at(1, 2) * at(1, 2));
+		camera.vert_fov = (up_length > 0.0 ? 2.0 * std::atan(1.0 / up_length) : 0.0);
+		camera.near_plane = (camera.depth_a != 0.0 ? -camera.depth_b / camera.depth_a : 0.0);
+		if (camera.near_plane > 0.0)
+		{
+			camera.far_plane = (camera.depth_a > 1.0 + 1e-6 ? camera.depth_b / (1.0 - camera.depth_a) : camera.near_plane * 1e6);
+		}
+		return camera;
+	}
+
+	// D3D12 command lists that used a replaced upscaler object (DLSS feature, FSR context) can still be running, so it's released a few
+	// presents later ("SuperResolutionImpl::ReleaseRetired()"), also when its upscaler isn't picked anymore.
+	template <typename T>
+	struct DeferredReleases
+	{
+		struct Entry
+		{
+			T object;
+			uint64_t update = 0;
+		};
+		std::vector<Entry> entries;
+		uint64_t updates = 0;
+
+		void Push(const T& object) { entries.push_back({.object = object, .update = updates}); }
+		// Pushes "*object" (if any) and clears it
+		void Retire(T* object)
+		{
+			if (*object)
+			{
+				Push(*object);
+				*object = {};
+			}
+		}
+		// Once per present: releases what the swapchain's up to 3 frames in flight can't use anymore
+		template <typename F>
+		void Release(F&& release)
+		{
+			updates++;
+			std::erase_if(entries, [&](Entry& entry)
+			{
+				if (updates - entry.update <= 3)
+				{
+					return false;
+				}
+				release(&entry.object);
+				return true;
+			});
+		}
+		// At the shutdown
+		template <typename F>
+		void ReleaseAll(F&& release)
+		{
+			for (Entry& entry : entries)
+			{
+				release(&entry.object);
+			}
+			entries.clear();
+		}
+	};
 
 	struct SettingsData
 	{
@@ -159,6 +274,9 @@ namespace SR
 		bool							requires_unordered_access_output_texture = true;
 		bool							automatically_restores_pipeline_state = false;
 		unsigned int				min_resolution = 1; // Min width or height
+		// The version the runtime picked (e.g. FSR 4 or 3.1 on D3D12), for display. Owned by the implementation's dll, nullptr if unknown.
+		// Atomic as FSR changes it on recording threads (its context recreation) while the overlay reads it: load it once.
+		std::atomic<const char*>	version_name = nullptr;
 
 		SettingsData				settings_data = {};
 
@@ -189,34 +307,42 @@ namespace SR
 		// The implementations are owned and deleted through this base.
 		// A new virtual must also be forwarded by the DEVELOPMENT MCP wrapper ("SrTap" in "mcp_server.inl"), or it silently gets the defaults below there.
 		virtual ~SuperResolutionImpl() = default;
-		virtual bool HasInit(const InstanceData* data) const { return false; }
+		virtual bool HasInit(const InstanceData* data) const { return data != nullptr; }
 		// Needs init to be called first
-		virtual bool IsSupported(const InstanceData* data) const { return false; }
+		virtual bool IsSupported(const InstanceData* data) const { return data && data->is_supported; }
 
 		// Must be called once before usage. Still expects Deinit() to be called even if it failed.
 		// Returns whether this SR implementation is supported by hardware and driver.
 		// Fill in a data "handle", there can be more than one at a time.
-		virtual bool Init(InstanceData*& data, ID3D11Device* device, IDXGIAdapter* adapter = nullptr) { return false; }
+		virtual bool Init(InstanceData*& data, Device* device, IDXGIAdapter* adapter = nullptr) { return false; }
 		// Should be called before shutdown or on device destruction.
-		virtual void Deinit(InstanceData*& data, ID3D11Device* optional_device = nullptr) {}
+		virtual void Deinit(InstanceData*& data, Device* optional_device = nullptr) {}
+		// Frees what "UpdateSettings()" and "Draw()" created (the upscaler's own resources, the SR bridge's helper) but keeps the implementation loaded,
+		// for when it's not selected anymore. The next "UpdateSettings()" (for the SR bridge, "Draw()") creates them again.
+		virtual void ReleaseResources(InstanceData* data) {}
 
 		// Note that this might expect the same command list all the times.
 		// Returns true if the settings changed or were up to date.
-		virtual bool UpdateSettings(InstanceData* data, ID3D11DeviceContext* command_list, const SettingsData& settings_data) { return false; }
+		virtual bool UpdateSettings(InstanceData* data, CommandList* command_list, const SettingsData& settings_data) { return false; }
 
 		struct DrawData
 		{
 			bool reset = false;
+			// The first draws into a new "output_color", until one succeeds. DLSS writes nothing into a new output until its feature is
+			// created again after a draw (DLSS-Best-Practices OUT-4): a successful draw with this set recreates it at the next "UpdateSettings()".
+			bool output_recreated = false;
 
-			ID3D11Resource* output_color = nullptr;
-			ID3D11Resource* source_color = nullptr;
-			ID3D11Resource* motion_vectors = nullptr;
-			ID3D11Resource* depth_buffer = nullptr; // SR expects the depth to be the device/HW one (1 being near, not 1 being the camera (linear depth)), though it might actually not matter
+			// On D3D12 the caller puts the inputs in "D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE" and the output
+			// in "D3D12_RESOURCE_STATE_UNORDERED_ACCESS" (implementations leave them in these states), and binds its own state back after "Draw()" (see "NeedsStateRestoration()").
+			Resource* output_color = nullptr;
+			Resource* source_color = nullptr;
+			Resource* motion_vectors = nullptr;
+			Resource* depth_buffer = nullptr; // SR expects the depth to be the device/HW one (1 being near, not 1 being the camera (linear depth)), though it might actually not matter
 
 			// Optional data:
-			ID3D11Resource* exposure = nullptr; // Can be left nullptr to default to 1 or to auto exposure
-			ID3D11Resource* bias_mask = nullptr; // Reactivity/Bias mask (might not be used by all SR implementations)
-			ID3D11Resource* transparency_alpha = nullptr; // Amount of intensity in this pixel (only used by some FSR implementations)
+			Resource* exposure = nullptr; // Can be left nullptr to default to 1 or to auto exposure
+			Resource* bias_mask = nullptr; // Reactivity/Bias mask (might not be used by all SR implementations)
+			Resource* transparency_alpha = nullptr; // Amount of intensity in this pixel (only used by some FSR implementations)
 
 			unsigned int render_width = 0;
 			unsigned int render_height = 0;
@@ -234,20 +360,27 @@ namespace SR
 
 		// Returns true if drawing didn't fail.
 		// Note that this might expect the same command list all the times.
-		virtual bool Draw(const InstanceData* data, ID3D11DeviceContext* command_list, const DrawData& draw_data) { return false; }
+		virtual bool Draw(const InstanceData* data, CommandList* command_list, const DrawData& draw_data) { return false; }
 
 		// Returns the suggested or requested period, depending on the implementation.
 		// All implementations work well with Halton for now, so always use that.
 		virtual int GetJitterPhases(const SR::InstanceData* data) const { return 1 /*jitters disabled*/; }
 
+		// Whether "Draw()" upscales, rather than still preparing (e.g. the SR bridge's helper starting, which copies the color as it is)
+		virtual bool IsReady(const InstanceData* data) const { return true; }
+
 		// Returns the suggested mip lod bias for the current resolution scale.
 		// This assumes the jitter phases are increased with lower resolution scales.
-		// -1 at native resolution as we'd still be running TAA.
-		static float GetMipLODBias(const SR::InstanceData* data)
+		// -1 at native resolution as we'd still be running TAA (DLSS and FSR's guides).
+		virtual float GetMipLODBias(const SR::InstanceData* data) const
 		{
 			return SR::GetMipLODBias(data->settings_data.render_height, data->settings_data.output_height);
 		}
 		
+		// At every present, for every initialized implementation, with "DeviceData::sr_mutex" held exclusively (no "UpdateSettings()" or "Draw()" runs):
+		// releases what its replaced objects' frames can't use anymore (see "DeferredReleases")
+		virtual void ReleaseRetired(InstanceData* data) {}
+
 		// Whether the implementation leaves the state dirty compared to when it begun
 		virtual bool NeedsStateRestoration() const { return false; }
 	};

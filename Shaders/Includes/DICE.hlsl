@@ -228,7 +228,7 @@ float3 DICETonemap(
           // TODO: for consistency, we should pick a fixed alternative "peakWhitePerceptual" (and "shoulderStartPerceptual") here? Otherwise if we tonemap to 10k nits, per channel TM will basically be identical to TM by luminance, failing to desaturate highlights and failing to emulate the SDR per channel TM look, which is the primary reason for this method to exist
           const float3 compressedColorPerceptual = DICE::LuminanceCompress(sourceColorPerceptual, peakWhitePerceptual, shoulderStartPerceptual, clipInputMax, inputMaxPerceptual);
           const float3 compressedColorNormalized = DICE::FromPerceptual(compressedColorPerceptual, Settings);
-          perChannelTMColor *= (sourceColorPerceptual > shoulderStartPerceptual) ? (compressedColorNormalized / sourceColorNormalized) : 1.0;
+          perChannelTMColor *= select(sourceColorPerceptual > shoulderStartPerceptual, compressedColorNormalized / sourceColorNormalized, 1.0);
 
           Color = RestoreHueAndChrominance(Color, perChannelTMColor, 0.0, Settings.DesaturationVsDarkeningRatio, 0.0, FLT_MAX, 0.0, Settings.ProcessingColorSpace); // We don't expose the min/max chrominance changes given it should almost always be lower with TM by channel
         }
@@ -294,7 +294,7 @@ float3 DICETonemap(
       const float3 compressedColorPerceptual = DICE::LuminanceCompress(sourceColorPerceptual, peakWhitePerceptual, shoulderStartPerceptual, clipInputMax, inputMaxPerceptual);
       const float3 compressedColorNormalized = DICE::FromPerceptual(compressedColorPerceptual, Settings);
       // Colors below the shoulder (or below zero) don't need to be adjusted
-      Color *= (sourceColorPerceptual > shoulderStartPerceptual) ? (compressedColorNormalized / sourceColorNormalized) : 1.0;
+      Color *= select(sourceColorPerceptual > shoulderStartPerceptual, compressedColorNormalized / sourceColorNormalized, 1.0);
     }
       
     Color = FromColorSpaceToColorSpace(Color, Settings.ProcessingColorSpace, Settings.InOutColorSpace);

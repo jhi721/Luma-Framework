@@ -18,7 +18,17 @@
 #include <utility>
 #include <vector>
 
+#if DX11
 #include "managed_resources.h"
+#else
+#include "d3d12_passes.h"
+#include "d3d12_state.h"
+#include "d3d12_upload_ring.h"
+#include "d3d12_resource_creation.h" // see "DX12" and "ENABLE_MINHOOK"
+#if DEVELOPMENT
+#include "d3d12_readback.hpp"
+#endif
+#endif
 #include "patch.hpp"
 #include "trace.hpp"
 #include "debug.h"
@@ -45,7 +55,7 @@ enum class DrawOrDispatchOverrideType
 };
 
 // Same signature as "Game::OnDrawOrDispatch()". See "draw_callbacks_by_shader_hashes" and "dispatch_callbacks_by_shader_hashes".
-using DrawOrDispatchCallback = DrawOrDispatchOverrideType(*)(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const Shader::ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func);
+using DrawOrDispatchCallback = DrawOrDispatchOverrideType(*)(NativeDevice* native_device, NativeCommandList* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const Shader::ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func);
 
 enum class ShaderReplaceDrawType
 {
@@ -70,6 +80,8 @@ enum class ShaderCustomDepthStencilType
 struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
 {
    bool is_primary = false; // Immediate/Primary (as opposed to Async/Secondary/Deferred)
+   // The "texture_mip_lod_bias_offset" this context's bound samplers were last swapped for ("RebindUpgradedSamplers")
+   float applied_texture_mip_lod_bias_offset = 0.f;
 
    CB::LumaInstanceDataPadded cb_luma_instance_data = {};
    // Always start from dirty given that deferred command lists inherit the cbuffers data from the immediate ones, but we don't know when they will get joined, so we always need to assume the data was dirty and needs to be re-set from scratch
@@ -98,6 +110,12 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
    bool pipeline_state_has_custom_pixel_shader = false;
    bool pipeline_state_has_custom_graphics_shader = false;
    bool pipeline_state_has_custom_compute_shader = false;
+   // D3D11: the cached pipelines bound to the pixel and compute stages, valid while "pipeline_cache_generation" still equals the one read
+   // before each was looked up (a pipeline destruction raises it), so the draws read their redirections without "s_mutex_generic"
+   const Shader::CachedPipeline* bound_pixel_cached_pipeline = nullptr;
+   const Shader::CachedPipeline* bound_compute_cached_pipeline = nullptr;
+   uint32_t bound_pixel_cached_pipeline_generation = UINT32_MAX;
+   uint32_t bound_compute_cached_pipeline_generation = UINT32_MAX;
    Shader::CustomPipelineData custom_vertex_pipeline;
    Shader::CustomPipelineData custom_pixel_pipeline;
    Shader::CustomPipelineData custom_compute_pipeline;
@@ -117,6 +135,43 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
 
    const AutoTextureFormatUpgradeShaderHash* auto_graphics_texture_format_upgrades = nullptr;
    const AutoTextureFormatUpgradeShaderHash* auto_compute_texture_format_upgrades = nullptr;
+
+   // What a command list reset clears, and a D3D12 pipeline bind too (a D3D12 list has one pipeline, so a bind replaces all of it).
+   // The D3D12 bundle hand-over ("OnExecuteSecondaryCommandList()") must copy these same fields.
+   void ResetBoundPipeline()
+   {
+      pipeline_state_original_compute_shader = {};
+      pipeline_state_original_vertex_shader = {};
+      pipeline_state_original_pixel_shader = {};
+      pipeline_state_original_graphics_shader_hashes.Clear();
+      pipeline_state_original_compute_shader_hashes.Clear();
+      pipeline_state_has_custom_vertex_shader = false;
+      pipeline_state_has_custom_pixel_shader = false;
+      pipeline_state_has_custom_graphics_shader = false;
+      pipeline_state_has_custom_compute_shader = false;
+      custom_vertex_pipeline = {};
+      custom_pixel_pipeline = {};
+      custom_compute_pipeline = {};
+      pipeline_state_custom_vertex_shader = {};
+      pipeline_state_custom_pixel_shader = {};
+      pipeline_state_custom_compute_shader = {};
+      bound_pixel_cached_pipeline = nullptr;
+      bound_compute_cached_pipeline = nullptr;
+      bound_pixel_cached_pipeline_generation = UINT32_MAX;
+      bound_compute_cached_pipeline_generation = UINT32_MAX;
+      draw_callback = nullptr;
+      dispatch_callback = nullptr;
+      is_known_ui_shader_bound = false;
+      auto_graphics_texture_format_upgrades = nullptr;
+#if DX12
+      luma_settings_param = -1;
+      luma_data_param = -1;
+      bound_cached_pipeline = nullptr;
+      bound_base_pipeline = 0;
+      bound_current_pipeline = 0;
+      render_target_formats_dirty = false;
+#endif
+   }
 
    enum ViewState
    {
@@ -186,6 +241,7 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
       any_upgraded_cs_uavs = std::any_of(cs_uavs_state.begin(), cs_uavs_state.end(), [](auto v) { return v == ViewState::SetAndUpgraded; });
    }
 
+#if DX11
    static void SetConstantBuffers(ID3D11DeviceContext* device_context, reshade::api::shader_stage stages, uint32_t slot, ID3D11Buffer* const buffers, uint32_t num = 1)
    {
       if ((stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
@@ -197,6 +253,7 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
       if ((stages & reshade::api::shader_stage::compute) == reshade::api::shader_stage::compute)
          device_context->CSSetConstantBuffers(slot, num, &buffers);
    }
+#endif // DX11
 
 #if ENABLE_AUTO_CBUFFER_RESTORATION
    com_ptr<ID3D11Buffer> original_constant_buffers[(uint8_t)Shader::Stage::Count][D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT];
@@ -268,6 +325,31 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
 
    ShaderCustomDepthStencilType temp_custom_depth_stencil = ShaderCustomDepthStencilType::None;
 #endif
+
+#if DX12
+   // ReShade's proxy of the list, through whose API Luma records its passes on it (see "DrawRCAS()")
+   reshade::api::command_list* cmd_list = nullptr;
+   // What the command list bound, as far as game code can query it on release builds too (see "d3d12_state.h")
+   D3D12State::CommandListState d3d12_state;
+   // A bundle (secondary command list): the command list that executes it inherits what it bound
+   bool is_bundle = false;
+   // The memory of the root CBVs Luma sets on this command list (see "d3d12_upload_ring.h"). The pool is the device's, held here too: this data can outlive the device's
+   std::shared_ptr<D3D12UploadRing::Pool> upload_ring;
+   D3D12UploadRing::Pages upload_pages;
+   D3D12_GPU_VIRTUAL_ADDRESS luma_data_address = 0; // Of the last upload of "cb_luma_instance_data", 0 since the last reset
+   // The root parameters of Luma's CBVs in the root signature of the bound pipeline, when the bind swapped in a replacement (-1 for the CBVs it doesn't have, see
+   // "D3D12RootSignatures::LumaParams"). Plain integers: builds without MinHook have no root signature hook
+   int32_t luma_settings_param = -1;
+   int32_t luma_data_param = -1;
+   // The pipeline the command list bound, for its draws to follow the formats of the render targets (see "UpdateD3D12PipelineVariant()"). Null if it isn't tracked. Valid while it's bound, like the hashes above
+   const Shader::CachedPipeline* bound_cached_pipeline = nullptr;
+   // What Luma set at the bind: the clone of the pipeline if it has an active one, else the pipeline. A render target format variant is made from it
+   uint64_t bound_base_pipeline = 0;
+   // What the command list really has bound now: "bound_base_pipeline" or one of its variants
+   uint64_t bound_current_pipeline = 0;
+   // Set by the binds of a pipeline and of render targets: the next graphics draw looks at the formats of the render targets again
+   bool render_target_formats_dirty = false;
+#endif
 };
 
 struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
@@ -327,10 +409,16 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
 
    std::unordered_set<reshade::api::swapchain*> swapchains;
    std::unordered_set<uint64_t> back_buffers; // From all the swapchains (whether they are upgraded or not)
-   ID3D11Device* native_device = nullptr; // Doesn't need mutex, always valid given it's a ptr to "itself"
+#if DX12
+   // The ones of "back_buffers" whose format family the swapchain upgrade changed (see "OnCreateSwapchain()"): only these can't take the game's copies through a buffer
+   std::unordered_set<uint64_t> upgraded_back_buffers;
+#endif
+   NativeDevice* native_device = nullptr; // Doesn't need mutex, always valid given it's a ptr to "itself"
    reshade::api::device* reshade_device = nullptr; // Always valid as it's our parent. Not owned by this.
+#if DX11
    com_ptr<ID3D11DeviceContext> primary_command_list; // The immediate/primary command list is always valid
    CommandListData* primary_command_list_data = nullptr; // The immediate/primary command list is always valid
+#endif
 
    UINT uav_max_count = D3D11_1_UAV_SLOT_COUNT; // DX11.1. Use "D3D11_PS_CS_UAV_REGISTER_COUNT" for DX11.
 
@@ -362,11 +450,32 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    std::unordered_set<uint64_t> pipelines_to_reload;
    static_assert(sizeof(reshade::api::pipeline::handle) == sizeof(uint64_t));
 
+#if DX12 && DEVELOPMENT // For the frame capture, for now
+   D3D12State::PipelineLayouts pipeline_layouts;
+   D3D12State::DescriptorHeaps descriptor_heaps;
+   D3D12State::BufferAddresses buffer_addresses;
+   // The frame capture, joined from the command lists in submission order (the queue's immediate command list is ReShade's own)
+   CommandListData trace_command_list_data;
+   D3D12Readback::State readback; // The dev MCP's GPU copies
+#if ENABLE_MINHOOK
+   D3D12ResourceCreation::TextureKinds texture_kinds; // How the game created each live texture, for the dev MCP's "creation" (see "includes/d3d12_resource_creation.h")
+#endif
+#endif
+
+#if DX11
    // Custom samplers mapped to original ones by texture LOD bias
    std::unordered_map<uint64_t, std::unordered_map<float, com_ptr<ID3D11SamplerState>>> custom_sampler_by_original_sampler;
+#endif
 
 #if ENABLE_SR
    SR::Type sr_type = SR::Type::None; // If active, the SR tech enabled by the user and supported+initialized correctly on this device
+   std::atomic<SR::Type> sr_type_selected = SR::Type::None; // The overlay's and the MCP's pick, applied to "sr_type" at the next present
+   // None was applied ("ApplySRType"): a game whose draws may still use its upscaler resources until its "OnPresent" latches the
+   // selection releases them there, taking this with "exchange(false)" (and can set it for its own reasons)
+   std::atomic<bool> release_sr_resources = false;
+   // Exclusive for "ApplySRType()" (at present), shared by a game's SR draw ("LockSRForDraw()"): the type and its instance don't switch, nor do retired
+   // upscaler objects go, while a list records the draw
+   std::shared_mutex sr_mutex;
    std::map<SR::Type, SR::InstanceData*> sr_implementations_instances; // All implementations allowed by the current mod, might not all be compatible
    SR::InstanceData* GetSRInstanceData() const
    {
@@ -378,11 +487,17 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    // Resources:
 
 #if ENABLE_SR
+#if DX12
+   com_ptr<ID3D12Resource> sr_output_color;
+   com_ptr<ID3D12Resource> sr_exposure;
+#else
    com_ptr<ID3D11Texture2D> sr_output_color;
    com_ptr<ID3D11Texture2D> sr_exposure;
+#endif
    float sr_exposure_texture_value = 1.f;
 #endif // ENABLE_SR
 
+#if DX11 // D3D11 objects: the D3D12 Luma passes make their pipelines from the natives' bytecode ("CreateD3D12NativePipeline()"), its UI resources aren't ported, its cbuffers are in the upload ring below
    // Native Shaders (from "native_shaders_definitions")
    bool created_native_shaders = false;
    std::unordered_map<uint32_t, com_ptr<ID3D11VertexShader>> native_vertex_shaders;
@@ -406,9 +521,138 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    com_ptr<ID3D11Buffer> luma_global_settings;
    com_ptr<ID3D11Buffer> luma_instance_data;
    com_ptr<ID3D11Buffer> luma_ui_data;
+#endif // DX11
    CB::LumaUIDataPadded cb_luma_ui_data = {};
    std::atomic<bool> cb_luma_global_settings_dirty = true;
 
+#if DX12
+   // The memory of the root CBVs Luma adds to the game's root signatures (see "d3d12_upload_ring.h"). Command lists hold the pool too, their data can outlive this
+   std::shared_ptr<D3D12UploadRing::Pool> upload_ring;
+   // The copies of the Luma settings, one per change: a command list keeps pointing at the one it recorded. Every command list may use the newest, so "settings_mutex"
+   // serializes the uploads into these pages
+   D3D12UploadRing::Pages settings_pages = {.shared = true};
+   std::shared_mutex settings_mutex;
+   std::atomic<D3D12_GPU_VIRTUAL_ADDRESS> settings_address = 0; // The newest copy, 0 before the first
+   // The ring frees its pages by the fences it signals with this count at each present
+   std::atomic<uint64_t> present_count = 0;
+
+   // Bumped when any of Luma's native shaders changes (see "CompileCustomShaders()"): the pipelines made of them are made again
+   std::atomic<uint32_t> native_shaders_generation = 0;
+
+   // What a fullscreen pass of Luma's natives at present makes when it first draws (see "PrepareD3D12NativePass()"). "mutex" serializes the pass's draws and guards the rest
+   struct NativePassD3D12
+   {
+      std::shared_mutex mutex;
+      D3D12Passes::Context passes;                 // Its command list, run on the present queue
+      com_ptr<ID3D12RootSignature> root_signature; // Its CBVs are at the registers the natives were compiled with
+      com_ptr<ID3D12PipelineState> pipeline;       // Null if the last attempt to make it for the format and generation below failed
+      DXGI_FORMAT pipeline_format = DXGI_FORMAT_UNKNOWN;
+      uint32_t pipeline_generation = 0;
+      bool pipeline_compute = false; // Made for a compute shader (see "PrepareD3D12NativePass()")
+      CommandListData cmd_list_data; // Owns the memory of its root CBVs (root parameters 0 and 1), for "SetLumaConstantBuffers()"
+      // Each of these failures is logged once per pass
+      std::atomic_flag logged_no_passes;
+      std::atomic_flag logged_no_frame;
+      std::atomic_flag logged_no_submit;
+   };
+   // The display composition (see "DrawDisplayCompositionD3D12()")
+   struct DisplayCompositionD3D12 : NativePassD3D12
+   {
+      com_ptr<ID3D12Resource> source;    // A copy of the back buffer, which the shader reads while it writes the back buffer
+      uint32_t drawn_frame = UINT32_MAX; // The "FrameIndex" of the last present it drew in, for the dev MCP
+      // The compute shader loads the back buffer it writes (a typed UAV load): the last format checked for it, and whether it supports it
+      DXGI_FORMAT typed_load_format = DXGI_FORMAT_UNKNOWN;
+      bool typed_load = false;
+   } display_composition;
+   // The encode of the scRGB proxy into the real back buffer (see "DrawSwapchainEncodeD3D12()")
+   NativePassD3D12 swapchain_encode;
+#if ENABLE_D3D12_PASSES
+   // What a D3D12 pass drawn on the game's command lists ("DrawRCAS()", "DrawSMAA()") makes when it first draws (see "PrepareD3D12GamePass()").
+   // "mutex" serializes its draws and guards the rest
+   struct GamePassD3D12
+   {
+      std::shared_mutex mutex;
+      reshade::api::pipeline_layout layout = {};                            // Made through ReShade, which its descriptor tables need
+      std::vector<reshade::api::descriptor_table> tables;                   // Of ReShade's GPU heap, by present, by draw in it and by table of the draw
+      std::unordered_map<uint64_t, com_ptr<ID3D12PipelineState>> pipelines; // By pixel shader hash and render target format, of the natives of "pipelines_generation"
+      uint32_t pipelines_generation = 0;
+      std::vector<std::pair<uint64_t, com_ptr<ID3D12PipelineState>>> retired; // Of older natives, with the present count they were replaced at: a game list recorded with them may still run (see "DestroyRetiredD3D12GamePassResources()")
+      uint64_t frame = UINT64_MAX;                        // The present count of the last draw, and the draws since it
+      uint32_t frame_draws = 0;
+      bool failed = false;                                                        // ReShade refused the layout or the tables, which isn't tried again
+      uint32_t fullscreen_source_count = 0;                                       // "DrawFullscreenPassD3D12()": the SRVs of the table of t0, fixed by the pass's first draw
+      std::vector<std::pair<uint64_t, reshade::api::resource>> retired_resources; // Replaced textures, with the present count they were replaced at (see "RetireD3D12GamePassResource()")
+   };
+#if ENABLE_RCAS
+   GamePassD3D12 rcas; // "SharpenParams" as 4 root constants (b0), then a table of t0
+#endif
+#if ENABLE_SMAA
+   // 8 root constants (b1), a table of t0-t2 and the linear and point samplers (s0, s1)
+   struct SMAAD3D12 : GamePassD3D12
+   {
+      // Uploaded through ReShade's immediate list, so at a present ("CreateSMAATexturesD3D12()"), once a draw asked for them
+      std::atomic<bool> textures_wanted = false;
+      reshade::api::resource area_texture = {};
+      reshade::api::resource search_texture = {};
+      reshade::api::resource_view area_srv = {};
+      reshade::api::resource_view search_srv = {};
+      // At the target's size, made again with it. In a shader resource state between draws
+      reshade::api::resource edges = {};
+      reshade::api::resource weights = {};
+      reshade::api::resource_view edges_rtv = {};
+      reshade::api::resource_view edges_srv = {};
+      reshade::api::resource_view weights_rtv = {};
+      reshade::api::resource_view weights_srv = {};
+      // The neighborhood blend's, when RCAS follows it: at the target's size and format
+      reshade::api::resource output = {};
+      reshade::api::resource_view output_rtv = {};
+      reshade::api::resource_view output_srv = {};
+      reshade::api::format output_format = reshade::api::format::unknown;
+      uint32_t width = 0;
+      uint32_t height = 0;
+   } smaa;
+#endif
+#if ENABLE_BLOOM
+   // A table of t0 and u0. Its output (fp16, at the source's size) is in a shader resource state between draws
+   struct KarisAverageD3D12 : GamePassD3D12
+   {
+      reshade::api::resource output = {};
+      reshade::api::resource_view output_srv = {};
+      reshade::api::resource_view output_uav = {};
+      uint32_t width = 0;
+      uint32_t height = 0;
+   } karis_average;
+   // "LumaBloom" as 8 root constants (b11), a table of t0 and the linear sampler (s0). The chains are made again with the scene's size or the mip count,
+   // in a shader resource state between draws: Y is one texture with a mip per level (mip 0 is the bloom), X one texture per level (see "DrawBloom()")
+   struct BloomD3D12 : GamePassD3D12
+   {
+      reshade::api::resource mips_y = {};
+      std::vector<reshade::api::resource> mips_x;
+      std::vector<reshade::api::resource_view> rtvs_y, srvs_y, rtvs_x, srvs_x;
+      uint32_t scene_width = 0;
+      uint32_t scene_height = 0;
+      uint32_t mip_count = 0;
+   } bloom;
+#endif
+   // "ConvertTextureCopyD3D12()": a table of t0, and the textures it goes through, one for each usage, size and format the game's copies had (see "GetD3D12CopyIntermediate()"): the render
+   // target it draws into when the copy's destination can't be one (or may be in a layout), in a render target state between draws, and the texture it samples when the copy's source may be in a
+   // layout (a copy of the source), in a copy destination state between draws
+   struct TextureCopyD3D12 : GamePassD3D12
+   {
+      struct Intermediate
+      {
+         reshade::api::resource resource = {};
+         reshade::api::resource_usage usage = reshade::api::resource_usage::undefined;
+         uint32_t width = 0;
+         uint32_t height = 0;
+         reshade::api::format format = reshade::api::format::unknown;
+      };
+      std::vector<Intermediate> intermediates;
+   } texture_copy;
+#endif
+#endif
+
+#if DX11
    // UI
    com_ptr<ID3D11Texture2D> ui_texture;
    com_ptr<ID3D11RenderTargetView> ui_texture_rtv;
@@ -431,11 +675,14 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    std::unordered_set<ID3D11Buffer*> cb_per_view_global_buffers;
 #endif
    void* cb_per_view_global_buffer_map_data = nullptr;
+#endif // DX11
 #if DEVELOPMENT
-   std::shared_ptr<void> debug_draw_frozen_draw_state_stack;
-   com_ptr<ID3D11Resource> debug_draw_texture;
    DXGI_FORMAT debug_draw_texture_format = DXGI_FORMAT_UNKNOWN; // The view format, not the texture format
    uint4 debug_draw_texture_size = {}; // 3rd and 4th channels are Array/MS/Mips
+#endif
+#if DEVELOPMENT && DX11
+   std::shared_ptr<void> debug_draw_frozen_draw_state_stack;
+   com_ptr<ID3D11Resource> debug_draw_texture;
 
    struct TrackBufferData
    {
@@ -495,6 +742,10 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    // Live settings (set by the code, not directly by users):
    float default_user_peak_white = default_peak_white;
    float texture_mip_lod_bias_offset = 0.f;
+#if DX12
+   // The sampler upgrade the D3D12 sampler descriptors the game wrote have ("GetSamplersUpgradeState()"): "OnPresent()" writes them again when it changes
+   std::tuple<float, int, int, bool, bool> applied_samplers_upgrade;
+#endif
 #if ENABLE_SR
    float sr_scene_exposure = 1.f;
    float sr_scene_pre_exposure = 1.f;
@@ -510,6 +761,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    // Per game custom data
    GameDeviceData* game = nullptr;
 
+#if DX11
    std::vector<ID3D11Buffer*> GetLumaCBuffers() const
    {
       std::vector<ID3D11Buffer*> buffers;
@@ -523,7 +775,24 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    }
 
    ManagedResources managed_resources;
+#endif // DX11
 };
+
+// A Luma native shader ("native_*_shaders") by name, null until compiled. Looked up with "find": "operator[]" would insert on a miss,
+// mutating a map Core's draw helpers read concurrently. A caller that can race a shader (re)load holds "s_mutex_shader_objects".
+template <typename ShaderMap>
+auto FindShader(const ShaderMap& shaders, uint32_t name)
+{
+   const auto it = shaders.find(name);
+   return (it != shaders.end() ? it->second.get() : nullptr);
+}
+
+// Whether all the named Luma native shaders are compiled (shaders load asynchronously and reload live in development)
+template <typename ShaderMap, typename... Names>
+bool HasShaders(const ShaderMap& shaders, Names... names)
+{
+   return ((FindShader(shaders, names) != nullptr) && ...);
+}
 
 struct __declspec(uuid("c5805458-2c02-4ebf-b139-38b85118d971")) SwapchainData
 {
@@ -532,7 +801,9 @@ struct __declspec(uuid("c5805458-2c02-4ebf-b139-38b85118d971")) SwapchainData
 
    std::unordered_set<uint64_t> back_buffers;
 
+#if DX11
    std::vector<com_ptr<ID3D11RenderTargetView>> display_composition_rtvs;
+#endif
 
    // Whether the original SDR (vanilla) swapchain was linear space (e.g. sRGB formats)
     bool vanilla_was_linear_space = false;

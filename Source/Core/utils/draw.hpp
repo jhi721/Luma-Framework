@@ -2,6 +2,7 @@
 
 #include "../texture_data/SMAA_AreaTex.h"
 #include "../texture_data/SMAA_SearchTex.h"
+#include "../texture_data/SMAA_AreaTex_SharpU.h"
 
 #include "../includes/callbacks.h"
 #include "../includes/math.h"
@@ -346,8 +347,9 @@ struct DrawStateStack
    std::unique_ptr<State> state;
 };
 
-// Fullscreen (full render target) pass
-void DrawCustomPixelShader(ID3D11DeviceContext* device_context, ID3D11DepthStencilState* depth_stencil_state, ID3D11BlendState* blend_state, ID3D11SamplerState* sampler_state, ID3D11VertexShader* vs, ID3D11PixelShader* ps, ID3D11ShaderResourceView* source_resource_texture_view, ID3D11RenderTargetView* target_resource_texture_view, UINT width, UINT height, bool alpha = true, const char* trace_name = nullptr)
+// Fullscreen (full render target) pass. "second_target_resource_texture_view" (optional): a second target of the same size, for a pixel
+// shader writing SV_Target1 too.
+void DrawCustomPixelShader(ID3D11DeviceContext* device_context, ID3D11DepthStencilState* depth_stencil_state, ID3D11BlendState* blend_state, ID3D11SamplerState* sampler_state, ID3D11VertexShader* vs, ID3D11PixelShader* ps, ID3D11ShaderResourceView* source_resource_texture_view, ID3D11RenderTargetView* target_resource_texture_view, UINT width, UINT height, bool alpha = true, const char* trace_name = nullptr, ID3D11RenderTargetView* second_target_resource_texture_view = nullptr)
 {
    // Set the new resources/states:
    constexpr FLOAT blend_factor_alpha[4] = { 1.f, 1.f, 1.f, 1.f };
@@ -365,13 +367,15 @@ void DrawCustomPixelShader(ID3D11DeviceContext* device_context, ID3D11DepthStenc
    viewport.MinDepth = 0;
    viewport.MaxDepth = 1;
    device_context->RSSetViewports(1, &viewport); // Viewport is always needed
+   // The targets before the source: D3D11 binds a resource still bound as an output (e.g. the game's render target) as a null SRV
+   ID3D11RenderTargetView* const target_resource_texture_views[] = { target_resource_texture_view, second_target_resource_texture_view };
+   device_context->OMSetRenderTargets(second_target_resource_texture_view ? 2 : 1, target_resource_texture_views, nullptr);
    device_context->PSSetShaderResources(0, 1, &source_resource_texture_view);
    device_context->OMSetDepthStencilState(depth_stencil_state, 0);
    if (sampler_state) // Optional
    {
       device_context->PSSetSamplers(0, 1, &sampler_state);
    }
-   device_context->OMSetRenderTargets(1, &target_resource_texture_view, nullptr);
    device_context->VSSetShader(vs, nullptr, 0);
    device_context->PSSetShader(ps, nullptr, 0);
    device_context->IASetInputLayout(nullptr);
@@ -830,8 +834,40 @@ void ReleaseSMAAIntermediates(DeviceData& device_data)
    managed_resources.shader_resource_views["smaa_blending_weight_calculation"_h].reset();
 }
 
+// The size of the texture behind a view (0x0 without one)
+uint2 GetViewTextureSize(ID3D11View* view)
+{
+   D3D11_TEXTURE2D_DESC desc = {};
+   ComPtr<ID3D11Resource> resource;
+   ComPtr<ID3D11Texture2D> texture;
+   if (view)
+   {
+      view->GetResource(resource.put());
+      if (SUCCEEDED(resource->QueryInterface(texture.put())))
+         texture->GetDesc(&desc);
+   }
+   return uint2{desc.Width, desc.Height};
+}
+
+// Whether Core's SMAA passes ("DrawSMAA" below) are compiled
+inline bool HasSMAAShaders(const DeviceData& device_data)
+{
+   return HasShaders(device_data.native_pixel_shaders, "SMAA Edge Detection PS"_h, "SMAA Blending Weight Calculation PS"_h, "SMAA Neighborhood Blending PS"_h) &&
+          HasShaders(device_data.native_vertex_shaders, "SMAA Edge Detection VS"_h, "SMAA Blending Weight Calculation VS"_h, "SMAA Neighborhood Blending VS"_h);
+}
+
+// SMAA T2x: the game's blending weight and neighborhood blending pixel shaders built with "SMAA_SUBSAMPLE_INDICES" and
+// "SMAA_REPROJECTION" (SMAA_Passes.hlsl), and the velocity the neighborhood blend reads at t2. Its target then holds the velocity
+// length in alpha, for the game's temporal resolve ("SMAAResolvePS").
+struct SMAAT2xPasses
+{
+   ID3D11PixelShader* blending_weight_calculation_ps = nullptr;
+   ID3D11PixelShader* neighborhood_blending_ps = nullptr;
+   ID3D11ShaderResourceView* velocity = nullptr;
+};
+
 // "cb_smaa_metrics" (optional) is bound to VS and PS b1, the slot the "Luma_SMAA_impl.hlsl" files declare their metrics cbuffer at.
-void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D11RenderTargetView* rtv, ID3D11ShaderResourceView* srv_color_tex, ID3D11ShaderResourceView* srv_color_tex_gamma, ID3D11ShaderResourceView* srv_predication_tex = nullptr, ID3D11Buffer* cb_smaa_metrics = nullptr)
+void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D11RenderTargetView* rtv, ID3D11ShaderResourceView* srv_color_tex, ID3D11ShaderResourceView* srv_color_tex_gamma, ID3D11ShaderResourceView* srv_predication_tex = nullptr, ID3D11Buffer* cb_smaa_metrics = nullptr, const SMAAT2xPasses* t2x = nullptr)
 {
    auto& managed_resources = device_data.managed_resources;
 
@@ -996,6 +1032,14 @@ void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceD
       D3D11_SUBRESOURCE_DATA subresource_data = {};
       subresource_data.pSysMem = areaTexBytes;
       subresource_data.SysMemPitch = AREATEX_PITCH;
+#if !SMAA_SMOOTH_U_SHAPES
+      std::vector<unsigned char> area_tex_bytes(std::begin(areaTexBytes), std::end(areaTexBytes));
+      for (const auto& [offset, value] : areaTexSharpUPatch)
+      {
+         area_tex_bytes[offset] = value;
+      }
+      subresource_data.pSysMem = area_tex_bytes.data();
+#endif
       ensure(device->CreateTexture2D(&tex_desc, &subresource_data, tex.put()), >= 0);
       ensure(device->CreateShaderResourceView(tex.get(), nullptr, managed_resources.shader_resource_views["smaa_area_tex"_h].put()), >= 0);
    }
@@ -1033,6 +1077,7 @@ void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceD
    [[unlikely]] if (!managed_resources.render_target_views["smaa_blending_weight_calculation"_h])
    {
       tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      tex_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET; // Not left to the branches above, which might not have run
       ensure(device->CreateTexture2D(&tex_desc, nullptr, tex.put()), >= 0);
       ensure(device->CreateRenderTargetView(tex.get(), nullptr, managed_resources.render_target_views["smaa_blending_weight_calculation"_h].put()), >= 0);
       ensure(device->CreateShaderResourceView(tex.get(), nullptr, managed_resources.shader_resource_views["smaa_blending_weight_calculation"_h].put()), >= 0); 
@@ -1042,7 +1087,7 @@ void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceD
    device_context->OMSetDepthStencilState(managed_resources.depth_stencils["smaa_disable_depth_use_stencil"_h].get(), 1);
    device_context->OMSetRenderTargets(1, &managed_resources.render_target_views["smaa_blending_weight_calculation"_h], managed_resources.depth_stencil_views["smaa_dsv"_h].get());
    device_context->VSSetShader(device_data.native_vertex_shaders.at("SMAA Blending Weight Calculation VS"_h).get(), nullptr, 0);
-   device_context->PSSetShader(device_data.native_pixel_shaders.at("SMAA Blending Weight Calculation PS"_h).get(), nullptr, 0);
+   device_context->PSSetShader(t2x ? t2x->blending_weight_calculation_ps : device_data.native_pixel_shaders.at("SMAA Blending Weight Calculation PS"_h).get(), nullptr, 0);
    const std::array ps_srvs_blending_weight_calculation = { managed_resources.shader_resource_views["smaa_edge_detection"_h].get(), managed_resources.shader_resource_views["smaa_area_tex"_h].get(), managed_resources.shader_resource_views["smaa_search_tex"_h].get() };
    device_context->PSSetShaderResources(0, ps_srvs_blending_weight_calculation.size(), ps_srvs_blending_weight_calculation.data());
 
@@ -1058,8 +1103,8 @@ void DrawSMAA(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceD
    // Bindings.
    device_context->OMSetRenderTargets(1, &rtv, nullptr);
    device_context->VSSetShader(device_data.native_vertex_shaders.at("SMAA Neighborhood Blending VS"_h).get(), nullptr, 0);
-   device_context->PSSetShader(device_data.native_pixel_shaders.at("SMAA Neighborhood Blending PS"_h).get(), nullptr, 0);
-   const std::array ps_srvs_neighborhood_blending = { srv_color_tex, managed_resources.shader_resource_views["smaa_blending_weight_calculation"_h].get() };
+   device_context->PSSetShader(t2x ? t2x->neighborhood_blending_ps : device_data.native_pixel_shaders.at("SMAA Neighborhood Blending PS"_h).get(), nullptr, 0);
+   const std::array ps_srvs_neighborhood_blending = { srv_color_tex, managed_resources.shader_resource_views["smaa_blending_weight_calculation"_h].get(), t2x ? t2x->velocity : nullptr };
    device_context->PSSetShaderResources(0, ps_srvs_neighborhood_blending.size(), ps_srvs_neighborhood_blending.data());
 
    device_context->Draw(3, 0);
@@ -1138,6 +1183,57 @@ void DrawRCAS(ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D
 }
 #endif // ENABLE_RCAS
 
+// HDR-weighted MSAA resolve ("Luma_MSAAResolve_PS.hlsl", registered by the game as "pixel_shader_name") of the whole single slice
+// "source" into "dest", in place of the game's ResolveSubresource of them in "format", which also makes their views. "exposure_srv" (t1)
+// and "exposure_cb" (b0) feed the shader's MSAA_RESOLVE_EXPOSURE. The caller holds "s_mutex_shader_objects" (shared) through it, so a
+// shader reload can't release the shaders mid-draw. False, with nothing drawn, if the pair can't be bound or the shaders aren't
+// compiled: the caller keeps the hardware resolve. Restores the state it changes.
+bool DrawMSAAResolve(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const DeviceData& device_data, ID3D11Resource* source, ID3D11Resource* dest, DXGI_FORMAT format,
+   ID3D11ShaderResourceView* exposure_srv = nullptr, ID3D11Buffer* exposure_cb = nullptr, uint32_t pixel_shader_name = "MSAA Resolve PS"_h)
+{
+   ComPtr<ID3D11Texture2D> source_texture;
+   ComPtr<ID3D11Texture2D> dest_texture;
+   if (FAILED(source->QueryInterface(source_texture.put())) || FAILED(dest->QueryInterface(dest_texture.put())))
+      return false;
+   D3D11_TEXTURE2D_DESC source_desc;
+   D3D11_TEXTURE2D_DESC dest_desc;
+   source_texture->GetDesc(&source_desc);
+   dest_texture->GetDesc(&dest_desc);
+   // MSAA targets are often created without a shader resource bind: the game adds it at their creation
+   if (source_desc.SampleDesc.Count <= 1 || source_desc.ArraySize != 1 || dest_desc.ArraySize != 1 || (source_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 || (dest_desc.BindFlags & D3D11_BIND_RENDER_TARGET) == 0)
+      return false;
+
+   auto* const vs = FindShader(device_data.native_vertex_shaders, "Copy VS"_h);
+   auto* const ps = FindShader(device_data.native_pixel_shaders, pixel_shader_name);
+   if (!vs || !ps)
+      return false;
+
+   // ponytail: views are created per resolve (one to three a frame); cache them per resource if it ever shows in a profile
+   const D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {.Format = format, .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS};
+   const D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {.Format = format, .ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D};
+   ComPtr<ID3D11ShaderResourceView> source_srv;
+   ComPtr<ID3D11RenderTargetView> dest_rtv;
+   if (FAILED(native_device->CreateShaderResourceView(source_texture.get(), &srv_desc, source_srv.put())) || FAILED(native_device->CreateRenderTargetView(dest_texture.get(), &rtv_desc, dest_rtv.put())))
+      return false;
+
+   DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
+   draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
+   // Games resolve with the MSAA target still bound for output, and D3D11 refuses it as a shader resource then
+   native_device_context->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 0, nullptr, nullptr);
+   native_device_context->PSSetShaderResources(1, 1, &exposure_srv);
+   native_device_context->PSSetConstantBuffers(0, 1, &exposure_cb);
+   DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, vs, ps, source_srv.get(), dest_rtv.get(), dest_desc.Width, dest_desc.Height);
+   draw_state_stack.Restore(native_device_context);
+   return true;
+}
+
+// Frees "DrawKarisAverage"'s output, both views (e.g. while a game's bloom is off); its next draw recreates it
+void ReleaseKarisAverage(DeviceData& device_data)
+{
+   device_data.managed_resources.unordered_access_views["luma_karis_average"_h].reset();
+   device_data.managed_resources.shader_resource_views["luma_karis_average"_h].reset();
+}
+
 void DrawKarisAverage(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D11ShaderResourceView* srv_source, ID3D11ShaderResourceView** srv_out)
 {
    auto& managed_resources = device_data.managed_resources;
@@ -1157,6 +1253,18 @@ void DrawKarisAverage(ID3D11Device* device, ID3D11DeviceContext* device_context,
    ensure(resource->QueryInterface(tex.put()), >= 0);
    D3D11_TEXTURE2D_DESC tex_desc;
    tex->GetDesc(&tex_desc);
+
+   // Rebuild the output whenever the source size changes (e.g. a game's resolution scale), not only with the swapchain.
+   if (const auto& output_uav = managed_resources.unordered_access_views["luma_karis_average"_h])
+   {
+      uint4 output_size;
+      DXGI_FORMAT output_format;
+      GetResourceInfo(output_uav.get(), output_size, output_format);
+      if (output_size.x != tex_desc.Width || output_size.y != tex_desc.Height)
+      {
+         ReleaseKarisAverage(device_data);
+      }
+   }
 
    // Create RT and views.
    if (!managed_resources.unordered_access_views["luma_karis_average"_h])
@@ -1190,9 +1298,9 @@ void DrawKarisAverage(ID3D11Device* device, ID3D11DeviceContext* device_context,
 
    // Reset resolution dependent resources on init swapchain.
    // Some are intentioanlly left out, we will recreate/reset them here.
-   auto on_init_swapchain = [&]()
+   auto on_init_swapchain = [&device_data]()
    {
-      managed_resources.unordered_access_views["luma_karis_average"_h].reset();
+      ReleaseKarisAverage(device_data);
    };
 
    LumaCallbacks::on_init_swapchain.try_emplace("luma_karis_average"_h, on_init_swapchain);
@@ -1218,6 +1326,16 @@ static struct
    UINT last_scene_height = 0;
    int last_nmips = -1;
 } draw_bloom_mips;
+
+// Frees "DrawBloom"'s mip chains (e.g. while a game's bloom is off); its next draw rebuilds them
+void ReleaseBloom()
+{
+   ResetCOMArray(draw_bloom_mips.rtv_mips_x);
+   ResetCOMArray(draw_bloom_mips.srv_mips_x);
+   ResetCOMArray(draw_bloom_mips.rtv_mips_y);
+   ResetCOMArray(draw_bloom_mips.srv_mips_y);
+   draw_bloom_mips.last_nmips = -1;
+}
 
 void DrawBloom(ID3D11Device* device, ID3D11DeviceContext* device_context, DeviceData& device_data, ID3D11ShaderResourceView* srv_scene, int nmips, const float* sigmas, ID3D11ShaderResourceView** srv_bloom)
 {

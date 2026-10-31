@@ -271,6 +271,8 @@ namespace Patch
       uint32_t bytecode_offset = 0; // Chunk bytecode offset relative to the container start
       bool valid = false;
    };
+   // Validates the DXBC container and locates the SHEX/SHDR bytecode chunk
+   ByteCodeView FindShaderByteCode(const void* container, size_t container_size);
 
    // Async patch job: owns one container copy + the parsed bytecode view offset.
    struct PatchJob

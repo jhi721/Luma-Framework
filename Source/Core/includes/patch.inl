@@ -6,58 +6,57 @@
 
 namespace Patch
 {
-   namespace
+   ByteCodeView FindShaderByteCode(const void* container, size_t container_size)
    {
-      // Validates the DXBC container and locates the SHEX/SHDR bytecode chunk.
-      ByteCodeView FindShaderByteCode(const void* container, size_t container_size)
+      ByteCodeView view;
+      if (container == nullptr || container_size < sizeof(Shader::DXBCHeader))
       {
-         ByteCodeView view;
-         if (container == nullptr || container_size < sizeof(Shader::DXBCHeader))
-         {
-            return view;
-         }
-
-         const auto* header = static_cast<const Shader::DXBCHeader*>(container);
-         if (memcmp(header->format_name, "DXBC", 4) != 0 || header->file_size != container_size)
-         {
-            return view;
-         }
-
-         for (uint32_t i = 0; i < header->chunk_count; ++i)
-         {
-            if (header->chunk_offsets[i] + sizeof(Shader::DXBCChunk) > container_size)
-            {
-               return view;
-            }
-
-            const auto* chunk = reinterpret_cast<const Shader::DXBCChunk*>(static_cast<const uint8_t*>(container) + header->chunk_offsets[i]);
-            if (memcmp(&chunk->type_name, "SHEX", 4) == 0 || memcmp(&chunk->type_name, "SHDR", 4) == 0)
-            {
-               if (header->chunk_offsets[i] + sizeof(Shader::DXBCChunk) + sizeof(Shader::DXBCByteCodeChunk) > container_size)
-               {
-                  return view;
-               }
-
-               const auto* chunk_byte_code = reinterpret_cast<const Shader::DXBCByteCodeChunk*>(chunk->chunk_data);
-               const size_t bytecode_offset = header->chunk_offsets[i] + sizeof(Shader::DXBCChunk) + offsetof(Shader::DXBCByteCodeChunk, byte_code);
-               const uint32_t bytecode_size = (chunk_byte_code->chunk_size_dword * sizeof(uint32_t)) - sizeof(Shader::DXBCByteCodeChunk); // Stored in DWORDs and counts the size and program version/type in its count, so we remove them
-
-               if (bytecode_offset + bytecode_size > container_size)
-               {
-                  return view;
-               }
-
-               view.bytecode = static_cast<const uint8_t*>(container) + bytecode_offset;
-               view.bytecode_size = bytecode_size;
-               view.bytecode_offset = uint32_t(bytecode_offset);
-               view.valid = true;
-               return view;
-            }
-         }
-
          return view;
       }
 
+      const auto* header = static_cast<const Shader::DXBCHeader*>(container);
+      if (memcmp(header->format_name, "DXBC", 4) != 0 || header->file_size != container_size)
+      {
+         return view;
+      }
+
+      for (uint32_t i = 0; i < header->chunk_count; ++i)
+      {
+         if (header->chunk_offsets[i] + sizeof(Shader::DXBCChunk) > container_size)
+         {
+            return view;
+         }
+
+         const auto* chunk = reinterpret_cast<const Shader::DXBCChunk*>(static_cast<const uint8_t*>(container) + header->chunk_offsets[i]);
+         if (memcmp(&chunk->type_name, "SHEX", 4) == 0 || memcmp(&chunk->type_name, "SHDR", 4) == 0)
+         {
+            if (header->chunk_offsets[i] + sizeof(Shader::DXBCChunk) + sizeof(Shader::DXBCByteCodeChunk) > container_size)
+            {
+               return view;
+            }
+
+            const auto* chunk_byte_code = reinterpret_cast<const Shader::DXBCByteCodeChunk*>(chunk->chunk_data);
+            const size_t bytecode_offset = header->chunk_offsets[i] + sizeof(Shader::DXBCChunk) + offsetof(Shader::DXBCByteCodeChunk, byte_code);
+            const uint32_t bytecode_size = (chunk_byte_code->chunk_size_dword * sizeof(uint32_t)) - sizeof(Shader::DXBCByteCodeChunk); // Stored in DWORDs and counts the size and program version/type in its count, so we remove them
+
+            if (bytecode_offset + bytecode_size > container_size)
+            {
+               return view;
+            }
+
+            view.bytecode = static_cast<const uint8_t*>(container) + bytecode_offset;
+            view.bytecode_size = bytecode_size;
+            view.bytecode_offset = uint32_t(bytecode_offset);
+            view.valid = true;
+            return view;
+         }
+      }
+
+      return view;
+   }
+
+   namespace
+   {
       // Splices new SHEX/SHDR bytecode into a copied container, fixing chunk
       // offsets/sizes and recomputing the container MD5 (mandatory, or D3D may
       // refuse the shader). Returns an empty vector on invalid input.
@@ -166,12 +165,18 @@ namespace Patch
             switch (subobject.type)
             {
             case reshade::api::pipeline_subobject_type::geometry_shader:
-            case reshade::api::pipeline_subobject_type::vertex_shader:
-            case reshade::api::pipeline_subobject_type::compute_shader:
-            case reshade::api::pipeline_subobject_type::pixel_shader:
-               break;
-            default:
-               continue;
+         case reshade::api::pipeline_subobject_type::vertex_shader:
+         case reshade::api::pipeline_subobject_type::compute_shader:
+         case reshade::api::pipeline_subobject_type::pixel_shader:
+#if DX12
+         case reshade::api::pipeline_subobject_type::hull_shader:
+         case reshade::api::pipeline_subobject_type::domain_shader:
+         case reshade::api::pipeline_subobject_type::amplification_shader:
+         case reshade::api::pipeline_subobject_type::mesh_shader:
+#endif
+            break;
+         default:
+            continue;
             }
 
             auto* clone_desc = static_cast<reshade::api::shader_desc*>(new_subobjects[i].data);
@@ -1286,6 +1291,7 @@ namespace Patch
             {
                Shader::CachedPipeline* cached_pipeline = pair.second;
                if (cached_pipeline == nullptr || cached_pipeline->cloned || cached_pipeline->pipeline_clone.handle != 0 || cached_pipeline->shader_hashes.size() == 0) continue;
+               if (cached_pipeline->patch_application_mode == Shader::PatchApplicationMode::Inplace) continue; // Its shader object already runs the patch
                if (std::any_of(cached_pipeline->shader_hashes.begin(), cached_pipeline->shader_hashes.end(),
                   [&](uint32_t hash) { return ShouldQueuePatchPipeline(device_data, hash); }))
                {
@@ -1683,7 +1689,10 @@ namespace Patch
             }
             cached_pipeline->pipeline_clone = clone;
             cached_pipeline->cloned = true;
-            cached_pipeline->patch_application_mode = Shader::PatchApplicationMode::Async;
+            if (cached_pipeline->patch_application_mode != Shader::PatchApplicationMode::Inplace) // Describes the original shader object
+            {
+               cached_pipeline->patch_application_mode = Shader::PatchApplicationMode::Async;
+            }
             cached_pipeline->clone_origin = entry.clone_origin;
             cached_pipeline->custom_pipeline_data = entry.custom_pipeline_data;
 #if LUMA_USE_DXP

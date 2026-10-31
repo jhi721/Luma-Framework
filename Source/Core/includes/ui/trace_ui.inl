@@ -20,6 +20,10 @@ namespace UI
       ImGui::PopID();
       if (handle_shader_tab)
       {
+#if DX12
+         // The capture's entries name the pipelines of the device it recorded ("trace_device_data")
+         DeviceData& device_data = GetTraceDeviceData(runtime);
+#endif
          bool list_size_changed = false;
 
          if (ImGui::Button("Clear Capture and Debug Settings"))
@@ -29,8 +33,10 @@ namespace UI
             changed_selected = true;
             open_settings_tab = true;
 
+#if DX11 // Debug draw and constant buffer tracking are D3D11 only
             Trace::ClearDebugDrawTarget(device_data);
             Trace::ClearTrackBufferTarget(device_data);
+#endif // DX11
 
             Trace::highlighted_resource = "";
 
@@ -54,7 +60,7 @@ namespace UI
 
             // Only the primary command list should have any capture data, the others would have joined their with it
             {
-               CommandListData& cmd_list_data = *runtime->get_command_queue()->get_immediate_command_list()->get_private_data<CommandListData>();
+               CommandListData& cmd_list_data = GetTraceCommandListData(runtime);
                const std::shared_lock lock_trace_2(cmd_list_data.mutex_trace);
                cmd_list_data.trace_draw_calls_data.clear();
             }
@@ -81,7 +87,7 @@ namespace UI
                if (!Trace::running)
                {
                   const std::shared_lock lock_generic(s_mutex_generic);
-                  CommandListData& cmd_list_data = *runtime->get_command_queue()->get_immediate_command_list()->get_private_data<CommandListData>();
+                  CommandListData& cmd_list_data = GetTraceCommandListData(runtime);
                   const std::shared_lock lock_trace_2(cmd_list_data.mutex_trace);
 
 #if 1 // Much more optimized, drawing all items is extremely slow otherwise
@@ -101,7 +107,7 @@ namespace UI
                         const auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(pipeline_handle);
                         const bool is_valid = pipeline_pair != device_data.pipeline_cache_by_pipeline_handle.end() && pipeline_pair->second != nullptr;
                         if (is_valid) {
-                           if (Trace::ignore_vertex_shaders && pipeline_pair->second->HasVertexShader()) continue; // DX11 exclusive behaviour
+                           if (Trace::ignore_vertex_shaders && pipeline_pair->second->HasVertexShader() && !pipeline_pair->second->HasPixelShader()) continue; // D3D11 has one entry per stage, D3D12 one per draw
                         }
                      }
                      else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CPUWrite) {
@@ -143,6 +149,7 @@ namespace UI
                   for (uint32_t index = 0; index < Trace::captured_count; index++) {
 #endif
                      auto& draw_call_data = cmd_list_data.trace_draw_calls_data.at(index);
+#if DX11 // D3D12 device level entries (present, display composition, swapchain encode) have no command list, nothing below reads it there
                      ASSERT_ONCE_MSG(draw_call_data.command_list, "The code below will probably crash if the command list isn't valid, remember to always assign it when adding a new element to the list");
                      if (draw_call_data.command_list)
                      {
@@ -150,6 +157,7 @@ namespace UI
                         HRESULT hr = draw_call_data.command_list->QueryInterface(&native_device_context);
                         ASSERT_ONCE(SUCCEEDED(hr) && native_device_context); // Just to make sure it accidentally wasn't saved as a "ID3D11CommandList", given ReShade's design that mixes them up
                      }
+#endif
 
                      auto pipeline_handle = draw_call_data.pipeline_handle;
                      auto thread_id = draw_call_data.thread_id._Get_underlying_id(); // Possibly compiler dependent but whatever, cast to int alternatively
@@ -163,10 +171,14 @@ namespace UI
                      std::string command_list_info = "";
                      if (Trace::show_command_list_info)
                      {
+#if DX11
                         if (draw_call_data.command_list && draw_call_data.command_list->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) // Deferred
                            command_list_info = " - ~> " + std::to_string(reinterpret_cast<uint64_t>(draw_call_data.command_list.get())) + " - " + std::to_string(thread_id);
                         else // Immediate
                            command_list_info = " - " + std::to_string(thread_id); // No need to fill up the immediate command list ptr every time
+#else // Games record on their own command lists only
+                        command_list_info = " - ~> " + std::to_string(reinterpret_cast<uint64_t>(draw_call_data.command_list)) + " - " + std::to_string(thread_id);
+#endif
                      }
 
                      bool found_highlighted_resource_write = false;
@@ -188,7 +200,7 @@ namespace UI
                            if (found_highlighted_resource_write) break;
                            found_highlighted_resource_write |= draw_call_data.rt_hash[i] == Trace::highlighted_resource;
                         }
-                        for (UINT i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
+                        for (UINT i = 0; i < TraceDrawCallData::cbs_size; i++)
                         {
                            if (found_highlighted_resource_read) break;
                            found_highlighted_resource_read |= draw_call_data.cb_hash[i] == Trace::highlighted_resource;
@@ -244,7 +256,7 @@ namespace UI
                         const char* sm = pipeline->StageName();
 
                         // Pick the default color by shader type
-                        if (pipeline->HasVertexShader())
+                        if (pipeline->HasVertexShader() && !pipeline->HasPixelShader())
                         {
                            if (Trace::ignore_vertex_shaders)
                            {
@@ -262,11 +274,14 @@ namespace UI
                         }
 
                         // There should always be at least one
-                        for (auto shader_hash : pipeline->shader_hashes)
+                        for (size_t i = 0; i < pipeline->shader_hashes.size(); i++)
                         {
                            if (written_any_text)
                               name << " - ";
-                           name << sm << " " << PRINT_CRC32(shader_hash);
+#if DX12 // PSOs have one shader per stage
+                           sm = CachedPipeline::StageName(pipeline->shader_types[i]);
+#endif
+                           name << sm << " " << PRINT_CRC32(pipeline->shader_hashes[i]);
                            written_any_text = true;
                         }
 
@@ -357,7 +372,11 @@ namespace UI
                         }
                         else
                         {
+#if DX11
                            std::optional<std::string> optional_name = GetD3DNameW(reinterpret_cast<ID3D11DeviceChild*>(pipeline->pipeline.handle));
+#else
+                           std::optional<std::string> optional_name = GetD3DNameW(reinterpret_cast<ID3D12Object*>(pipeline->pipeline.handle));
+#endif
                            if (optional_name.has_value())
                            {
                               name << " - " << optional_name.value().c_str();
@@ -366,10 +385,12 @@ namespace UI
 
                         // Print out dangerous blend modes. We only check the first RT for now.
                         // Note: theoretically we should only check this on upgraded textures (and all upgraded textures, not just RGBA) (here and in other places where we do this)! We can't check the format here reliably as it's the non upgraded one in case of indirect upgrades.
+#if DX11
                         if (pipeline->HasPixelShader() && IsRGBAFormat(draw_call_data.rtv_format[0], true) /*&& IsSignedFloatFormat(draw_call_data.rtv_format[0])*/ && IsBlendInverted(draw_call_data.blend_desc, 1, false))
                         {
                            text_color = IM_COL32(255, 165, 0, 255); // Orange for Warning
                         }
+#endif
 
                         // Highlight loading error
                         if (custom_shader != nullptr && !custom_shader->compilation_errors.empty())
@@ -535,15 +556,14 @@ namespace UI
                         name << "Present";
                         text_color = IM_COL32(50, 80, 190, 255); // Some Blue
 
+#if DX11 // D3D12 Present entries hold the back buffer they showed as their source
                         // Highlight the resource on the swapchain too, given that "Present" traces aren't tracked the same way
                         if (!Trace::highlighted_resource.empty() && !device_data.swapchains.empty())
                         {
                            // Not fully safe, but it should do for almost all cases
                            reshade::api::swapchain* swapchain = *device_data.swapchains.begin();
                            IDXGISwapChain* native_swapchain = (IDXGISwapChain*)(swapchain->get_native());
-                           UINT back_buffer_index = swapchain->get_current_back_buffer_index();
-                           com_ptr<ID3D11Texture2D> back_buffer;
-                           native_swapchain->GetBuffer(back_buffer_index, IID_PPV_ARGS(&back_buffer));
+                           const com_ptr<ID3D11Texture2D> back_buffer = GetGameBackBuffer(native_swapchain);
 
                            std::string backbuffer_hash = std::to_string(std::hash<void*>{}(back_buffer.get()));
                            if (Trace::highlighted_resource == backbuffer_hash)
@@ -551,6 +571,18 @@ namespace UI
                               found_highlighted_resource_read = true;
                            }
                         }
+#endif // DX11
+                     }
+                     else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BeginRenderPass || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::EndRenderPass)
+                     {
+                        if (Trace::show_command_list_info)
+                        {
+                           name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                           name << command_list_info;
+                           name << " - ";
+                        }
+                        name << (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BeginRenderPass ? "Begin Render Pass" : "End Render Pass");
+                        text_color = IM_COL32(50, 80, 190, 255); // Some Blue
                      }
                      else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Custom)
                      {
@@ -594,6 +626,7 @@ namespace UI
                         changed_selected = true;
                      }
                      ImGui::PopStyleColor();
+#if DX11 // Debug draw
                      if ((draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Shader && is_valid) || (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Custom && draw_call_data.custom_stage != reshade::api::shader_stage(0)))
                      {
                         ImGui::SameLine();
@@ -605,6 +638,17 @@ namespace UI
                               Trace::SetDebugDrawTarget(device_data, *target, draw_call_data, true);
                         }
                      }
+#else
+                     if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Shader)
+                     {
+                        ImGui::SameLine();
+                        ImGui::SetNextItemAllowOverlap(); // Allow the button to be clickable if rects overlap
+                        if (ImGui::SmallButton(ICON_FK_SEARCH))
+                        {
+                           Mcp::SetD3D12DebugDrawFromTrace(device_data, cmd_list_data.trace_draw_calls_data, size_t(index), *pipeline_pair->second);
+                        }
+                     }
+#endif // DX11
                      ImGui::PopID();
 
                      if (is_selected)
@@ -633,6 +677,7 @@ namespace UI
          ImGui::EndChild(); // HashList
 
          ImGui::SameLine();
+#if DX11 // Constant buffer tracking
          // The constant buffer the tracking read back (of a game pipeline, or a Luma pass by name) and the slot it reads
          const auto draw_tracked_buffer = [&](const TraceDrawCallData& draw_call_data)
          {
@@ -724,6 +769,7 @@ namespace UI
                }
             }
          };
+#endif // DX11
 
          // The state a trace entry recorded: a game draw's ("pipeline"), or a Luma pass's without one ("CustomDraw()").
          // Slots a draw callback changed ("UpdateDraw()") show what it bound, the replaced ones can show the game's original too.
@@ -776,9 +822,48 @@ namespace UI
             };
             bool is_first_draw = true;
 
+#if DX12
+            if (draw_call_data.uses_descriptor_heap)
+            {
+               ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 165, 0, 255)); // Orange
+               ImGui::Text("Indexes the SM 6.6 descriptor heaps: those resources aren't listed, their indices are usually in the constants");
+               ImGui::PopStyleColor();
+               ImGui::NewLine();
+            }
+#endif
+
+#if DX12 && ENABLE_MINHOOK
+            // ExecuteIndirect(): what its command signature sets per command (the bindings of those root arguments are each command's, not the ones listed)
+            const auto show_indirect_command = [&]
+            {
+               if (!draw_call_data.draw_dispatch_data.indirect || draw_call_data.indirect_buffer == 0)
+                  return;
+               ImGui::Text("Indirect Commands: up to %u%s", draw_call_data.indirect_max_count, draw_call_data.indirect_count_buffer ? " (and a count buffer)" : "");
+               if (!draw_call_data.indirect_signature_known)
+               {
+                  ImGui::Text("Command Signature: unknown (created before Luma's hook)");
+                  return;
+               }
+               ImGui::Text("Command Stride: %u", draw_call_data.indirect_stride);
+               for (const TraceDrawCallData::IndirectArgument& argument : draw_call_data.indirect_arguments)
+               {
+                  if (argument.register_type != 0)
+                  {
+                     ImGui::Text("Per Command: %s %c%u space%u", D3D12CommandSignatures::ArgumentName(argument.type), argument.register_type, argument.shader_register.index, argument.shader_register.space);
+                  }
+                  else
+                  {
+                     ImGui::Text("Per Command: %s", D3D12CommandSignatures::ArgumentName(argument.type));
+                  }
+               }
+            };
+#endif
             if (has_cs)
             {
                ImGui::Text("Indirect: %s", draw_call_data.draw_dispatch_data.indirect ? "True" : "False");
+#if DX12 && ENABLE_MINHOOK
+               show_indirect_command();
+#endif
                ImGui::Text("Dispatch Count: %ux%ux%u", draw_call_data.draw_dispatch_data.dispatch_count.x, draw_call_data.draw_dispatch_data.dispatch_count.y, draw_call_data.draw_dispatch_data.dispatch_count.z);
                is_first_draw = false;
             }
@@ -790,6 +875,9 @@ namespace UI
             else if (has_vs)
             {
                ImGui::Text("Indirect: %s", draw_call_data.draw_dispatch_data.indirect ? "True" : "False");
+#if DX12 && ENABLE_MINHOOK
+               show_indirect_command();
+#endif
                ImGui::NewLine();
                ImGui::Text("Vertex Count: %u", draw_call_data.draw_dispatch_data.vertex_count);
                ImGui::Text("Instance Count: %u", draw_call_data.draw_dispatch_data.instance_count);
@@ -824,16 +912,18 @@ namespace UI
                for (size_t i = 0; i < draw_call_data.vertex_buffer_hashes.size(); i++)
                {
                   ImGui::NewLine();
-                  ImGui::Text("Vertex Buffer %u: %s", i, draw_call_data.vertex_buffer_hashes[i].c_str());
-                  ImGui::Text("Input Layout %u Format: %s", i, GetFormatNameSafe(draw_call_data.input_layouts_formats[i]));
+                  ImGui::Text("Vertex Buffer %zu: %s", i, draw_call_data.vertex_buffer_hashes[i].c_str());
+                  ImGui::Text("Input Layout %zu Format: %s", i, GetFormatNameSafe(draw_call_data.input_layouts_formats[i]));
                }
 
                ImGui::NewLine();
-               ImGui::Text("Input Buffer: %s", draw_call_data.input_layout_hash.c_str());
-               ImGui::Text("Input Buffer Format: %s", GetFormatNameSafe(draw_call_data.index_buffer_format));
-               ImGui::Text("Input Buffer Offset: %u", draw_call_data.index_buffer_offset);
+               ImGui::Text("Index Buffer: %s", draw_call_data.index_buffer_hash.c_str());
+               ImGui::Text("Index Buffer Format: %s", GetFormatNameSafe(draw_call_data.index_buffer_format));
+               ImGui::Text("Index Buffer Offset: %u", draw_call_data.index_buffer_offset);
 
-               ImGui::Text("Input Layout: %s", draw_call_data.index_buffer_hash.c_str());
+#if DX11 // D3D12 input layouts are part of the PSO
+               ImGui::Text("Input Layout: %s", draw_call_data.input_layout_hash.c_str());
+#endif
                is_first_draw = false;
             }
 
@@ -843,10 +933,15 @@ namespace UI
                {
                   const TraceDrawCallData& slot_data = SlotData(TraceDrawCallData::SlotKind::SRV, i);
                   auto srv_format = slot_data.srv_format[i];
+#if DX12 // Packed in binding order, and buffers can have no view format
+                  if (i >= draw_call_data.srv_count)
+                     break;
+#else
                   if (srv_format == DXGI_FORMAT_UNKNOWN) // Resource was not valid
                   {
                      continue;
                   }
+#endif
                   const bool non_referenced = srv_format == DXGI_FORMAT(-1);
                   if (Trace::ignore_non_bound_shader_referenced_resources && srv_format == DXGI_FORMAT(-1))
                   {
@@ -865,7 +960,11 @@ namespace UI
                   if (!is_first_draw) { ImGui::Text(""); };
                   is_first_draw = false;
                   ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(245, 230, 140, 255)); // Faint Yellow
+#if DX12
+                  ImGui::Text("SRV Register: t%u, space%u", draw_call_data.sr_register[i].index, draw_call_data.sr_register[i].space);
+#else
                   ImGui::Text("SRV Index: %u", i);
+#endif
                   ImGui::PopStyleColor();
                   DrawSlotChange(TraceDrawCallData::SlotKind::SRV, i);
                   if (non_referenced)
@@ -913,7 +1012,7 @@ namespace UI
 
                            ImGui::Text("R Original Format: %s", GetFormatName(DXGI_FORMAT(upgraded_resource_pair.second)));
 
-                           if (const auto it = device_data.resource_upgrades.original_upgraded_resource_views_formats.find(reinterpret_cast<uint64_t>(slot_data.srvs[i])); it != device_data.resource_upgrades.original_upgraded_resource_views_formats.end())
+                           if (const auto it = device_data.resource_upgrades.original_upgraded_resource_views_formats.find(slot_data.srvs[i]); it != device_data.resource_upgrades.original_upgraded_resource_views_formats.end())
                            {
                               const auto& [native_resource, original_view_format] = it->second;
                               ASSERT_ONCE(native_resource == upgraded_resource_pair.first); // Uh!?
@@ -962,6 +1061,7 @@ namespace UI
                      Trace::highlighted_resource = is_highlighted_resource ? "" : sr_hash;
                   }
 
+#if DX11
                   // TODO: hide the button if the resource is a buffer
                   if (debug_draw_shader_enabled && (Trace::debug_draw_mode != Trace::DebugDrawMode::ShaderResource || Trace::debug_draw_view_index != i) && ImGui::Button("Debug Draw Resource"))
                   {
@@ -973,6 +1073,7 @@ namespace UI
                      Trace::debug_draw_view_index = i;
                      Trace::debug_draw_mip = slot_data.srv_mip[i];
                   }
+#endif
 
                   ImGui::PopID();
                }
@@ -984,10 +1085,15 @@ namespace UI
                {
                   const TraceDrawCallData& slot_data = SlotData(TraceDrawCallData::SlotKind::UAV, i);
                   auto uav_format = slot_data.uav_format[i];
+#if DX12 // Packed in binding order, and buffers can have no view format
+                  if (i >= draw_call_data.uav_count)
+                     break;
+#else
                   if (uav_format == DXGI_FORMAT_UNKNOWN) // Resource was not valid
                   {
                      continue;
                   }
+#endif
                   const bool non_referenced = uav_format == DXGI_FORMAT(-1);
                   if (Trace::ignore_non_bound_shader_referenced_resources && uav_format == DXGI_FORMAT(-1))
                   {
@@ -1005,7 +1111,11 @@ namespace UI
                   if (!is_first_draw) { ImGui::Text(""); };
                   is_first_draw = false;
                   ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 170, 230, 255)); // Faint Purple
+#if DX12
+                  ImGui::Text("UAV Register: u%u, space%u", draw_call_data.ua_register[i].index, draw_call_data.ua_register[i].space);
+#else
                   ImGui::Text("UAV Index: %u", i);
+#endif
                   ImGui::PopStyleColor();
                   DrawSlotChange(TraceDrawCallData::SlotKind::UAV, i);
                   if (non_referenced)
@@ -1051,7 +1161,7 @@ namespace UI
 
                            ImGui::Text("R Original Format: %s", GetFormatName(DXGI_FORMAT(upgraded_resource_pair.second)));
 
-                           if (const auto it = device_data.resource_upgrades.original_upgraded_resource_views_formats.find(reinterpret_cast<uint64_t>(slot_data.uavs[i])); it != device_data.resource_upgrades.original_upgraded_resource_views_formats.end())
+                           if (const auto it = device_data.resource_upgrades.original_upgraded_resource_views_formats.find(slot_data.uavs[i]); it != device_data.resource_upgrades.original_upgraded_resource_views_formats.end())
                            {
                               const auto& [native_resource, original_view_format] = it->second;
                               ASSERT_ONCE(native_resource == upgraded_resource_pair.first); // Uh!?
@@ -1098,6 +1208,7 @@ namespace UI
                      auto_texture_format_upgrade_shader_hashes[pipeline->shader_hashes[0]] = AutoTextureFormatUpgradeShaderHash{ std::vector<uint8_t>(), std::vector<uint8_t>{ uint8_t(i) }, false }; // DX11 logic
                   }
 
+#if DX11
                   if (debug_draw_shader_enabled && (Trace::debug_draw_mode != Trace::DebugDrawMode::UnorderedAccessView || Trace::debug_draw_view_index != i) && ImGui::Button("Debug Draw Resource"))
                   {
                      if (Trace::debug_draw_mode == Trace::DebugDrawMode::Depth || Trace::debug_draw_mode == Trace::DebugDrawMode::Stencil)
@@ -1108,6 +1219,7 @@ namespace UI
                      Trace::debug_draw_view_index = i;
                      Trace::debug_draw_mip = slot_data.uav_mip[i];
                   }
+#endif
 
                   if (pipeline)
                   {
@@ -1223,7 +1335,7 @@ namespace UI
                            ImGui::Text("R Original Format: %s", GetFormatName(DXGI_FORMAT(upgraded_resource_pair.second)));
 
                            // TODO: why does this flicker on and off in Deux Ex HR when it writes on the swapchain for material draws?
-                           if (const auto it = device_data.resource_upgrades.original_upgraded_resource_views_formats.find(reinterpret_cast<uint64_t>(slot_data.rtvs[i])); it != device_data.resource_upgrades.original_upgraded_resource_views_formats.end())
+                           if (const auto it = device_data.resource_upgrades.original_upgraded_resource_views_formats.find(slot_data.rtvs[i]); it != device_data.resource_upgrades.original_upgraded_resource_views_formats.end())
                            {
                               const auto& [native_resource, original_view_format] = it->second;
                               ASSERT_ONCE(native_resource == upgraded_resource_pair.first); // Uh!?
@@ -1263,6 +1375,7 @@ namespace UI
                   // Blend mode
                   {
                      bool pop_text_style_color = false;
+#if DX11 // "IsBlendInverted()" is with the native D3D11 helpers
                      // Print out invalid blend modes.
                      // Note: this is assuming that indirect upgrades always upgrade to a signed float type, which is generally true. Ideally we'd implement something like "GetBestResourceViewUpgradeFormat(slot_data.rtv_format[i])" here, but given it's just a warning, it doesn't really matter
                      if (IsRGBAFormat(slot_data.rtv_format[i], true) && (indirect_upgraded || IsSignedFloatFormat(slot_data.rtv_format[i])) && IsBlendInverted(slot_data.blend_desc, 1, false, i))
@@ -1270,94 +1383,95 @@ namespace UI
                         ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 105, 0, 255)); // Orange
                         pop_text_style_color = true;
                      }
+#endif
 
-                     const D3D11_RENDER_TARGET_BLEND_DESC1& render_target_blend_desc = blend_desc.IndependentBlendEnable ? blend_desc.RenderTarget[i] : blend_desc.RenderTarget[0];
+                     const auto& render_target_blend_desc = blend_desc.IndependentBlendEnable ? blend_desc.RenderTarget[i] : blend_desc.RenderTarget[0];
                      // See "ui_data.blend_mode" for details on usage
                      if (render_target_blend_desc.BlendEnable)
                      {
                         bool has_drawn_blend_rgb_text = false;
 
-                        if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_BLEND_FACTOR || render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_BLEND_FACTOR
-                           || render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_INV_BLEND_FACTOR || render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_INV_BLEND_FACTOR)
+                        if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_BLEND_FACTOR) || render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_BLEND_FACTOR)
+                           || render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_INV_BLEND_FACTOR) || render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_INV_BLEND_FACTOR))
                         {
                            ImGui::Text("Blend RGB Mode: Blend Factor (Any)");
                            has_drawn_blend_rgb_text = true;
                         }
-                        else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_ZERO && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ZERO)
+                        else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_ZERO) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ZERO))
                         {
                            ImGui::Text("Blend RGB Mode: Zero (Override Color with Zero)");
                            has_drawn_blend_rgb_text = true;
                         }
 
-                        if (!has_drawn_blend_rgb_text && render_target_blend_desc.BlendOp == D3D11_BLEND_OP::D3D11_BLEND_OP_ADD)
+                        if (!has_drawn_blend_rgb_text && render_target_blend_desc.BlendOp == LUMA_D3D(BLEND_OP_ADD))
                         {
-                           if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_ONE && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                           if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_ONE) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                            {
                               ImGui::Text("Blend RGB Mode: Additive Color");
                               has_drawn_blend_rgb_text = true;
                            }
-                           else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                           else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_SRC_ALPHA) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                            {
                               ImGui::Text("Blend RGB Mode: Additive Alpha");
                               has_drawn_blend_rgb_text = true;
                            }
-                           else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA_SAT && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                           else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_SRC_ALPHA_SAT) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                            {
                               ImGui::Text("Blend RGB Mode: Additive Alpha (Saturated)");
                               has_drawn_blend_rgb_text = true;
                            }
-                           else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_ONE && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_INV_SRC_ALPHA)
+                           else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_ONE) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_INV_SRC_ALPHA))
                            {
                               ImGui::Text("Blend RGB Mode: Premultiplied Alpha"); // The alpha was supposedly (but not necessarily) pre-multiplied in the rgb before the pixel shader output
                               has_drawn_blend_rgb_text = true;
                            }
-                           else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_INV_SRC_ALPHA)
+                           else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_SRC_ALPHA) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_INV_SRC_ALPHA))
                            {
                               ImGui::Text("Blend RGB Mode: Straight Alpha");
                               has_drawn_blend_rgb_text = true;
                            }
-                           else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA_SAT && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_INV_SRC_ALPHA)
+                           else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_SRC_ALPHA_SAT) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_INV_SRC_ALPHA))
                            {
                               ImGui::Text("Blend RGB Mode: Straight Alpha (Saturated)");
                               has_drawn_blend_rgb_text = true;
                            }
                            // Often used for lighting, glow, or compositing effects where the destination alpha controls how much of the source contributes
-                           else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_DEST_ALPHA && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                           else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_DEST_ALPHA) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                            {
                               ImGui::Text("Blend RGB Mode: Reverse Premultiplied Alpha");
                               has_drawn_blend_rgb_text = true;
                            }
-                           else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_DEST_COLOR && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ZERO)
+                           else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_DEST_COLOR) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ZERO))
                            {
                               ImGui::Text("Blend RGB Mode: Multiplicative Color");
                               has_drawn_blend_rgb_text = true;
                            }
                            // It's enabled but it's as if it was disabled
-                           else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_ONE && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ZERO)
+                           else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_ONE) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ZERO))
                            {
                               ImGui::Text("Blend RGB Mode: Disabled");
                               has_drawn_blend_rgb_text = true;
                            }
                         }
                         // This subtracts the source from the target
-                        else if (!has_drawn_blend_rgb_text && render_target_blend_desc.BlendOp == D3D11_BLEND_OP::D3D11_BLEND_OP_REV_SUBTRACT)
+                        else if (!has_drawn_blend_rgb_text && render_target_blend_desc.BlendOp == LUMA_D3D(BLEND_OP_REV_SUBTRACT))
                         {
-                           if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_ONE && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                           if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_ONE) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                            {
                               ImGui::Text("Blend RGB Mode: Subtractive Color");
                               has_drawn_blend_rgb_text = true;
                            }
-                           else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                           else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_SRC_ALPHA) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                            {
                               ImGui::Text("Blend RGB Mode: Subtractive Alpha");
                               has_drawn_blend_rgb_text = true;
                            }
-                           else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA_SAT && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                           else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_SRC_ALPHA_SAT) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                            {
                               ImGui::Text("Blend RGB Mode: Subtractive Alpha (Saturated)");
                               has_drawn_blend_rgb_text = true;
                            }
-                           else if (render_target_blend_desc.SrcBlend == D3D11_BLEND::D3D11_BLEND_ZERO && render_target_blend_desc.DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
+                           else if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_ZERO) && render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_ONE))
                            {
                               ImGui::Text("Blend RGB Mode: Disabled");
                               has_drawn_blend_rgb_text = true;
@@ -1375,7 +1489,7 @@ namespace UI
                            has_drawn_blend_rgb_text = true;
                         }
 
-                        if ((render_target_blend_desc.RenderTargetWriteMask & (D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE)) == 0)
+                        if ((render_target_blend_desc.RenderTargetWriteMask & (LUMA_D3D(COLOR_WRITE_ENABLE_RED) | LUMA_D3D(COLOR_WRITE_ENABLE_GREEN) | LUMA_D3D(COLOR_WRITE_ENABLE_BLUE))) == 0)
                         {
                            ImGui::SameLine();
                            ImGui::Text(" (Ignored)");
@@ -1387,52 +1501,52 @@ namespace UI
                         bool has_drawn_blend_a_text = false;
 
                         // It's enabled but it's as if it was disabled
-                        if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_BLEND_FACTOR || render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_BLEND_FACTOR
-                           || render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_INV_BLEND_FACTOR || render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_INV_BLEND_FACTOR)
+                        if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_BLEND_FACTOR) || render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_BLEND_FACTOR)
+                           || render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_INV_BLEND_FACTOR) || render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_INV_BLEND_FACTOR))
                         {
                            ImGui::Text("Blend A Mode: Blend Factor (Any)");
                            has_drawn_blend_a_text = true;
                         }
-                        if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_ZERO && render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_ZERO)
+                        if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_ZERO) && render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_ZERO))
                         {
                            ImGui::Text("Blend A Mode: Zero (Overwrite Alpha with Zero)");
                            has_drawn_blend_a_text = true;
                         }
 
-                        if (!has_drawn_blend_a_text && render_target_blend_desc.BlendOpAlpha == D3D11_BLEND_OP::D3D11_BLEND_OP_ADD)
+                        if (!has_drawn_blend_a_text && render_target_blend_desc.BlendOpAlpha == LUMA_D3D(BLEND_OP_ADD))
                         {
-                           if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA && render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_INV_SRC_ALPHA)
+                           if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_SRC_ALPHA) && render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_INV_SRC_ALPHA))
                            {
                               ImGui::Text("Blend A Mode: Standard Transparency");
                               has_drawn_blend_a_text = true;
                            }
-                           else if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA_SAT && render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_INV_SRC_ALPHA)
+                           else if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_SRC_ALPHA_SAT) && render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_INV_SRC_ALPHA))
                            {
                               ImGui::Text("Blend A Mode: Standard Transparency (Saturated)");
                               has_drawn_blend_a_text = true;
                            }
-                           else if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_DEST_ALPHA && render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_ZERO)
+                           else if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_DEST_ALPHA) && render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_ZERO))
                            {
                               ImGui::Text("Blend A Mode: Multiplicative");
                               has_drawn_blend_a_text = true;
                            }
-                           else if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_ONE && render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_ONE)
+                           else if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_ONE) && render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_ONE))
                            {
                               ImGui::Text("Blend A Mode: Additive");
                               has_drawn_blend_a_text = true;
                            }
-                           else if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_ONE && render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_ZERO)
+                           else if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_ONE) && render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_ZERO))
                            {
                               ImGui::Text("Blend A Mode: Source Alpha (Overwrite Alpha, Blending Disabled)");
                               has_drawn_blend_a_text = true;
                            }
-                           else if (render_target_blend_desc.SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_ZERO && render_target_blend_desc.DestBlendAlpha == D3D11_BLEND::D3D11_BLEND_ONE)
+                           else if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_ZERO) && render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_ONE))
                            {
                               ImGui::Text("Blend A Mode: Destination Alpha (Preserve Alpha)");
                               has_drawn_blend_a_text = true;
                            }
                         }
-                        else if (!has_drawn_blend_a_text && render_target_blend_desc.BlendOpAlpha == D3D11_BLEND_OP::D3D11_BLEND_OP_REV_SUBTRACT)
+                        else if (!has_drawn_blend_a_text && render_target_blend_desc.BlendOpAlpha == LUMA_D3D(BLEND_OP_REV_SUBTRACT))
                         {
                            ImGui::Text("Blend A Mode: Subtractive (Any)");
                            has_drawn_blend_a_text = true;
@@ -1444,7 +1558,7 @@ namespace UI
                            has_drawn_blend_a_text = true;
                         }
 
-                        if ((render_target_blend_desc.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_ALPHA) == 0)
+                        if ((render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_ALPHA)) == 0)
                         {
                            ImGui::SameLine();
                            ImGui::Text("(Ignored)");
@@ -1467,21 +1581,21 @@ namespace UI
                      }
 
                      // This applies even if blending is disabled!
-                     if ((render_target_blend_desc.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_ALL) == D3D11_COLOR_WRITE_ENABLE_ALL)
+                     if ((render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_ALL)) == LUMA_D3D(COLOR_WRITE_ENABLE_ALL))
                      {
                         ImGui::Text("Write Mask: All");
                      }
-                     else if ((render_target_blend_desc.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_ALL) == 0)
+                     else if ((render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_ALL)) == 0)
                      {
                         ImGui::Text("Write Mask: None");
                      }
                      else
                      {
                         ImGui::Text("Write Mask:");
-                        if (render_target_blend_desc.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_RED)   ImGui::SameLine(), ImGui::Text(" R");
-                        if (render_target_blend_desc.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_GREEN) ImGui::SameLine(), ImGui::Text(" G");
-                        if (render_target_blend_desc.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_BLUE)  ImGui::SameLine(), ImGui::Text(" B");
-                        if (render_target_blend_desc.RenderTargetWriteMask & D3D11_COLOR_WRITE_ENABLE_ALPHA) ImGui::SameLine(), ImGui::Text(" A");
+                        if (render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_RED))   ImGui::SameLine(), ImGui::Text(" R");
+                        if (render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_GREEN)) ImGui::SameLine(), ImGui::Text(" G");
+                        if (render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_BLUE))  ImGui::SameLine(), ImGui::Text(" B");
+                        if (render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_ALPHA)) ImGui::SameLine(), ImGui::Text(" A");
                      }
                   }
 
@@ -1499,6 +1613,7 @@ namespace UI
                      auto_texture_format_upgrade_shader_hashes[pipeline->shader_hashes[0]] = AutoTextureFormatUpgradeShaderHash{ std::vector<uint8_t>{ uint8_t(i) }, std::vector<uint8_t>(), false }; // DX11 logic
                   }
 
+#if DX11
                   if (debug_draw_shader_enabled && (Trace::debug_draw_mode != Trace::DebugDrawMode::RenderTarget || Trace::debug_draw_view_index != i) && ImGui::Button("Debug Draw Resource"))
                   {
                      if (Trace::debug_draw_mode == Trace::DebugDrawMode::Depth || Trace::debug_draw_mode == Trace::DebugDrawMode::Stencil)
@@ -1509,6 +1624,7 @@ namespace UI
                      Trace::debug_draw_view_index = i;
                      Trace::debug_draw_mip = slot_data.rtv_mip[i];
                   }
+#endif
 
                   if (pipeline)
                   {
@@ -1626,6 +1742,7 @@ namespace UI
                   ImGui::PopID();
                }
 
+#if DX11
                const bool has_valid_depth = draw_call_data.depth_state != TraceDrawCallData::DepthStateType::Disabled
                   && draw_call_data.depth_state != TraceDrawCallData::DepthStateType::Invalid;
                if (has_valid_depth && debug_draw_shader_enabled && Trace::debug_draw_mode != Trace::DebugDrawMode::Depth && ImGui::Button("Debug Draw Depth Resource"))
@@ -1643,6 +1760,7 @@ namespace UI
                   Trace::debug_draw_options |= (uint32_t)Trace::DebugDrawTextureOptionsMask::RedOnly;
                   Trace::debug_draw_mip = 0;
                }
+#endif // DX11
 
                ImGui::Text("");
                ImGui::Text("Scissors Enabled: %s", draw_call_data.scissor_count >= 1 ? "True" : "False");
@@ -1656,14 +1774,22 @@ namespace UI
 
             if (has_vs || has_ps || has_cs)
             {
+#if DX12 // Packed in binding order
+               for (UINT i = 0; i < draw_call_data.sampler_count; i++)
+#else
                for (UINT i = 0; i < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT; i++)
+#endif
                {
                   const TraceDrawCallData& slot_data = SlotData(TraceDrawCallData::SlotKind::Sampler, i);
                   if (int(slot_data.samplers_filter[i]) >= 0)
                   {
                      ImGui::PushID(i + TraceDrawCallData::srvs_size + TraceDrawCallData::uavs_size + TraceDrawCallData::rtvs_size); // Offset by the max amount of previous iterations from above
                      ImGui::Text("");
+#if DX12
+                     ImGui::Text("Sampler Register: s%u, space%u", draw_call_data.sa_register[i].index, draw_call_data.sa_register[i].space);
+#else
                      ImGui::Text("Sampler Index: %u", i);
+#endif
                      DrawSlotChange(TraceDrawCallData::SlotKind::Sampler, i);
                      ImGui::Text("Sampler Filter: %s", GetFilterName(slot_data.samplers_filter[i]));
                      ImGui::Text("Sampler Address U: %s", GetTextureAddressModeName(slot_data.samplers_address_u[i]));
@@ -1674,22 +1800,43 @@ namespace UI
                   }
                }
 
-               for (UINT i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
+               for (UINT i = 0; i < TraceDrawCallData::cbs_size; i++)
                {
                   const TraceDrawCallData& slot_data = SlotData(TraceDrawCallData::SlotKind::CB, i);
                   if (slot_data.cbs[i])
                   {
                      ImGui::PushID(i + TraceDrawCallData::srvs_size + TraceDrawCallData::uavs_size + TraceDrawCallData::rtvs_size + D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT); // Offset by the max amount of previous iterations from above
                      ImGui::Text("");
+#if DX12
+                     ImGui::Text("CB Register: b%u, space%u", draw_call_data.cb_register[i].index, draw_call_data.cb_register[i].space);
+                     if (const std::vector<uint32_t>& root_constants = draw_call_data.cb_root_constants[i]; !root_constants.empty())
+                     {
+                        ImGui::Text("CB Root Constants:");
+                        for (size_t j = 0; j < root_constants.size(); j++)
+                        {
+                           ImGui::Text("%zu: %.7f (%i)", j, Math::AsFloat(root_constants[j]), int32_t(root_constants[j]));
+                        }
+                     }
+#else
                      ImGui::Text("CB Index: %u", i);
+#endif
                      DrawSlotChange(TraceDrawCallData::SlotKind::CB, i);
                      ImGui::Text("CB Hash: %s", slot_data.cb_hash[i].c_str());
+#if DX12 // A CBV is a range of any buffer, root CBVs have no size
+                     if (draw_call_data.cb_root_constants[i].empty())
+                     {
+                        ImGui::Text("CB Offset: %u bytes", draw_call_data.cb_first_constant[i] * 16);
+                        if (draw_call_data.cb_num_constants[i] != 0)
+                           ImGui::Text("CB Size: %u bytes", draw_call_data.cb_num_constants[i] * 16);
+                     }
+#else
                      if (slot_data.cb_num_constants[i] != 0)
                      {
                         const bool is_partial = slot_data.cb_first_constant[i] != 0 || slot_data.cb_num_constants[i] != D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT;
                         ImGui::Text("CB First Constant: %u%s", slot_data.cb_first_constant[i], is_partial ? " (partial)" : "");
                         ImGui::Text("CB Num Constants: %u", slot_data.cb_num_constants[i]);
                      }
+#endif
                      const bool is_highlighted_resource = Trace::highlighted_resource == slot_data.cb_hash[i];
                      if (is_highlighted_resource ? ImGui::Button("Unhighlight Resource") : ImGui::Button("Highlight Resource"))
                      {
@@ -1711,7 +1858,7 @@ namespace UI
                ImGui::PopID();
                if (open_settings_tab_item)
                {
-                  CommandListData& cmd_list_data = *runtime->get_command_queue()->get_immediate_command_list()->get_private_data<CommandListData>();
+                  CommandListData& cmd_list_data = GetTraceCommandListData(runtime);
                   const std::shared_lock lock_trace(cmd_list_data.mutex_trace);
                   if (selected_index >= 0 && cmd_list_data.trace_draw_calls_data.size() >= selected_index + 1)
                   {
@@ -1835,6 +1982,7 @@ namespace UI
                                  System::OpenExplorerToFile(custom_shader->file_path);
                               }
 
+#if DX11 // Debug draw and constant buffer tracking are D3D11 only
                               bool debug_draw_shader_enabled = false; // Whether this pass instance is the one we are draw debugging
                               if (const auto debug_draw_target = Trace::FindPassTarget(device_data, cmd_list_data, selected_index, Trace::debug_draw_pipeline_instance_filter_by_thread))
                               {
@@ -1907,6 +2055,28 @@ namespace UI
                               {
                                  device_data.track_buffer_data.Clear();
                               }
+#else
+                              bool debug_draw_shader_enabled = false;
+                              if (pipeline_pair->second->HasPixelShader() || pipeline_pair->second->HasComputeShader())
+                              {
+                                 // Whether this instance is the draw being shown: its shader, signature and place among its equals
+                                 D3D12Readback::Target selected_target;
+                                 const uint32_t selected_hash = Mcp::FillDrawTarget(device_data, cmd_list_data.trace_draw_calls_data, size_t(selected_index), *pipeline_pair->second, &selected_target);
+                                 debug_draw_shader_enabled = debug_draw_registered_texture.empty() && Trace::debug_draw_shader_hash == selected_hash && debug_draw_signature_hash == selected_hash && debug_draw_signature == selected_target.signature && Trace::debug_draw_pipeline_target_instance == selected_target.instance;
+                                 if (debug_draw_shader_enabled ? ImGui::Button("Disable Debug Draw Shader Instance") : ImGui::Button("Debug Draw Shader Instance"))
+                                 {
+                                    if (debug_draw_shader_enabled)
+                                    {
+                                       Trace::debug_draw_shader_hash = 0;
+                                       Trace::debug_draw_shader_hash_string[0] = 0;
+                                    }
+                                    else
+                                    {
+                                       Mcp::SetD3D12DebugDrawFromTrace(device_data, cmd_list_data.trace_draw_calls_data, size_t(selected_index), *pipeline_pair->second);
+                                    }
+                                 }
+                              }
+#endif // DX11
 
                               ImGui::NewLine();
                               ImGui::Text("State Analysis:");
@@ -2067,7 +2237,7 @@ namespace UI
                   }
 
                   static std::string disasm_string;
-                  CommandListData& cmd_list_data = *runtime->get_command_queue()->get_immediate_command_list()->get_private_data<CommandListData>();
+                  CommandListData& cmd_list_data = GetTraceCommandListData(runtime);
                   const std::shared_lock lock_trace(cmd_list_data.mutex_trace);
 
                   bool refresh_disassembly = changed_selected || opened_disassembly_tab_item != open_disassembly_tab_item || pending_disassembly_refresh;
@@ -2185,7 +2355,7 @@ namespace UI
                   static std::string hlsl_string;
                   static bool hlsl_error = false;
                   static bool hlsl_warning = false;
-                  CommandListData& cmd_list_data = *runtime->get_command_queue()->get_immediate_command_list()->get_private_data<CommandListData>();
+                  CommandListData& cmd_list_data = GetTraceCommandListData(runtime);
                   const std::shared_lock lock_trace(cmd_list_data.mutex_trace);
                   static bool pending_live_code_refresh = false;
                   bool refresh_live_code = changed_selected || inline_includes_toggled || opened_live_tab_item != open_live_tab_item || refresh_cloned_pipelines || pending_live_code_refresh;
@@ -2332,24 +2502,41 @@ namespace UI
          if (Trace::debug_draw_shader_hash != 0)
          {
             Trace::debug_draw_pipeline = 0;
+#if DX11
             Trace::debug_draw_custom_pass = 0;
+#endif
          }
 
+#if DX11
          device_data.debug_draw_frozen_draw_state_stack.reset();
          device_data.debug_draw_texture = nullptr;
+#endif
          device_data.debug_draw_texture_format = DXGI_FORMAT_UNKNOWN;
          device_data.debug_draw_texture_size = {};
       }
       ImGui::SameLine();
       // Allow it to go through if we have a custom debug draw texture set
-      bool debug_draw_enabled = Trace::debug_draw_shader_hash != 0 || Trace::debug_draw_pipeline != 0 || Trace::debug_draw_custom_pass != 0 || (Trace::debug_draw_mode == Trace::DebugDrawMode::Custom && device_data.debug_draw_texture.get()); // It wants to be shown (if it manages!)
+#if DX11
+      bool debug_draw_enabled = Trace::debug_draw_shader_hash != 0 || Trace::debug_draw_pipeline != 0 || Trace::debug_draw_custom_pass != 0 || (Trace::debug_draw_mode == Trace::DebugDrawMode::Custom && device_data.debug_draw_texture.get());
+#else
+      bool debug_draw_enabled = Trace::debug_draw_shader_hash != 0 || Trace::debug_draw_pipeline != 0 || !debug_draw_registered_texture.empty();
+#endif // It wants to be shown (if it manages!)
       // Show the reset button for both conditions or they could get stuck
       if (debug_draw_enabled)
       {
          ImGui::PushID("Debug Draw");
          if (ImGui::SmallButton(ICON_FK_UNDO))
          {
+#if DX11
             Trace::ClearDebugDrawTarget(device_data);
+#else
+            Trace::debug_draw_shader_hash_string[0] = 0;
+            Trace::debug_draw_shader_hash = 0;
+            Trace::debug_draw_pipeline = 0;
+            debug_draw_registered_texture.clear();
+            device_data.debug_draw_texture_format = DXGI_FORMAT_UNKNOWN;
+            device_data.debug_draw_texture_size = {};
+#endif
          }
          ImGui::PopID();
       }
@@ -2381,11 +2568,13 @@ namespace UI
                   Trace::debug_draw_options &= ~(uint32_t)Trace::DebugDrawTextureOptionsMask::RedOnly;
                }
             }
+#if DX11
             if (ImGui::Checkbox("Debug Draw: Freeze Inputs", &Trace::debug_draw_freeze_inputs))
             {
                device_data.debug_draw_frozen_draw_state_stack.reset();
             }
             ImGui::Checkbox("Debug Draw: Disable Blends", &Trace::debug_draw_disable_blends);
+#endif
          }
          if (Trace::debug_draw_mode == Trace::DebugDrawMode::RenderTarget)
          {
@@ -2393,20 +2582,29 @@ namespace UI
          }
          else if (Trace::debug_draw_mode == Trace::DebugDrawMode::UnorderedAccessView)
          {
+#if DX11
             ImGui::SliderInt("Debug Draw: Unordered Access View", &Trace::debug_draw_view_index, 0, device_data.uav_max_count - 1);
+#else
+            ImGui::SliderInt("Debug Draw: Unordered Access View", &Trace::debug_draw_view_index, 0, 7);
+#endif
          }
+#if DX11 // D3D12 shows the draw that wrote a shader resource instead, its state isn't known
          else if (Trace::debug_draw_mode == Trace::DebugDrawMode::ShaderResource)
          {
             ImGui::SliderInt("Debug Draw: Pixel Shader Resource Index", &Trace::debug_draw_view_index, 0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT - 1);
          }
-         const int max_mip = GetTextureMaxMipLevels(D3D11_REQ_TEXTURE1D_U_DIMENSION) - 1;
-         ImGui::SliderInt("Debug Draw: Texture Mip", &Trace::debug_draw_mip, 0, max_mip);
+#endif
+         ImGui::SliderInt("Debug Draw: Texture Mip", &Trace::debug_draw_mip, 0, int(ResourceUpgradeGetTextureMaxMipLevels(LUMA_D3D(REQ_TEXTURE2D_U_OR_V_DIMENSION))) - 1);
+#if DX11
          ImGui::Checkbox("Debug Draw: Allow Drawing Replaced Pass", &Trace::debug_draw_replaced_pass);
+#endif
          ImGui::SliderInt("Debug Draw: Target Pipeline Instance", &Trace::debug_draw_pipeline_target_instance, -1, 100); // In case the same pipeline was run more than once by the game, we can pick one to print
+#if DX11
          if (ImGui::Checkbox("Debug Draw: Filter Target Pipeline Instance By Thread", &Trace::debug_draw_pipeline_instance_filter_by_thread) && !Trace::debug_draw_pipeline_instance_filter_by_thread)
          {
             Trace::debug_draw_pipeline_target_thread = std::thread::id();
          }
+#endif
          bool debug_draw_fullscreen = (Trace::debug_draw_options & (uint32_t)Trace::DebugDrawTextureOptionsMask::Fullscreen) != 0;
          bool debug_draw_rend_res_scale = (Trace::debug_draw_options & (uint32_t)Trace::DebugDrawTextureOptionsMask::RenderResolutionScale) != 0;
          bool debug_draw_red_only = (Trace::debug_draw_options & (uint32_t)Trace::DebugDrawTextureOptionsMask::RedOnly) != 0;
@@ -2668,7 +2866,11 @@ namespace UI
          {
             ImGui::SetTooltip("Bilinear instead of Nearest Neighbor");
          }
+#if DX11
          if (device_data.debug_draw_texture || Trace::debug_draw_auto_clear_texture)
+#else
+         if (device_data.debug_draw_texture_size.x != 0)
+#endif
          {
             if (GetFormatName(device_data.debug_draw_texture_format) != nullptr)
             {
@@ -2680,11 +2882,22 @@ namespace UI
             }
             ImGui::Text("Debug Draw Info: Texture Size: %ux%ux%ux%u", device_data.debug_draw_texture_size.x, device_data.debug_draw_texture_size.y, device_data.debug_draw_texture_size.z, device_data.debug_draw_texture_size.w);
          }
+#if DX11
          if (ImGui::Checkbox("Debug Draw: Auto Clear Texture", &Trace::debug_draw_auto_clear_texture)) // Is it persistent or not (in case the target texture stopped being found on newer frames). We could also "freeze" it and stop updating it, but we don't need that for now.
          {
             device_data.debug_draw_texture_format = DXGI_FORMAT_UNKNOWN;
             device_data.debug_draw_texture_size = {};
          }
+#else
+         {
+            const std::shared_lock lock(device_data.readback.mutex);
+            if (!device_data.readback.debug_error.empty())
+            {
+               ImGui::TextColored(ImVec4(1.f, 0.3f, 0.3f, 1.f), "Debug Draw Error: %s", device_data.readback.debug_error.c_str());
+            }
+         }
+         ImGui::Text("Debug Draw Info: Last Copy Frame: %u", debug_draw_copied_frame);
+#endif
       }
    }
 } // namespace UI

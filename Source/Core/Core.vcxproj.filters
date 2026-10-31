@@ -156,9 +156,6 @@
     <ClInclude Include="includes\patch.hpp">
       <Filter>Includes</Filter>
     </ClInclude>
-    <ClInclude Include="includes\mcp.hpp">
-      <Filter>Includes</Filter>
-    </ClInclude>
     <ClInclude Include="includes\trace.hpp">
       <Filter>Includes</Filter>
     </ClInclude>

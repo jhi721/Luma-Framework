@@ -13,7 +13,9 @@
 #include <thread>
 #include <vector>
 
+#if DX11
 #include <d3d11.h>
+#endif
 #include <d3d11shader.h>
 #include <include/reshade.hpp>
 
@@ -45,13 +47,26 @@ struct DrawDispatchData
    bool indirect = false;
 };
 
+#if DX12
+// The command a D3D12 draw event stands for, to re-issue it natively. "ExecuteIndirect()" comes without its command signature, and ReShade passes
+// "DispatchMesh()" with X as Y: those ("Other") can't be re-issued.
+enum class D3D12DrawCommand : uint8_t
+{
+   Draw,
+   DrawIndexed,
+   Dispatch,
+   Other,
+};
+#endif
+
+// A frame capture entry. D3D12 fills the D3D11 named render state, viewport and sampler fields with its own, alike numbered, values (see "D3D12Trace").
 struct TraceDrawCallData
 {
    TraceDrawCallData()
    {
       thread_id = std::this_thread::get_id();
 
-      std::fill_n(samplers_filter, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, static_cast<D3D11_FILTER>(-1)); // Default to no sampler
+      std::fill_n(samplers_filter, samplers_size, static_cast<D3D11_FILTER>(-1)); // Default to no sampler
    }
 
    enum class TraceDrawCallType
@@ -71,6 +86,9 @@ struct TraceDrawCallData
       ResetCommmandList,
       FlushCommandList,
         Custom, // Custom draw call for custom passes we added/replaced
+      // D3D12 render passes (the game's draws between them are inside the pass)
+      BeginRenderPass,
+      EndRenderPass,
    };
 
    TraceDrawCallType type = TraceDrawCallType::Shader;
@@ -82,8 +100,13 @@ struct TraceDrawCallData
    ShaderHashesList shader_hashes;
 #endif
 
+#if DX11
    // The original command list (can be useful to have later)
    com_ptr<ID3D11DeviceContext> command_list = nullptr;
+#else
+   // The command list that recorded this call. It only identifies it, it might be destroyed by now.
+   const reshade::api::command_list* command_list = nullptr;
+#endif
    // The thread this call was made on (usually 1:1 with deferred (async) command lists)
    std::thread::id thread_id = {};
 
@@ -102,7 +125,7 @@ struct TraceDrawCallData
    DrawDispatchData draw_dispatch_data = {};
 
    // Vertex shader
-   D3D11_PRIMITIVE_TOPOLOGY primitive_topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+   D3D_PRIMITIVE_TOPOLOGY primitive_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
    std::vector<std::string> vertex_buffer_hashes;
    std::string input_layout_hash;
    std::string index_buffer_hash;
@@ -112,29 +135,44 @@ struct TraceDrawCallData
 
    DepthStateType depth_state = DepthStateType::Disabled;
    DepthStateType stencil_state = DepthStateType::Disabled;
-   // Already includes all the render targets
+   // Already includes all the render targets. The D3D12 capture converts its PSO's blend state to it (the D3D11 and D3D12 enums are numbered alike)
    D3D11_BLEND_DESC1 blend_desc = {};
-   FLOAT blend_factor[4] = { 1.f, 1.f, 1.f, 1.f };
+   // The blend factor (D3D11 draws), or the clear values of clear entries (depth and stencil in the first two for depth clears)
+   FLOAT blend_factor[4] = {1.f, 1.f, 1.f, 1.f};
 
-   bool cbs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
+   // D3D12 packs the constant buffers in binding order (see "cb_register"): a draw can have more of them than D3D11's slots
+#if DX12
+   static constexpr size_t cbs_size = 32;
+#else
+   static constexpr size_t cbs_size = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
+#endif
+   bool cbs[cbs_size] = {};
+#if DX11
    // The views and buffers bound to every slot (only compared, never dereferenced), including the slots the shader doesn't use, see "Trace::UpdateDraw()"
    const ID3D11Buffer* cb_buffers[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
    const ID3D11SamplerState* sampler_states[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
    const ID3D11DepthStencilView* dsv = nullptr;
-   std::string cb_hash[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {}; // Ptr hash (not content hash)
+#endif
+   std::string cb_hash[cbs_size] = {}; // Ptr hash (not content hash)
    // D3D11.1 partial buffer binding offsets (0/0 means data not available or full-buffer bind via legacy API)
-   UINT cb_first_constant[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
-   UINT cb_num_constants[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
+   UINT cb_first_constant[cbs_size] = {};
+   UINT cb_num_constants[cbs_size] = {};
 
-   D3D11_FILTER samplers_filter[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
-   D3D11_TEXTURE_ADDRESS_MODE samplers_address_u[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
-   D3D11_TEXTURE_ADDRESS_MODE samplers_address_v[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
-   D3D11_TEXTURE_ADDRESS_MODE samplers_address_w[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
-   float samplers_mip_lod_bias[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
+   // D3D12 packs the samplers in binding order (see "sa_register"), with the D3D12 values in the D3D11 enums (they are numbered alike)
+#if DX12
+   static constexpr size_t samplers_size = 32;
+#else
+   static constexpr size_t samplers_size = D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT;
+#endif
+   D3D11_FILTER samplers_filter[samplers_size] = {};
+   D3D11_TEXTURE_ADDRESS_MODE samplers_address_u[samplers_size] = {};
+   D3D11_TEXTURE_ADDRESS_MODE samplers_address_v[samplers_size] = {};
+   D3D11_TEXTURE_ADDRESS_MODE samplers_address_w[samplers_size] = {};
+   float samplers_mip_lod_bias[samplers_size] = {};
 
    // Render Target (Resource+Views)
    static constexpr size_t rtvs_size = D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; // Max size (we can lower it if needed) // TODO: allocate these as a vector of structs
-   const ID3D11RenderTargetView* rtvs[rtvs_size] = {};                  // TODO.. find a better way, this is very hacky (though safe, as long as we read/compare it)
+   uint64_t rtvs[rtvs_size] = {};                                       // View handles, only compared and looked up
    DXGI_FORMAT rt_format[rtvs_size] = {};                               // The format of the resource
    DXGI_FORMAT rtv_format[rtvs_size] = {};                              // The format of the view
    uint4 rt_size[rtvs_size] = {};                                       // 3th and 4th channels are Array, MS and Mips
@@ -150,7 +188,7 @@ struct TraceDrawCallData
 #else
    static constexpr size_t srvs_size = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
 #endif
-   const ID3D11ShaderResourceView* srvs[srvs_size] = {};
+   uint64_t srvs[srvs_size] = {};
    DXGI_FORMAT srv_format[srvs_size] = {};                                   // The format of the view
    DXGI_FORMAT sr_format[srvs_size] = {};                            // The format of the resource
    uint4 sr_size[srvs_size] = {};                                            // 3th and 4th channels are Array, MS and Mips
@@ -167,7 +205,7 @@ struct TraceDrawCallData
 #else
    static constexpr size_t uavs_size = D3D11_1_UAV_SLOT_COUNT;
 #endif
-   const ID3D11UnorderedAccessView* uavs[uavs_size] = {};
+   uint64_t uavs[uavs_size] = {};
    DXGI_FORMAT ua_format[uavs_size] = {};               // The format of the resource
    DXGI_FORMAT uav_format[uavs_size] = {};     // The format of the view
    uint4 ua_size[uavs_size] = {};                       // 3th and 4th channels are Array, MS and Mips
@@ -184,12 +222,86 @@ struct TraceDrawCallData
    std::string ds_hash = {}; // Ptr hash (not content hash)
    std::string ds_debug_name = {}; // Debug name of the texture or the view
 
-   // Full depth/stencil and rasterizer state (pixel shader entries only). Without a bound state object D3D11 uses its defaults.
+#if DX12
+   // D3D12 binds by root signature, not by slot: the SRV, UAV and constant buffer entries above are packed in binding order, the
+   // first "*_count" are valid, and these are their registers
+   struct ShaderRegister
+   {
+      uint32_t index = 0;
+      uint32_t space = 0;
+   };
+   uint32_t srv_count = 0;
+   uint32_t uav_count = 0;
+   uint32_t cb_count = 0;
+   uint32_t sampler_count = 0;
+   ShaderRegister sr_register[srvs_size] = {};
+   ShaderRegister ua_register[uavs_size] = {};
+   ShaderRegister cb_register[cbs_size] = {};
+   ShaderRegister sa_register[samplers_size] = {};
+   // Only the comparison filters use it
+   D3D11_COMPARISON_FUNC samplers_comparison_func[samplers_size] = {};
+   std::vector<uint32_t> cb_root_constants[cbs_size]; // The values of root constants (they have no "cb_hash")
+   bool uses_descriptor_heap = false; // A shader indexes the SM 6.6 descriptor heaps: those resources aren't listed, their indices usually are in the constants
+   // ExecuteIndirect() (with the command signature hooks, see "D3D12CommandSignatures"): the argument buffer range, the most commands and what each command sets,
+   // in the signature's order. The root arguments name their root parameter's register: those bindings are each command's, not the ones the list shows.
+   struct IndirectArgument
+   {
+      D3D12_INDIRECT_ARGUMENT_TYPE type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+      uint32_t root_parameter = UINT32_MAX; // Root constants and views
+      char register_type = 0;               // 'b', 't' or 'u', 0 if the root parameter isn't known
+      ShaderRegister shader_register;
+      uint32_t constant_offset = 0; // Root constants: the first 32 bit value and how many
+      uint32_t constant_count = 0;
+      uint32_t slot = 0; // Vertex buffers
+   };
+   bool indirect_signature_known = false;
+   uint64_t indirect_buffer = 0;
+   uint64_t indirect_offset = 0;
+   uint32_t indirect_max_count = 0;
+   uint32_t indirect_stride = 0;
+   bool indirect_count_buffer = false;
+   std::vector<IndirectArgument> indirect_arguments;
+   // A bindless range or a type's packed entries went past their limit: the entries above are incomplete
+   bool truncated = false;
+   // The table descriptors of the entries above, read when the command list executes: until it's submitted, games can still write
+   // them (root signature 1.0 and "DESCRIPTORS_VOLATILE" ranges)
+   struct TableDescriptor
+   {
+      reshade::api::descriptor_table table = {};
+      uint32_t binding = 0; // Offset from the table start
+      char type = 0;        // 't', 'u', 'b' or 's'
+      uint32_t index = 0;   // In the packed SRV, UAV or constant buffer entries
+   };
+   std::vector<TableDescriptor> table_descriptors;
+   // What readbacks copy, which the hashes above can't give back: the render target, unordered access and depth stencil views, and the
+   // buffers of constant buffer views (root constants have none). Copy, resolve and clear entries have no views: their "rt_view[0]" is
+   // what they wrote (the cleared view, else the whole resource or the destination subresource's mip and layer) and "copy_source" is
+   // the resource a copy read
+   D3D12State::ViewInfo rt_view[rtvs_size] = {};
+   D3D12State::ViewInfo ua_view[uavs_size] = {};
+   D3D12State::ViewInfo ds_view = {};
+   uint64_t cb_resource[cbs_size] = {};
+   uint64_t copy_source = 0;
+   // The view a clear entry cleared: readbacks re-issue render target and depth stencil clears, not unordered access ones
+   enum class ClearKind : uint8_t
+   {
+      RenderTarget,
+      DepthStencil,
+      UnorderedAccess,
+   };
+   ClearKind clear_kind = ClearKind::RenderTarget;
+#endif
+
+   // Full depth/stencil and rasterizer state (pixel shader entries only). Without a bound state object D3D11 uses its defaults. The D3D12 capture
+   // converts its PSO's, and tracks the viewports and scissors only with "ENABLE_D3D12_PASSES".
    bool has_depth_stencil_state = false;
    D3D11_DEPTH_STENCIL_DESC depth_stencil_desc = {};
    UINT stencil_ref = 0;
    bool has_rasterizer_state = false;
    D3D11_RASTERIZER_DESC rasterizer_desc = {};
+#if DX12
+   bool scissor_enable = false; // D3D12's rasterizer desc has no scissor flag
+#endif
    UINT viewport_count = 0;
    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
    UINT scissor_count = 0;
@@ -202,6 +314,9 @@ struct TraceDrawCallData
       Region,
       Resolve,
       BufferRegion,
+      // D3D12 only
+      BufferToTexture, // An upload: "box" is the written size in texels, from the origin
+      TextureToBuffer,
    };
    struct CopyInfo
    {
@@ -210,7 +325,12 @@ struct TraceDrawCallData
       UINT dest_subresource = 0;
       uint3 dest_offset = {}; // Bytes in "x" for buffer copies
       bool has_box = false;
-      D3D11_BOX box = {}; // Source region (bytes in "left"/"right" for buffer copies)
+      // Source region (bytes in "left"/"right" for buffer copies, but the written size in texels for D3D12 uploads)
+#if DX11
+      D3D11_BOX box = {};
+#else
+      D3D12_BOX box = {};
+#endif
       DXGI_FORMAT resolve_format = DXGI_FORMAT_UNKNOWN;
    };
    CopyInfo copy_info;
@@ -258,6 +378,7 @@ struct TraceDrawCallData
    bool IsDSVValid() const { return dsv_format != DXGI_FORMAT_UNKNOWN && dsv_format != DXGI_FORMAT(-1); }
 
    const char* custom_name = "Unknown";
+   bool predicted = false; // A custom entry listed before it ran (the swapchain encode, which runs in the native present after the capture closed)
    // Luma passes ("Trace::CustomDraw()"): the stage whose state was recorded (none for markers), and its "native_shaders_definitions" key
    reshade::api::shader_stage custom_stage = reshade::api::shader_stage(0);
    uint32_t custom_shader_hash = 0;
@@ -295,6 +416,8 @@ namespace Trace
       SRGB = 1 << 19,
       UVToPixelSpace = 1 << 20,
       Denormalize = 1 << 21,
+      // The texture is an R8_UINT one (the stencil plane), a plain 2D at t9 of the display composition (D3D12 only): loaded as integers and shown as value / 255
+      TextureUint = 1 << 22,
    };
    enum class DebugDrawMode : uint32_t
    {
@@ -362,8 +485,22 @@ namespace Trace
    inline std::atomic<int32_t> track_buffer_pipeline_instance = 0; // Theoretically should be within "CommandListData" but this should work for most cases
    inline std::atomic<int32_t> track_buffer_custom_pass_instance = 0;
 
-   // Core: at the ReShade present, ends the running capture or starts the scheduled one (in the immediate command list)
+   // Core: at the ReShade present, ends the running capture or starts the scheduled one (in the command list holding the capture)
    void OnPresent(CommandListData& cmd_list_data);
+   // A pass the debug draw and the constant buffer tracking can target: a game pipeline, or a Luma pass by name ("CustomDraw()")
+   struct PassTarget
+   {
+      uint64_t pipeline = 0;
+      uint32_t shader_hash = 0; // The pipeline's (first) shader, or the Luma pass's native shader
+      uint32_t custom_pass = 0;
+      reshade::api::shader_stage stage = reshade::api::shader_stage(0);
+      int32_t instance = 0; // Among the passes with the same identity in a frame, like the runtime counters
+      std::thread::id thread; // Set if the instances were counted on its thread only
+   };
+   // The pass of a captured entry (a game draw with a live pipeline, or a Luma pass), counting its instance among the previous entries (the ones
+   // recorded on its thread only, if "by_thread"). Needs "s_mutex_generic" and the command list's "mutex_trace" locked.
+   std::optional<PassTarget> FindPassTarget(const DeviceData& device_data, const CommandListData& cmd_list_data, size_t index, bool by_thread);
+#if DX11
    // Copies the view of the pass that just drew (still bound) selected by "debug_draw_mode" and "debug_draw_view_index" into "DeviceData::debug_draw_texture"
    bool CopyDebugDrawTexture(DebugDrawMode debug_draw_mode, int32_t debug_draw_view_index, ID3D11DeviceContext* native_device_context, DeviceData& device_data, bool is_dispatch);
    bool CopyDebugDrawTexture(DebugDrawMode debug_draw_mode, int32_t debug_draw_view_index, reshade::api::command_list* cmd_list, bool is_dispatch = false);
@@ -384,6 +521,7 @@ namespace Trace
    // From a draw callback that changed what the game draw binds (e.g. a texture swapped for its own) and lets it draw: records the views, cbuffers
    // and samplers that were added, replaced or unbound on the draw's entries, next to the ones the game bound.
    void UpdateDraw(CommandListData& cmd_list_data, DeviceData& device_data, ID3D11DeviceContext* native_device_context);
+#endif // DX11
    // Attaches a note to the draw being processed in the current capture (e.g. the game's motion vector decision).
    // Call it from "Game::OnDrawOrDispatch", where the shader entries of the current draw are the last ones of "cmd_list_data".
    // "value" is appended as "text=value" (formatted only while capturing, so it can be called on every draw).
@@ -392,6 +530,7 @@ namespace Trace
    // Core: reads the slots a shader reads or writes from its reflections (RTVs, SRVs, UAVs, cbuffers and samplers), the ones a draw's entry records.
    // Game shaders are reflected at creation, Luma's when a pass is recorded.
    void ReflectShaderSlots(ID3D11ShaderReflection* shader_reflector, const D3D11_SHADER_DESC& shader_desc, Shader::CachedShader& cached_shader, bool& found_any_rtvs, bool& found_any_other_bindings);
+#if DX11
    // Core: the entries of events that aren't draws, with the resource they read ("source", in "sr_*[0]") and the one they write ("target", in "rt_*[0]")
    void AddEvent(CommandListData& cmd_list_data, ID3D11DeviceContext* command_list, TraceDrawCallData::TraceDrawCallType type, ID3D11Resource* source = nullptr, ID3D11Resource* target = nullptr);
    // "values" are stored in "blend_factor" (depth and stencil in the first two for depth clears)
@@ -420,19 +559,6 @@ namespace Trace
    // Core: at the end of every frame
    void EndFrame(DeviceData& device_data);
 
-   // A pass the debug draw and the constant buffer tracking can target: a game pipeline, or a Luma pass by name ("CustomDraw()")
-   struct PassTarget
-   {
-      uint64_t pipeline = 0;
-      uint32_t shader_hash = 0; // The pipeline's (first) shader, or the Luma pass's native shader
-      uint32_t custom_pass = 0;
-      reshade::api::shader_stage stage = reshade::api::shader_stage(0);
-      int32_t instance = 0; // Among the passes with the same identity in a frame, like the runtime counters
-      std::thread::id thread; // Set if the instances were counted on its thread only
-   };
-   // The pass of a captured entry (a game draw with a live pipeline, or a Luma pass), counting its instance among the previous entries (the ones
-   // recorded on its thread only, if "by_thread"). Needs "s_mutex_generic" and the command list's "mutex_trace" locked.
-   std::optional<PassTarget> FindPassTarget(const DeviceData& device_data, const CommandListData& cmd_list_data, size_t index, bool by_thread);
    bool IsDebugDrawTarget(const PassTarget& target);
    // Debug draws a pass, from its captured "entry". The view type follows the pass (render target, UAV, or SRV), unless "keep_mode" and the pass has the view.
    void SetDebugDrawTarget(DeviceData& device_data, const PassTarget& target, const TraceDrawCallData& entry, bool keep_mode);
@@ -440,7 +566,6 @@ namespace Trace
    bool IsTrackBufferTarget(const PassTarget& target);
    void SetTrackBufferTarget(DeviceData& device_data, const PassTarget& target);
    void ClearTrackBufferTarget(DeviceData& device_data);
-
    // Core: moves the entries queued on this thread for "native_device_context" (Luma passes and markers) into its trace, outside of the draw hooks
    // (the other contexts' are dropped). Without a command list, they are dropped.
    void FlushQueued(CommandListData* cmd_list_data, ID3D11DeviceContext* native_device_context);
@@ -448,7 +573,8 @@ namespace Trace
    void InitCommandList(CommandListData& cmd_list_data);
    // Core: called by the draw hooks with what the draw callbacks returned, flags the entries of the draw ("trace_current_draw") if they didn't let it through
    void EndDraw(CommandListData& cmd_list_data, bool cancelled_or_replaced);
-#else
+#endif // DX11
+#elif DX11
    inline void CustomDraw(ID3D11DeviceContext*, const char*, UINT) {}
    inline void CustomDispatch(ID3D11DeviceContext*, const char*, UINT, UINT, UINT) {}
    inline void Marker(ID3D11DeviceContext*, const char*, ID3D11DeviceChild* = nullptr) {}

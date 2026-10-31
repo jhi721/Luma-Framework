@@ -26,6 +26,8 @@
 #pragma comment(lib, "Gdi32.lib") // For "SetDeviceGammaRamp"
 #pragma comment(lib, "dxguid.lib")
 #pragma comment(lib, "Dxva2.lib")   // For "SetMonitorBrightness"
+#pragma comment(lib, "Advapi32.lib") // For the MCP pipe's security descriptor
+#pragma comment(lib, "dxgi.lib") // For "CreateDXGIFactory1()" (the MCP's VRAM log)
 
 #define _USE_MATH_DEFINES
 
@@ -33,15 +35,40 @@
 #define ImTextureID ImU64
 #endif
 
+#if DX12
+#include <d3d12.h>
+// Shader model register limits that size Core's API agnostic per-slot data (shader reflections, draw traces). D3D12 has the same values.
+#define D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT D3D12_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
+#define D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT D3D12_COMMONSHADER_SAMPLER_SLOT_COUNT
+#define D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT
+#define D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT
+#define D3D11_1_UAV_SLOT_COUNT D3D12_UAV_SLOT_COUNT
+#define D3D11_PS_CS_UAV_REGISTER_COUNT D3D12_PS_CS_UAV_REGISTER_COUNT
+#define D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT
+#define D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE
+// The render state and sampler types of the frame capture (see "TraceDrawCallData"): D3D12's are laid out and numbered like D3D11's (apart from its rasterizer's missing scissor flag)
+#define D3D11_BLEND_DESC1 D3D12_BLEND_DESC
+#define D3D11_DEPTH_STENCIL_DESC D3D12_DEPTH_STENCIL_DESC
+#define D3D11_DEPTH_STENCILOP_DESC D3D12_DEPTH_STENCILOP_DESC
+#define D3D11_RASTERIZER_DESC D3D12_RASTERIZER_DESC
+#define D3D11_VIEWPORT D3D12_VIEWPORT
+#define D3D11_RECT D3D12_RECT
+#define D3D11_FILTER D3D12_FILTER
+#define D3D11_TEXTURE_ADDRESS_MODE D3D12_TEXTURE_ADDRESS_MODE
+#define D3D11_COMPARISON_FUNC D3D12_COMPARISON_FUNC
+// The native objects the "Game" interface receives
+using NativeDevice = ID3D12Device;
+using NativeCommandList = ID3D12GraphicsCommandList;
+#else
 #include <d3d11.h>
 #include <d3d11_4.h>
+using NativeDevice = ID3D11Device;
+using NativeCommandList = ID3D11DeviceContext;
+#endif
 #include <dxgi.h>
 #include <dxgi1_6.h>
 #include <Windows.h>
-#if DEVELOPMENT
-#include <sddl.h> // For the MCP pipe's security descriptor
-#pragma comment(lib, "Advapi32.lib")
-#endif
+#include <sddl.h>
 #include <HighLevelMonitorConfigurationAPI.h> // For "SetMonitorBrightness"
 
 #include <cstdio>
@@ -90,6 +117,10 @@
 #ifndef ENABLE_SMAA
 #define ENABLE_SMAA 0
 #endif // ENABLE_SMAA
+// 0: SMAA's area texture without the U-shape smoothing of short U patterns (see "texture_data/SMAA_AreaTex_SharpU.h")
+#ifndef SMAA_SMOOTH_U_SHAPES
+#define SMAA_SMOOTH_U_SHAPES 1
+#endif // SMAA_SMOOTH_U_SHAPES
 // RCAS sharpening pass drawn by "DrawRCAS()" (e.g. after SMAA or super resolution)
 #ifndef ENABLE_RCAS
 #define ENABLE_RCAS 0
@@ -101,11 +132,15 @@
 #ifndef ENABLE_FIDELITY_SK
 #define ENABLE_FIDELITY_SK 0
 #endif // ENABLE_FIDELITY_SK
+// 64x D3D12 only
+#ifndef ENABLE_XESS
+#define ENABLE_XESS 0
+#endif // ENABLE_XESS
 // Automatically define "ENABLE_SR" if any SR tech is enabled
 #ifdef ENABLE_SR
 #undef ENABLE_SR
 #endif // ENABLE_SR
-#if (defined(ENABLE_NGX) && ENABLE_NGX) || (defined(ENABLE_FIDELITY_SK) && ENABLE_FIDELITY_SK)
+#if (defined(ENABLE_NGX) && ENABLE_NGX) || (defined(ENABLE_FIDELITY_SK) && ENABLE_FIDELITY_SK) || ENABLE_XESS
 #define ENABLE_SR 1
 #else
 #define ENABLE_SR 0
@@ -114,6 +149,9 @@
 #ifndef ENABLE_NVAPI
 #define ENABLE_NVAPI 0
 #endif // ENABLE_NVAPI
+#ifndef ENABLE_MINHOOK
+#define ENABLE_MINHOOK 0
+#endif // ENABLE_MINHOOK
 #ifndef PROJECT_NAME
 // Matches "Globals::MOD_NAME"
 #define PROJECT_NAME "Luma"
@@ -156,6 +194,16 @@
 #if !DX12
 #define DX11 1
 #endif
+// Luma passes recorded in the middle of the game's D3D12 command lists (RCAS, SMAA, bloom, the texture copy conversion) and the viewports they scale for clones of other sizes:
+// release builds track the graphics state they replace too, to bind it again after them (see "D3D12State::RestoreGraphics()"). On for every D3D12 build, as the copy conversion and
+// the custom dimensions of the texture upgrades need it too; a game can define it as 0 (the copies that cross format families are skipped then, and custom dimensions refused)
+#ifndef ENABLE_D3D12_PASSES
+#if DX12
+#define ENABLE_D3D12_PASSES 1
+#else
+#define ENABLE_D3D12_PASSES 0
+#endif
+#endif
 
 // This might not disable all shaders dumping related code, but it disables enough to remove any performance cost
 #ifndef ALLOW_SHADERS_DUMPING
@@ -183,6 +231,11 @@
 
 #include "dlss/DLSS.h" // see "ENABLE_NGX"
 #include "fsr/FSR.h" // see "ENABLE_FIDELITY_SK"
+#include "xess/XeSS.h" // see "ENABLE_XESS"
+#if ENABLE_MINHOOK
+#include "includes/minhook.h"
+#endif
+#include "includes/d3d12_pso_capture.h" // see "DX12" and "ENABLE_MINHOOK"
 #include "fsr/FSR4.h" // see "ENABLE_FSR4"
 
 #include "includes/containers.h"
@@ -199,19 +252,42 @@
 #include "includes/instance_data.h"
 #include "includes/game.h"
 #include "includes/com_ptr.h"
+#include "includes/callbacks.h"
 #include "includes/trace.hpp"
 #if DEVELOPMENT
-#include "includes/mcp.hpp"
 #include "includes/ui/ui.hpp"
 #endif
 
 #include "utils/format.hpp"
 #include "utils/pipeline.hpp"
 #include "utils/shader_compiler.hpp"
+#include "includes/d3d12_resource_creation.h" // see "DX12" and "ENABLE_MINHOOK"
+// See "DX12", "ENABLE_MINHOOK" and "DEVELOPMENT"
+#include "includes/d3d12_command_signatures.h"
+#include "includes/d3d12_clones.h" // see "DX12" and "ENABLE_MINHOOK"
+#include "includes/d3d12_root_signatures.h" // see "DX12" and "ENABLE_MINHOOK"
 #include "utils/display.hpp"
+#if DX11 // Native D3D11 helpers
 #include "utils/resource.hpp"
 #include "utils/draw.hpp"
+#elif ENABLE_SMAA
+#include "texture_data/SMAA_AreaTex.h"
+#include "texture_data/SMAA_SearchTex.h"
+#include "texture_data/SMAA_AreaTex_SharpU.h"
+#endif
+#if DX12 && DEVELOPMENT
+#include "utils/d3d12_trace.hpp"
+#endif
 #include "utils/system.h"
+
+#if DX12 && defined(__d3d11_h__)
+#error "A D3D11 header reached a D3D12 build, gate its include with \"DX11\""
+#endif
+
+#if DX12 && LUMA_PATCH_PROVIDERS != 0
+// Their DXBC patching isn't ported to DXIL, and the async clone queue never drains on D3D12
+#error "Shader patch providers are D3D11 only"
+#endif
 
 #define ICON_FK_CANCEL reinterpret_cast<const char*>(u8"\uf00d")
 #define ICON_FK_OK reinterpret_cast<const char*>(u8"\uf00c")
@@ -251,6 +327,8 @@ namespace
    // Mutexes:
    // For "pipeline_cache_by_pipeline_handle", "pipeline_cache_by_pipeline_clone_handle", "pipeline_caches_by_shader_hash" and "cloned_pipeline_count"
    recursive_shared_mutex s_mutex_generic;
+   // Bumped (under "s_mutex_generic") whenever a pipeline leaves "pipeline_cache_by_pipeline_handle", invalidating the per-thread lookup cache in "OnBindPipeline()"
+   std::atomic<uint32_t> pipeline_cache_generation = 0;
    // For "shaders_to_dump", "dumped_shaders", "dumped_shaders_meta_paths", "shader_cache". In general for dumping shaders to disk (this almost always needs to be read and write locked together so there's no need for it to be a shared mutex)
    std::recursive_mutex s_mutex_dumping;
    // For "custom_shaders_cache", "pipelines_to_reload". In general for loading shaders from disk and compiling them
@@ -370,6 +448,7 @@ namespace
       // TODO: delete all redirectors by doing a global rename
       TextureFormatUpgradesType& texture_format_upgrades_type = ResourceUpgradeManager::texture_format_upgrades_type;
       bool& enable_indirect_texture_format_upgrades = ResourceUpgradeManager::enable_indirect_texture_format_upgrades;
+      bool& texture_format_upgrades_on_creation = ResourceUpgradeManager::texture_format_upgrades_on_creation;
       ChainTextureFormatUpgradesType& enable_chain_indirect_texture_format_upgrades = ResourceUpgradeManager::enable_chain_indirect_texture_format_upgrades;
       bool& ignore_indirect_upgraded_textures = ResourceUpgradeManager::ignore_indirect_upgraded_textures;
 #if DEVELOPMENT && 0 // WIP
@@ -445,6 +524,11 @@ namespace
       float custom_sdr_gamma = 0.f;
 
       bool force_disable_display_composition = false;
+      // The Display Mode, Peak and Paper White settings even with "force_disable_display_composition" (a mod encoding its own HDR
+      // output, e.g. in its replaced present shaders); "SDR in HDR" needs Luma's composition and isn't offered then
+      bool show_display_settings_without_composition = false;
+      // The UI Paper White slider whatever "UI_DRAW_TYPE" is (a mod scaling the UI on its own)
+      bool force_separate_ui_paper_white = false;
 
       //
       // Samplers
@@ -459,6 +543,19 @@ namespace
 #endif
       PUBLISHING_CONSTEXPR bool custom_texture_mip_lod_bias_offset = false; // Live edit
    }
+
+#if DX12
+   // What Luma's upgrade of a sampler depends on: when it changes, the D3D12 sampler descriptors the game wrote are written again (see "OnPresent()")
+   std::tuple<float, int, int, bool, bool> GetSamplersUpgradeState(const DeviceData& device_data)
+   {
+      const std::shared_lock lock(s_mutex_samplers);
+#if DEVELOPMENT
+      return {device_data.texture_mip_lod_bias_offset, samplers_upgrade_mode, samplers_upgrade_mode_2, force_upgrade_linear_samplers, ignore_upgraded_samplers};
+#else
+      return {device_data.texture_mip_lod_bias_offset, samplers_upgrade_mode, 0, force_upgrade_linear_samplers, ignore_upgraded_samplers};
+#endif
+   }
+#endif
 
    // The root path of all the shaders we load and dump
    std::filesystem::path shaders_path;
@@ -489,6 +586,16 @@ namespace
    uint32_t luma_settings_cbuffer_index = 13;
    uint32_t luma_data_cbuffer_index = -1; // Needed, unless "POST_PROCESS_SPACE_TYPE" is 0 and we don't need the final display composition pass
 	uint32_t luma_ui_cbuffer_index = -1; // Optional, for "UI_DRAW_TYPE" 1
+#if DX12 && ENABLE_MINHOOK
+   // Root parameters the game wants in every root signature, after Luma's CBVs (see "D3D12RootSignatures::GameParameter"). Set by the game in "OnInit()", read once at device init
+   std::vector<D3D12RootSignatures::GameParameter> d3d12_game_root_parameters;
+#endif
+
+   // The registers Luma's native shaders are compiled with ("LUMA_*_CB_INDEX"): the game's indices above, else the first free ones (see "CompileCustomShaders()", which writes them
+   // with the same values every time). The D3D12 passes bind their cbuffers there.
+   uint32_t luma_settings_cbuffer_define_index = 0;
+   uint32_t luma_data_cbuffer_define_index = 0;
+   uint32_t luma_ui_cbuffer_define_index = 0;
 
    // A list of luma native shader definitions, to be later compiled in the device data. The hash can be used globally to identify and retrieve them (they need to be unique!).
    // We define the shader name and the file shader because we can make different permutations out of the same code file.
@@ -498,13 +605,42 @@ namespace
    std::unordered_map<uint32_t, ShaderDefinition> native_shaders_definitions =
    {
       { CompileTimeStringHash("Copy VS"), { "Luma_Copy_VS", reshade::api::pipeline_subobject_type::vertex_shader } },
-      { CompileTimeStringHash("Copy PS"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
+      { CompileTimeStringHash("Display Composition"), { "Luma_DisplayComposition", reshade::api::pipeline_subobject_type::pixel_shader } },
+#if DX12
+      // The in place one, on back buffers that allow unordered access (see "DrawDisplayCompositionD3D12()"). Not on D3D11: SM 5 has no typed UAV loads of float4
+      { CompileTimeStringHash("Display Composition CS"), { "Luma_DisplayComposition", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_cs" } },
+#endif
 
+#if ENABLE_RCAS
+      { CompileTimeStringHash("RCAS PS"), { "Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps" } },
+#endif
+
+#if ENABLE_SMAA // D3D11: CB::LumaGameSettings::OutputRes is required! See BioShock Series implementation. D3D12: see "DrawSMAA()"
+      { CompileTimeStringHash("SMAA Edge Detection VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_edge_detection_vs" } },
+      { CompileTimeStringHash("SMAA Edge Detection PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_edge_detection_ps" } },
+      { CompileTimeStringHash("SMAA Blending Weight Calculation VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_blending_weight_calculation_vs" } },
+      { CompileTimeStringHash("SMAA Blending Weight Calculation PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps" } },
+      { CompileTimeStringHash("SMAA Neighborhood Blending VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_neighborhood_blending_vs" } },
+      { CompileTimeStringHash("SMAA Neighborhood Blending PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps" } },
+#endif
+
+#if ENABLE_BLOOM
+      { CompileTimeStringHash("Bloom VS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "bloom_main_vs" } },
+      { CompileTimeStringHash("Bloom Prefilter PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_prefilter_ps" } },
+      { CompileTimeStringHash("Bloom Downsample PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_downsample_ps" } },
+      { CompileTimeStringHash("Bloom Upsample PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_upsample_ps" } },
+#endif
+#if DX11 || ENABLE_BLOOM // D3D12 only draws it before its bloom
+      { CompileTimeStringHash("Karis Average CS"), { "Luma_KarisAverage", reshade::api::pipeline_subobject_type::compute_shader } },
+#endif
+
+#if DX11 || ENABLE_D3D12_PASSES // D3D12: "ConvertTextureCopyD3D12()"
+      { CompileTimeStringHash("Copy PS"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
       // Bilinear scaling copy (same aspect, different size): separate from the point-sampled Copy PS.
       { CompileTimeStringHash("Scale VS"), { "Luma_Scale_VS", reshade::api::pipeline_subobject_type::vertex_shader } },
       { CompileTimeStringHash("Scale PS"), { "Luma_Scale_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
-
-      { CompileTimeStringHash("Display Composition"), { "Luma_DisplayComposition", reshade::api::pipeline_subobject_type::pixel_shader } },
+#endif
+#if DX11 // The D3D12 builds only have the natives of their display composition, swapchain encode, RCAS, SMAA, bloom and texture copy: the passes of the others aren't ported to D3D12 yet
       
       { CompileTimeStringHash("Copy RGB Max 0 A Sat"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, { { "RGB_MAX_0", "1" }, { "A_SAT", "1" } } } },
       { CompileTimeStringHash("Copy RGB Max 0 A Sat MS"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, { { "MS", "1" }, { "RGB_MAX_0", "1" }, { "A_SAT", "1" } } } },
@@ -532,27 +668,7 @@ namespace
       { CompileTimeStringHash("Unclip LUT 1D"), { "Luma_UnclipLUT1D", reshade::api::pipeline_subobject_type::compute_shader } },
 #endif
 
-#if ENABLE_SMAA // CB::LumaGameSettings::OutputRes is required! See BioShock Series implementation.
-      { CompileTimeStringHash("SMAA Edge Detection VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_edge_detection_vs" } },
-      { CompileTimeStringHash("SMAA Edge Detection PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_edge_detection_ps" } },
-      { CompileTimeStringHash("SMAA Blending Weight Calculation VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_blending_weight_calculation_vs" } },
-      { CompileTimeStringHash("SMAA Blending Weight Calculation PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps" } },
-      { CompileTimeStringHash("SMAA Neighborhood Blending VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_neighborhood_blending_vs" } },
-      { CompileTimeStringHash("SMAA Neighborhood Blending PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps" } },
-#endif
-
-#if ENABLE_RCAS
-      { CompileTimeStringHash("RCAS PS"), { "Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps" } },
-#endif
-
-#if ENABLE_BLOOM
-      { CompileTimeStringHash("Bloom VS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "bloom_main_vs" } },
-      { CompileTimeStringHash("Bloom Prefilter PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_prefilter_ps" } },
-      { CompileTimeStringHash("Bloom Downsample PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_downsample_ps" } },
-      { CompileTimeStringHash("Bloom Upsample PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_upsample_ps" } },
-#endif
-
-      { CompileTimeStringHash("Karis Average CS"), { "Luma_KarisAverage", reshade::api::pipeline_subobject_type::compute_shader } },
+#endif // DX11
    };
 
    // TODO: make the data in these a unique ptr for easier handling, and the shader binary data contained inside of "CachedShader" too.
@@ -606,8 +722,9 @@ namespace
    }
 
    std::string shaders_compilation_errors; // errors and warning log
+   bool shaders_compilation_failed = false; // Whether "shaders_compilation_errors" has errors, not only warnings
 #if DEVELOPMENT
-   std::vector<std::string> custom_shaders_compile_defines; // Name/value pairs of the last "CompileCustomShaders()", for "luma_get_settings"
+   std::vector<std::string> custom_shaders_compile_defines; // Name/value pairs of the last "CompileCustomShaders()", for "luma_get_settings" (offline replays)
 #endif
 
    // List of define values read by our settings shaders
@@ -683,7 +800,7 @@ namespace
    // There's only one swapchain and one device in most games (e.g. Prey), but the game changes its configuration from different threads.
    // A new device+swapchain can be created if the user resets the settings as the old one is still rendering (or is it?).
    // These are raw pointers that did not add a reference to the counter.
-   std::vector<ID3D11Device*> global_native_devices; // Possibly unused
+   std::vector<NativeDevice*> global_native_devices; // Possibly unused
    std::vector<DeviceData*> global_devices_data;
    HWND game_window = 0; // This is fixed forever (in almost all games (e.g. Prey))
 #if DEVELOPMENT
@@ -692,12 +809,26 @@ namespace
    WNDPROC game_window_custom_proc = nullptr;
 #endif
    thread_local bool last_swapchain_linear_space = false;
+   // Set by "OnCreateSwapchain()": the format the game asked for the swapchain, and the one it sees on it (equal unless upgraded, "OnInitSwapchain()" sets the fp16 of the proxies).
+   // Reset when the swapchain is destroyed, not resized
+   reshade::api::format last_swapchain_vanilla_format = reshade::api::format::unknown;
+   reshade::api::format last_swapchain_seen_format = reshade::api::format::unknown;
 #if GAME_FF7_REMAKE
    thread_local reshade::api::format last_swapchain_format = reshade::api::format::r10g10b10a2_unorm;
 #endif
    thread_local bool waiting_on_upgraded_resource_init = false;
    thread_local reshade::api::resource_desc upgraded_resource_init_desc = {};
    thread_local reshade::api::resource_desc forced_upgraded_resource_init_desc = {};
+#if DX12 && ENABLE_MINHOOK
+   // Set by "OnCreateResource()" for the "OnInitResource()" of the same create: the format (unknown: no clone) and the size its clone is made in
+   struct PendingClone
+   {
+      DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+      uint32_t width = 0;
+      uint32_t height = 0;
+   };
+   thread_local PendingClone pending_clone;
+#endif
    thread_local void* upgraded_resource_init_data = {};
    thread_local std::unordered_map<uint64_t, reshade::api::subresource_data*> upgraded_mapped_resources;
 #if LUMA_PATCH_PROVIDERS != 0
@@ -708,16 +839,62 @@ namespace
    thread_local uint64_t last_live_patched_shader_hash = -1;
 #endif
 #if ENABLE_DRAW_DISPATCH_DATA_CACHE || DEVELOPMENT
+   // The arguments of the draw, dispatch or indirect call the thread's "Game::OnDrawOrDispatch()" runs for, to re-issue it natively. Replaced whole for every one of them, tracked pipeline or not:
+   // by D3D11's draw hooks before their callbacks, by D3D12's at the top of "OnDrawOrDispatchD3D12()" (no reset after the callbacks on either)
    thread_local DrawDispatchData last_draw_dispatch_data = {};
 #endif // ENABLE_DRAW_DISPATCH_DATA_CACHE || DEVELOPMENT
-#if DEVELOPMENT
    // ReShade specific design as we don't get a rejection between the create and init events if creation failed
    thread_local reshade::api::format last_attempted_upgraded_resource_creation_format = reshade::api::format::unknown;
+#if DEVELOPMENT
    thread_local reshade::api::format last_attempted_upgraded_resource_view_creation_view_format = reshade::api::format::unknown;
+
+#if DX12
+   // The device whose command lists and presents the frame capture records, of a game with several (video or compute ones): only its entries are kept, so the others' don't pile
+   // up. The overlay's device unless another one was picked (in the capture's device list, or by the MCP's "device"), set when a capture starts and cleared with its device.
+   // "s_mutex_trace". ponytail: a reader of another device's capture (the overlay, an MCP job) isn't guarded against that device's destruction on another thread meanwhile
+   DeviceData* trace_device_data = nullptr;
+#endif
+
+   // Locks "s_mutex_trace" only while a trace runs, so untraced draws, binds and copies take no lock. Recheck "trace_running" under the returned lock, the trace might have ended in between.
+   std::shared_lock<std::shared_mutex> LockTraceIfRunning()
+   {
+      if (!Trace::running)
+         return {};
+      return std::shared_lock(Trace::s_mutex);
+   }
+
+#if DX12
+   DeviceData& GetTraceDeviceData(reshade::api::effect_runtime* runtime)
+   {
+      return (trace_device_data ? *trace_device_data : *runtime->get_device()->get_private_data<DeviceData>());
+   }
+#endif
+
+   // The command list data holding the frame capture: the immediate command list's in D3D11 (deferred ones join it), the captured device's in D3D12
+   CommandListData& GetTraceCommandListData(reshade::api::effect_runtime* runtime)
+   {
+#if DX11
+      return *runtime->get_command_queue()->get_immediate_command_list()->get_private_data<CommandListData>();
+#else
+      return GetTraceDeviceData(runtime).trace_command_list_data;
+#endif
+   }
 
    uint64_t last_drawn_shader = SHADER_HASH_NONE; // Not exactly thread safe but it's fine...
 
    thread_local reshade::api::command_list* thread_local_cmd_list = nullptr; // Hacky global variable (possibly not cleared, stale), only use to quickly tell the command list of the thread
+
+   // D3D12 copies the debug draw texture where its draw hook finds the target ("D3D12Readback::State::debug_target", made from the "Trace::debug_draw_*" selection by "SyncD3D12DebugDraw()")
+#if DX12
+   namespace
+   {
+      // The outputs and arguments of the draw to show (see "D3D12Readback::DrawSignature"), what tells it apart from the other draws of its pipeline on engines that record passes on any thread. Only valid for the hash it was made with.
+      std::optional<D3D12Readback::DrawSignature> debug_draw_signature;
+      uint32_t debug_draw_signature_hash = 0;
+      std::string debug_draw_registered_texture; // "DevValueKind::Texture" name shown straight from the state it rests in (Trace::DebugDrawMode::Custom), instead of a copy of a draw's view
+      uint32_t debug_draw_copied_frame = 0;      // "FrameIndex" of the last copy of a draw's view
+   }
+#endif
 
    // CB Dev settings settings
    namespace
@@ -733,7 +910,7 @@ namespace
 
    // Forward declares:
    void DumpShader(uint32_t shader_hash);
-   void ForceToggleShaders(DeviceData& device_data, bool enabled); // Used by the MCP server, included before its definition
+   void ForceToggleShaders(DeviceData& device_data, bool enabled);
 #if ALLOW_SHADER_PATCHES_DUMPING && LUMA_PATCH_PROVIDERS != 0
    void DumpPatchedShader(uint32_t shader_hash);
 #endif
@@ -776,6 +953,41 @@ namespace
    {
       return GetShaderDefineData(hash).GetCompiledNumericalValue();
    }
+
+#if DEVELOPMENT
+   // The options the display composition shader gets to draw a texture of "view_format" as the debug draw: the user's ones, with the gamma conversion
+   // guessed from the format if "debug_draw_auto_gamma" (kept in them), and no tonemap for what isn't HDR
+   uint32_t GetDebugDrawShaderOptions(DXGI_FORMAT view_format)
+   {
+      if (Trace::debug_draw_auto_gamma)
+      {
+         // TODO: if this is depth and depth is inverted (or not), should we flip the gamma direction? Gamma to linear looks good on direct/linear depth
+         if (!IsLinearFormat(view_format)) // We don't use the texture format as we create a new view with the native format
+         {
+            Trace::debug_draw_options |= (uint32_t)Trace::DebugDrawTextureOptionsMask::GammaToLinear;
+         }
+         else
+         {
+            Trace::debug_draw_options &= ~(uint32_t)Trace::DebugDrawTextureOptionsMask::LinearToGamma;
+            Trace::debug_draw_options &= ~(uint32_t)Trace::DebugDrawTextureOptionsMask::GammaToLinear;
+            // If the game rendering or post processing was in gamma space, automatically linearize color textures (just a guess, it's usually right)
+            if (IsRGBAFormat(view_format, false) && GetShaderDefineCompiledNumericalValue(POST_PROCESS_SPACE_TYPE_HASH) == 0)
+            {
+               Trace::debug_draw_options |= (uint32_t)Trace::DebugDrawTextureOptionsMask::GammaToLinear;
+            }
+         }
+      }
+
+      uint32_t shader_options = Trace::debug_draw_options;
+      const bool debug_draw_saturate = (Trace::debug_draw_options & (uint32_t)Trace::DebugDrawTextureOptionsMask::Saturate) != 0;
+      // TODO: save two versions of "debug_draw_options", one that matches the user settings and one that is the current automated version of it
+      if (debug_draw_saturate || !IsFloatFormat(view_format))
+      {
+         shader_options &= ~(uint32_t)Trace::DebugDrawTextureOptionsMask::Tonemap;
+      }
+      return shader_options;
+   }
+#endif
 
    // TODO: add a setting to compile all the shaders in all game folders at once to quickly test them
    // Ideally only to be called once on boot and cached
@@ -895,6 +1107,25 @@ namespace
       return false;
    }
 
+   // Empties a custom shader as if its file never existed (the entry stays in the cache). Needs "s_mutex_loading"
+   void ResetCustomShader(CachedCustomShader* custom_shader)
+   {
+      custom_shader->code.clear();
+      custom_shader->is_hlsl = false;
+      custom_shader->is_luma_native = false;
+      custom_shader->file_path.clear();
+      custom_shader->preprocessed_hash = 0;
+      custom_shader->compilation_errors.clear();
+#if DEVELOPMENT || TEST
+      custom_shader->compilation_error = false;
+      custom_shader->preprocessed_code.clear();
+      custom_shader->disasm.clear();
+#if DEVELOPMENT
+      custom_shader->definition = {};
+#endif
+#endif
+   }
+
    void ClearCustomShader(uint64_t shader_hash)
    {
       const std::unique_lock lock(s_mutex_loading);
@@ -902,22 +1133,450 @@ namespace
       // TODO: why not just remove it from the array or call the default initializer?
       if (custom_shader != custom_shaders_cache.end() && custom_shader->second != nullptr)
       {
-         custom_shader->second->code.clear();
-         custom_shader->second->is_hlsl = false;
-         custom_shader->second->is_luma_native = false;
-         custom_shader->second->file_path.clear();
-         custom_shader->second->preprocessed_hash = 0;
-         custom_shader->second->compilation_errors.clear();
-#if DEVELOPMENT || TEST
-         custom_shader->second->compilation_error = false;
-         custom_shader->second->preprocessed_code.clear();
-         custom_shader->second->disasm.clear();
-#if DEVELOPMENT
-         custom_shader->second->definition = {};
-#endif
-#endif
+         ResetCustomShader(custom_shader->second);
       }
    }
+
+#if DX12
+   // The stream subobject of a ReShade shader subobject, none for any other (ray tracing shaders are in state objects, which aren't captured)
+   std::optional<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE> ToStreamShaderType(reshade::api::pipeline_subobject_type type)
+   {
+      switch (type)
+      {
+      case reshade::api::pipeline_subobject_type::vertex_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
+      case reshade::api::pipeline_subobject_type::hull_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS;
+      case reshade::api::pipeline_subobject_type::domain_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS;
+      case reshade::api::pipeline_subobject_type::geometry_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS;
+      case reshade::api::pipeline_subobject_type::pixel_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS;
+      case reshade::api::pipeline_subobject_type::compute_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
+      case reshade::api::pipeline_subobject_type::amplification_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS;
+      case reshade::api::pipeline_subobject_type::mesh_shader:
+         return D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS;
+      default:
+         return std::nullopt;
+      }
+   }
+
+   // A custom shader replacing a stage of a D3D12 pipeline
+   struct D3D12StageReplacement
+   {
+      reshade::api::pipeline_subobject_type type;
+      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE stream_type;
+      // Of the game's shader
+      uint32_t shader_hash;
+      // The game's shader, in "CachedPipeline::subobjects_cache"
+      const reshade::api::shader_desc* original;
+      // The custom shader's: valid for as long as the lock it was found under is held (or the copy it points to is)
+      std::span<const uint8_t> code;
+   };
+
+   // The custom shaders replacing stages of a D3D12 pipeline, none if no stage has a usable one. Needs "s_mutex_loading" locked, for as long as the code is used.
+   // A file whose container (DXIL or DXBC) isn't its stage's is refused, as a pipeline can't mix them.
+   std::vector<D3D12StageReplacement> FindD3D12StageReplacements(const CachedPipeline& cached_pipeline)
+   {
+      const std::span<const reshade::api::pipeline_subobject> subobjects(cached_pipeline.subobjects_cache, cached_pipeline.subobject_count);
+      std::vector<D3D12StageReplacement> replacements;
+      for (size_t i = 0; i < cached_pipeline.shader_hashes.size(); ++i)
+      {
+         const uint32_t shader_hash = cached_pipeline.shader_hashes[i];
+         const auto custom_shader_pair = custom_shaders_cache.find(shader_hash);
+         if (custom_shader_pair == custom_shaders_cache.end() || custom_shader_pair->second == nullptr)
+         {
+            continue;
+         }
+         const CachedCustomShader& custom_shader = *custom_shader_pair->second;
+         const reshade::api::pipeline_subobject_type type = cached_pipeline.shader_types[i];
+         const std::optional<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE> stream_type = ToStreamShaderType(type);
+         const auto original_subobject = std::ranges::find(subobjects, type, &reshade::api::pipeline_subobject::type);
+         if (custom_shader.is_luma_native || custom_shader.code.empty() || !stream_type || original_subobject == subobjects.end())
+         {
+            continue;
+         }
+
+         const auto* original = static_cast<const reshade::api::shader_desc*>(original_subobject->data);
+         bool original_is_dxil = false;
+         bool replacement_is_dxil = false;
+         Shader::FindProgramChunk(original->code, original->code_size, &original_is_dxil);
+         Shader::FindProgramChunk(custom_shader.code.data(), custom_shader.code.size(), &replacement_is_dxil);
+         if (original_is_dxil != replacement_is_dxil)
+         {
+            reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Refused \"{}\" for the shader {:08X}: it's {} but the game's is {}, and a pipeline can't mix them", custom_shader.file_path.string(), shader_hash, replacement_is_dxil ? "DXIL" : "DXBC", original_is_dxil ? "DXIL" : "DXBC").c_str());
+            continue;
+         }
+         replacements.push_back({.type = type, .stream_type = *stream_type, .shader_hash = shader_hash, .original = original, .code = custom_shader.code});
+      }
+      return replacements;
+   }
+
+   // Identifies the code (and stages) a clone is built from, to tell the versions of a pipeline's clone apart. 64 bits (x64 only, like the D3D12 builds),
+   // so a collision can't bring back a stale version
+   uint64_t HashD3D12Replacements(std::span<const D3D12StageReplacement> replacements)
+   {
+      uint64_t hash = 0;
+      for (const D3D12StageReplacement& replacement : replacements)
+      {
+         const uint64_t code_hash = std::hash<std::string_view>()(std::string_view(reinterpret_cast<const char*>(replacement.code.data()), replacement.code.size()));
+         hash = (hash ^ (code_hash + static_cast<uint64_t>(replacement.type))) * 0x100000001b3ull;
+      }
+      return hash;
+   }
+
+   // A render target a pipeline draws into besides its own, after them, with the blend of its draws
+   struct D3D12AppendedRenderTarget
+   {
+      DXGI_FORMAT format;
+      D3D12_RENDER_TARGET_BLEND_DESC blend;
+   };
+
+   // Creates the clone of a D3D12 pipeline with the code of "replacements" in place of its stages', a null handle if it failed (logged).
+   // With "render_target_formats" it's a render target format variant instead (see "FindOrCreateD3D12PipelineVariant()"), of the original if there are no replacements.
+   // "appended_render_target" (with "render_target_formats") adds one render target after the pipeline's own, so the replacements can write one more output: refused (null, logged) for a
+   // pipeline without a captured stream and for one with 8 targets. Its blend goes to the target alone: a stream with a blend subobject has independent blend turned on, the targets before keeping
+   // the blend of target 0 they shared. A stream without one gets the runtime's default blend (documented only as "a default value"), so one is added only for a blend other than
+   // the opaque write-all one that every default target is assumed to have.
+   // Calls the device: no Luma lock may be held, but the one keeping the code alive. The clone is destroyed with the original, retired or not.
+   reshade::api::pipeline CreateD3D12Clone(const CachedPipeline& cached_pipeline, std::span<const D3D12StageReplacement> replacements, const std::array<DXGI_FORMAT, 8>* render_target_formats = nullptr, const D3D12AppendedRenderTarget* appended_render_target = nullptr)
+   {
+      ID3D12Device* const native_device = reinterpret_cast<ID3D12Device*>(cached_pipeline.device->get_native());
+      const char* const kind = (render_target_formats ? "variant" : "clone");
+      // The runtime only answers E_INVALIDARG when a replacement reads Luma's constant buffers that the pipeline's root signature doesn't hold: names the likely causes
+      const auto luma_cbuffers_hint = [&]
+      {
+         std::string hint;
+         if (replacements.empty()) // A variant of the original runs the game's shaders
+         {
+            return hint;
+         }
+#if ENABLE_MINHOOK
+         if (cached_pipeline.luma_settings_param < 0)
+         {
+            const D3D12RootSignatures::Skip skip = (cached_pipeline.layout.handle == 0 ? D3D12RootSignatures::Skip::ShaderContainer : D3D12RootSignatures::Find(cached_pipeline.layout.handle).skip);
+            hint = std::format(" (if the replacement reads Luma's constant buffers: its root signature has none because {})", (skip != D3D12RootSignatures::Skip::None ? D3D12RootSignatures::SKIP_NAMES[static_cast<size_t>(skip)] : "it wasn't created through Luma's hook"));
+         }
+#endif
+         // Shader model 5.0 and older have no register spaces, where the constant buffers are
+         for (const D3D12StageReplacement& replacement : replacements)
+         {
+            const Shader::DXBCByteCodeChunk* const program = Shader::FindProgramChunk(replacement.code.data(), replacement.code.size());
+            if (program && program->version_major_and_minor < 0x51)
+            {
+               hint += " (a *_5_0 replacement has no register space for Luma's constant buffers)";
+               break;
+            }
+         }
+         return hint;
+      };
+#if ENABLE_MINHOOK
+      D3D12PsoCapture::Stream* const capture = cached_pipeline.capture.get();
+      const bool can_append_render_target = (capture && render_target_formats);
+#else
+      constexpr bool can_append_render_target = false;
+#endif
+      if (appended_render_target && !can_append_render_target)
+      {
+         reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Refused to append a render target to pipeline {:x}: it has no captured stream", cached_pipeline.pipeline.handle).c_str());
+         return {};
+      }
+
+#if ENABLE_MINHOOK
+      if (capture)
+      {
+         std::vector<std::byte> stream = capture->bytes;
+         const auto append_subobject = [&stream](const auto& subobject)
+         {
+            const auto* const bytes = reinterpret_cast<const std::byte*>(&subobject);
+            stream.insert(stream.end(), bytes, bytes + sizeof(subobject));
+         };
+         for (const D3D12StageReplacement& replacement : replacements)
+         {
+            D3D12_SHADER_BYTECODE* const bytecode = capture->Find<D3D12_SHADER_BYTECODE>(replacement.stream_type, stream.data());
+            ASSERT_ONCE(bytecode != nullptr); // "OnInitPipeline()" only keeps a capture that has all the shaders of its pipeline
+            if (bytecode)
+            {
+               *bytecode = {.pShaderBytecode = replacement.code.data(), .BytecodeLength = replacement.code.size()};
+            }
+         }
+         if (render_target_formats)
+         {
+            D3D12_RT_FORMAT_ARRAY* const stream_formats = capture->Find<D3D12_RT_FORMAT_ARRAY>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, stream.data());
+            // The pipeline's own targets, so the slot of the appended one
+            const uint32_t appended_slot = (std::min)((stream_formats ? stream_formats->NumRenderTargets : cached_pipeline.render_target_count), 8u);
+            if (appended_render_target && appended_slot == 8)
+            {
+               reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Refused to append a render target to pipeline {:x}: it already has 8", cached_pipeline.pipeline.handle).c_str());
+               return {};
+            }
+            if (stream_formats)
+            {
+               std::copy_n(render_target_formats->begin(), appended_slot, stream_formats->RTFormats);
+               if (appended_render_target)
+               {
+                  stream_formats->RTFormats[appended_slot] = appended_render_target->format;
+                  stream_formats->NumRenderTargets = appended_slot + 1;
+               }
+            }
+            else if (cached_pipeline.render_target_count != 0 || appended_render_target)
+            {
+               D3D12PsoCapture::Subobject<D3D12_RT_FORMAT_ARRAY> formats_subobject = {.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, .data = {.NumRenderTargets = cached_pipeline.render_target_count + (appended_render_target ? 1u : 0u)}};
+               std::copy_n(render_target_formats->begin(), 8, formats_subobject.data.RTFormats);
+               if (appended_render_target)
+               {
+                  formats_subobject.data.RTFormats[appended_slot] = appended_render_target->format;
+               }
+               append_subobject(formats_subobject);
+            }
+
+            if (appended_render_target)
+            {
+               const auto set_appended_blend = [&](D3D12_BLEND_DESC* blend_desc)
+               {
+                  if (!blend_desc->IndependentBlendEnable)
+                  {
+                     blend_desc->IndependentBlendEnable = TRUE;
+                     for (uint32_t i = 1; i < appended_slot; ++i)
+                     {
+                        blend_desc->RenderTarget[i] = blend_desc->RenderTarget[0];
+                     }
+                  }
+                  blend_desc->RenderTarget[appended_slot] = appended_render_target->blend;
+               };
+               const D3D12_RENDER_TARGET_BLEND_DESC& appended_blend = appended_render_target->blend;
+               if (D3D12_BLEND_DESC* const stream_blend = capture->Find<D3D12_BLEND_DESC>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, stream.data()))
+               {
+                  set_appended_blend(stream_blend);
+               }
+               else if (appended_blend.BlendEnable || appended_blend.LogicOpEnable || appended_blend.RenderTargetWriteMask != D3D12_COLOR_WRITE_ENABLE_ALL)
+               {
+                  D3D12PsoCapture::Subobject<D3D12_BLEND_DESC> blend_subobject = {.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND};
+                  std::fill_n(blend_subobject.data.RenderTarget, 8, D3D12Passes::OPAQUE_BLEND);
+                  set_appended_blend(&blend_subobject.data);
+                  append_subobject(blend_subobject);
+               }
+            }
+         }
+         if (!replacements.empty() && cached_pipeline.layout.handle == 0 && cached_pipeline.root_signature)
+         {
+            if (ID3D12RootSignature** const stream_root_signature = capture->Find<ID3D12RootSignature*>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, stream.data()))
+            {
+               *stream_root_signature = cached_pipeline.root_signature.get();
+            }
+            else
+            {
+               append_subobject(D3D12PsoCapture::Subobject<ID3D12RootSignature*>{.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, .data = cached_pipeline.root_signature.get()});
+            }
+         }
+
+         com_ptr<ID3D12Device2> device2;
+         ID3D12PipelineState* pipeline = nullptr;
+         HRESULT result = native_device->QueryInterface(&device2);
+         if (SUCCEEDED(result))
+         {
+            result = D3D12PsoCapture::Create(device2.get(), stream, &pipeline);
+         }
+         if (FAILED(result))
+         {
+            reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Creating the {} of pipeline {:x} failed with HRESULT {:#010x}{}", kind, cached_pipeline.pipeline.handle, static_cast<uint32_t>(result), luma_cbuffers_hint()).c_str());
+            return {};
+         }
+         return {reinterpret_cast<uint64_t>(pipeline)};
+      }
+#endif // ENABLE_MINHOOK
+
+      static std::atomic_flag logged_fallback;
+      if (!logged_fallback.test_and_set())
+      {
+         reshade::log::message(reshade::log::level::warning, "[Shader replacement] A pipeline without a captured stream is rebuilt through ReShade, which doesn't model all of its state (like the strip cut value and view instancing)");
+      }
+      // ReShade's rebuild from the subobjects it reported: a copy of the array that points at the replacements' code and at the override formats
+      std::vector<reshade::api::pipeline_subobject> subobjects(cached_pipeline.subobjects_cache, cached_pipeline.subobjects_cache + cached_pipeline.subobject_count);
+      std::vector<reshade::api::shader_desc> replaced_shaders;
+      replaced_shaders.reserve(replacements.size()); // The subobjects point at them
+      std::array<reshade::api::format, 8> override_formats = {};
+      for (reshade::api::pipeline_subobject& subobject : subobjects)
+      {
+         if (const auto replacement = std::ranges::find(replacements, static_cast<const reshade::api::shader_desc*>(subobject.data), &D3D12StageReplacement::original); replacement != replacements.end())
+         {
+            reshade::api::shader_desc& replaced_shader = replaced_shaders.emplace_back(*replacement->original);
+            replaced_shader.code = replacement->code.data();
+            replaced_shader.code_size = replacement->code.size();
+            subobject.data = &replaced_shader;
+         }
+         else if (render_target_formats && subobject.type == reshade::api::pipeline_subobject_type::render_target_formats)
+         {
+            std::ranges::transform(*render_target_formats, override_formats.begin(), [](DXGI_FORMAT format)
+               { return reshade::api::format(format); });
+            subobject.data = override_formats.data();
+         }
+      }
+      reshade::api::pipeline clone = {};
+      if (!cached_pipeline.device->create_pipeline({reinterpret_cast<uint64_t>(cached_pipeline.root_signature.get())}, cached_pipeline.subobject_count, subobjects.data(), &clone))
+      {
+         clone = {};
+         reshade::log::message(reshade::log::level::warning, std::format("[Shader replacement] Creating the {} of pipeline {:x} through ReShade failed{}", kind, cached_pipeline.pipeline.handle, luma_cbuffers_hint()).c_str());
+      }
+      return clone;
+   }
+
+   // A clone becomes the replacement of its pipeline, the way "ClearCustomShader()" undoes. Needs "s_mutex_generic" locked, unless the pipeline isn't shared yet.
+   void ActivateD3D12Clone(DeviceData& device_data, CachedPipeline* cached_pipeline, reshade::api::pipeline clone, uint64_t code_hash)
+   {
+      assert(!cached_pipeline->cloned && cached_pipeline->pipeline_clone.handle == 0);
+      // A clone that was retired is reactivated
+      if (const auto retired_clone = std::ranges::find(cached_pipeline->retired_clones, clone, &CachedPipeline::RetiredClone::clone); retired_clone != cached_pipeline->retired_clones.end())
+      {
+         cached_pipeline->retired_clones.erase(retired_clone);
+      }
+      cached_pipeline->pipeline_clone = clone;
+      cached_pipeline->cloned = true;
+      cached_pipeline->active_clone_code_hash = code_hash;
+      cached_pipeline->active_clone.store(clone.handle, std::memory_order_release);
+      device_data.pipeline_cache_by_pipeline_clone_handle[clone.handle] = cached_pipeline;
+      device_data.cloned_pipeline_count++;
+      device_data.cloned_pipelines_changed = true;
+   }
+
+   // A game's own variant of a pipeline (see "FindOrCreateD3D12GameVariant()"): the original made again with in-memory shaders in place of its stages' and one render target more
+   struct D3D12GameVariant
+   {
+      uint32_t id; // Not 0 (that is Core's format variants): tells the game's variants of a pipeline apart
+      // The shaders of the variant (the DXIL the game holds), "original" can stay null: the stream's shaders are replaced by "stream_type". Must stay valid for the call
+      std::span<const D3D12StageReplacement> replacements;
+      D3D12AppendedRenderTarget appended_render_target;
+      // Asked once per pipeline (and set of formats) before the variant is made, with the game's stream: false leaves the pipeline as it is. Null accepts all.
+      // "D3D12PsoCapture::WritesDepth()" and "CachedPipeline::render_target_count" tell the usual things
+      bool (*accept)(const CachedPipeline& cached_pipeline, D3D12PsoCapture::Stream& capture);
+   };
+
+   // The pipeline that draws into render targets of the formats "formats": "base" (the original pipeline, or one of its clones) made again with them as its render target formats.
+   // D3D12 checks the formats a pipeline declares against the render targets bound when it draws, which the upgrades change (the swapchain, the textures).
+   // Made on its first use by the thread that records the draw (a stall of a few ms), and kept until the original is destroyed, like the retired clones: a command list can still hold it.
+   // A clone's handle always stands for the same code, so it's enough to key its variants. Returns "base" if the variant can't be made (logged), which the draw then keeps.
+   // With "game_variant" (then "base" is the original, see "FindOrCreateD3D12GameVariant()") it's 0 instead: the game's shaders are used or not, there is no base to keep
+   uint64_t FindOrCreateD3D12PipelineVariant(const CachedPipeline& cached_pipeline, uint64_t base, const std::array<DXGI_FORMAT, 8>& formats, const D3D12GameVariant* game_variant = nullptr)
+   {
+      assert(!game_variant || (game_variant->id != 0 && base == cached_pipeline.pipeline.handle));
+      const uint32_t game_variant_id = (game_variant ? game_variant->id : 0);
+      const uint64_t unpatched = (game_variant ? 0 : base);
+      const auto is_variant = [&](const CachedPipeline::RenderTargetVariant& candidate)
+      { return candidate.base == base && candidate.formats == formats && candidate.game_variant_id == game_variant_id; };
+      {
+         const std::shared_lock lock(cached_pipeline.variants_mutex);
+         if (const auto variant = std::ranges::find_if(cached_pipeline.variants, is_variant); variant != cached_pipeline.variants.end())
+         {
+            return (variant->pipeline != 0 ? variant->pipeline : unpatched); // 0 if it failed, not tried again
+         }
+      }
+
+      const auto start = std::chrono::steady_clock::now();
+      const bool is_clone = (base != cached_pipeline.pipeline.handle);
+      // The code a clone was built from never changes, whereas the replacements now in the loading cache do (a reload). The locks aren't nested: "LoadCustomShaders()" and "UnloadCustomShaders()"
+      // lock "s_mutex_generic" before "s_mutex_loading", which nesting them here would invert
+      std::optional<uint64_t> clone_code_hash;
+      if (is_clone)
+      {
+         const std::shared_lock lock_generic(s_mutex_generic);
+         if (cached_pipeline.pipeline_clone.handle == base)
+         {
+            clone_code_hash = cached_pipeline.active_clone_code_hash;
+         }
+         else if (const auto retired_clone = std::ranges::find(cached_pipeline.retired_clones, base, [](const CachedPipeline::RetiredClone& retired)
+                     { return retired.clone.handle; });
+            retired_clone != cached_pipeline.retired_clones.end())
+         {
+            clone_code_hash = retired_clone->code_hash;
+         }
+      }
+      reshade::api::pipeline variant = {};
+      bool clone_code_changed = false;
+      // The game's check sees the stream, which a pipeline created without a capture lacks (CreateD3D12Clone() would refuse it too)
+      const bool accepted = (!game_variant || !game_variant->accept || (cached_pipeline.capture && game_variant->accept(cached_pipeline, *cached_pipeline.capture)));
+      {
+         // The code of the replacements is in the loading cache, which a reload replaces: held until the pipeline is made
+         std::shared_lock lock_loading(s_mutex_loading, std::defer_lock);
+         std::vector<D3D12StageReplacement> replacements;
+         if (is_clone)
+         {
+            lock_loading.lock();
+            replacements = FindD3D12StageReplacements(cached_pipeline);
+            clone_code_changed = (clone_code_hash != HashD3D12Replacements(replacements));
+         }
+         if (!clone_code_changed && accepted)
+         {
+            const std::span<const D3D12StageReplacement> variant_replacements = (game_variant ? game_variant->replacements : std::span<const D3D12StageReplacement>(replacements));
+            variant = CreateD3D12Clone(cached_pipeline, variant_replacements, &formats, (game_variant ? &game_variant->appended_render_target : nullptr));
+         }
+      }
+      if (clone_code_changed)
+      {
+         // A reload changed the code under a command list that still has the old clone bound (development only): its formats are right with the original's variant, the replacement is
+         // missing until the list binds the pipeline again
+         static std::atomic_flag logged_changed_clone;
+         if (!logged_changed_clone.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::info, "[PSO variants] A command list binds a replaced pipeline whose shaders were reloaded since: its draws use the original's variant until it binds the pipeline again");
+         }
+         return FindOrCreateD3D12PipelineVariant(cached_pipeline, cached_pipeline.pipeline.handle, formats);
+      }
+
+      uint64_t result = variant.handle;
+      bool inserted = true;
+      {
+         const std::unique_lock lock(cached_pipeline.variants_mutex);
+         if (const auto existing = std::ranges::find_if(cached_pipeline.variants, is_variant); existing != cached_pipeline.variants.end())
+         {
+            // Another thread made the same one meanwhile: it's the one in use, this one was never bound
+            result = existing->pipeline;
+            inserted = false;
+         }
+         else
+         {
+            cached_pipeline.variants.push_back({.base = base, .formats = formats, .game_variant_id = game_variant_id, .pipeline = variant.handle});
+         }
+      }
+      if (!inserted && variant.handle != 0)
+      {
+         cached_pipeline.device->destroy_pipeline(variant);
+      }
+#if DEVELOPMENT
+      if (inserted && variant.handle != 0)
+      {
+         const auto describe_formats = [&](const std::array<DXGI_FORMAT, 8>& list)
+         {
+            std::string text;
+            for (uint32_t i = 0; i < cached_pipeline.render_target_count; ++i)
+            {
+               text += std::format("{}{}", (i != 0 ? ", " : ""), GetFormatNameSafe(list[i]));
+            }
+            return text;
+         };
+         std::string shaders;
+         for (size_t i = 0; i < cached_pipeline.shader_hashes.size(); ++i)
+         {
+            shaders += std::format("{}{} {:08X}", (i != 0 ? " " : ""), CachedPipeline::StageName(cached_pipeline.shader_types[i]), cached_pipeline.shader_hashes[i]);
+         }
+         const std::string appended_format = (game_variant ? std::format(", {} (appended)", GetFormatNameSafe(game_variant->appended_render_target.format)) : std::string());
+         reshade::log::message(reshade::log::level::info, std::format("[PSO variants] Pipeline {:x} ({}): {} -> {}{}, made from {} {:x} as {:x} in {:.2f} ms", cached_pipeline.pipeline.handle, shaders, describe_formats(cached_pipeline.render_target_formats), describe_formats(formats), appended_format, (base == cached_pipeline.pipeline.handle ? "the original" : "its clone"), base, variant.handle, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count()).c_str());
+      }
+#endif
+      return (result != 0 ? result : unpatched);
+   }
+
+   // The pipeline for a game's draw that replaces the shaders of "cached_pipeline" with its own and writes one more render target (see "D3D12GameVariant"): made on its first use by the thread that
+   // records the draw (a stall of a few ms), and kept until the original is destroyed. "formats" are the formats of the targets the draw is bound to, as for the format variants; each set of them is
+   // a variant. Always of the original pipeline, so a Luma shader replacement of it plays no part. 0 if the variant can't be made or the game's check refused the pipeline (not tried again): the
+   // draw then keeps its pipeline
+   uint64_t FindOrCreateD3D12GameVariant(const CachedPipeline& cached_pipeline, const D3D12GameVariant& game_variant, const std::array<DXGI_FORMAT, 8>& formats)
+   {
+      return FindOrCreateD3D12PipelineVariant(cached_pipeline, cached_pipeline.pipeline.handle, formats, &game_variant);
+   }
+#endif // DX12
 
    // Ambiguous name but this one clears the pipeline. "destroy_clone" keeps the
    // clone object alive (patch-only clones survive unloads); the caller is then
@@ -939,6 +1598,13 @@ namespace
       device_data.cloned_pipelines_changed = true;
       if (destroy_clone)
       {
+#if DX12
+         // A D3D12 clone is never destroyed while its original lives, as a command list can still use it. It's retired: the bind callback stops
+         // using it, and a load of the same code reactivates it. The caller has nothing to destroy.
+         device_data.pipeline_cache_by_pipeline_clone_handle.erase(cached_pipeline->pipeline_clone.handle);
+         cached_pipeline->active_clone.store(0, std::memory_order_release);
+         cached_pipeline->retired_clones.push_back({.code_hash = std::exchange(cached_pipeline->active_clone_code_hash, 0), .clone = cached_pipeline->pipeline_clone});
+#endif
          cached_pipeline->pipeline_clone = {0};
       }
       return true;
@@ -961,6 +1627,9 @@ namespace
             Shader::CachedPipeline* cached_pipeline = pair.second;
             if (cached_pipeline == nullptr || (!pipelines_filter.empty() && !pipelines_filter.contains(cached_pipeline->pipeline.handle))) continue;
 
+#if DX12
+            ClearCustomShader(device_data, cached_pipeline, clean_custom_shader); // Retires the clone, nothing is destroyed
+#else
             auto pipeline_clone_handle = cached_pipeline->pipeline_clone.handle;
             // "Unload Shaders" keeps its original semantics: destroy every clone
             // (files and patches); patches have their own preserving "Unload Patches".
@@ -983,6 +1652,7 @@ namespace
             // (bound command lists keep their own copy of the recipe reports).
             cached_pipeline->clone_origin = Shader::CloneOrigin::None;
             cached_pipeline->custom_pipeline_data = {};
+#endif // DX12
          }
       }
 
@@ -1071,6 +1741,7 @@ namespace
       }
    }
 
+#if DX11 // Luma's own D3D12 shaders need their own root signature and PSOs (see "CreateD3D12NativePipeline()")
    // Expects "s_mutex_loading" and "s_mutex_shader_objects"
    template<typename T = ID3D11DeviceChild>
    void CreateShaderObject(ID3D11Device* native_device, uint32_t native_shader_hash, com_ptr<T>& shader_object, bool force_delete_previous = !(bool)FORCE_KEEP_CUSTOM_SHADERS_LOADED, bool trigger_assert = false)
@@ -1191,6 +1862,7 @@ namespace
       device_data.created_native_shaders = true; // Some of the shader object creations above might have failed due to filtering, but they will likely be compiled soon after anyway
       if (lock) s_mutex_shader_objects.unlock();
    }
+#endif // DX11
 
    // Compiles all the "custom" shaders we have in our shaders folder
    void CompileCustomShaders(DeviceData* optional_device_data = nullptr, bool warn_about_duplicates = false, const std::unordered_set<uint64_t>& pipelines_filter = std::unordered_set<uint64_t>())
@@ -1241,7 +1913,6 @@ namespace
          // This is because in case the users disabled some of them, we don't want them to bother to
          // define unique indexes for each of them, but the shader compiler fails if two cbuffers have the same value,
          // so we have to find the "next" unique one.
-         uint32_t luma_settings_cbuffer_define_index, luma_data_cbuffer_define_index, luma_ui_cbuffer_define_index;
          std::unordered_set<uint32_t> excluded_values;
          if (luma_settings_cbuffer_index <= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT - 1)
             luma_settings_cbuffer_define_index = luma_settings_cbuffer_index;
@@ -1284,6 +1955,7 @@ namespace
       {
          const std::unique_lock lock(s_mutex_loading);
          shaders_compilation_errors.clear();
+         shaders_compilation_failed = false;
 #if DEVELOPMENT
          custom_shaders_compile_defines = shader_defines;
 #endif
@@ -1298,6 +1970,7 @@ namespace
          {
             const std::unique_lock lock(s_mutex_loading);
             shaders_compilation_errors = "Cannot find nor create shaders directory";
+            shaders_compilation_failed = true;
             return;
          }
          shaders_directory_created_or_empty = true; // Largely redundant
@@ -1659,7 +2332,11 @@ namespace
                   }
                   else // DX11 default (5_1 doesn't add any features we might need)
                   {
+#if DX12 // DXC's lowest shader model: DXIL, like the shaders of the game's pipelines (a pipeline can't mix it with DXBC). Plain registers, in space 0: the passes bind them
+                     local_shader_target += "6_0";
+#else
                      local_shader_target += "5_0";
+#endif
                   }
                }
                else
@@ -1680,6 +2357,14 @@ namespace
                local_shader_defines.push_back("_" + hash_string);
                local_shader_defines.push_back("1");
             }
+#if DX12 && ENABLE_MINHOOK
+            // The game replacements read Luma's cbuffers from the root CBVs that live in a register space of their own. Shader model 5.0 and older have none, so they keep the plain registers
+            if (!is_luma_native && is_hlsl && std::string_view(local_shader_target).substr(3) >= "5_1")
+            {
+               local_shader_defines.push_back("LUMA_CB_SPACE");
+               local_shader_defines.push_back(std::format("space{}", D3D12RootSignatures::LUMA_CB_REGISTER_SPACE));
+            }
+#endif
             // Add the shader target type to (e.g.) allow unifying a PS and CS under the same file
             if (shader_definition_and_hash.second)
             {
@@ -1755,6 +2440,12 @@ namespace
                   else
                   {
                      file_name_cso += L"_0x" + std::wstring(hash_string.begin(), hash_string.end());
+                  }
+                  // The repository's shaders are shared by every project: a D3D12 build's DXIL can't take the name of a D3D11 build's DXBC, which would
+                  // load it as the cache of the same native (the config's preprocessor hash matches) and fail to create its shader
+                  if (local_shader_target[3] >= '6')
+                  {
+                     file_name_cso += L"." + std::wstring(local_shader_target.begin(), local_shader_target.end());
                   }
                }
 
@@ -1864,6 +2555,7 @@ namespace
                      shaders_compilation_errors.append(filename_no_extension_string);
                      shaders_compilation_errors.append(": ");
                      shaders_compilation_errors.append(compilation_errors);
+                     shaders_compilation_failed |= error;
                   }
                }
                // Print out the same (last) compilation errors again if the shader still needs to be compiled but hasn't changed.
@@ -1875,6 +2567,7 @@ namespace
                   shaders_compilation_errors.append(filename_no_extension_string);
                   shaders_compilation_errors.append(": ");
                   shaders_compilation_errors.append(custom_shader->compilation_errors);
+                  shaders_compilation_failed = true;
                }
 
                if (compile_from_current_path)
@@ -1971,6 +2664,7 @@ namespace
                      shaders_compilation_errors.append(filename_no_extension_string);
                      shaders_compilation_errors.append(": ");
                      shaders_compilation_errors.append(custom_shader->compilation_errors);
+                     shaders_compilation_failed |= error;
                   }
                }
 
@@ -2027,6 +2721,25 @@ namespace
          }
       }
 
+      // A shader file that was deleted or renamed stops replacing: its cache entry would otherwise keep its code, and its errors, for as long as the game runs.
+      // The device objects of the native ones (D3D11) are created again below, like the changed ones.
+      {
+         const std::unique_lock lock(s_mutex_loading);
+         for (const auto& [shader_hash, custom_shader] : custom_shaders_cache)
+         {
+            std::error_code file_error;
+            if (custom_shader == nullptr || custom_shader->file_path.empty() || std::filesystem::exists(custom_shader->file_path, file_error))
+            {
+               continue;
+            }
+            if (custom_shader->is_luma_native)
+            {
+               changed_luma_native_shaders_hashes.emplace(uint32_t(shader_hash >> 32));
+            }
+            ResetCustomShader(custom_shader);
+         }
+      }
+
       // TODO: theoretically if "prevent_shader_cache_saving" is true, we should clean all the shader hashes and defines from the config, though hopefully it's fine without
       if (pipelines_filter.empty() && !prevent_shader_cache_saving)
       {
@@ -2035,11 +2748,74 @@ namespace
          ShaderDefineData::Save(shader_defines_data, NAME_ADVANCED_SETTINGS);
       }
 
+#if DX11
       // Refresh the persistent custom shaders we have.
       if (optional_device_data)
       {
          CreateDeviceNativeShaders(*optional_device_data, &changed_luma_native_shaders_hashes);
       }
+#else
+      // The set holds the natives that were loaded from the cache, compiled (even if they failed) or deleted. The pipelines made of them are rebuilt at their next use
+      if (optional_device_data && !changed_luma_native_shaders_hashes.empty())
+      {
+         optional_device_data->native_shaders_generation.fetch_add(1, std::memory_order_release);
+      }
+#endif
+   }
+
+   // What freeing cached pipelines leaves for the caller to release once it dropped the locks: calls into the device could deadlock if the game rendering is multithreaded
+   struct PipelineObjectsToRelease
+   {
+      std::vector<uint64_t> pipelines; // TODO: define a pointer size for ReShade handles, given they are just a pointer 64bit in x64 and 32bit in x32
+#if DX12
+      std::vector<com_ptr<ID3D12RootSignature>> root_signatures;
+#endif
+   };
+
+   // Frees a destroyed pipeline, which no thread can find anymore but through its clones: they and its variants go to "to_release". Needs "s_mutex_generic" locked
+   void FreeCachedPipeline(DeviceData& device_data, CachedPipeline* cached_pipeline, PipelineObjectsToRelease* to_release)
+   {
+      // Destroy our cloned subojects
+      DestroyPipelineSubojects(cached_pipeline->subobjects_cache, cached_pipeline->subobject_count);
+      cached_pipeline->subobjects_cache = nullptr;
+
+      // Destroy our cloned version of the pipeline (and leave the original intact, because the life time is not handled by us)
+      // Preserved patch clones (kept across unloads) can have "cloned == false"
+      // while still owning the object — destroy by handle presence.
+      if (cached_pipeline->cloned || cached_pipeline->pipeline_clone.handle != 0)
+      {
+         if (cached_pipeline->cloned)
+         {
+            cached_pipeline->cloned = false;
+            device_data.cloned_pipeline_count--;
+         }
+         to_release->pipelines.push_back(cached_pipeline->pipeline_clone.handle);
+         device_data.pipeline_cache_by_pipeline_clone_handle.erase(cached_pipeline->pipeline_clone.handle);
+         device_data.cloned_pipelines_changed = true;
+      }
+#if DX12
+      // The clones the DX12 path keeps besides "pipeline_clone": the active one (which "pipeline_clone" can mirror) and the retired ones
+      if (const uint64_t active_clone = cached_pipeline->active_clone.exchange(0); active_clone != 0 && active_clone != cached_pipeline->pipeline_clone.handle)
+      {
+         to_release->pipelines.push_back(active_clone);
+         device_data.pipeline_cache_by_pipeline_clone_handle.erase(active_clone);
+      }
+      for (const auto& retired_clone : cached_pipeline->retired_clones)
+      {
+         to_release->pipelines.push_back(retired_clone.clone.handle);
+         device_data.pipeline_cache_by_pipeline_clone_handle.erase(retired_clone.clone.handle);
+      }
+      // The render target format variants (never in "pipeline_cache_by_pipeline_clone_handle"), the failed ones have no pipeline
+      for (const auto& variant : cached_pipeline->variants)
+      {
+         if (variant.pipeline != 0)
+         {
+            to_release->pipelines.push_back(variant.pipeline);
+         }
+      }
+      to_release->root_signatures.push_back(std::move(cached_pipeline->root_signature));
+#endif
+      delete cached_pipeline;
    }
 
    void LoadCustomShaders(DeviceData& device_data, const std::unordered_set<uint64_t>& pipelines_filter = std::unordered_set<uint64_t>(), bool recompile_shaders = true)
@@ -2053,11 +2829,13 @@ namespace
          CompileCustomShaders(&device_data, false, pipelines_filter);
       }
 
+#if DX11 // D3D12 pins the pipelines it clones instead (see "CachedPipeline::clone_pins"): its runtime destroys pipelines inside its final release, which can't wait for a clone's creation
       // Make sure the pipelines we read below stay alive (aren't removed/destroyed), even when "s_mutex_generic" is unlocked, hence we need to keep this locked for the whole time.
       // Note: this isn't entirely safe as we still call device functions while it's being locked, however, there should hopefully be no deadlocks,
       // as this is only used in a couple rare functions. if there were, we could either swap the lock order of this with the "s_mutex_generic" (delaying this below in the function),
       // and then caching a list of recently destroyed pipelines and skip them from being cloned at the end.
       std::shared_lock lock_pipeline_destroy(device_data.pipeline_cache_destruction_mutex);
+#endif
       // We can, and should, only lock this after compiling new shaders (above).
       // We keep this locked across the function to avoid pollution in pipelines from other threads while this is running.
       std::unique_lock lock(s_mutex_generic);
@@ -2070,7 +2848,7 @@ namespace
       std::vector<CachedPipeline*> pipelines_to_clone;
       std::unordered_set<uint64_t> iterated_pipelines;
 
-      const std::shared_lock lock_loading(s_mutex_loading);
+      std::shared_lock lock_loading(s_mutex_loading);
 
       for (const auto& custom_shader_pair : custom_shaders_cache)
       {
@@ -2103,6 +2881,9 @@ namespace
             if (!iterated_pipelines.emplace(cached_pipeline->pipeline.handle).second) continue;
             pipelines_to_clone.emplace_back(cached_pipeline);
 
+#if DX12
+            ClearCustomShader(device_data, cached_pipeline, false); // Retires the clone, nothing is destroyed
+#else
             // Force clear this pipeline's clone in case it was already cloned. This
             // full reload re-clones everything, so preserved patch clones are released here too.
             auto pipeline_clone_handle = cached_pipeline->pipeline_clone.handle;
@@ -2117,10 +2898,11 @@ namespace
                pipelines_to_destroy[pipeline_clone_handle] = cached_pipeline->device;
                cached_pipeline->pipeline_clone = {0};
             }
+#endif // DX12
          }
       }
 
-#if LUMA_PATCH_PROVIDERS != 0
+#if LUMA_PATCH_PROVIDERS != 0 // D3D11 only (see the "#error" next to the includes), so it has no D3D12 branch
       {
          const std::shared_lock lock_device(device_data.mutex);
          Patch::ForEachPatchedShader(device_data, [&](const uint32_t shader_hash, const Patch::PatchedShaderData&)
@@ -2134,6 +2916,9 @@ namespace
             for (CachedPipeline* cached_pipeline : pipelines_pair->second)
             {
                if (cached_pipeline == nullptr || cached_pipeline->manually_unloaded) continue;
+               // Its shader object already runs the patch (see OnInitPipeline): a clone of it would be a duplicate, and would make the
+               // game's draws custom passes
+               if (cached_pipeline->patch_application_mode == Shader::PatchApplicationMode::Inplace) continue;
                if (!pipelines_filter.empty() && !pipelines_filter.contains(cached_pipeline->pipeline.handle)) continue;
                if (!iterated_pipelines.emplace(cached_pipeline->pipeline.handle).second) continue;
                pipelines_to_clone.emplace_back(cached_pipeline);
@@ -2156,6 +2941,14 @@ namespace
       }
 #endif
 
+#if DX12
+      // Alive until the clones are activated below, as "s_mutex_generic" is unlocked in between
+      for (CachedPipeline* cached_pipeline : pipelines_to_clone)
+      {
+         cached_pipeline->clone_pins++;
+      }
+#endif
+
       lock.unlock(); // Calls into the device could deadlock if the game rendering is multithreaded
 
       for (auto pair : pipelines_to_destroy)
@@ -2163,7 +2956,18 @@ namespace
          pair.second->destroy_pipeline(reshade::api::pipeline{pair.first}); // TODO: verify the device is the same as the "device_data" we passed in here? Otherwise it might not properly support two devices. Theoretically we should pass in a device filter to the funcs to unload cloned pipelines
       }
 
-      std::vector<std::tuple<CachedPipeline*, reshade::api::pipeline>> cloned_pipelines_data;
+      std::vector<std::tuple<CachedPipeline*, reshade::api::pipeline, uint64_t>> cloned_pipelines_data; // And the hash of the code each was built from (D3D12 only)
+#if DX12
+      // The code is copied, so the clones are created without "s_mutex_loading" held across the device calls (as in "OnInitPipeline()")
+      struct D3D12CloneSource
+      {
+         CachedPipeline* cached_pipeline = nullptr;
+         uint64_t code_hash = 0;
+         std::vector<std::vector<uint8_t>> codes; // What "replacements" point to
+         std::vector<D3D12StageReplacement> replacements;
+      };
+      std::vector<D3D12CloneSource> d3d12_clone_sources;
+#endif
 
        // "s_mutex_loading" is expected to still be locked
        for (CachedPipeline* cached_pipeline : pipelines_to_clone)
@@ -2183,9 +2987,6 @@ namespace
           cached_pipeline->clone_origin = Shader::CloneOrigin::None;
           cached_pipeline->custom_pipeline_data = {};
 
-          // Async-race note: the worker holds raw CachedPipeline* across the
-          // clone window; a concurrent OnDestroyPipeline can free the object.
-
 #if _DEBUG && LOG_VERBOSE
           {
              std::stringstream s;
@@ -2197,6 +2998,21 @@ namespace
           }
 #endif
 
+#if DX12
+          std::vector<D3D12StageReplacement> replacements = FindD3D12StageReplacements(*cached_pipeline);
+          if (replacements.empty())
+          {
+             continue;
+          }
+          cached_pipeline->clone_origin = Shader::CloneOrigin::File;
+          D3D12CloneSource& clone_source = d3d12_clone_sources.emplace_back(D3D12CloneSource{.cached_pipeline = cached_pipeline, .code_hash = HashD3D12Replacements(replacements)});
+          clone_source.codes.reserve(replacements.size());
+          for (D3D12StageReplacement& replacement : replacements)
+          {
+             replacement.code = clone_source.codes.emplace_back(replacement.code.begin(), replacement.code.end());
+          }
+          clone_source.replacements = std::move(replacements);
+#else
           auto [pipeline_clone, injected] = Patch::ClonePipelineWithPatches(
              cached_pipeline->device, cached_pipeline->layout,
              subobjects, subobject_count,
@@ -2267,17 +3083,61 @@ namespace
 
           if (pipeline_clone.handle != 0)
           {
-             cloned_pipelines_data.push_back(std::make_tuple(cached_pipeline, pipeline_clone));
+             cloned_pipelines_data.push_back(std::make_tuple(cached_pipeline, pipeline_clone, uint64_t{0}));
           }
+#endif // DX12
 
        }
 
+      lock_loading.unlock(); // Before "s_mutex_generic" is locked again, as "UnloadCustomShaders()" locks it first
+
+#if DX12
+      for (const D3D12CloneSource& clone_source : d3d12_clone_sources)
+      {
+         // A reload of the same code reuses the clone it made, which was retired above
+         reshade::api::pipeline pipeline_clone = {};
+         {
+            const std::shared_lock lock_retired(s_mutex_generic);
+            const auto retired_clone = std::ranges::find(clone_source.cached_pipeline->retired_clones, clone_source.code_hash, &CachedPipeline::RetiredClone::code_hash);
+            if (retired_clone != clone_source.cached_pipeline->retired_clones.end())
+            {
+               pipeline_clone = retired_clone->clone;
+            }
+         }
+         if (pipeline_clone.handle == 0)
+         {
+            pipeline_clone = CreateD3D12Clone(*clone_source.cached_pipeline, clone_source.replacements);
+         }
+         if (pipeline_clone.handle != 0)
+         {
+            cloned_pipelines_data.push_back(std::make_tuple(clone_source.cached_pipeline, pipeline_clone, clone_source.code_hash));
+         }
+      }
+#endif
+
+#if DX12
+      PipelineObjectsToRelease to_release;
+#endif
       lock.lock(); // Needed for "pipeline_cache_by_pipeline_clone_handle"
 
       for (const auto& cloned_pipeline_data : cloned_pipelines_data)
       {
          CachedPipeline* cached_pipeline = std::get<0>(cloned_pipeline_data);
          reshade::api::pipeline pipeline_clone = std::get<1>(cloned_pipeline_data);
+#if DX12
+         if (cached_pipeline->destroyed)
+         {
+            // A reused retired clone is still in "retired_clones": the free below destroys it
+            if (std::ranges::find(cached_pipeline->retired_clones, pipeline_clone, &CachedPipeline::RetiredClone::clone) == cached_pipeline->retired_clones.end())
+            {
+               to_release.pipelines.push_back(pipeline_clone.handle);
+            }
+         }
+         else
+         {
+            ActivateD3D12Clone(device_data, cached_pipeline, pipeline_clone, std::get<2>(cloned_pipeline_data));
+         }
+#else
 
          assert(!cached_pipeline->cloned && cached_pipeline->pipeline_clone.handle == 0); // We destroy the potential previous one above in "UnloadCustomShaders"
          cached_pipeline->pipeline_clone = pipeline_clone;
@@ -2289,13 +3149,33 @@ namespace
          }
 #endif
          cached_pipeline->cloned = true;
-         // Clones registered here come from the background AutoLoadShaders thread (async).
-         cached_pipeline->patch_application_mode = Shader::PatchApplicationMode::Async;
+         // Clones registered here come from the background AutoLoadShaders thread (async). "Inplace" describes the original shader
+         // object, under any file clone.
+         if (cached_pipeline->patch_application_mode != Shader::PatchApplicationMode::Inplace)
+         {
+            cached_pipeline->patch_application_mode = Shader::PatchApplicationMode::Async;
+         }
          // TODO: make sure the pixel shaders have the same signature (through reflections) unless the vertex shader was also changed and has a different output signature? Just to make sure random hashes didn't end up replacing an accidentally equal hash (however unlikely)
          device_data.pipeline_cache_by_pipeline_clone_handle[pipeline_clone.handle] = cached_pipeline;
          device_data.cloned_pipeline_count++;
          device_data.cloned_pipelines_changed = true;
+#endif // DX12
       }
+
+#if DX12
+      for (CachedPipeline* cached_pipeline : pipelines_to_clone)
+      {
+         if (--cached_pipeline->clone_pins == 0 && cached_pipeline->destroyed)
+         {
+            FreeCachedPipeline(device_data, cached_pipeline, &to_release);
+         }
+      }
+      lock.unlock();
+      for (const uint64_t pipeline_to_destroy : to_release.pipelines)
+      {
+         device_data.reshade_device->destroy_pipeline(reshade::api::pipeline{pipeline_to_destroy});
+      }
+#endif
    }
 
    void OnDisplayModeChanged()
@@ -2306,16 +3186,25 @@ namespace
       game->OnDisplayModeChanged();
    }
 
+   // The API is fixed per build ("DX12"). Other devices are ignored, e.g. the D3D11 device ReShade creates over a D3D12 game's one for its 11on12 layer.
+#if DX12
+   constexpr reshade::api::device_api supported_graphics_api = reshade::api::device_api::d3d12;
+   constexpr const char* supported_graphics_api_name = "DirectX 12";
+#else
+   constexpr reshade::api::device_api supported_graphics_api = reshade::api::device_api::d3d11;
+   constexpr const char* supported_graphics_api_name = "DirectX 11";
+#endif
+
    bool IsSupportedGraphicsAPI(reshade::api::device_api api)
    {
-      return api == reshade::api::device_api::d3d11;
+      return api == supported_graphics_api;
    }
 
    bool OnCreateDevice(reshade::api::device_api api, uint32_t& api_version)
    {
 #if !CHECK_GRAPHICS_API_COMPATIBILITY
 #if DEVELOPMENT || TEST
-      ASSERT_ONCE_MSG(api == reshade::api::device_api::d3d11, "Luma only supports DirectX 11 at the moment, add \"CHECK_GRAPHICS_API_COMPATIBILITY\" to ignore calls from other APIs");
+      ASSERT_ONCE_MSG(IsSupportedGraphicsAPI(api), "This Luma mod only supports one graphics API, add \"CHECK_GRAPHICS_API_COMPATIBILITY\" to ignore calls from other APIs");
 #else
       static bool skip_api_compatibility_check = false;
       if (!skip_api_compatibility_check)
@@ -2323,9 +3212,10 @@ namespace
          const std::shared_lock lock(s_mutex_reshade);
          reshade::get_config_value(nullptr, NAME, "SkipAPICompatibilityCheck", skip_api_compatibility_check);
       }
-      if (api != reshade::api::device_api::d3d11 && !skip_api_compatibility_check)
+      if (!IsSupportedGraphicsAPI(api) && !skip_api_compatibility_check)
       {
-         int ret = MessageBoxA(NULL, "The application tried to create a non DirectX 11 device. Luma currently only supports DirectX 11, the application might crash.\nPress \"OK\" to continue.\nPress \"Cancel\" to skip this message in the future.", NAME, MB_SETFOREGROUND | MB_OKCANCEL);
+         const std::string message = std::format("The application tried to create a non {0} device. This Luma mod only supports {0}, the application might crash.\nPress \"OK\" to continue.\nPress \"Cancel\" to skip this message in the future.", supported_graphics_api_name);
+         int ret = MessageBoxA(NULL, message.c_str(), NAME, MB_SETFOREGROUND | MB_OKCANCEL);
          if (ret == IDCANCEL)
          {
             const std::unique_lock lock(s_mutex_reshade);
@@ -2342,7 +3232,7 @@ namespace
       return true;
 #endif
 
-#if ENABLE_FIDELITY_SK
+#if ENABLE_FIDELITY_SK && DX11
       // Required by FSR 3 on DX11. Also goes to determine whether we have to use D3D11_1_UAV_SLOT_COUNT or (the older) D3D11_PS_CS_UAV_REGISTER_COUNT.
       // This is usually fully retro compatible with all games.
       if (api_version == D3D_FEATURE_LEVEL_11_0)
@@ -2360,7 +3250,7 @@ namespace
       // Always skip this one, don't use "SKIP_UNSUPPORTED_DEVICE_API", some games create devices of other graphics API without actually doing anything with them (e.g. Deus Ex HR)
       if (!IsSupportedGraphicsAPI(device->get_api())) return;
 
-      ID3D11Device* native_device = (ID3D11Device*)(device->get_native()); // This is the unproxied device, the one the game tried to natively create was instead created as a proxy by reshade, but we don't want that one, as that will pass all our calls through ReShade too, while we want to keep that layer only for stuff coming from the game
+      NativeDevice* native_device = (NativeDevice*)(device->get_native()); // This is the unproxied device, the one the game tried to natively create was instead created as a proxy by reshade, but we don't want that one, as that will pass all our calls through ReShade too, while we want to keep that layer only for stuff coming from the game
       DeviceData& device_data = *device->create_private_data<DeviceData>();
       device_data.native_device = native_device;
       device_data.reshade_device = device;
@@ -2372,9 +3262,11 @@ namespace
 #endif
 #endif
 
+#if DX11
       device_data.uav_max_count = (native_device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1) ? D3D11_1_UAV_SLOT_COUNT : D3D11_PS_CS_UAV_REGISTER_COUNT;
 
       native_device->GetImmediateContext(&device_data.primary_command_list);
+#endif
 
       {
          const std::unique_lock lock(s_mutex_device);
@@ -2409,6 +3301,7 @@ namespace
 
       HRESULT hr;
 
+#if DX11
       D3D11_BUFFER_DESC buffer_desc = {};
       // From MS docs: you must set the ByteWidth value of D3D11_BUFFER_DESC in multiples of 16, and less than or equal to D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT.
       buffer_desc.ByteWidth = sizeof(CB::LumaGlobalSettingsPadded);
@@ -2488,10 +3381,13 @@ namespace
       assert(SUCCEEDED(hr));
 #endif
 
+#endif // DX11
+
 #if ENABLE_NVAPI
       Display::NVAPI::Init();
 #endif
 
+#if DX11 // D3D12 devices aren't DXGI devices, their frame latency is set on the swapchain
       com_ptr<IDXGIDevice1> native_dxgi_device;
       hr = native_device->QueryInterface(&native_dxgi_device);
       assert(SUCCEEDED(hr));
@@ -2501,14 +3397,17 @@ namespace
       // We should possibly link this to the "DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT" flag.
       HRESULT hr2 = native_dxgi_device->SetMaximumFrameLatency(1);
       assert(SUCCEEDED(hr2));
+#endif // DX11
 
 #if ENABLE_SR
-      com_ptr<IDXGIAdapter> native_adapter;
+      com_ptr<IDXGIAdapter> native_adapter; // Only DLSS's D3D11 feature requirements read it, D3D12 leaves it null
+#if DX11
       if (SUCCEEDED(hr))
       {
          hr = native_dxgi_device->GetAdapter(&native_adapter);
          assert(SUCCEEDED(hr));
       }
+#endif
 
       bool selected_sr_implementation = false;
       for (auto& sr_implementation : sr_implementations)
@@ -2567,10 +3466,73 @@ namespace
          const std::unique_lock lock_reshade(s_mutex_reshade);
          sr_user_type = SR::UserType::None; // Reset the global user setting if it's not supported, we want to grey it out in the UI (there's no need to serialize the new value for it though!)
 		}
+      device_data.sr_type_selected = device_data.sr_type;
 #endif // ENABLE_SR
 
       game->OnInitDevice(native_device, device_data);
 
+#if DX12
+      device_data.applied_samplers_upgrade = GetSamplersUpgradeState(device_data);
+      device_data.upload_ring = std::make_shared<D3D12UploadRing::Pool>(native_device);
+#if ENABLE_MINHOOK
+      if (!D3D12PsoCapture::Install(native_device))
+      {
+         reshade::log::message(reshade::log::level::warning, "[PSO capture] ID3D12Device2::CreatePipelineState isn't hooked for this device, so shader replacements will rebuild its pipelines through ReShade");
+      }
+#if DEVELOPMENT
+      // What the game's ExecuteIndirect() commands set, for the frame capture and the MCP's readbacks (see "includes/d3d12_command_signatures.h")
+      if (!D3D12CommandSignatures::Install(native_device))
+      {
+         static std::atomic_flag logged_signatures_failure;
+         if (!logged_signatures_failure.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[Frame capture] ID3D12Device::CreateCommandSignature isn't hooked, so the capture can't say what the game's ExecuteIndirect() commands set");
+         }
+      }
+#endif
+      // Which of the game's resources are committed, placed or reserved (see "includes/d3d12_resource_creation.h")
+      if (!D3D12ResourceCreation::Install(native_device))
+      {
+         static std::atomic_flag logged_creation_failure;
+         if (!logged_creation_failure.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[Resource creation] The game's creates of resources aren't all hooked, so they can't be told committed from placed (no ReShade device proxy, or MinHook failed): the textures made by the creates that aren't hooked are not upgraded");
+         }
+      }
+      // The game's views, barriers, clears and discards follow its textures' clones (see "includes/d3d12_clones.h"). With writer shaders listed (the D3D11 seed list), only the textures
+      // they render into get upgraded: on D3D12 their "rtv_slots" are what counts, "uav_slots" and "scale" are ignored
+      if (!D3D12Clones::Install(native_device, !auto_texture_format_upgrade_shader_hashes.empty(), enable_samplers_upgrade))
+      {
+         static std::atomic_flag logged_clone_hooks_failure;
+         if (!logged_clone_hooks_failure.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[Texture upgrades] The hooks of the clones of placed textures aren't all in (no ReShade device proxy, or MinHook failed): those textures can't be upgraded correctly");
+         }
+      }
+      static std::atomic_flag logged_ignored_seed_settings;
+      if (!logged_ignored_seed_settings.test_and_set() && std::ranges::any_of(auto_texture_format_upgrade_shader_hashes, [](const auto& entry)
+                                                             { return !entry.second.uav_slots.empty() || entry.second.scale; }))
+      {
+         reshade::log::message(reshade::log::level::warning, "[Texture upgrades] On D3D12 the writer shaders only promote the textures of their \"rtv_slots\": \"uav_slots\" and \"scale\" are ignored");
+      }
+      // The game's root signatures get Luma's cbuffers at the indexes the game picked (see "includes/d3d12_root_signatures.h"), LumaData only if it has one
+      if (luma_settings_cbuffer_index < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+      {
+         const int32_t data_register = (luma_data_cbuffer_index < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT ? static_cast<int32_t>(luma_data_cbuffer_index) : -1);
+         if (!D3D12RootSignatures::Install(native_device, luma_settings_cbuffer_index, data_register, [](const char* message)
+                { reshade::log::message(reshade::log::level::warning, std::format("[Luma cbuffers] {}", message).c_str()); }, d3d12_game_root_parameters,
+                !auto_texture_format_upgrade_shader_hashes.empty() || enable_samplers_upgrade)) // The promotions and the sampler rewrites write the game's descriptors again
+         {
+            static std::atomic_flag logged_install_failure;
+            if (!logged_install_failure.test_and_set())
+            {
+               reshade::log::message(reshade::log::level::warning, "[Luma cbuffers] The game's root signatures won't get Luma's constant buffers: the hook couldn't be installed (no ReShade device proxy, no root signature serializer in the D3D12 runtime, or MinHook failed)");
+            }
+         }
+      }
+#endif
+      reshade::log::message(reshade::log::level::info, "Initialized the D3D12 device");
+#else
       LoadTexture2DArrays(native_device, device_data);
 
       // If we upgrade textures, make sure that MSAA DXGI_FORMAT_R16G16B16A16_FLOAT is supported on our GPU, given that it's optional.
@@ -2612,35 +3574,62 @@ namespace
          SetThreadPriority(static_cast<HANDLE>(device_data.thread_auto_loading.native_handle()), THREAD_PRIORITY_BELOW_NORMAL);
       }
 #endif
+#endif // DX12
    }
+
+#if DEVELOPMENT
+   namespace Mcp
+   {
+      // Declared ahead of "includes/mcp_server.inl", which is included far below, after the dev globals it drives
+      void OnDestroyDevice(DeviceData& device_data);
+   } // namespace Mcp
+#endif
 
    void OnDestroyDevice(reshade::api::device* device)
    {
       if (!IsSupportedGraphicsAPI(device->get_api())) return;
 
-      ID3D11Device* native_device = (ID3D11Device*)(device->get_native());
+      NativeDevice* native_device = (NativeDevice*)(device->get_native());
       DeviceData& device_data = *device->get_private_data<DeviceData>(); // No need to lock the data mutex here, it could be concurrently used at this point
 
       game->OnDestroyDeviceData(device_data);
 
+
       // It can apparently happen that in DX11 the device destructor callback is sent before its pipelines, so make sure we empty the memory before.
       // Note: ReShade has fixed this bug now, but as of 6.6 it simply skips ever calling the destroy event for these.
       {
-         std::unordered_map<uint64_t, Shader::CachedPipeline*> pipeline_cache_by_pipeline_handle;
+         std::vector<uint64_t> pipeline_handles;
          {
-            const std::unique_lock lock(s_mutex_generic); // Nobody should be accessing our device data at this point but who knows
-            pipeline_cache_by_pipeline_handle = device_data.pipeline_cache_by_pipeline_handle;
-            device_data.pipeline_cache_by_pipeline_handle.clear(); // Redundant but, let's do it anyway (change the mutex lock to shared if you change this)
+            const std::shared_lock lock(s_mutex_generic); // Nobody should be accessing our device data at this point but who knows
+            for (const uint64_t pipeline_handle : device_data.pipeline_cache_by_pipeline_handle | std::views::keys)
+            {
+               pipeline_handles.push_back(pipeline_handle);
+            }
          }
-         for (auto& pipeline_pair : pipeline_cache_by_pipeline_handle)
+         // "OnDestroyPipeline()" tears down what we cache for a pipeline (its subobjects, clones and references) and removes it from the maps, so it needs it in them
+         for (const uint64_t pipeline_handle : pipeline_handles)
          {
-            OnDestroyPipeline(device, reshade::api::pipeline{ pipeline_pair.first });
+            OnDestroyPipeline(device, reshade::api::pipeline{pipeline_handle});
          }
+         const std::unique_lock lock(s_mutex_generic);
+         pipeline_cache_generation++;
       }
 
+#if DEVELOPMENT && DX12
+      {
+         const std::unique_lock lock_trace(Trace::s_mutex);
+         if (trace_device_data == &device_data)
+         {
+            trace_device_data = nullptr;
+         }
+      }
+#endif
+#if DEVELOPMENT
+      Mcp::OnDestroyDevice(device_data);
+#endif
       {
          const std::unique_lock lock(s_mutex_device);
-         if (std::vector<ID3D11Device*>::iterator position = std::find(global_native_devices.begin(), global_native_devices.end(), native_device); position != global_native_devices.end())
+         if (std::vector<NativeDevice*>::iterator position = std::find(global_native_devices.begin(), global_native_devices.end(), native_device); position != global_native_devices.end())
          {
             global_native_devices.erase(position);
          }
@@ -2688,6 +3677,7 @@ namespace
       }
 #endif
 
+#if DX11
       assert(device_data.cb_per_view_global_buffer_map_data == nullptr); // It's fine (but not great) if we map wasn't unmapped before destruction (not our fault anyway)
 
       if (enable_samplers_upgrade)
@@ -2701,16 +3691,18 @@ namespace
             device_data.custom_sampler_by_original_sampler.clear();
          }
       }
+#endif // DX11
 
 #if ENABLE_SR
-      // All the initialized ones, not just the selected one (e.g. FSR 4 owns a DX12 device)
-      for (auto& sr_instance : device_data.sr_implementations_instances)
+      // Every supported type was initialized at device creation, not just the selected one (see "OnInitDevice()")
+      for (auto& [sr_type, sr_instance_data] : device_data.sr_implementations_instances)
       {
-         if (sr_instance.second)
+         if (sr_instance_data)
          {
-            sr_implementations[sr_instance.first]->Deinit(sr_instance.second); // NOTE: this could stutter the game on closure as it forces unloading the SR DLL (if it's the last device instance?), but we can't avoid it
+            sr_implementations[sr_type]->Deinit(sr_instance_data); // NOTE: this could stutter the game on closure as it forces unloading the SR DLL (if it's the last device instance?), but we can't avoid it
          }
       }
+      device_data.sr_implementations_instances.clear();
 #endif // ENABLE_SR
 
       // Execute all Luma callbacks.
@@ -2719,10 +3711,135 @@ namespace
           callback.second();
       }
 
-#if ENABLE_NVAPI
-      Display::NVAPI::DeInit();
+#if DX12
+      // Waits for the GPU to be done with the command lists of the passes at present, then lets go of what they used
+      {
+         DeviceData::NativePassD3D12* const pass = &device_data.display_composition;
+         const std::unique_lock lock(pass->mutex);
+         D3D12Passes::Destroy(&pass->passes);
+         pass->pipeline.reset();
+         pass->root_signature.reset();
+         D3D12UploadRing::Retire(pass->cmd_list_data.upload_ring.get(), &pass->cmd_list_data.upload_pages);
+         pass->cmd_list_data.upload_ring.reset();
+      }
+      device_data.display_composition.source.reset();
+#if ENABLE_D3D12_PASSES
+      // The caller holds "pass->mutex"
+      const auto destroy_game_pass = [device](DeviceData::GamePassD3D12* pass)
+      {
+         if (pass->layout.handle != 0)
+         {
+            device->free_descriptor_tables(uint32_t(pass->tables.size()), pass->tables.data());
+            device->destroy_pipeline_layout(pass->layout);
+         }
+         pass->tables.clear();
+         pass->layout = {};
+         pass->pipelines.clear();
+         pass->retired.clear();
+         for (const auto& [present_count, resource] : pass->retired_resources)
+         {
+            device->destroy_resource(resource);
+         }
+         pass->retired_resources.clear();
+      };
+      const auto destroy_views = [device](std::initializer_list<reshade::api::resource_view*> views)
+      {
+         for (reshade::api::resource_view* const view : views)
+         {
+            device->destroy_resource_view(*view);
+            *view = {};
+         }
+      };
+      const auto destroy_resources = [device](std::initializer_list<reshade::api::resource*> resources)
+      {
+         for (reshade::api::resource* const resource : resources)
+         {
+            device->destroy_resource(*resource);
+            *resource = {};
+         }
+      };
+#if ENABLE_RCAS
+      {
+         const std::unique_lock lock(device_data.rcas.mutex);
+         destroy_game_pass(&device_data.rcas);
+      }
 #endif
-
+#if ENABLE_SMAA
+      {
+         auto& smaa = device_data.smaa;
+         const std::unique_lock lock(smaa.mutex);
+         destroy_game_pass(&smaa);
+         destroy_views({&smaa.area_srv, &smaa.search_srv, &smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv, &smaa.output_rtv, &smaa.output_srv});
+         destroy_resources({&smaa.area_texture, &smaa.search_texture, &smaa.edges, &smaa.weights, &smaa.output});
+      }
+#endif
+#if ENABLE_BLOOM
+      {
+         auto& karis = device_data.karis_average;
+         const std::unique_lock lock(karis.mutex);
+         destroy_game_pass(&karis);
+         destroy_views({&karis.output_srv, &karis.output_uav});
+         destroy_resources({&karis.output});
+      }
+      {
+         auto& bloom = device_data.bloom;
+         const std::unique_lock lock(bloom.mutex);
+         destroy_game_pass(&bloom);
+         for (std::vector<reshade::api::resource_view>* const views : {&bloom.rtvs_y, &bloom.srvs_y, &bloom.rtvs_x, &bloom.srvs_x})
+         {
+            for (const reshade::api::resource_view view : *views)
+            {
+               device->destroy_resource_view(view);
+            }
+            views->clear();
+         }
+         destroy_resources({&bloom.mips_y});
+         for (const reshade::api::resource resource : bloom.mips_x)
+         {
+            device->destroy_resource(resource);
+         }
+         bloom.mips_x.clear();
+      }
+#endif
+      {
+         auto& texture_copy = device_data.texture_copy;
+         const std::unique_lock lock(texture_copy.mutex);
+         destroy_game_pass(&texture_copy);
+         for (const auto& intermediate : texture_copy.intermediates)
+         {
+            device->destroy_resource(intermediate.resource);
+         }
+         texture_copy.intermediates.clear();
+      }
+#endif
+#if ENABLE_MINHOOK
+      D3D12Clones::OnDestroyDevice(native_device);
+#endif
+      device_data.upload_ring.reset(); // The command lists that outlive the device's data keep the pool through their own pointer
+#if ENABLE_MINHOOK
+      // After the last device the proxy hooks go here, outside the loader lock, where "MinHook::Detach()" can still pin the addon if another module
+      // hooked over one. The next device installs them again ("OnInitDevice()"), "DllMain" removes whatever is left.
+      const bool last_device = []
+      {
+         const std::shared_lock lock(s_mutex_device);
+         return global_devices_data.empty();
+      }();
+      if (last_device)
+      {
+         bool removed_all = D3D12PsoCapture::Remove();
+         removed_all &= D3D12RootSignatures::Remove();
+         removed_all &= D3D12ResourceCreation::Remove();
+         removed_all &= D3D12Clones::Remove();
+#if DEVELOPMENT
+         removed_all &= D3D12CommandSignatures::Remove();
+#endif
+         if (!removed_all)
+         {
+            reshade::log::message(reshade::log::level::warning, "[D3D12 hooks] Another module hooked over one of Luma's device proxy hooks, so it stays and the addon stays loaded");
+         }
+      }
+#endif
+#endif
       device->destroy_private_data<DeviceData>();
    }
 
@@ -2774,6 +3891,15 @@ namespace
 
       // There's only one swapchain so it's fine if this is global ("OnInitSwapchain()" will always be called later anyway)
       bool changed = false;
+      // Some games (Yakuza Kiwami) resize the swapchain with the format its description reports, which is the one we upgraded it to
+      // they still render for their vanilla one
+      if (desc.back_buffer.texture.format == last_swapchain_seen_format && last_swapchain_seen_format != last_swapchain_vanilla_format)
+      {
+         desc.back_buffer.texture.format = last_swapchain_vanilla_format;
+         changed = true;
+      }
+      // ReShade tells the format the game asked for, also when it resized with DXGI_FORMAT_UNKNOWN (it keeps the game's description, the add-ons' changes are not in it)
+      last_swapchain_vanilla_format = desc.back_buffer.texture.format;
 
 #if DEVELOPMENT
       ASSERT_ONCE(desc.back_buffer.texture.format != reshade::api::format::unknown); // With the latest ReShade changes, this should never be set to Unknown, even if the game did a swapchain buffer resize and preserved the previous format.
@@ -2832,8 +3958,7 @@ namespace
          changed = true;
       }
 
-      // Note that occasionally this breaks after resizing the swapchain, because some games resize the swapchain maintaining whatever format it had before
-      last_swapchain_linear_space = desc.back_buffer.texture.format == reshade::api::format::r8g8b8a8_unorm_srgb || desc.back_buffer.texture.format == reshade::api::format::b8g8r8a8_unorm_srgb || desc.back_buffer.texture.format == reshade::api::format::r16g16b16a16_float;
+      last_swapchain_linear_space = last_swapchain_vanilla_format == reshade::api::format::r8g8b8a8_unorm_srgb || last_swapchain_vanilla_format == reshade::api::format::b8g8r8a8_unorm_srgb || last_swapchain_vanilla_format == reshade::api::format::r16g16b16a16_float;
 #if GAME_FF7_REMAKE
       last_swapchain_format = desc.back_buffer.texture.format;
 #endif
@@ -2845,7 +3970,23 @@ namespace
          changed = true;
       }
 
+      last_swapchain_seen_format = desc.back_buffer.texture.format;
       return changed;
+   }
+
+
+#if DX11
+   using SwapchainBackBuffer = ID3D11Texture2D;
+#else
+   using SwapchainBackBuffer = ID3D12Resource;
+#endif
+
+   // A back buffer the game draws into. DX10/11 only have "index" 0
+   com_ptr<SwapchainBackBuffer> GetGameBackBuffer(IDXGISwapChain* native_swapchain, UINT index = 0)
+   {
+      com_ptr<SwapchainBackBuffer> back_buffer;
+      native_swapchain->GetBuffer(index, IID_PPV_ARGS(&back_buffer));
+      return back_buffer;
    }
 
    void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize)
@@ -2855,27 +3996,39 @@ namespace
       OverlayLog::PauseMessages(); // Pause messages until the swapchain has finished resizing, it might take a while
 
       IDXGISwapChain* native_swapchain = (IDXGISwapChain*)(swapchain->get_native());
-#if 0
-      DXGI_SWAP_CHAIN_DESC desc;
-      native_swapchain->GetDesc(&desc);
-      const size_t back_buffer_count = desc.BufferCount;
-#else // Always 1 on DX10/11, even if the swapchain desc says 2...
-      const size_t back_buffer_count = swapchain->get_back_buffer_count();
+#if DX12
+      // The swapchain upgrade changed the format family of the back buffers the game sees (it made the swapchain with another one)
+      const bool format_upgraded = (GetTypelessFormat(DXGI_FORMAT(last_swapchain_vanilla_format)) != GetTypelessFormat(DXGI_FORMAT(last_swapchain_seen_format)));
 #endif
+      // What the game draws into (DX10/11 have one back buffer, even if the swapchain desc says 2)
+#if DX11
+      constexpr uint32_t back_buffer_count = 1;
+#else
+      const uint32_t back_buffer_count = swapchain->get_back_buffer_count();
+#endif
+      std::vector<com_ptr<SwapchainBackBuffer>> game_back_buffers;
+      for (uint32_t index = 0; index < back_buffer_count; index++)
+      {
+         game_back_buffers.push_back(GetGameBackBuffer(native_swapchain, index));
+      }
+      const auto handle_of = [](const com_ptr<SwapchainBackBuffer>& back_buffer)
+      { return reinterpret_cast<uint64_t>(back_buffer.get()); };
       auto* device = swapchain->get_device();
+#if DX11
       ID3D11Device* native_device = (ID3D11Device*)(device->get_native());
+#endif
       DeviceData& device_data = *device->get_private_data<DeviceData>();
       SwapchainData& swapchain_data = *swapchain->create_private_data<SwapchainData>();
       ASSERT_ONCE(&device_data != nullptr); // Hacky nullptr check (should ever be able to happen)
 
 #if DEVELOPMENT
-      const reshade::api::resource_desc resource_desc = device->get_resource_desc(swapchain->get_back_buffer(0));
+      const reshade::api::resource_desc resource_desc = device->get_resource_desc({handle_of(game_back_buffers[0])});
       if (last_attempted_upgraded_resource_creation_format != resource_desc.texture.format) // Upgraded
       {
          const std::unique_lock lock(device_data.mutex);
-         for (uint32_t index = 0; index < back_buffer_count; index++)
+         for (const com_ptr<SwapchainBackBuffer>& back_buffer : game_back_buffers)
          {
-            device_data.resource_upgrades.original_upgraded_resources_formats[swapchain->get_back_buffer(index).handle] = last_attempted_upgraded_resource_creation_format;
+            device_data.resource_upgrades.original_upgraded_resources_formats[handle_of(back_buffer)] = last_attempted_upgraded_resource_creation_format;
          }
       }
 #endif
@@ -2888,21 +4041,21 @@ namespace
 
       {
          const std::unique_lock lock(swapchain_data.mutex); // Not much need to lock this on its own creation, but let's do it anyway...
-         for (uint32_t index = 0; index < back_buffer_count; index++)
+         for (const com_ptr<SwapchainBackBuffer>& back_buffer : game_back_buffers)
          {
-            auto buffer = swapchain->get_back_buffer(index);
-            swapchain_data.back_buffers.emplace(buffer.handle);
-
-            com_ptr<ID3D11RenderTargetView> display_composition_rtv;
-            if (force_create_swapchain_rtvs)
-            {
-               ID3D11Texture2D* back_buffer = (ID3D11Texture2D*)buffer.handle;
-               HRESULT hr = native_device->CreateRenderTargetView(back_buffer, nullptr, &display_composition_rtv);
-               ASSERT_ONCE(SUCCEEDED(hr));
-            }
-
-            swapchain_data.display_composition_rtvs.push_back(display_composition_rtv);
+            swapchain_data.back_buffers.emplace(handle_of(back_buffer));
          }
+
+#if DX11
+         com_ptr<ID3D11RenderTargetView> display_composition_rtv;
+         if (force_create_swapchain_rtvs)
+         {
+            HRESULT hr = native_device->CreateRenderTargetView(game_back_buffers[0].get(), nullptr, &display_composition_rtv);
+            ASSERT_ONCE(SUCCEEDED(hr));
+         }
+
+         swapchain_data.display_composition_rtvs.push_back(display_composition_rtv);
+#endif
       }
 
       {
@@ -2910,10 +4063,15 @@ namespace
          device_data.swapchains.emplace(swapchain);
          ASSERT_ONCE(device_data.swapchains.size() == 1); // Having more than one swapchain per device is probably supported but unexpected
 
-         for (uint32_t index = 0; index < back_buffer_count; index++)
+         for (const com_ptr<SwapchainBackBuffer>& back_buffer : game_back_buffers)
          {
-            auto buffer = swapchain->get_back_buffer(index);
-            device_data.back_buffers.emplace(buffer.handle);
+            device_data.back_buffers.emplace(handle_of(back_buffer));
+#if DX12
+            if (format_upgraded)
+            {
+               device_data.upgraded_back_buffers.emplace(handle_of(back_buffer));
+            }
+#endif
          }
       }
 
@@ -2938,6 +4096,7 @@ namespace
          device_data.cb_luma_global_settings_dirty = true;
       }
 
+#if DX11
 		device_data.ui_texture = nullptr;
       device_data.ui_texture_rtv = nullptr;
       device_data.ui_texture_srv = nullptr;
@@ -2945,10 +4104,13 @@ namespace
       // so we don't support changing this shader define live, but if needed, we could always move these allocations
       if (GetShaderDefineCompiledNumericalValue(UI_DRAW_TYPE_HASH) >= 3)
       {
-         device_data.ui_texture = CloneTexture<ID3D11Texture2D>(native_device, (ID3D11Texture2D*)swapchain->get_back_buffer(0).handle, ui_separation_format, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, D3D11_BIND_UNORDERED_ACCESS, true, false, nullptr); // Unordered Access is not needed until proven otherwise
+         device_data.ui_texture = CloneTexture<ID3D11Texture2D>(native_device, game_back_buffers[0].get(), ui_separation_format, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, D3D11_BIND_UNORDERED_ACCESS, true, false, nullptr); // Unordered Access is not needed until proven otherwise
          native_device->CreateRenderTargetView(device_data.ui_texture.get(), nullptr, &device_data.ui_texture_rtv);
          native_device->CreateShaderResourceView(device_data.ui_texture.get(), nullptr, &device_data.ui_texture_srv);
       }
+#else
+      reshade::log::message(reshade::log::level::info, std::format("Initialized the D3D12 swapchain ({}x{}, {} back buffers{})", device_data.output_resolution.x, device_data.output_resolution.y, back_buffer_count, resize ? ", resized" : "").c_str());
+#endif
 
       IDXGISwapChain3* native_swapchain3;
       // The cast pointer is actually the same, we are just making sure the type is right.
@@ -3134,6 +4296,12 @@ namespace
       DeviceData& device_data = *device->get_private_data<DeviceData>();
       ASSERT_ONCE(&device_data != nullptr); // Hacky nullptr check (should ever be able to happen)
       SwapchainData& swapchain_data = *swapchain->get_private_data<SwapchainData>();
+      // Only a resize keeps the formats of the swapchain (see "OnCreateSwapchain()")
+      if (!resize)
+      {
+         last_swapchain_vanilla_format = reshade::api::format::unknown;
+         last_swapchain_seen_format = reshade::api::format::unknown;
+      }
       {
          const std::shared_lock lock_swapchain(swapchain_data.mutex);
 
@@ -3143,12 +4311,16 @@ namespace
             for (const uint64_t handle : swapchain_data.back_buffers)
             {
                device_data.back_buffers.erase(handle);
+#if DX12
+               device_data.upgraded_back_buffers.erase(handle);
+#endif
 #if DEVELOPMENT
                device_data.resource_upgrades.original_upgraded_resources_formats.erase(handle);
 #endif // DEVELOPMENT
             }
          }
 
+#if DX11
          // Before resizing the swapchain, we need to make sure any of its resources/views are not bound to any state.
          // The swapchain data will be destroyed below anyway, so we are leaving no references to them.
          if (resize && !swapchain_data.display_composition_rtvs.empty())
@@ -3175,8 +4347,35 @@ namespace
                device_data.primary_command_list->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs_const, depth_stencil_view.get());
             }
          }
+#endif // DX11
       }
 
+#if DX12 && DEVELOPMENT // While the game objects are still alive, unlike at device destruction
+      if (!resize)
+      {
+         const std::shared_lock lock_layouts(device_data.pipeline_layouts.mutex);
+         size_t views = 0;
+         size_t constant_buffers = 0;
+         for (const auto& [heap, heap_descriptors] : device_data.descriptor_heaps.descriptors_by_heap)
+         {
+            for (const D3D12State::Descriptor& descriptor : heap_descriptors)
+            {
+               if (descriptor.handle == 0)
+                  continue;
+               if (descriptor.type == reshade::api::descriptor_type::constant_buffer)
+               {
+                  constant_buffers++;
+               }
+               else
+               {
+                  views++;
+               }
+            }
+         }
+         reshade::log::message(reshade::log::level::info, std::format("Destroying the D3D12 swapchain: {} root signatures alive, {} descriptor heaps tracked ({} views and samplers, {} constant buffers), {} pipelines cached",
+            device_data.pipeline_layouts.parameters_by_layout.size(), device_data.descriptor_heaps.descriptors_by_heap.size(), views, constant_buffers, device_data.pipeline_cache_by_pipeline_handle.size()).c_str());
+      }
+#endif
       swapchain->destroy_private_data<SwapchainData>();
    }
 
@@ -3263,7 +4462,7 @@ namespace
 // patch is applied to the shader description so D3D compiles the patched shader
 // directly (no pipeline clone, zero latency). In CLONE mode this function is
 // not compiled and sync providers run in OnInitPipeline instead.
-#if (LUMA_PATCH_PROVIDERS & (LUMA_PATCH_PROVIDER_BYTECODE_SYNC | LUMA_PATCH_PROVIDER_RECIPE_SYNC)) && !LUMA_PATCH_SYNC_MODE_CLONE
+#if (LUMA_PATCH_PROVIDERS & (LUMA_PATCH_PROVIDER_BYTECODE_SYNC | LUMA_PATCH_PROVIDER_RECIPE_SYNC)) && !LUMA_PATCH_SYNC_MODE_CLONE && DX11 // The sync patch providers aren't ported to D3D12
    bool OnCreatePipeline(
       reshade::api::device* device,
       reshade::api::pipeline_layout layout,
@@ -3271,6 +4470,15 @@ namespace
       const reshade::api::pipeline_subobject* subobjects)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api(), false);
+
+      // "CreateInputLayout" only reads its vertex shader's input signature, there is nothing to patch. Some games (UE3) create
+      // layouts every frame, and hashing the whole shader for each cost ~2 ms of CPU per frame (MELE). "OnInitPipeline" doesn't
+      // restore an edited layout shader either.
+      for (uint32_t i = 0; i < subobject_count; ++i)
+      {
+         if (subobjects[i].type == reshade::api::pipeline_subobject_type::input_layout)
+            return false;
+      }
 
       ASSERT_ONCE(!last_live_patched_original_shader_code); // This should never happen, it means our conditions don't match, or well, that shader creation failed, which is possible, even in the original game code
       last_live_patched_original_shader_code = nullptr;
@@ -3527,7 +4735,6 @@ namespace
    }
 #endif // INPLACE sync providers
 
-
    void OnInitPipeline(
       reshade::api::device* device,
       reshade::api::pipeline_layout layout,
@@ -3536,6 +4743,11 @@ namespace
       reshade::api::pipeline pipeline)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
+
+#if DX12 && ENABLE_MINHOOK
+      // Always taken, so a capture never outlives its pipeline's creation (even if there's nothing in it to replace)
+      std::unique_ptr<D3D12PsoCapture::Stream> pso_capture = D3D12PsoCapture::Take(reinterpret_cast<ID3D12PipelineState*>(pipeline.handle));
+#endif
 
       const void* live_patched_shader_code = nullptr;
       size_t live_patched_shader_size = 0;
@@ -3547,11 +4759,15 @@ namespace
          const auto& subobject = subobjects[i];
          switch (subobject.type)
          {
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11
          case reshade::api::pipeline_subobject_type::input_layout:
          {
             DeviceData& device_data = *device->get_private_data<DeviceData>();
             const std::unique_lock lock_device(device_data.mutex);
+            std::vector<D3D11_INPUT_ELEMENT_DESC>& layout_descs = device_data.input_layouts_descs[reinterpret_cast<ID3D11InputLayout*>(pipeline.handle)];
+            // UE3 creates layouts every frame, and a destroyed layout's address comes back for a new one
+            layout_descs.clear();
+            layout_descs.reserve(subobject.count);
             for (uint32_t j = 0; j < subobject.count; ++j)
             {
                reshade::api::input_element* desc = reinterpret_cast<reshade::api::input_element*>(subobject.data) + j;
@@ -3568,7 +4784,7 @@ namespace
                   internal_desc.SemanticName = "TEXCOORD";
                   internal_desc.SemanticIndex = desc->location;
                }
-               device_data.input_layouts_descs[reinterpret_cast<ID3D11InputLayout*>(pipeline.handle)].push_back(internal_desc);
+               layout_descs.push_back(internal_desc);
             }
             return;
          }
@@ -3627,7 +4843,11 @@ namespace
          }
          default:
          {
+#if DX12 // Graphics PSOs also carry their states, input layout and render target formats
+            break;
+#else
             return; // Nothing to do here, we don't want to clone the pipeline
+#endif
          }
          }
       }
@@ -3667,9 +4887,15 @@ namespace
          {
             switch (subobject.type)
             {
-#if GEOMETRY_SHADER_SUPPORT
+#if GEOMETRY_SHADER_SUPPORT || DX12
             case reshade::api::pipeline_subobject_type::geometry_shader:
-#endif // GEOMETRY_SHADER_SUPPORT
+#endif
+#if DX12 // Hashed and dumped for the frame capture, they can't be replaced yet
+            case reshade::api::pipeline_subobject_type::hull_shader:
+            case reshade::api::pipeline_subobject_type::domain_shader:
+            case reshade::api::pipeline_subobject_type::amplification_shader:
+            case reshade::api::pipeline_subobject_type::mesh_shader:
+#endif // DX12
             case reshade::api::pipeline_subobject_type::vertex_shader:
             case reshade::api::pipeline_subobject_type::compute_shader:
             case reshade::api::pipeline_subobject_type::pixel_shader:
@@ -3820,6 +5046,12 @@ namespace
                   }
 #endif // DEVELOPMENT && LUMA_PATCH_PROVIDERS != 0
 
+#if DX12 // D3D11 reflections can't read DXIL or SM5.1, and disassembling every shader just for its model would be slow
+                  if (cached_shader->type_and_version.empty())
+                  {
+                     cached_shader->type_and_version = Shader::GetShaderTypeAndVersion(cached_shader->data, cached_shader->size);
+                  }
+#endif
                   // Try with native DX11 reflections first, they are much faster than disassembly
                   if (!found_reflections)
                   {
@@ -3850,6 +5082,8 @@ namespace
                            switch (cached_shader->type)
                            {
                            case reshade::api::pipeline_subobject_type::vertex_shader:   type_prefix = "vs"; assert(type == D3D11_SHVER_VERTEX_SHADER); break;
+                           case reshade::api::pipeline_subobject_type::hull_shader:     type_prefix = "hs"; assert(type == D3D11_SHVER_HULL_SHADER); break;
+                           case reshade::api::pipeline_subobject_type::domain_shader:   type_prefix = "ds"; assert(type == D3D11_SHVER_DOMAIN_SHADER); break;
                            case reshade::api::pipeline_subobject_type::geometry_shader: type_prefix = "gs"; assert(type == D3D11_SHVER_GEOMETRY_SHADER); break;
                            case reshade::api::pipeline_subobject_type::pixel_shader:    type_prefix = "ps"; assert(type == D3D11_SHVER_PIXEL_SHADER); break;
                            case reshade::api::pipeline_subobject_type::compute_shader:  type_prefix = "cs"; assert(type == D3D11_SHVER_COMPUTE_SHADER); break;
@@ -4078,6 +5312,7 @@ namespace
                assert(std::find(cached_pipeline->shader_hashes.begin(), cached_pipeline->shader_hashes.end(), shader_hash) == cached_pipeline->shader_hashes.end());
 #if DX12
                cached_pipeline->shader_hashes.emplace_back(shader_hash);
+               cached_pipeline->shader_types.emplace_back(subobject.type);
 #else
                cached_pipeline->shader_hashes[0] = shader_hash;
                ASSERT_ONCE(cached_pipeline->shader_hashes.size() == 1); // Just to make sure if this actually happens
@@ -4123,6 +5358,139 @@ namespace
          return;
       }
 
+#if DX12
+      // The layout of a D3D12 pipeline is its root signature, null if the shaders embed it
+      cached_pipeline->root_signature = reinterpret_cast<ID3D12RootSignature*>(layout.handle);
+#if ENABLE_MINHOOK
+      const D3D12RootSignatures::LumaParams luma_params = D3D12RootSignatures::Find(layout.handle);
+      cached_pipeline->luma_settings_param = luma_params.settings_index;
+      cached_pipeline->luma_data_param = luma_params.data_index;
+      // A pipeline without a root signature takes the one its shaders embed. If that is the original of a root signature Luma added CBVs to, the game binds the
+      // rewritten one for this pipeline's draws, which D3D12 doesn't accept with a pipeline built on the original
+      if (layout.handle == 0)
+      {
+         for (uint32_t i = 0; i < subobject_count; ++i)
+         {
+            const auto* embedding_shader_desc = static_cast<const reshade::api::shader_desc*>(subobjects[i].data);
+            if (!ToStreamShaderType(subobjects[i].type) || !D3D12RootSignatures::IsInjectedOriginal(embedding_shader_desc->code, embedding_shader_desc->code_size))
+            {
+               continue;
+            }
+            // Once per shader: a game can create thousands of pipelines with it
+            static std::shared_mutex warned_shaders_mutex;
+            static std::unordered_set<uint32_t> warned_shader_hashes;
+            const uint32_t embedding_shader_hash = Shader::BinToHash(static_cast<const uint8_t*>(embedding_shader_desc->code), embedding_shader_desc->code_size);
+            const std::unique_lock lock_warned_shaders(warned_shaders_mutex);
+            if (warned_shader_hashes.insert(embedding_shader_hash).second)
+            {
+               reshade::log::message(reshade::log::level::warning, std::format("[Luma cbuffers] The shader {:08X} of pipeline {:x} embeds the root signature of one Luma added constant buffers to: the pipeline is built on the original, while the game binds the rewritten one for its draws", embedding_shader_hash, pipeline.handle).c_str());
+            }
+         }
+      }
+      // The stream is this pipeline's if its shaders are the ones ReShade reports (a stale capture, or one of an address reused after the
+      // original was destroyed, wouldn't have them). Its bytecode then points at our copies, as the game's memory can be gone when a clone is created.
+      uint32_t matched_shader_count = 0;
+      for (uint32_t i = 0; pso_capture && i < subobject_count; ++i)
+      {
+         const std::optional<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE> stream_type = ToStreamShaderType(subobjects[i].type);
+         if (!stream_type)
+         {
+            continue;
+         }
+         const auto* original_shader_desc = static_cast<const reshade::api::shader_desc*>(subobjects[i].data);
+         D3D12_SHADER_BYTECODE* const captured_shader = pso_capture->Find<D3D12_SHADER_BYTECODE>(*stream_type);
+         if (captured_shader == nullptr || captured_shader->pShaderBytecode != original_shader_desc->code || captured_shader->BytecodeLength != original_shader_desc->code_size)
+         {
+            pso_capture.reset();
+            break;
+         }
+         const auto* cached_shader_desc = static_cast<const reshade::api::shader_desc*>(subobjects_cache[i].data);
+         *captured_shader = {.pShaderBytecode = cached_shader_desc->code, .BytecodeLength = cached_shader_desc->code_size};
+         matched_shader_count++;
+      }
+      if (pso_capture && pso_capture->shader_count == matched_shader_count)
+      {
+         cached_pipeline->capture = std::move(pso_capture);
+      }
+      else
+      {
+         static std::atomic_flag logged_missing_capture;
+         if (!logged_missing_capture.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[PSO capture] A pipeline has no captured stream (ReShade's or another add-on's rebuild, or a device the hook doesn't cover), so its shader replacements will rebuild it through ReShade");
+         }
+      }
+#endif // ENABLE_MINHOOK
+
+      // A pipeline whose shaders embed their root signature has no object for it, and the replacements of its clones (compiled from HLSL) don't carry it: made here from the
+      // game's shaders, before the pipeline is shared. A serialized root signature in the stream is its own. The variants of the original keep the shaders that embed it
+#if ENABLE_MINHOOK
+      const bool needs_root_signature = (layout.handle == 0 && !(cached_pipeline->capture && cached_pipeline->capture->Find<D3D12PsoCapture::SerializedRootSignatureDesc>(D3D12PsoCapture::SERIALIZED_ROOT_SIGNATURE)));
+#else
+      const bool needs_root_signature = (layout.handle == 0);
+#endif
+      for (uint32_t i = 0; needs_root_signature && i < subobject_count && !cached_pipeline->root_signature; ++i)
+      {
+         const auto* embedding_shader_desc = static_cast<const reshade::api::shader_desc*>(subobjects_cache[i].data);
+         // The device logs an error if asked to make a root signature from a shader that doesn't embed one (a "RTS0" chunk)
+         if (ToStreamShaderType(subobjects_cache[i].type) && Shader::FindChunk(embedding_shader_desc->code, embedding_shader_desc->code_size, "RTS0") != nullptr)
+         {
+            reinterpret_cast<ID3D12Device*>(device->get_native())->CreateRootSignature(0, embedding_shader_desc->code, embedding_shader_desc->code_size, IID_PPV_ARGS(&cached_pipeline->root_signature));
+         }
+      }
+      // The render target formats the pipeline declares, which its variants replace: the stream's if there is one, else the subobject ReShade reports
+      bool formats_from_stream = false;
+#if ENABLE_MINHOOK
+      if (cached_pipeline->capture)
+      {
+         formats_from_stream = true; // A stream without the subobject has no render targets
+         if (const D3D12_RT_FORMAT_ARRAY* const stream_formats = cached_pipeline->capture->Find<D3D12_RT_FORMAT_ARRAY>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS))
+         {
+            cached_pipeline->render_target_count = (std::min)(stream_formats->NumRenderTargets, 8u);
+            std::copy_n(stream_formats->RTFormats, cached_pipeline->render_target_count, cached_pipeline->render_target_formats.begin());
+         }
+      }
+#endif
+      for (uint32_t i = 0; !formats_from_stream && i < subobject_count; ++i)
+      {
+         const reshade::api::pipeline_subobject& subobject = subobjects_cache[i];
+         if (subobject.type == reshade::api::pipeline_subobject_type::render_target_formats && subobject.data)
+         {
+            cached_pipeline->render_target_count = (std::min)(subobject.count, 8u);
+            for (uint32_t j = 0; j < cached_pipeline->render_target_count; ++j)
+            {
+               cached_pipeline->render_target_formats[j] = DXGI_FORMAT(static_cast<const reshade::api::format*>(subobject.data)[j]);
+            }
+         }
+      }
+
+      // The replacements of a D3D12 pipeline are created with it, as its clones are only bound from here on, and before it's shared with the other threads (so it needs no pin,
+      // unlike in "LoadCustomShaders()")
+      reshade::api::pipeline creation_clone = {};
+      uint64_t creation_clone_code_hash = 0;
+      if (auto_load && !last_pressed_unload && found_custom_shader_file)
+      {
+         // The code is copied, to create the clone without holding the lock
+         std::vector<std::vector<uint8_t>> replacement_codes;
+         std::vector<D3D12StageReplacement> replacements;
+         {
+            const std::shared_lock lock_loading(s_mutex_loading);
+            replacements = FindD3D12StageReplacements(*cached_pipeline);
+            replacement_codes.reserve(replacements.size());
+            for (D3D12StageReplacement& replacement : replacements)
+            {
+               replacement.code = replacement_codes.emplace_back(replacement.code.begin(), replacement.code.end());
+            }
+         }
+         if (!replacements.empty())
+         {
+            cached_pipeline->clone_origin = Shader::CloneOrigin::File;
+            creation_clone_code_hash = HashD3D12Replacements(replacements);
+            creation_clone = CreateD3D12Clone(*cached_pipeline, replacements);
+         }
+      }
+#endif // DX12
+
       {
          const std::unique_lock lock(s_mutex_generic);
          for (const auto shader_hash : cached_pipeline->shader_hashes)
@@ -4137,16 +5505,24 @@ namespace
             {
                device_data.pipeline_caches_by_shader_hash[shader_hash] = { cached_pipeline };
             }
-
-            ASSERT_ONCE(device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle) == device_data.pipeline_cache_by_pipeline_handle.end());
-            device_data.pipeline_cache_by_pipeline_handle[pipeline.handle] = cached_pipeline;
          }
+
+         // Once per pipeline, D3D12 PSOs have a hash per stage
+         ASSERT_ONCE(device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle) == device_data.pipeline_cache_by_pipeline_handle.end());
+         device_data.pipeline_cache_by_pipeline_handle[pipeline.handle] = cached_pipeline;
+#if DX12
+         if (creation_clone.handle != 0)
+         {
+            ActivateD3D12Clone(device_data, cached_pipeline, creation_clone, creation_clone_code_hash);
+         }
+#endif
       }
 
 #if LUMA_PATCH_PROVIDERS != 0
       Patch::TryPatchPipeline(device_data, pipeline.handle);
 #endif
 
+#if DX11 // The D3D12 clones are created above, before the pipeline is shared
       // Automatically load any custom shaders that might have been bound to this pipeline.
       // To avoid this slowing down everything, we only do it if we detect the user already had a matching shader in its custom shaders folder.
       if (auto_load && !last_pressed_unload && found_custom_shader_file && !cached_pipeline->cloned)
@@ -4166,6 +5542,7 @@ namespace
          LoadCustomShaders(device_data, { pipeline.handle }, !precompile_custom_shaders);
 #endif
       }
+#endif // DX11
    }
 #pragma optimize("", on) // Restore the previous state
 
@@ -4186,9 +5563,11 @@ namespace
             device_data.pipelines_to_reload.erase(pipeline.handle);
          }
          
-         std::vector<uint64_t> pipelines_to_destroy; // TODO: define a pointer size for ReShade handles, given they are just a pointer 64bit in x64 and 32bit in x32
-         
+         PipelineObjectsToRelease to_release; // Declared before the locks, so the root signatures are released after them
+
+#if DX11 // D3D12 pins the pipelines "LoadCustomShaders()" clones instead (see "CachedPipeline::clone_pins")
          std::unique_lock lock_pipeline_destroy(device_data.pipeline_cache_destruction_mutex);
+#endif
          std::unique_lock lock(s_mutex_generic);
          if (auto pipeline_cache_pair = device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle); pipeline_cache_pair != device_data.pipeline_cache_by_pipeline_handle.end())
          {
@@ -4196,46 +5575,36 @@ namespace
 
             if (cached_pipeline != nullptr)
             {
-               // Clean other references to the pipeline
-               for (auto& pipelines_cache_pair : device_data.pipeline_caches_by_shader_hash)
+               // Clean other references to the pipeline (it's only listed under its own hashes, see "OnInitPipeline()")
+               for (const auto shader_hash : cached_pipeline->shader_hashes)
                {
-                  auto& cached_pipelines = pipelines_cache_pair.second;
-                  cached_pipelines.erase(cached_pipeline);
-               }
-
-               // Destroy our cloned subojects
-               DestroyPipelineSubojects(cached_pipeline->subobjects_cache, cached_pipeline->subobject_count);
-               cached_pipeline->subobjects_cache = nullptr;
-#if DX12 && 0 // Redundant
-               cached_pipeline->subobject_count = 0;
-#endif
-
-               // Destroy our cloned version of the pipeline (and leave the original intact, because the life time is not handled by us)
-               // Preserved patch clones (kept across unloads) can have "cloned == false"
-               // while still owning the object — destroy by handle presence.
-               if (cached_pipeline->cloned || cached_pipeline->pipeline_clone.handle != 0)
-               {
-                  if (cached_pipeline->cloned)
+                  if (auto pipelines_pair = device_data.pipeline_caches_by_shader_hash.find(shader_hash); pipelines_pair != device_data.pipeline_caches_by_shader_hash.end())
                   {
-                     cached_pipeline->cloned = false;
-                     device_data.cloned_pipeline_count--;
+                     pipelines_pair->second.erase(cached_pipeline);
                   }
-                  assert(cached_pipeline->device == device);
-                  pipelines_to_destroy.push_back(cached_pipeline->pipeline_clone.handle);
-                  device_data.pipeline_cache_by_pipeline_clone_handle.erase(cached_pipeline->pipeline_clone.handle);
-#if 0 // Redundant
-                  cached_pipeline->pipeline_clone.handled = 0;
-#endif
-                  device_data.cloned_pipelines_changed = true;
                }
-               delete cached_pipeline;
+
+#if DX12
+               if (cached_pipeline->clone_pins != 0)
+               {
+                  cached_pipeline->destroyed = true; // "LoadCustomShaders()" frees it
+               }
+               else
+               {
+                  FreeCachedPipeline(device_data, cached_pipeline, &to_release);
+               }
+#else
+               assert(cached_pipeline->device == device);
+               FreeCachedPipeline(device_data, cached_pipeline, &to_release);
+#endif
                cached_pipeline = nullptr;
             }
 
             device_data.pipeline_cache_by_pipeline_handle.erase(pipeline_cache_pair);
+            pipeline_cache_generation++;
          }
 
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11
          {
             // Note: this is optional, we don't need to remove them because they are "read only", with no strong references
             const std::unique_lock lock_device(device_data.mutex);
@@ -4244,9 +5613,11 @@ namespace
 #endif
 
          lock.unlock(); // Calls into the device could deadlock if the game rendering is multithreaded
+#if DX11
          lock_pipeline_destroy.unlock(); // Unlock these two in reverse order!
+#endif
 
-         for (auto pipeline_to_destroy : pipelines_to_destroy)
+         for (auto pipeline_to_destroy : to_release.pipelines)
          {
             // For DX11, this simply releases the reference to a shader (or whatever else the pipeline contains)
             device->destroy_pipeline(reshade::api::pipeline{pipeline_to_destroy});
@@ -4254,6 +5625,1419 @@ namespace
       }
    }
 
+   // The cached pipeline of an original pipeline a command list binds, null if it isn't tracked. Called on every pipeline bind
+   const Shader::CachedPipeline* FindCachedPipelineToBind(reshade::api::command_list* cmd_list, uint64_t pipeline_handle)
+   {
+      // Direct-mapped per-thread cache of the lookup below, so binds (every VS/PS/CS set) skip "s_mutex_generic". A handle can only be reused after its pipeline is destroyed,
+      // which bumps the generation and flushes every thread's cache, so a hit never returns a stale pipeline. Colliding handles fall back to the locked lookup.
+      struct BindCacheEntry
+      {
+         uint64_t pipeline_handle = 0;
+         const Shader::CachedPipeline* cached_pipeline = nullptr;
+      };
+      static thread_local std::array<BindCacheEntry, 256> bind_cache = {};
+      static thread_local uint32_t bind_cache_generation = 0;
+      if (const uint32_t generation = pipeline_cache_generation; bind_cache_generation != generation)
+      {
+         bind_cache = {};
+         bind_cache_generation = generation;
+      }
+      // A multiply spreads the handles: native objects are allocated at large alignments, so their low bits alone collided (and took the lock)
+      BindCacheEntry& bind_cache_entry = bind_cache[size_t((pipeline_handle * 0x9E3779B97F4A7C15ull) >> 56)];
+      static_assert(std::tuple_size_v<decltype(bind_cache)> == 256);
+      if (bind_cache_entry.pipeline_handle == pipeline_handle)
+      {
+         return bind_cache_entry.cached_pipeline;
+      }
+
+      const DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+      const std::shared_lock lock(s_mutex_generic);
+      const auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(pipeline_handle);
+      if (pipeline_pair != device_data.pipeline_cache_by_pipeline_handle.end())
+      {
+         ASSERT_ONCE(pipeline_pair->second != nullptr); // Shouldn't usually happen but if it did, it's supported anyway and innocuous
+         // This is guaranteed to not be destroyed while it's bound
+         if (pipeline_pair->second != nullptr)
+         {
+            bind_cache_entry = {.pipeline_handle = pipeline_handle, .cached_pipeline = pipeline_pair->second};
+         }
+         return pipeline_pair->second;
+      }
+#if ENABLE_GAME_PIPELINE_STATE_READBACK // Allow either game engines or other mods between the game and ReShade to read back states we had changed
+      // "Deus Ex: Human Revolution" with the golden filter restoration mod sets back customized shaders to the pipeline,
+      // as it also read back the state of DX etc, so make sure to search it from the cloned shaders list too!
+      const auto pipeline_pair_2 = device_data.pipeline_cache_by_pipeline_clone_handle.find(pipeline_handle);
+      if (pipeline_pair_2 != device_data.pipeline_cache_by_pipeline_clone_handle.end())
+      {
+         return pipeline_pair_2->second;
+      }
+#endif
+      return nullptr;
+   }
+
+#if DX12 && DEVELOPMENT // State tracking for the frame capture
+   void OnInitPipelineLayout(reshade::api::device* device, uint32_t param_count, const reshade::api::pipeline_layout_param* params, reshade::api::pipeline_layout layout)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
+      auto* const pipeline_layouts = &device->get_private_data<DeviceData>()->pipeline_layouts;
+      D3D12State::AddPipelineLayout(pipeline_layouts, layout, param_count, params);
+#if ENABLE_MINHOOK
+      D3D12State::AddStaticSamplers(pipeline_layouts, layout, D3D12RootSignatures::pending_static_samplers);
+#endif
+   }
+#endif // DX12 && DEVELOPMENT
+
+#if DX12
+   // All builds forget the root signatures Luma added CBVs to when they are destroyed, development builds also the layouts of the frame capture
+   void OnDestroyPipelineLayout(reshade::api::device* device, reshade::api::pipeline_layout layout)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
+#if ENABLE_MINHOOK
+      D3D12RootSignatures::Forget(layout.handle);
+#endif
+#if DEVELOPMENT
+      D3D12State::RemovePipelineLayout(&device->get_private_data<DeviceData>()->pipeline_layouts, layout);
+#endif
+   }
+#endif // DX12
+
+#if DX12 && DEVELOPMENT
+   bool OnUpdateDescriptorTables(reshade::api::device* device, uint32_t count, const reshade::api::descriptor_table_update* updates)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(device->get_api(), false);
+      D3D12State::UpdateDescriptors(&device->get_private_data<DeviceData>()->descriptor_heaps, device, count, updates);
+      return false;
+   }
+
+   bool OnCopyDescriptorTables(reshade::api::device* device, uint32_t count, const reshade::api::descriptor_table_copy* copies)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(device->get_api(), false);
+      D3D12State::CopyDescriptors(&device->get_private_data<DeviceData>()->descriptor_heaps, device, count, copies);
+      return false;
+   }
+
+   // The desc of a sampler a game created, by the CPU descriptor it created it in (the frame capture reads it back from the descriptors' copies)
+   void OnInitSamplerDescriptor(reshade::api::device* device, const reshade::api::sampler_desc& desc, reshade::api::sampler sampler)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
+      device->get_private_data<DeviceData>()->descriptor_heaps.sampler_descs[sampler.handle] = desc;
+   }
+
+#endif // DX12 && DEVELOPMENT
+
+   enum class LumaConstantBufferType
+   {
+      // Global/frame settings
+      LumaSettings,
+      // Per draw/instance data
+      LumaData,
+      LumaUIData
+   };
+
+#if DX12
+   // Tracks the pipeline a command list binds (on every build) like the D3D11 binds do: the hashes of its shaders, whether it runs custom ones, and the draw or dispatch callback they match.
+   // Then binds the clone in place of the pipeline the game sets. The runtime sets the game's pipeline before this event, and "bind_pipeline()" sets the clone over it.
+   // Never with "all_graphics": it would also replay the topology and blend factor ReShade stores for the pipelines it creates.
+   // Not ported: patch clones (no patch providers on D3D12) and UI separation. The known UI shader is only tracked for Hide UI. The automatic texture format upgrades only resolve the writer shader
+   // of a bound pixel shader (see "OnDrawOrDispatchD3D12()").
+   void OnBindPipeline(reshade::api::command_list* cmd_list, reshade::api::pipeline_stage stages, reshade::api::pipeline pipeline)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      if (stages == reshade::api::pipeline_stage::all_ray_tracing) // State objects aren't replaced
+      {
+         return;
+      }
+      // Command lists are recorded by one thread at a time, so their state needs no lock. It follows the game's pipeline, not our clone
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      cmd_list_data.d3d12_state.pipeline = pipeline;
+
+      // ReShade passes "all" stages for every PSO and a command list has one pipeline: a compute one replaces a graphics one and the other way around, so nothing stays bound.
+      // That's also what handle 0 (clearing the state, a reset without an initial pipeline) and the pipelines we don't track leave.
+      cmd_list_data.ResetBoundPipeline();
+      if (pipeline.handle == 0)
+      {
+         return;
+      }
+      const Shader::CachedPipeline* cached_pipeline = FindCachedPipelineToBind(cmd_list, pipeline.handle);
+      if (cached_pipeline == nullptr)
+      {
+         return;
+      }
+      // No lock: a clone retired since this read is still alive, as long as the original (which the game keeps alive for the command lists using it).
+      // Disabling the custom shaders only stops the swap, the hashes and callbacks are still tracked.
+      uint64_t clone_handle = (custom_shaders_enabled ? cached_pipeline->active_clone.load(std::memory_order_acquire) : 0);
+      // A bundle can't set root arguments without setting a root signature of its own, and what it would allocate for them outlives the upload ring's frame margin: it keeps the original
+      if (clone_handle != 0 && cmd_list_data.is_bundle && cached_pipeline->luma_settings_param >= 0)
+      {
+         static std::atomic_flag logged_bundle;
+         if (!logged_bundle.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[Luma cbuffers] A bundle binds a pipeline whose replacement can read Luma's constant buffers, which a bundle can't set: it keeps the game's pipeline");
+         }
+         clone_handle = 0;
+      }
+      const bool has_clone = clone_handle != 0;
+      // What the draws need to follow the formats of the render targets (see "UpdateD3D12PipelineVariant()")
+      cmd_list_data.bound_cached_pipeline = cached_pipeline;
+      cmd_list_data.bound_base_pipeline = (has_clone ? clone_handle : pipeline.handle);
+      cmd_list_data.bound_current_pipeline = cmd_list_data.bound_base_pipeline;
+      cmd_list_data.render_target_formats_dirty = true;
+      for (size_t i = 0; i < cached_pipeline->shader_hashes.size(); i++)
+      {
+         const uint32_t shader_hash = cached_pipeline->shader_hashes[i];
+         switch (cached_pipeline->shader_types[i])
+         {
+         case reshade::api::pipeline_subobject_type::vertex_shader:
+            cmd_list_data.pipeline_state_original_vertex_shader = pipeline;
+            cmd_list_data.pipeline_state_original_graphics_shader_hashes.vertex_shaders[0] = shader_hash;
+            cmd_list_data.pipeline_state_has_custom_vertex_shader = has_clone;
+            break;
+         case reshade::api::pipeline_subobject_type::pixel_shader:
+            cmd_list_data.pipeline_state_original_pixel_shader = pipeline;
+            cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders[0] = shader_hash;
+            cmd_list_data.pipeline_state_has_custom_pixel_shader = has_clone;
+            break;
+#if GEOMETRY_SHADER_SUPPORT
+         case reshade::api::pipeline_subobject_type::geometry_shader:
+            cmd_list_data.pipeline_state_original_graphics_shader_hashes.geometry_shaders[0] = shader_hash;
+            break;
+#endif
+         case reshade::api::pipeline_subobject_type::compute_shader:
+            cmd_list_data.pipeline_state_original_compute_shader = pipeline;
+            cmd_list_data.pipeline_state_original_compute_shader_hashes.compute_shaders[0] = shader_hash;
+            cmd_list_data.pipeline_state_has_custom_compute_shader = has_clone;
+            break;
+         default: // Hull, domain, amplification and mesh shaders have no slot in "ShaderHashesList", so no callback matches them
+            break;
+         }
+      }
+      const auto find_callback = [](const auto& callbacks_by_shader_hashes, const auto& original_shader_hashes) -> DrawOrDispatchCallback
+      {
+         for (const auto& [shader_hashes, callback] : callbacks_by_shader_hashes)
+         {
+            if (original_shader_hashes.ContainsAll(shader_hashes))
+            {
+               ASSERT(callback); // Game won't crash, this is just useless and weird
+               return callback;
+            }
+         }
+         return nullptr;
+      };
+      if (cmd_list_data.pipeline_state_original_compute_shader.handle != 0)
+      {
+         cmd_list_data.dispatch_callback = find_callback(dispatch_callbacks_by_shader_hashes, cmd_list_data.pipeline_state_original_compute_shader_hashes);
+      }
+      else
+      {
+         cmd_list_data.pipeline_state_has_custom_graphics_shader = has_clone;
+         cmd_list_data.draw_callback = find_callback(draw_callbacks_by_shader_hashes, cmd_list_data.pipeline_state_original_graphics_shader_hashes);
+         cmd_list_data.is_known_ui_shader_bound = ((enable_ui_separation || hide_ui) && cmd_list_data.pipeline_state_original_graphics_shader_hashes.Contains(shader_hashes_UI));
+         if (cmd_list_data.pipeline_state_original_pixel_shader.handle != 0)
+         {
+            const auto writer = auto_texture_format_upgrade_shader_hashes.find(uint32_t(cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders[0]));
+            cmd_list_data.auto_graphics_texture_format_upgrades = (writer != auto_texture_format_upgrade_shader_hashes.end() ? &writer->second : nullptr);
+         }
+      }
+      if (has_clone)
+      {
+         cmd_list_data.luma_settings_param = cached_pipeline->luma_settings_param;
+         cmd_list_data.luma_data_param = cached_pipeline->luma_data_param;
+         cmd_list->bind_pipeline(stages, reshade::api::pipeline{clone_handle});
+      }
+   }
+
+   void OnBindDescriptorTables(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t first, uint32_t count, const reshade::api::descriptor_table* tables, uint32_t dynamic_offset_count, const uint32_t* dynamic_offsets)
+   {
+#if !DEVELOPMENT && !ENABLE_D3D12_PASSES
+      if (count != 0) // Release builds without Luma passes only track the root signature ("Set*RootSignature()" binds no tables), not what is bound to it
+      {
+         return;
+      }
+#endif
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      D3D12State::BindDescriptorTables(&cmd_list->get_private_data<CommandListData>()->d3d12_state, stages, layout, first, count, tables);
+   }
+
+#if DEVELOPMENT || ENABLE_D3D12_PASSES
+   void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, const reshade::api::descriptor_table_update& update)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      D3D12State::PushDescriptors(&cmd_list->get_private_data<CommandListData>()->d3d12_state, stages, layout, layout_param, update);
+   }
+
+   void OnPushConstants(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, uint32_t first, uint32_t count, const void* values)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      D3D12State::PushConstants(&cmd_list->get_private_data<CommandListData>()->d3d12_state, stages, layout, layout_param, first, count, values);
+   }
+#endif
+
+   void OnBindRenderTargetsAndDepthStencil(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::resource_view* rtvs, reshade::api::resource_view dsv)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      D3D12State::BindRenderTargets(&cmd_list_data.d3d12_state, cmd_list->get_device(), count, rtvs, dsv);
+      cmd_list_data.render_target_formats_dirty = true;
+   }
+
+#if DEVELOPMENT || ENABLE_D3D12_PASSES
+   void OnBindPipelineStates(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::dynamic_state* states, const uint32_t* values)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      D3D12State::BindPipelineStates(&cmd_list->get_private_data<CommandListData>()->d3d12_state, count, states, values);
+   }
+#endif
+
+#if ENABLE_D3D12_PASSES
+   // The game's own: a draw into a scaled clone scales them again ("viewports_scaled")
+   void OnBindViewports(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::viewport* viewports)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      D3D12State::BindViewports(&cmd_list_data.d3d12_state, first, count, viewports);
+      cmd_list_data.viewports_scaled = false;
+   }
+
+   void OnBindScissorRects(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::rect* rects)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      D3D12State::BindScissorRects(&cmd_list_data.d3d12_state, first, count, rects);
+      cmd_list_data.scissors_scaled = false;
+   }
+#endif
+
+#if DEVELOPMENT
+   void OnBindIndexBuffer(reshade::api::command_list* cmd_list, reshade::api::resource buffer, uint64_t offset, uint32_t index_size)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      cmd_list->get_private_data<CommandListData>()->d3d12_state.index_buffer = {.buffer = buffer.handle, .offset = offset, .stride = index_size};
+   }
+#endif
+
+#if DEVELOPMENT || ENABLE_DRAW_DISPATCH_DATA_CACHE
+   // Also tracked for games that re-issue draws (ENABLE_DRAW_DISPATCH_DATA_CACHE). The cost: once an add-on listens, ReShade resolves the GPU address of every view of every game "IASetVertexBuffers()" call,
+   // and drops the event (the tracker keeps the previous buffers) for a view it can't resolve
+   void OnBindVertexBuffers(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::resource* buffers, const uint64_t* offsets, const uint32_t* strides)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      D3D12State::BindVertexBuffers(&cmd_list->get_private_data<CommandListData>()->d3d12_state, first, count, buffers, offsets, strides);
+   }
+#endif
+
+   // Luma's passes and readbacks record draws, copies and barriers that a render pass cannot hold, so they refuse inside one (the game's command runs as it is). Only the native ones
+   // count: the hooks emulate the others with ordinary binds and clears (see "D3D12Clones::BeginRenderPassDetour()"). A bundle holds none of them either (nor render target, viewport or
+   // descriptor heap binds). Said once for each "kind" (a literal)
+   bool RefusedInRenderPass(const CommandListData& cmd_list_data, const char* kind)
+   {
+      if (!cmd_list_data.d3d12_state.in_render_pass && !cmd_list_data.is_bundle)
+      {
+         return false;
+      }
+      static std::shared_mutex mutex;
+      static std::unordered_set<std::string_view> logged_kinds;
+      if (const std::unique_lock lock(mutex); logged_kinds.emplace(kind).second)
+      {
+         const char* const reason = (cmd_list_data.is_bundle ? "Refused in a bundle: D3D12 bundles hold no copies, barriers, render target, viewport or descriptor heap binds" : "Refused inside a render pass that stays native (see the \"[Render passes]\" warning): between BeginRenderPass() and EndRenderPass() D3D12 holds no copies or barriers, and the render targets cannot change");
+         reshade::log::message(reshade::log::level::warning, std::format("[{}] {}", kind, reason).c_str());
+      }
+      return true;
+   }
+
+   // Re-issues the native command of a draw event, nothing for the ones that can't be re-issued. For the "original_draw_dispatch_func" of the callbacks and the readbacks.
+   void ReissueDrawOrDispatch(ID3D12GraphicsCommandList* native_list, const DrawDispatchData& draw_dispatch_data, D3D12DrawCommand command)
+   {
+      switch (command)
+      {
+      case D3D12DrawCommand::Draw:
+         native_list->DrawInstanced(draw_dispatch_data.vertex_count, draw_dispatch_data.instance_count, draw_dispatch_data.first_vertex, draw_dispatch_data.first_instance);
+         break;
+      case D3D12DrawCommand::DrawIndexed:
+         native_list->DrawIndexedInstanced(draw_dispatch_data.index_count, draw_dispatch_data.instance_count, draw_dispatch_data.first_index, draw_dispatch_data.vertex_offset, draw_dispatch_data.first_instance);
+         break;
+      case D3D12DrawCommand::Dispatch:
+         native_list->Dispatch(draw_dispatch_data.dispatch_count.x, draw_dispatch_data.dispatch_count.y, draw_dispatch_data.dispatch_count.z);
+         break;
+      case D3D12DrawCommand::Other:
+         break;
+      }
+   }
+
+#if DEVELOPMENT
+   // Command lists record their own capture entries, "OnExecuteCommandList()" joins them in submission order
+   // A bundle records its draws whether a capture runs or not: it is often recorded once and executed every frame, and its entries join the capture of the list that executes it
+   // ("OnExecuteSecondaryCommandList()"). They go with its next reset.
+   void TraceDrawOrDispatch(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data)
+   {
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      const auto lock_trace = LockTraceIfRunning();
+      if (!cmd_list_data.is_bundle && (!lock_trace || !Trace::running))
+         return;
+      const std::shared_lock lock_generic(s_mutex_generic);
+      const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
+      const std::lock_guard<std::recursive_mutex> lock_dumping(s_mutex_dumping);
+      D3D12Trace::AddTraceDrawCallData(&cmd_list_data.trace_draw_calls_data, cmd_list->get_device()->get_private_data<DeviceData>(), cmd_list, cmd_list_data.d3d12_state, shader_cache, draw_dispatch_data);
+   }
+
+   // Records a copy, resolve or clear on the command list's capture: "fill" sets the entry up ("D3D12Trace::FillCopy()" and "FillClear()") and
+   // only runs during a capture. Copies into buffers are dropped with "trace_ignore_buffer_writes": games upload thousands per frame, and an
+   // entry takes ~20 KB.
+   void TraceCopyOrClear(reshade::api::command_list* cmd_list, auto&& fill)
+   {
+      const auto lock_trace = LockTraceIfRunning();
+      if (!lock_trace || !Trace::running)
+         return;
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
+      TraceDrawCallData& entry = cmd_list_data.trace_draw_calls_data.emplace_back();
+      entry.command_list = cmd_list;
+      fill(&entry);
+      if (Trace::ignore_buffer_writes && entry.type == TraceDrawCallData::TraceDrawCallType::CopyResource && entry.rt_type_name[0] == "Buffer")
+      {
+         cmd_list_data.trace_draw_calls_data.pop_back();
+      }
+   }
+
+   // Finishes a readback at its target command: "reissue" re-issues the command on the native list, then the "plane" of one mip of the layers
+   // "view" covers is copied, where "draw_state" is the state the command left it in (a constant buffer's or an ExecuteIndirect()'s "buffer"
+   // range is copied before its draw instead, from "draw_state"). "is_color" is false for depth planes, which multisampled textures can't resolve. Returns true when it re-issued the command
+   // to copy its output after it, then the original call must be skipped.
+   bool RecordReadback(reshade::api::command_list* cmd_list, D3D12Readback::Copy copy, const D3D12State::ViewInfo& view, D3D12_RESOURCE_STATES draw_state, uint32_t plane, ID3D12Resource* buffer, bool is_color, auto&& reissue)
+   {
+      reshade::api::device* device = cmd_list->get_device();
+      D3D12Readback::State& readback = device->get_private_data<DeviceData>()->readback;
+      auto* native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+
+      // The subresources the view covers, one mip
+      std::vector<uint32_t> subresources;
+      ID3D12Resource* resource = reinterpret_cast<ID3D12Resource*>(view.resource);
+      if (copy.error.empty() && resource)
+      {
+         const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+         const bool is_3d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+         const uint32_t array_size = (is_3d ? 1 : desc.DepthOrArraySize);
+         copy.mip = view.first_level;
+         copy.first_layer = (is_3d ? 0 : view.first_layer);
+         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+         {
+            copy.error = "Buffer views aren't read back (like on D3D11), only textures";
+         }
+         else if (desc.SampleDesc.Count > 1 && !is_color)
+         {
+            copy.error = "Multisampled depth can't be resolved for readback";
+         }
+         else if (desc.SampleDesc.Count > 1 && (IsTypelessFormat(copy.data_format) || IsIntFormat(copy.data_format)))
+         {
+            copy.error = "Multisampled typeless and integer textures can't be resolved for readback";
+         }
+         else if (copy.first_layer >= array_size || copy.mip >= desc.MipLevels)
+         {
+            copy.error = "The view is out of its resource's range";
+         }
+         else
+         {
+            const uint32_t layers = (is_3d ? 1 : (std::min)(view.layer_count, array_size - copy.first_layer));
+            for (uint32_t layer = copy.first_layer; layer < copy.first_layer + layers; layer++)
+            {
+               subresources.push_back(copy.mip + layer * desc.MipLevels + plane * desc.MipLevels * array_size);
+            }
+         }
+      }
+
+      bool reissued = false;
+      const std::unique_lock lock(readback.mutex);
+      if (copy.error.empty() && copy.status == D3D12Readback::Copy::Status::Recorded)
+      {
+         auto* native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+         // Before the draw for constant buffers, it doesn't write them
+         const bool recorded = buffer ? D3D12Readback::RecordBufferCopy(&readback, native_device, native_list, buffer, copy.buffer_offset, copy.size, &copy, draw_state) : D3D12Readback::RecordTextureCopy(&readback, native_device, native_list, resource, draw_state, subresources, copy.data_format, &copy, reissue);
+         reissued = recorded && !buffer;
+         if (!recorded)
+         {
+            copy.error = "Failed to create the readback resources";
+         }
+      }
+      if (!copy.error.empty())
+      {
+         copy.status = D3D12Readback::Copy::Status::Failed;
+      }
+      else if (copy.status == D3D12Readback::Copy::Status::Recorded)
+      {
+         D3D12Readback::recorded_copies++;
+      }
+      D3D12Readback::Retire(&readback);
+      readback.copy = std::move(copy);
+      return reissued;
+   }
+
+   // The counterpart of "RecordReadback()" for the debug draw ("D3D12Readback::State::debug_target"): copies one mip of the layers "view" covers
+   // (the "plane" of a depth stencil view: 1 is the stencil one, "view_format" then is its R8_UINT) into the debug draw's texture, which the display composition draws at present.
+   // "error" is what the target draw's checks refused, if anything. A refusal is logged when it changes and shown by the overlay. Returns true when it re-issued the draw to copy its output after it.
+   bool RecordDebugDraw(reshade::api::command_list* cmd_list, std::string error, const D3D12State::ViewInfo& view, D3D12_RESOURCE_STATES draw_state, bool is_depth, uint32_t plane, DXGI_FORMAT view_format, auto&& reissue)
+   {
+      reshade::api::device* device = cmd_list->get_device();
+      DeviceData& device_data = *device->get_private_data<DeviceData>();
+      D3D12Readback::State& readback = device_data.readback;
+      auto* native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+      auto* resource = reinterpret_cast<ID3D12Resource*>(view.resource);
+      DXGI_FORMAT texture_format = view_format;
+      DXGI_FORMAT srv_format = view_format;
+      uint32_t layers = 1;
+      const D3D12_RESOURCE_DESC desc = (resource ? resource->GetDesc() : D3D12_RESOURCE_DESC{});
+      if (error.empty())
+      {
+         if (!resource)
+         {
+            error = "The view has no resource";
+         }
+         else if (native_list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
+         {
+            error = "The draw isn't on a direct command list: the display composition draws on the present queue";
+         }
+         else if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+         {
+            error = "Only 2D textures and their arrays are shown";
+         }
+         else if (desc.SampleDesc.Count > 1 && (is_depth || plane == 1))
+         {
+            error = "Multisampled depth and stencil can't be resolved";
+         }
+         else if (view.first_layer >= desc.DepthOrArraySize || view.first_level >= desc.MipLevels)
+         {
+            error = "The view is out of its resource's range";
+         }
+         else
+         {
+            layers = (std::min)(view.layer_count, uint32_t(desc.DepthOrArraySize) - view.first_layer);
+            if (is_depth)
+            {
+               const D3D12Readback::DepthSampleFormats formats = D3D12Readback::DepthSampleFormatsOf(desc.Format);
+               texture_format = formats.texture;
+               srv_format = formats.srv;
+            }
+            else if (view_format == DXGI_FORMAT_UNKNOWN)
+            {
+               texture_format = srv_format = desc.Format;
+            }
+            if (texture_format == DXGI_FORMAT_UNKNOWN || (!is_depth && IsTypelessFormat(texture_format)))
+            {
+               error = "The view has no typed format to show it in";
+            }
+            else if (desc.SampleDesc.Count > 1 && IsIntFormat(texture_format))
+            {
+               error = "Multisampled integer textures can't be resolved";
+            }
+         }
+      }
+
+      bool reissued = false;
+      const std::unique_lock lock(readback.mutex);
+      if (error.empty())
+      {
+         reissued = D3D12Readback::RecordDebugCopy(&readback, reinterpret_cast<ID3D12Device*>(device->get_native()), native_list, cmd_list, resource, draw_state, view.first_level, view.first_layer, layers, plane, texture_format, srv_format, reissue);
+         if (reissued)
+         {
+            debug_draw_copied_frame = uint32_t(cb_luma_global_settings.FrameIndex);
+            device_data.debug_draw_texture_format = srv_format;
+            device_data.debug_draw_texture_size = {uint32_t((std::max)(desc.Width >> view.first_level, 1ull)), (std::max)(desc.Height >> view.first_level, 1u), layers, 1};
+         }
+         else
+         {
+            error = "Failed to create the debug draw's texture";
+         }
+      }
+      if (!error.empty() && readback.debug_copy)
+      {
+         // What the target draw showed last isn't kept on screen. A list can still copy into its texture: it's retired, not dropped.
+         D3D12Readback::RetireInFlight(&readback, &*readback.debug_copy);
+         readback.debug_copy.reset();
+      }
+      if (error != readback.debug_error)
+      {
+         if (!error.empty())
+         {
+            reshade::log::message(reshade::log::level::warning, ("[Debug draw] " + error).c_str());
+         }
+         readback.debug_error = error;
+      }
+      return reissued;
+   }
+
+   // The dev MCP's readbacks ("includes/d3d12_readback.hpp"): copies the view a job asked for at its target draw, and the overlay's debug
+   // draw ("D3D12Readback::State::debug_target") the one it shows. Returns true when it
+   // re-issued the draw to copy its output after it, then the original call must be skipped. The game's draw callback can have replaced the draw
+   // (it is not re-issued, the copy follows what the game drew) or skipped it (the readback is refused).
+   bool ReadbackDrawOrDispatch(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data, D3D12DrawCommand command, DrawOrDispatchOverrideType override_type)
+   {
+      if (!D3D12Readback::armed)
+         return false;
+      reshade::api::device* device = cmd_list->get_device();
+      DeviceData& device_data = *device->get_private_data<DeviceData>();
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      D3D12Readback::State& readback = device_data.readback;
+      D3D12Readback::Target target;
+      bool is_debug_draw = false;
+      {
+         const std::unique_lock lock(readback.mutex);
+         // Whether this draw is the one "candidate" asks for: its pipeline, thread, outputs and arguments, then its place among the ones that match (negative: all of them)
+         const auto matches = [&](const std::optional<D3D12Readback::Target>& candidate, int32_t* instances)
+         {
+            if (!candidate || std::ranges::find(candidate->pipelines, cmd_list_data.d3d12_state.pipeline.handle) == candidate->pipelines.end() || (candidate->thread != std::thread::id() && candidate->thread != std::this_thread::get_id()))
+            {
+               return false;
+            }
+            // A capture's index target matches by signature, whatever thread the game records the pass on
+            if (candidate->signature)
+            {
+               const D3D12State::CommandListState& state = cmd_list_data.d3d12_state;
+               if (D3D12Trace::MakeDrawSignature(device_data, draw_dispatch_data, candidate->signature->compute, state.render_target_views.empty() ? 0 : state.render_target_views[0].resource, state.depth_stencil_view.resource) != *candidate->signature)
+               {
+                  return false;
+               }
+            }
+            return (*instances)++ == candidate->instance || candidate->instance < 0;
+         };
+         // The MCP's readback goes first: a draw it takes isn't copied for the debug draw this frame
+         if (matches(readback.target, &readback.instances))
+         {
+            target = std::move(*readback.target);
+            readback.target.reset();
+            D3D12Readback::UpdateArmed(readback);
+         }
+         else if (matches(readback.debug_target, &readback.debug_instances))
+         {
+            target = *readback.debug_target;
+            is_debug_draw = true;
+         }
+         else
+         {
+            return false;
+         }
+      }
+
+      // The bindings in the frame capture's order, so slots mean what "luma_trace_get" lists
+      std::vector<TraceDrawCallData> entries;
+      bool writes_render_target = false; // "target.slot", a render target the pipeline doesn't write can be in any state
+      {
+         const std::shared_lock lock_generic(s_mutex_generic);
+         {
+            const std::lock_guard<std::recursive_mutex> lock_dumping(s_mutex_dumping);
+            D3D12Trace::AddTraceDrawCallData(&entries, &device_data, cmd_list, cmd_list_data.d3d12_state, shader_cache, draw_dispatch_data);
+         }
+         const auto it = device_data.pipeline_cache_by_pipeline_handle.find(cmd_list_data.d3d12_state.pipeline.handle);
+         if (target.kind == D3D12Readback::Kind::RenderTarget && target.slot < TraceDrawCallData::rtvs_size && it != device_data.pipeline_cache_by_pipeline_handle.end() && it->second)
+         {
+            uint32_t format_count = 0;
+            const reshade::api::format* formats = nullptr;
+            uint8_t write_mask = 0xF; // The D3D12 default without a blend state
+            for (uint32_t i = 0; i < it->second->subobject_count; i++)
+            {
+               const reshade::api::pipeline_subobject& subobject = it->second->subobjects_cache[i];
+               if (subobject.type == reshade::api::pipeline_subobject_type::render_target_formats)
+               {
+                  format_count = subobject.count;
+                  formats = static_cast<const reshade::api::format*>(subobject.data);
+               }
+               else if (subobject.type == reshade::api::pipeline_subobject_type::blend_state && subobject.data)
+               {
+                  write_mask = static_cast<const reshade::api::blend_desc*>(subobject.data)->render_target_write_mask[target.slot];
+               }
+            }
+            writes_render_target = formats && target.slot < format_count && formats[target.slot] != reshade::api::format::unknown && write_mask != 0;
+         }
+      }
+      D3D12Trace::ResolveTableDescriptors(&entries, &device_data);
+      const TraceDrawCallData& entry = entries.back();
+
+      auto* native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+      D3D12Readback::Copy copy = {.cmd_list = cmd_list};
+      D3D12State::ViewInfo view; // Textures
+      D3D12_RESOURCE_STATES draw_state = D3D12_RESOURCE_STATE_COMMON;
+      uint32_t plane = 0;
+      ID3D12Resource* buffer = nullptr; // Constant buffers
+      using Kind = D3D12Readback::Kind;
+      if (native_list->GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE)
+      {
+         copy.error = "The draw is recorded in a bundle, which can't hold copies";
+      }
+      else if (RefusedInRenderPass(cmd_list_data, "Draw readback"))
+      {
+         copy.error = "The draw is inside a render pass, which can't hold copies";
+      }
+      else if (override_type == DrawOrDispatchOverrideType::Skip)
+      {
+         copy.error = "The game's draw callback skipped this draw";
+      }
+      else if (target.kind != Kind::ConstantBuffer && target.kind != Kind::IndirectArguments && command == D3D12DrawCommand::Other && override_type == DrawOrDispatchOverrideType::None)
+      {
+         copy.error = "Indirect and mesh draws can't be re-issued to copy their output";
+      }
+      else
+      {
+         switch (target.kind)
+         {
+         case Kind::RenderTarget:
+         {
+            if (target.slot >= TraceDrawCallData::rtvs_size || !entry.IsRTVValid(target.slot))
+            {
+               copy.error = std::format("The draw has no render target at slot {}", target.slot);
+            }
+            else if (!writes_render_target)
+            {
+               copy.error = std::format("The pipeline doesn't write render target {}, its state isn't known", target.slot);
+            }
+            else
+            {
+               view = entry.rt_view[target.slot];
+               draw_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+               copy.data_format = entry.rtv_format[target.slot];
+            }
+            break;
+         }
+         case Kind::UnorderedAccess:
+         {
+            if (target.slot >= entry.uav_count || entry.ua_view[target.slot].resource == 0)
+            {
+               copy.error = std::format("The draw has no unordered access view at slot {}", target.slot);
+            }
+            else
+            {
+               view = entry.ua_view[target.slot];
+               draw_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+               copy.data_format = entry.uav_format[target.slot];
+            }
+            break;
+         }
+         case Kind::Depth:
+         case Kind::Stencil:
+         {
+            // A writable depth stencil view is in DEPTH_READ when the pipeline doesn't write that plane. The view's D3D12_DSV_FLAG_READ_ONLY_* flags
+            // aren't tracked: a pipeline that writes a plane is taken to have it writable (in DEPTH_WRITE).
+            using DepthStateType = TraceDrawCallData::DepthStateType;
+            const bool is_stencil = target.kind == Kind::Stencil;
+            const DepthStateType plane_state = is_stencil ? entry.stencil_state : entry.depth_state;
+            if (!entry.IsDSVValid())
+            {
+               copy.error = "The draw has no depth stencil view";
+            }
+            else if (plane_state != DepthStateType::TestAndWrite && plane_state != DepthStateType::WriteOnly)
+            {
+               copy.error = std::format("The pipeline doesn't write {0}, so its state isn't known: read it at a draw that writes {0}", is_stencil ? "stencil" : "depth");
+            }
+            else
+            {
+               view = entry.ds_view;
+               draw_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+               plane = is_stencil ? 1 : 0;
+               // The planes copy as R32 (D24's top 8 bits zeroed) and R8, typed here for the readers
+               copy.data_format = D3D12Readback::PlaneFormat(entry.dsv_format, is_stencil);
+            }
+            break;
+         }
+         case Kind::ConstantBuffer:
+         {
+            if (target.cb_register)
+            {
+               const std::span<const TraceDrawCallData::ShaderRegister> registers(entry.cb_register, entry.cb_count);
+               const auto register_it = std::ranges::find_if(registers, [&](const TraceDrawCallData::ShaderRegister& shader_register)
+                  { return shader_register.index == *target.cb_register && shader_register.space == target.cb_space; });
+               if (register_it == registers.end())
+               {
+                  std::string available;
+                  for (const auto& [index, space] : registers)
+                  {
+                     std::format_to(std::back_inserter(available), "{}b{}", available.empty() ? "" : ", ", index);
+                     if (space != 0)
+                     {
+                        std::format_to(std::back_inserter(available), " space{}", space);
+                     }
+                  }
+                  copy.error = std::format("The draw has no constant buffer at register b{} space{}, it has: {}{}", *target.cb_register, target.cb_space, available.empty() ? "none" : available, entry.truncated ? " (more were cut: the trace entry is truncated)" : "");
+                  break;
+               }
+               target.slot = uint32_t(register_it - registers.begin());
+            }
+            if (target.slot >= entry.cb_count)
+            {
+               copy.error = std::format("The draw has no constant buffer at slot {}", target.slot);
+               break;
+            }
+            copy.register_index = entry.cb_register[target.slot].index;
+            copy.register_space = entry.cb_register[target.slot].space;
+            copy.resource = entry.cb_hash[target.slot];
+            if (!entry.cb_root_constants[target.slot].empty())
+            {
+               copy.root_constants = entry.cb_root_constants[target.slot];
+               copy.status = D3D12Readback::Copy::Status::Ready;
+               break;
+            }
+            buffer = reinterpret_cast<ID3D12Resource*>(entry.cb_resource[target.slot]);
+            D3D12_HEAP_PROPERTIES heap = {};
+            if (!buffer)
+            {
+               copy.error = "The constant buffer view is null";
+            }
+            else if (FAILED(buffer->GetHeapProperties(&heap, nullptr)) || heap.Type != D3D12_HEAP_TYPE_UPLOAD)
+            {
+               copy.error = "The constant buffer isn't in an UPLOAD heap, its state at the draw isn't known";
+               buffer = nullptr;
+            }
+            else
+            {
+               draw_state = D3D12_RESOURCE_STATE_COPY_SOURCE; // No barrier: GENERIC_READ includes it
+               const uint64_t buffer_size = buffer->GetDesc().Width;
+               copy.buffer_offset = (std::min)(uint64_t(entry.cb_first_constant[target.slot]) * 16, buffer_size);
+               // Root constant buffer views have no size: up to what a view can address
+               const uint64_t size = (entry.cb_num_constants[target.slot] != 0) ? uint64_t(entry.cb_num_constants[target.slot]) * 16 : uint64_t(D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT) * 16;
+               copy.size = (std::min)(size, buffer_size - copy.buffer_offset);
+            }
+            break;
+         }
+#if ENABLE_MINHOOK
+         case Kind::IndirectArguments:
+         {
+            // ExecuteIndirect() requires its arguments in INDIRECT_ARGUMENT (which GENERIC_READ of UPLOAD heaps includes), the copy happens before it.
+            // ponytail: the first 32 commands, and not the count buffer (the GPU may run fewer than "max_count")
+            const std::optional<D3D12CommandSignatures::Call>& call = D3D12CommandSignatures::current_call;
+            D3D12_HEAP_PROPERTIES heap = {};
+            if (!call || !call->signature || call->signature->stride == 0)
+            {
+               copy.error = "The draw isn't an ExecuteIndirect() of a command signature created after Luma's hook";
+            }
+            else if (!call->argument_buffer || FAILED(call->argument_buffer->GetHeapProperties(&heap, nullptr)) || (heap.Type != D3D12_HEAP_TYPE_UPLOAD && heap.Type != D3D12_HEAP_TYPE_DEFAULT))
+            {
+               copy.error = "The argument buffer isn't in an UPLOAD or DEFAULT heap (a reserved or custom heap buffer), its state isn't known";
+            }
+            else
+            {
+               buffer = call->argument_buffer;
+               // Best effort for DEFAULT heaps: a buffer that decayed to COMMON or sits in a combined read state isn't in INDIRECT_ARGUMENT alone
+               draw_state = (heap.Type == D3D12_HEAP_TYPE_UPLOAD ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+               const uint64_t buffer_size = buffer->GetDesc().Width;
+               copy.buffer_offset = (std::min)(call->argument_offset, buffer_size);
+               copy.indirect_stride = call->signature->stride;
+               copy.indirect_commands = uint32_t((std::min)({uint64_t(call->max_count), uint64_t(32), (buffer_size - copy.buffer_offset) / copy.indirect_stride}));
+               copy.indirect_arguments = call->signature->arguments;
+               copy.size = uint64_t(copy.indirect_commands) * copy.indirect_stride;
+               if (copy.size == 0)
+               {
+                  copy.error = "The ExecuteIndirect() runs no command";
+                  buffer = nullptr;
+               }
+            }
+            break;
+         }
+#else
+         case Kind::IndirectArguments:
+            copy.error = "ExecuteIndirect() arguments need Luma's MinHook hooks (ENABLE_MINHOOK)";
+            break;
+#endif
+         }
+      }
+
+      const auto reissue = [&]
+      {
+         // The game's callback already drew in place of a replaced draw
+         if (override_type == DrawOrDispatchOverrideType::None)
+         {
+            ReissueDrawOrDispatch(native_list, draw_dispatch_data, command);
+         }
+      };
+      if (is_debug_draw)
+      {
+         return RecordDebugDraw(cmd_list, copy.error, view, draw_state, target.kind == Kind::Depth, plane, copy.data_format, reissue);
+      }
+      return RecordReadback(cmd_list, std::move(copy), view, draw_state, plane, buffer, target.kind == Kind::RenderTarget, reissue);
+   }
+
+   // The counterpart of "ReadbackDrawOrDispatch()" for copies, resolves and clears: "write" says which command this is (a clear's "view" completes
+   // it with the resource, mip and first layer it cleared), "reissue" re-issues it on the native list. Copies what the command wrote, in the state
+   // it left it in. Returns true when it re-issued the command to copy its output after it, then the original call must be skipped.
+   bool ReadbackCopyOrClear(reshade::api::command_list* cmd_list, D3D12Readback::Write write, reshade::api::resource_view view, auto&& reissue)
+   {
+      if (!D3D12Readback::armed)
+         return false;
+      reshade::api::device* device = cmd_list->get_device();
+      D3D12Readback::State& readback = device->get_private_data<DeviceData>()->readback;
+      D3D12State::ViewInfo view_info;
+      if (view.handle != 0)
+      {
+         view_info = D3D12State::GetViewInfo(device, view);
+         write.resource = view_info.resource;
+         write.level = view_info.first_level;
+         write.layer = view_info.first_layer;
+      }
+      D3D12Readback::Target target;
+      {
+         const std::unique_lock lock(readback.mutex);
+         if (!readback.target || write.resource == 0 || readback.target->write != write || (readback.target->thread != std::thread::id() && readback.target->thread != std::this_thread::get_id()))
+            return false;
+         if (readback.instances++ != readback.target->instance)
+            return false;
+         target = std::move(*readback.target);
+         readback.target.reset();
+         D3D12Readback::UpdateArmed(readback);
+      }
+
+      using Kind = D3D12Readback::Kind;
+      using WriteKind = D3D12Readback::WriteKind;
+      auto* native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+      const D3D12_RESOURCE_DESC desc = reinterpret_cast<ID3D12Resource*>(write.resource)->GetDesc();
+      const uint32_t array_size = ((desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ? 1 : desc.DepthOrArraySize);
+      // Depth stencil resources have a depth plane, and a stencil one in the combined formats
+      const bool is_depth = (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0 || desc.Format == DXGI_FORMAT_D16_UNORM || desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT || desc.Format == DXGI_FORMAT_D32_FLOAT || desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || desc.Format == DXGI_FORMAT_R24G8_TYPELESS || desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS;
+      const uint32_t plane = (target.kind == Kind::Stencil ? 1 : 0);
+      const bool is_resolve = write.kind == WriteKind::Resolve;
+
+      D3D12State::ViewInfo written = view_info; // What the command wrote, as much as is copied
+      D3D12_RESOURCE_STATES draw_state = D3D12_RESOURCE_STATE_COPY_DEST;
+      DXGI_FORMAT view_format = target.format;
+      switch (write.kind)
+      {
+      case WriteKind::CopyResource:
+         written = {.resource = write.resource, .first_level = target.mip};
+         break;
+      case WriteKind::CopyRegion:
+      case WriteKind::Resolve:
+         // The subresource index is mip + layer * mips + plane * mips * layers
+         written = {.resource = write.resource, .first_level = write.subresource % desc.MipLevels, .first_layer = (write.subresource / desc.MipLevels) % array_size, .layer_count = 1};
+         draw_state = (is_resolve ? D3D12_RESOURCE_STATE_RESOLVE_DEST : D3D12_RESOURCE_STATE_COPY_DEST);
+         break;
+      case WriteKind::ClearRenderTarget:
+         draw_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+         view_format = DXGI_FORMAT(view_info.format);
+         break;
+      case WriteKind::ClearDepthStencil:
+         draw_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+         break;
+      }
+
+      D3D12Readback::Copy copy = {.cmd_list = cmd_list};
+      if (is_depth)
+      {
+         copy.data_format = D3D12Readback::PlaneFormat(desc.Format, plane == 1);
+      }
+      else
+      {
+         copy.data_format = ((view_format != DXGI_FORMAT_UNKNOWN && view_format != DXGI_FORMAT(-1)) ? view_format : desc.Format);
+      }
+      const uint32_t written_plane = write.subresource / (desc.MipLevels * array_size);
+      if (RefusedInRenderPass(*cmd_list->get_private_data<CommandListData>(), "Write readback"))
+      {
+         copy.error = "The command is inside a render pass, which can't hold copies";
+      }
+      else if (native_list->GetType() == D3D12_COMMAND_LIST_TYPE_COPY)
+      {
+         // The copy queue works on resources in the COMMON layout only, the debug layer rejects the barrier to COPY_SOURCE
+         copy.error = "The command is on a copy queue's command list, which can't move what it wrote to COPY_SOURCE for the readback copy";
+      }
+      else if (!is_depth && target.kind != Kind::RenderTarget)
+      {
+         copy.error = "The command wrote a color texture, which has no depth or stencil plane";
+      }
+      else if (plane == 1 && D3D12Readback::PlaneFormat(desc.Format, true) != DXGI_FORMAT_R8_UINT)
+      {
+         copy.error = "The command wrote a depth texture without a stencil plane";
+      }
+      else if ((write.kind == WriteKind::CopyRegion || is_resolve) && written_plane != plane)
+      {
+         copy.error = std::format("The command wrote the {0} plane, not the {1} one: pass view {0}", (written_plane == 0 ? "depth" : "stencil"), (plane == 0 ? "depth" : "stencil"));
+      }
+      else if (is_resolve && desc.SampleDesc.Count > 1)
+      {
+         // Only a DECOMPRESS "ResolveSubresourceRegion()" writes a multisampled resource, and ReShade drops the mode
+         copy.error = "The resolve wrote a multisampled resource (a DECOMPRESS), which can't be re-issued: ReShade drops the resolve mode";
+      }
+      else if (is_resolve && (write.source == write.resource || is_depth || write.resolve_format == DXGI_FORMAT_UNKNOWN || IsTypelessFormat(write.resolve_format) || IsIntFormat(write.resolve_format) || write.resolve_format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE || write.resolve_format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE))
+      {
+         // Resolves are re-issued in the game's mode ("D3D12Clones::current_resolve_mode", see "OnResolveTextureRegion()"); depth, integer and
+         // sampler feedback formats stay refused (their modes aren't validated here).
+         copy.error = "Only resolves of color float, unorm and snorm formats are re-issued, not depth, integer, typeless or sampler feedback ones, nor a resource resolved into itself";
+      }
+      else if (desc.SampleDesc.Count > 1 && !is_depth && native_list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
+      {
+         copy.error = "Multisampled textures are resolved for readback, which only graphics command lists can do";
+      }
+      return RecordReadback(cmd_list, std::move(copy), written, draw_state, plane, nullptr, !is_depth, [&]
+         { reissue(native_list); });
+   }
+#endif // DEVELOPMENT
+
+   // The render pass entries of the capture hold the targets it binds (see "D3D12Trace::FillBoundTargets()"), the draws inside it have the same ones
+   bool OnBeginRenderPass(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::render_pass_render_target_desc* rts, const reshade::api::render_pass_depth_stencil_desc* ds, reshade::api::render_pass_flags flags)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      D3D12State::BeginRenderPass(&cmd_list_data.d3d12_state, cmd_list->get_device(), count, rts, ds);
+      cmd_list_data.render_target_formats_dirty = true;
+#if DEVELOPMENT
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         {
+            entry->type = TraceDrawCallData::TraceDrawCallType::BeginRenderPass;
+            D3D12Trace::FillBoundTargets(cmd_list->get_device(), cmd_list->get_device()->get_private_data<DeviceData>(), entry, cmd_list_data.d3d12_state); });
+#endif
+      return false;
+   }
+
+   bool OnEndRenderPass(reshade::api::command_list* cmd_list)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      cmd_list->get_private_data<CommandListData>()->d3d12_state.in_render_pass = false;
+#if DEVELOPMENT
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { entry->type = TraceDrawCallData::TraceDrawCallType::EndRenderPass; });
+#endif
+      return false;
+   }
+
+   // A Luma pass of the pass layer (see "D3D12Trace::FillLumaPass()") as a Custom entry of the capture, appended to the entries of "cmd_list_data" (the game's command list it was recorded
+   // on, so the capture joins it in submission order after the command that triggered it), or to the device's capture without one (a pass of Luma's own list, at present). Does nothing
+   // without a trace
+   void TraceLumaPass(CommandListData* cmd_list_data, DeviceData& device_data, const char* name, std::span<const D3D12State::ViewInfo> inputs, std::initializer_list<D3D12State::ViewInfo> outputs, bool compute = false, bool predicted = false)
+   {
+#if DEVELOPMENT
+      const auto lock_trace = LockTraceIfRunning();
+      if (!lock_trace || !Trace::running || (!cmd_list_data && &device_data != trace_device_data))
+         return;
+      CommandListData& trace_cmd_list_data = (cmd_list_data ? *cmd_list_data : device_data.trace_command_list_data);
+      const std::unique_lock lock_trace_2(trace_cmd_list_data.mutex_trace);
+      TraceDrawCallData& entry = trace_cmd_list_data.trace_draw_calls_data.emplace_back();
+      entry.command_list = trace_cmd_list_data.cmd_list;
+      D3D12Trace::FillLumaPass(device_data.reshade_device, &entry, name, inputs, outputs, compute);
+      entry.predicted = predicted;
+#endif
+   }
+
+   // A braced list of inputs (the overload resolution prefers an initializer_list to a span)
+   void TraceLumaPass(CommandListData* cmd_list_data, DeviceData& device_data, const char* name, std::initializer_list<D3D12State::ViewInfo> inputs, std::initializer_list<D3D12State::ViewInfo> outputs, bool compute = false, bool predicted = false)
+   {
+      TraceLumaPass(cmd_list_data, device_data, name, std::span<const D3D12State::ViewInfo>(inputs.begin(), inputs.size()), outputs, compute, predicted);
+   }
+
+   // The counterpart of the D3D11 function further down. The Luma cbuffers are root CBVs that Luma's hook added to the game's root signatures (see "includes/d3d12_root_signatures.h"),
+   // set here at the root parameters of the pipeline the command list bound with a replacement. Their memory comes from the upload ring (see "includes/d3d12_upload_ring.h"): one copy of the
+   // settings per change, for all the command lists, and the data per command list. There is no UI data cbuffer on D3D12, nor "is_primary", deferred contexts or "do_safety_checks".
+   void SetLumaConstantBuffers(NativeCommandList* native_command_list, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, LumaConstantBufferType type, uint32_t custom_data_1 = 0, uint32_t custom_data_2 = 0, float custom_data_3 = 0.f, float custom_data_4 = 0.f, bool do_safety_checks = true)
+   {
+      if (type == LumaConstantBufferType::LumaUIData)
+      {
+         ASSERT_ONCE_MSG(false, "Luma UI Data is not implemented (yet?)");
+         return;
+      }
+      const bool is_settings = (type == LumaConstantBufferType::LumaSettings);
+      const int32_t root_parameter = (is_settings ? cmd_list_data.luma_settings_param : cmd_list_data.luma_data_param);
+      if (root_parameter < 0)
+      {
+         static std::atomic_flag logged_no_root_parameter;
+         if (!logged_no_root_parameter.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[Luma cbuffers] The bound pipeline's root signature has no Luma constant buffers (or the pipeline isn't replaced), so they weren't set");
+         }
+         return;
+      }
+
+      D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+      if (is_settings)
+      {
+         address = device_data.settings_address.load(std::memory_order_acquire);
+         // A plain load first: the exchange's locked write on every draw would bounce the flag's cache line between the recording threads
+         if ((device_data.cb_luma_global_settings_dirty.load(std::memory_order_relaxed) && device_data.cb_luma_global_settings_dirty.exchange(false)) || address == 0)
+         {
+            // ponytail: a thread recording while another one uploads reads the previous copy for that draw, the new one is published once it's written
+            const std::unique_lock lock_settings(device_data.settings_mutex);
+            const D3D12UploadRing::Allocation upload = D3D12UploadRing::Allocate(device_data.upload_ring.get(), &device_data.settings_pages, sizeof(cb_luma_global_settings), device_data.present_count);
+            if (upload.cpu)
+            {
+               {
+                  const std::shared_lock lock_reshade(s_mutex_reshade);
+                  std::memcpy(upload.cpu, &cb_luma_global_settings, sizeof(cb_luma_global_settings));
+               }
+               address = upload.gpu;
+               device_data.settings_address.store(address, std::memory_order_release);
+            }
+         }
+      }
+      else
+      {
+         CB::LumaInstanceDataPadded cb_luma_instance_data = {};
+         cb_luma_instance_data.CustomData1 = custom_data_1;
+         cb_luma_instance_data.CustomData2 = custom_data_2;
+         cb_luma_instance_data.CustomData3 = custom_data_3;
+         cb_luma_instance_data.CustomData4 = custom_data_4;
+         cb_luma_instance_data.RenderResolutionScale.x = device_data.render_resolution.x / device_data.output_resolution.x;
+         cb_luma_instance_data.RenderResolutionScale.y = device_data.render_resolution.y / device_data.output_resolution.y;
+         cb_luma_instance_data.PreviousRenderResolutionScale.x = device_data.previous_render_resolution.x / device_data.output_resolution.x;
+         cb_luma_instance_data.PreviousRenderResolutionScale.y = device_data.previous_render_resolution.y / device_data.output_resolution.y;
+         // "RenderScaleActive" stays 0: D3D12 doesn't set a render scale yet (the scale chain test of the D3D11 path needs resource upgrades it doesn't have)
+
+         game->UpdateLumaInstanceDataCB(cb_luma_instance_data, cmd_list_data, device_data);
+
+         address = cmd_list_data.luma_data_address;
+         if (address == 0 || cmd_list_data.force_cb_luma_instance_data_dirty || std::memcmp(&cmd_list_data.cb_luma_instance_data, &cb_luma_instance_data, sizeof(cb_luma_instance_data)) != 0)
+         {
+            const D3D12UploadRing::Allocation upload = D3D12UploadRing::Allocate(cmd_list_data.upload_ring.get(), &cmd_list_data.upload_pages, sizeof(cb_luma_instance_data), device_data.present_count);
+            address = upload.gpu;
+            if (upload.cpu)
+            {
+               std::memcpy(upload.cpu, &cb_luma_instance_data, sizeof(cb_luma_instance_data));
+               cmd_list_data.cb_luma_instance_data = cb_luma_instance_data;
+               cmd_list_data.luma_data_address = address;
+               cmd_list_data.force_cb_luma_instance_data_dirty = false;
+            }
+         }
+      }
+
+      if (address == 0)
+      {
+         static std::atomic_flag logged_no_memory;
+         if (!logged_no_memory.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[Luma cbuffers] The upload ring couldn't grow, so a Luma constant buffer wasn't set");
+         }
+         return;
+      }
+      if ((stages & reshade::api::shader_stage::compute) != 0)
+      {
+         native_command_list->SetComputeRootConstantBufferView(root_parameter, address);
+      }
+      else
+      {
+         native_command_list->SetGraphicsRootConstantBufferView(root_parameter, address);
+      }
+   }
+
+   // D3D12 checks the render target formats a pipeline declares against the render targets bound when it draws, which the upgrades change (see "FindOrCreateD3D12PipelineVariant()").
+   // Sets the pipeline of the bound one that declares the formats of the render targets: a variant, or the pipeline Luma bound once the targets are the ones it declares (the swap goes both ways).
+   // Only the formats an upgrade outputs are followed, the mismatches the game makes into other formats are its own. Native "SetPipelineState()": it keeps the root signature and its arguments,
+   // ReShade's "bind_pipeline()" can replay the topology and blend factor (see "OnBindPipeline()"), and the game's command list would fire the events.
+   void UpdateD3D12PipelineVariant(reshade::api::command_list* cmd_list, CommandListData& cmd_list_data)
+   {
+      const CachedPipeline& cached_pipeline = *cmd_list_data.bound_cached_pipeline;
+      const std::vector<D3D12State::ViewInfo>& views = cmd_list_data.d3d12_state.render_target_views;
+      std::array<DXGI_FORMAT, 8> formats = cached_pipeline.render_target_formats;
+      bool any_replaced = false;
+      for (uint32_t i = 0; i < (std::min)(cached_pipeline.render_target_count, uint32_t(views.size())); ++i)
+      {
+         const DXGI_FORMAT bound_format = DXGI_FORMAT(views[i].format);
+         const bool is_upgrade_format = (bound_format == DXGI_FORMAT_R16G16B16A16_FLOAT || (bound_format == DXGI_FORMAT_R10G10B10A2_UNORM && swapchain_upgrade_type == SwapchainUpgradeType::HDR10));
+         if (formats[i] != DXGI_FORMAT_UNKNOWN && views[i].resource != 0 && bound_format != formats[i] && is_upgrade_format)
+         {
+            formats[i] = bound_format;
+            any_replaced = true;
+         }
+      }
+      const uint64_t pipeline = (any_replaced ? FindOrCreateD3D12PipelineVariant(cached_pipeline, cmd_list_data.bound_base_pipeline, formats) : cmd_list_data.bound_base_pipeline);
+      if (pipeline != cmd_list_data.bound_current_pipeline)
+      {
+         reinterpret_cast<NativeCommandList*>(cmd_list->get_native())->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(pipeline));
+         cmd_list_data.bound_current_pipeline = pipeline;
+      }
+   }
+
+   // The D3D11 draw callback contract on D3D12 ("Game::OnDrawOrDispatch()", "draw_callbacks_by_shader_hashes" and "dispatch_callbacks_by_shader_hashes"), for the draws, dispatches
+   // and "ExecuteIndirect()" calls the game records, on the threads recording them. Returns true to skip the native call: the game's callback replaced or skipped it, or a readback re-issued it.
+   bool OnDrawOrDispatchD3D12(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data, D3D12DrawCommand command)
+   {
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+#if ENABLE_DRAW_DISPATCH_DATA_CACHE || DEVELOPMENT
+      last_draw_dispatch_data = draw_dispatch_data;
+#endif
+      // A command list has one pipeline, so the bound one also tells "ExecuteIndirect()" draws and dispatches apart ("DispatchMesh()" runs a graphics pipeline)
+      const bool is_dispatch = command == D3D12DrawCommand::Dispatch || (command == D3D12DrawCommand::Other && cmd_list_data.pipeline_state_original_compute_shader.handle != 0);
+      const auto& original_shader_hashes = (is_dispatch ? cmd_list_data.pipeline_state_original_compute_shader_hashes : cmd_list_data.pipeline_state_original_graphics_shader_hashes);
+      const bool is_custom_pass = (is_dispatch ? cmd_list_data.pipeline_state_has_custom_compute_shader : cmd_list_data.pipeline_state_has_custom_graphics_shader);
+
+#if DX12 && ENABLE_MINHOOK
+      // A listed writer shader draws into the texture of an inactive clone: it is promoted at the next present (see "includes/d3d12_clones.h"), this frame stays as the game made it
+      if (const AutoTextureFormatUpgradeShaderHash* const writer = cmd_list_data.auto_graphics_texture_format_upgrades; writer && !is_dispatch)
+      {
+         const std::vector<D3D12State::ViewInfo>& render_target_views = cmd_list_data.d3d12_state.render_target_views;
+         for (const uint8_t slot : writer->rtv_slots)
+         {
+            if (slot < render_target_views.size() && render_target_views[slot].resource != 0)
+            {
+               D3D12Clones::RequestPromotion(reinterpret_cast<ID3D12Resource*>(render_target_views[slot].resource));
+            }
+         }
+      }
+#endif
+#if ENABLE_D3D12_PASSES && ENABLE_MINHOOK
+      // A draw into a clone of another size (custom dimensions: the bound views name the clone; the depth's counts for a draw without render targets) covers it all, like the D3D11 scaled
+      // mirrors: the game's viewports and scissors (the tracked ones) are set scaled by the clone's size over the original's, once until the game or a Luma pass binds them again
+      // ponytail: no dispatch sizes (neither does D3D11) and no clear rects; a depth copy between a scaled and an unscaled texture is skipped ("SkipUpgradedFormatCopy()")
+      if (!is_dispatch && D3D12Clones::registry.scaled_count.load(std::memory_order_relaxed) != 0 && (!cmd_list_data.viewports_scaled || !cmd_list_data.scissors_scaled))
+      {
+         const D3D12State::CommandListState& state = cmd_list_data.d3d12_state;
+         std::optional<std::pair<float, float>> scale;
+         bool any_render_target = false;
+         for (const D3D12State::ViewInfo& view : state.render_target_views)
+         {
+            any_render_target |= (view.resource != 0);
+            scale = (view.resource != 0 ? D3D12Clones::FindScale(reinterpret_cast<ID3D12Resource*>(view.resource)) : std::nullopt);
+            if (scale)
+            {
+               break;
+            }
+         }
+         if (!any_render_target && state.depth_stencil_view.resource != 0)
+         {
+            scale = D3D12Clones::FindScale(reinterpret_cast<ID3D12Resource*>(state.depth_stencil_view.resource));
+         }
+         if (scale)
+         {
+            const auto [scale_x, scale_y] = *scale;
+            auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+            if (!cmd_list_data.viewports_scaled && !state.viewports.empty())
+            {
+               // Scaled edges, rounded to whole pixels, and the sizes made again from them: adjacent viewports stay tiled
+               D3D12_VIEWPORT viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+               const UINT viewport_count = UINT((std::min)(state.viewports.size(), std::size(viewports)));
+               for (UINT i = 0; i < viewport_count; i++)
+               {
+                  const reshade::api::viewport& viewport = state.viewports[i];
+                  const float left = std::round(viewport.x * scale_x);
+                  const float top = std::round(viewport.y * scale_y);
+                  viewports[i] = {.TopLeftX = left, .TopLeftY = top, .Width = std::round((viewport.x + viewport.width) * scale_x) - left, .Height = std::round((viewport.y + viewport.height) * scale_y) - top, .MinDepth = viewport.min_depth, .MaxDepth = viewport.max_depth};
+               }
+               native_list->RSSetViewports(viewport_count, viewports);
+            }
+            if (!cmd_list_data.scissors_scaled && !state.scissor_rects.empty())
+            {
+               D3D12_RECT scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+               const UINT scissor_count = UINT((std::min)(state.scissor_rects.size(), std::size(scissors)));
+               for (UINT i = 0; i < scissor_count; i++)
+               {
+                  const reshade::api::rect& rect = state.scissor_rects[i];
+                  scissors[i] = {.left = std::lround(rect.left * scale_x), .top = std::lround(rect.top * scale_y), .right = std::lround(rect.right * scale_x), .bottom = std::lround(rect.bottom * scale_y)};
+               }
+               native_list->RSSetScissorRects(scissor_count, scissors);
+            }
+            cmd_list_data.viewports_scaled = true;
+            cmd_list_data.scissors_scaled = true;
+         }
+      }
+#endif
+
+      // The pipeline for the formats of the render targets comes first, so a re-issue of the draw (or a readback of it) uses it too. A bundle inherits its render targets from the command list that executes
+      // it: it keeps the pipeline it bound
+      if (!is_dispatch && cmd_list_data.render_target_formats_dirty && ((swapchain_format_upgrade_type > TextureFormatUpgradesType::None && swapchain_upgrade_type > SwapchainUpgradeType::None) || texture_format_upgrades_type > TextureFormatUpgradesType::None))
+      {
+         cmd_list_data.render_target_formats_dirty = false;
+         if (cmd_list_data.is_bundle)
+         {
+            static std::atomic_flag logged_bundle;
+            if (!logged_bundle.test_and_set())
+            {
+               reshade::log::message(reshade::log::level::warning, "[PSO variants] A bundle draws: it inherits the render targets of the command list that executes it, so it keeps the game's pipelines, which D3D12 rejects if they draw into an upgraded target");
+            }
+         }
+         else if (cmd_list_data.bound_cached_pipeline)
+         {
+            UpdateD3D12PipelineVariant(cmd_list, cmd_list_data);
+         }
+      }
+
+      // The replaced shader's root CBVs come before anything else records: a game callback can re-issue the draw itself ("original_draw_dispatch_func"), which must never run a replaced
+      // shader with unset root CBVs. They aren't reported with "updated_cbuffers", as games test "is_custom_pass && !updated_cbuffers" to set their own (which then replace these)
+      if (is_custom_pass && cmd_list_data.luma_settings_param >= 0)
+      {
+         DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+         auto* native_list = reinterpret_cast<NativeCommandList*>(cmd_list->get_native());
+         const reshade::api::shader_stage stages = (is_dispatch ? reshade::api::shader_stage::compute : (reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel));
+         SetLumaConstantBuffers(native_list, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
+         if (cmd_list_data.luma_data_param >= 0)
+         {
+            SetLumaConstantBuffers(native_list, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData);
+         }
+      }
+
+#if DEVELOPMENT
+      TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
+#endif
+
+      DrawOrDispatchOverrideType override_type = DrawOrDispatchOverrideType::None;
+      if (!is_dispatch && hide_ui && cmd_list_data.is_known_ui_shader_bound)
+      {
+         override_type = DrawOrDispatchOverrideType::Skip; // As on D3D11, before the game's callbacks
+      }
+      else if (!original_shader_hashes.Empty()) // Like on D3D11, nothing is called for the pipelines we don't track
+      {
+         reshade::api::device* device = cmd_list->get_device();
+         auto* native_device = reinterpret_cast<NativeDevice*>(device->get_native());
+         auto* native_list = reinterpret_cast<NativeCommandList*>(cmd_list->get_native());
+         DeviceData& device_data = *device->get_private_data<DeviceData>();
+
+         reshade::api::shader_stage stages = reshade::api::shader_stage(0); // None
+         if (is_dispatch)
+         {
+            stages = reshade::api::shader_stage::compute;
+         }
+         else
+         {
+            if (original_shader_hashes.HasAny(reshade::api::shader_stage::vertex))
+            {
+               stages = reshade::api::shader_stage::vertex;
+            }
+            if (original_shader_hashes.HasAny(reshade::api::shader_stage::pixel))
+            {
+               stages |= reshade::api::shader_stage::pixel;
+            }
+         }
+
+         std::function<void()>* original_draw_dispatch_func = nullptr;
+#if DEVELOPMENT || ENABLE_POST_DRAW_DISPATCH_CALLBACK
+         std::function<void()> reissue_function;
+         if (command != D3D12DrawCommand::Other) // Indirect and mesh draws can't be re-issued
+         {
+            reissue_function = [&]
+            { ReissueDrawOrDispatch(native_list, draw_dispatch_data, command); };
+            original_draw_dispatch_func = &reissue_function;
+         }
+#endif
+
+         bool updated_cbuffers = false;
+         // Use the specific callback if there's one, and fall back on the generic one otherwise
+         if (const DrawOrDispatchCallback draw_or_dispatch_callback = (is_dispatch ? cmd_list_data.dispatch_callback : cmd_list_data.draw_callback))
+         {
+            override_type = draw_or_dispatch_callback(native_device, native_list, cmd_list_data, device_data, stages, original_shader_hashes, is_custom_pass, updated_cbuffers, original_draw_dispatch_func);
+         }
+         else
+         {
+            override_type = game->OnDrawOrDispatch(native_device, native_list, cmd_list_data, device_data, stages, original_shader_hashes, is_custom_pass, updated_cbuffers, original_draw_dispatch_func);
+         }
+      }
+
+#if DEVELOPMENT
+      // The readback also runs for the draws the game replaced or skipped
+      return ReadbackDrawOrDispatch(cmd_list, draw_dispatch_data, command, override_type) || override_type != DrawOrDispatchOverrideType::None;
+#else
+      return override_type != DrawOrDispatchOverrideType::None;
+#endif
+   }
+
+   bool OnDraw(reshade::api::command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      return OnDrawOrDispatchD3D12(cmd_list, {.vertex_count = vertex_count, .instance_count = instance_count, .first_vertex = first_vertex, .first_instance = first_instance}, D3D12DrawCommand::Draw);
+   }
+
+   bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      return OnDrawOrDispatchD3D12(cmd_list, {.instance_count = instance_count, .first_instance = first_instance, .index_count = index_count, .first_index = first_index, .vertex_offset = vertex_offset, .indexed = true}, D3D12DrawCommand::DrawIndexed);
+   }
+
+   bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      return OnDrawOrDispatchD3D12(cmd_list, {.dispatch_count = uint3{group_count_x, group_count_y, group_count_z}}, D3D12DrawCommand::Dispatch);
+   }
+
+   bool OnDispatchMesh(reshade::api::command_list* cmd_list, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      return OnDrawOrDispatchD3D12(cmd_list, {.dispatch_count = uint3{group_count_x, group_count_y, group_count_z}}, D3D12DrawCommand::Other);
+   }
+
+   // "ExecuteIndirect()" comes as "indirect_command::unknown", the bound pipeline tells draws and dispatches apart. Its command signature
+   // can also set root constants and root views per command (and resets them after), ReShade doesn't pass it: these entries show
+   // the command list's bindings.
+   bool OnDrawOrDispatchIndirect(reshade::api::command_list* cmd_list, reshade::api::indirect_command type, reshade::api::resource buffer, uint64_t offset, uint32_t draw_count, uint32_t stride)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      return OnDrawOrDispatchD3D12(cmd_list, {.indexed = type == reshade::api::indirect_command::draw_indexed, .indirect = true}, D3D12DrawCommand::Other);
+   }
+
+#if DEVELOPMENT
+   // The clear values go in the entry's blend factor like on D3D11 (depth and stencil in the first two)
+   bool OnClearDepthStencilView(reshade::api::command_list* cmd_list, reshade::api::resource_view dsv, const float* depth, const uint8_t* stencil, uint32_t rect_count, const reshade::api::rect* rects)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         {
+            D3D12Trace::FillClear(cmd_list->get_device(), entry, dsv, TraceDrawCallData::ClearKind::DepthStencil);
+            entry->blend_factor[0] = (depth ? *depth : 0.f);
+            entry->blend_factor[1] = (stencil ? float(*stencil) : 0.f);
+            if (depth)
+            {
+               entry->depth_state = TraceDrawCallData::DepthStateType::WriteOnly;
+            }
+            if (stencil)
+            {
+               entry->stencil_state = TraceDrawCallData::DepthStateType::WriteOnly;
+            } });
+      return ReadbackCopyOrClear(cmd_list, {.kind = D3D12Readback::WriteKind::ClearDepthStencil, .planes = uint8_t((depth ? 1 : 0) | (stencil ? 2 : 0))}, dsv, [&](ID3D12GraphicsCommandList* native_list)
+         { native_list->ClearDepthStencilView({.ptr = SIZE_T(dsv.handle)}, D3D12_CLEAR_FLAGS((depth ? D3D12_CLEAR_FLAG_DEPTH : 0) | (stencil ? D3D12_CLEAR_FLAG_STENCIL : 0)), (depth ? *depth : 0.f), (stencil ? *stencil : uint8_t(0)), rect_count, reinterpret_cast<const D3D12_RECT*>(rects)); });
+   }
+
+   bool OnClearRenderTargetView(reshade::api::command_list* cmd_list, reshade::api::resource_view rtv, const float color[4], uint32_t rect_count, const reshade::api::rect* rects)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         {
+            D3D12Trace::FillClear(cmd_list->get_device(), entry, rtv, TraceDrawCallData::ClearKind::RenderTarget);
+            std::copy_n(color, 4, entry->blend_factor); });
+      return ReadbackCopyOrClear(cmd_list, {.kind = D3D12Readback::WriteKind::ClearRenderTarget}, rtv, [&](ID3D12GraphicsCommandList* native_list)
+         { native_list->ClearRenderTargetView({.ptr = SIZE_T(rtv.handle)}, color, rect_count, reinterpret_cast<const D3D12_RECT*>(rects)); });
+   }
+
+   bool OnClearUnorderedAccessViewUInt(reshade::api::command_list* cmd_list, reshade::api::resource_view uav, const uint32_t values[4], uint32_t rect_count, const reshade::api::rect* rects)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         {
+            D3D12Trace::FillClear(cmd_list->get_device(), entry, uav, TraceDrawCallData::ClearKind::UnorderedAccess);
+            std::transform(values, values + 4, entry->blend_factor, [](uint32_t value)
+               { return float(value); }); });
+      return false;
+   }
+
+   bool OnClearUnorderedAccessViewFloat(reshade::api::command_list* cmd_list, reshade::api::resource_view uav, const float values[4], uint32_t rect_count, const reshade::api::rect* rects)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         {
+            D3D12Trace::FillClear(cmd_list->get_device(), entry, uav, TraceDrawCallData::ClearKind::UnorderedAccess);
+            std::copy_n(values, 4, entry->blend_factor); });
+      return false;
+   }
+
+#endif // DEVELOPMENT
+
+   // The upload ring needs the executions on all builds: the pages of a command list are free once the queues that ran it passed their fences. Development builds also start
+   // the readback copies the list recorded and join its frame capture into the device's
+   void OnExecuteCommandList(reshade::api::command_queue* queue, reshade::api::command_list* cmd_list)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      CommandListData* cmd_list_data = cmd_list->get_private_data<CommandListData>(); // Null for ReShade's own immediate command list
+      if (cmd_list_data && !cmd_list_data->upload_pages.used.empty())
+      {
+         D3D12UploadRing::OnExecute(&cmd_list_data->upload_pages, reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()), cmd_list->get_device()->get_private_data<DeviceData>()->present_count);
+      }
+#if DEVELOPMENT
+      if (D3D12Readback::recorded_copies != 0)
+      {
+         D3D12Readback::OnExecute(&cmd_list->get_device()->get_private_data<DeviceData>()->readback, cmd_list, queue);
+      }
+      const auto lock_trace = LockTraceIfRunning();
+      if (!cmd_list_data || !lock_trace || !Trace::running)
+         return;
+      DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+      if (&device_data != trace_device_data) // Another device's: the list's entries go with its next reset
+         return;
+      CommandListData& trace_cmd_list_data = device_data.trace_command_list_data;
+      const std::unique_lock lock_trace_2(trace_cmd_list_data.mutex_trace);
+      const std::unique_lock lock_trace_3(cmd_list_data->mutex_trace);
+      // ponytail: moved, so a list executed again without a reset is only captured once
+      auto& entries = cmd_list_data->trace_draw_calls_data;
+      D3D12Trace::ResolveTableDescriptors(&entries, &device_data);
+      trace_cmd_list_data.trace_draw_calls_data.insert(trace_cmd_list_data.trace_draw_calls_data.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
+      entries.clear();
+#endif // DEVELOPMENT
+   }
+#endif // DX12
+
+#if DX11 // D3D12 has its own "OnBindPipeline()" and "SetLumaConstantBuffers()" above
    void OnBindPipeline(
       reshade::api::command_list* cmd_list,
       reshade::api::pipeline_stage stages,
@@ -4275,30 +7059,13 @@ namespace
 
       const Shader::CachedPipeline* cached_pipeline = nullptr;
       uint64_t cached_pipeline_shader_hash = SHADER_HASH_NONE;
+      // Read before the lookup: a destruction in between makes the stored generation stale, never a stale pipeline current
+      const uint32_t lookup_generation = pipeline_cache_generation;
 
       if (pipeline.handle != 0)
       {
-         const DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
-         const std::shared_lock lock(s_mutex_generic);
-         auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle);
-         if (pipeline_pair != device_data.pipeline_cache_by_pipeline_handle.end())
-         {
-            ASSERT_ONCE(pipeline_pair->second != nullptr); // Shouldn't usually happen but if it did, it's supported anyway and innocuous
-            cached_pipeline = pipeline_pair->second; // This is guaranteed to not be destroyed while it's bound
-         }
-         else
-         {
-#if ENABLE_GAME_PIPELINE_STATE_READBACK // Allow either game engines or other mods between the game and ReShade to read back states we had changed
-            // "Deus Ex: Human Revolution" with the golden filter restoration mod sets back customized shaders to the pipeline,
-            // as it also read back the state of DX etc, so make sure to search it from the cloned shaders list too!
-            auto pipeline_pair_2 = device_data.pipeline_cache_by_pipeline_clone_handle.find(pipeline.handle);
-            if (pipeline_pair_2 != device_data.pipeline_cache_by_pipeline_clone_handle.end())
-            {
-               cached_pipeline = pipeline_pair_2->second;
-            }
-#endif
-            ASSERT_ONCE(cached_pipeline != nullptr); // Why can't we find the shader?
-         }
+         cached_pipeline = FindCachedPipelineToBind(cmd_list, pipeline.handle);
+         ASSERT_ONCE(cached_pipeline != nullptr); // Why can't we find the shader?
 
          if (cached_pipeline != nullptr)
          {
@@ -4334,24 +7101,17 @@ namespace
       {
          ASSERT_ONCE(stages == reshade::api::pipeline_stage::compute_shader || stages == reshade::api::pipeline_stage::all); // Make sure only one stage happens at a time (it does in DX11)
          cmd_list_data.pipeline_state_original_compute_shader = original_pipeline;
+         cmd_list_data.bound_compute_cached_pipeline = cached_pipeline;
+         cmd_list_data.bound_compute_cached_pipeline_generation = lookup_generation;
          compute_changed = true;
          if (cached_pipeline)
          {
-#if DX12
-            // Note: this makes no sense, the shader hashes should be split by stage. Only one per stage can be bound in either DX11 and 12!
-            cmd_list_data.pipeline_state_original_compute_shader_hashes.compute_shaders = std::unordered_set<uint32_t>(cached_pipeline->shader_hashes.begin(), cached_pipeline->shader_hashes.end());
-#else
             cmd_list_data.pipeline_state_original_compute_shader_hashes.compute_shaders[0] = cached_pipeline->shader_hashes[0];
-#endif
             cmd_list_data.pipeline_state_has_custom_compute_shader = cached_pipeline->cloned;
          }
          else
          {
-#if DX12
-            cmd_list_data.pipeline_state_original_compute_shader_hashes.compute_shaders.clear();
-#else
             cmd_list_data.pipeline_state_original_compute_shader_hashes.compute_shaders[0] = SHADER_HASH_NONE;
-#endif
             cmd_list_data.pipeline_state_has_custom_compute_shader = false;
          }
       }
@@ -4362,20 +7122,12 @@ namespace
          graphics_changed = true;
          if (cached_pipeline)
          {
-#if DX12
-            cmd_list_data.pipeline_state_original_graphics_shader_hashes.vertex_shaders = std::unordered_set<uint32_t>(cached_pipeline->shader_hashes.begin(), cached_pipeline->shader_hashes.end());
-#else
             cmd_list_data.pipeline_state_original_graphics_shader_hashes.vertex_shaders[0] = cached_pipeline->shader_hashes[0];
-#endif
             cmd_list_data.pipeline_state_has_custom_vertex_shader = cached_pipeline->cloned;
          }
          else
          {
-#if DX12
-            cmd_list_data.pipeline_state_original_graphics_shader_hashes.vertex_shaders.clear();
-#else
             cmd_list_data.pipeline_state_original_graphics_shader_hashes.vertex_shaders[0] = SHADER_HASH_NONE;
-#endif
             cmd_list_data.pipeline_state_has_custom_vertex_shader = false;
          }
          cmd_list_data.pipeline_state_has_custom_graphics_shader = cmd_list_data.pipeline_state_has_custom_pixel_shader || cmd_list_data.pipeline_state_has_custom_vertex_shader;
@@ -4384,6 +7136,8 @@ namespace
       {
          ASSERT_ONCE(stages == reshade::api::pipeline_stage::pixel_shader || stages == reshade::api::pipeline_stage::all); // Make sure only one stage happens at a time (it does in DX11)
          cmd_list_data.pipeline_state_original_pixel_shader = original_pipeline;
+         cmd_list_data.bound_pixel_cached_pipeline = cached_pipeline;
+         cmd_list_data.bound_pixel_cached_pipeline_generation = lookup_generation;
          graphics_changed = true;
 #if DEVELOPMENT
          cmd_list_data.temp_custom_depth_stencil = cached_pipeline ? cached_pipeline->custom_depth_stencil : ShaderCustomDepthStencilType::None;
@@ -4391,20 +7145,12 @@ namespace
 
          if (cached_pipeline)
          {
-#if DX12
-            cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders = std::unordered_set<uint32_t>(cached_pipeline->shader_hashes.begin(), cached_pipeline->shader_hashes.end());
-#else
             cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders[0] = cached_pipeline->shader_hashes[0];
-#endif
             cmd_list_data.pipeline_state_has_custom_pixel_shader = cached_pipeline->cloned;
          }
          else
          {
-#if DX12
-            cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders.clear();
-#else
             cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders[0] = SHADER_HASH_NONE;
-#endif
             cmd_list_data.pipeline_state_has_custom_pixel_shader = false;
          }
          cmd_list_data.pipeline_state_has_custom_graphics_shader = cmd_list_data.pipeline_state_has_custom_pixel_shader || cmd_list_data.pipeline_state_has_custom_vertex_shader;
@@ -4436,10 +7182,8 @@ namespace
             cmd_list_data.is_known_ui_shader_bound = false;
          }
 
-#if !DX12 // They are always set all at once in DX12
          // These only depend on pixel shaders (no vertex etc)
          if ((stages & reshade::api::pipeline_stage::pixel_shader) != 0)
-#endif
          {
             cmd_list_data.auto_graphics_texture_format_upgrades = nullptr;
             if (cmd_list_data.pipeline_state_original_pixel_shader.handle != 0)
@@ -4510,6 +7254,9 @@ namespace
             // TODO: have a high performance mode that swaps the original shader binary with the custom one on creation, so we don't have to analyze shader binding calls (probably wouldn't really speed up performance anyway).
             // This would also help save some memory in x86 games where we keep all shaders binaries in memory ("custom_shaders_cache::code").
             reshade::api::pipeline pipeline_to_bind = {};
+            // Most of a game's shaders have no clone: nothing below changes for them (the stage's "pipeline_state_has_custom_*" is already
+            // "cloned" above), and skipping it skips the lock on most binds
+            if (cached_pipeline->cloned)
             {
                std::shared_lock lock(s_mutex_generic);
                // Bind the clone when cloned && custom_shaders_enabled (patch clones also need "allow_patches").
@@ -4580,18 +7327,6 @@ namespace
       //  - Seed (in_source_resource == 0): scale if the seed's scale toggle is set AND SR is active.
       //  - Chain (in_source_resource != 0): scale once SR has actually drawn this frame.
       //  - force_scale bypasses the has_drawn_sr gate for command lists recorded before SR ran (deferred contexts).
-      bool should_scale = force_scale;
-      if (in_source_resource == 0)
-      {
-#if ENABLE_SR
-         should_scale = should_scale || (allow_scale && device_data.sr_type != SR::Type::None && !device_data.sr_suppressed);
-#else
-         should_scale = should_scale || (allow_scale && false);
-#endif
-      }
-      else
-         should_scale = should_scale || device_data.has_drawn_sr;
-
       ResourceUpgradeFrameState state;
       state.render_resolution = device_data.render_resolution;
       state.output_resolution = device_data.output_resolution;
@@ -4602,6 +7337,7 @@ namespace
 #else
       state.sr_active = false;
 #endif
+      const bool should_scale = force_scale || (in_source_resource == 0 ? (allow_scale && state.sr_active) : state.has_drawn_sr);
 
       return device_data.resource_upgrades.FindOrCreateIndirectUpgradedResource(
          device, in_source_resource, in_resource, out_resource,
@@ -4705,30 +7441,6 @@ namespace
 
       CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
       cmd_list_data.scissors_scaled = false;
-   }
-
-   enum class LumaConstantBufferType
-   {
-      // Global/frame settings
-      LumaSettings,
-      // Per draw/instance data
-      LumaData,
-      LumaUIData
-   };
-
-   // True when the hash-upgrade scale chain is active this frame: a scale-enabled seed exists and SR
-   // upscaled early. Everything scale-specific (the shader flag probe and scaled copies) is gated on this.
-   bool IsScaleChainActive(const DeviceData& device_data)
-   {
-      if (!device_data.has_drawn_sr)
-         return false;
-      // TODO: cache this
-      for (const auto& entry : auto_texture_format_upgrade_shader_hashes)
-      {
-         if (entry.second.scale)
-            return true;
-      }
-      return false;
    }
 
    void SetLumaConstantBuffers(ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, LumaConstantBufferType type, uint32_t custom_data_1 = 0, uint32_t custom_data_2 = 0, float custom_data_3 = 0.f, float custom_data_4 = 0.f, bool do_safety_checks = true)
@@ -4841,7 +7553,7 @@ namespace
          // The shader applies the render scale only in the scaling zone: the hash-upgrade scale chain is
          // active (SR upscaled early) AND this pass still renders below output resolution (same aspect).
          // The RTV probe below only runs when a scale chain actually exists, to keep the common path cheap.
-         bool render_scale_active = IsScaleChainActive(device_data);
+         bool render_scale_active = device_data.resource_upgrades.IsScaleChainActive({.has_drawn_sr = device_data.has_drawn_sr});
          if (render_scale_active)
          {
             com_ptr<ID3D11RenderTargetView> rtv;
@@ -4898,6 +7610,7 @@ namespace
       }
       }
    }
+#endif // DX11
 
    // Mapped to the creation of "D3D11DeviceContext" and "D3D11CommandList". If this is a "D3D11CommandList", we can't know what "D3D11DeviceContext" it was generated form.
    void OnInitCommandList(reshade::api::command_list* cmd_list)
@@ -4905,7 +7618,11 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
 
       CommandListData& cmd_list_data = *cmd_list->create_private_data<CommandListData>();
+#if DX12
+      cmd_list_data.cmd_list = cmd_list;
+#endif
 
+#if DX11 // D3D12 has no immediate command list for games, they are all equal (ReShade's own immediate list doesn't fire this)
 #if ENABLE_AUTO_CBUFFER_RESTORATION
       cmd_list_data.ClearOriginalConstantBuffers();
 #endif
@@ -4941,46 +7658,52 @@ namespace
             ASSERT_ONCE(false);
          }
       }
+#endif // DX11
+#if DX12
+      cmd_list_data.is_bundle = reinterpret_cast<NativeCommandList*>(cmd_list->get_native())->GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE;
+      cmd_list_data.upload_ring = cmd_list->get_device()->get_private_data<DeviceData>()->upload_ring;
+#endif
    }
 
    void OnDestroyCommandList(reshade::api::command_list* cmd_list)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+#if DX12 && DEVELOPMENT
+      if (D3D12Readback::recorded_copies != 0)
+      {
+         D3D12Readback::OnReset(&cmd_list->get_device()->get_private_data<DeviceData>()->readback, cmd_list);
+      }
+#endif
 
+#if DX12
+      // The pages of the list are free once its queues are done with them. Through the list's pool pointer: the device's data can be gone, command lists don't keep their device alive
+      if (CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>())
+      {
+         D3D12UploadRing::Retire(cmd_list_data->upload_ring.get(), &cmd_list_data->upload_pages);
+      }
+#endif
       cmd_list->destroy_private_data<CommandListData>();
    }
 
-   // The way we interpret this is probably DX11 specific, as in DX12 this doesn't reset the state.
-   // This is called for "D3D11DeviceContext::FinishCommandList" (depending on a flag), so exclusively on deferred contexts.
+   // D3D11: called for "D3D11DeviceContext::FinishCommandList()" (depending on a flag), so only on deferred contexts, whose state it clears.
+   // D3D12: called for "ID3D12GraphicsCommandList::Reset()", which resets all the state of the list.
    void OnResetCommandList(reshade::api::command_list* cmd_list)
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
 
       CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
-      cmd_list_data.pipeline_state_original_compute_shader = reshade::api::pipeline(0);
-      cmd_list_data.pipeline_state_original_vertex_shader = reshade::api::pipeline(0);
-      cmd_list_data.pipeline_state_original_pixel_shader = reshade::api::pipeline(0);
-
-      cmd_list_data.pipeline_state_original_graphics_shader_hashes.Clear();
-      cmd_list_data.pipeline_state_original_compute_shader_hashes.Clear();
-      cmd_list_data.pipeline_state_has_custom_vertex_shader = false;
-      cmd_list_data.pipeline_state_has_custom_pixel_shader = false;
-      cmd_list_data.pipeline_state_has_custom_graphics_shader = false;
-      cmd_list_data.pipeline_state_has_custom_compute_shader = false;
-      cmd_list_data.custom_vertex_pipeline = {};
-      cmd_list_data.custom_pixel_pipeline = {};
-      cmd_list_data.custom_compute_pipeline = {};
-      cmd_list_data.pipeline_state_custom_vertex_shader = {};
-      cmd_list_data.pipeline_state_custom_pixel_shader = {};
-      cmd_list_data.pipeline_state_custom_compute_shader = {};
-
-      cmd_list_data.draw_callback = nullptr;
-      cmd_list_data.dispatch_callback = nullptr;
-
-      cmd_list_data.is_known_ui_shader_bound = false;
-
-      cmd_list_data.auto_graphics_texture_format_upgrades = nullptr;
+      cmd_list_data.ResetBoundPipeline();
       cmd_list_data.auto_compute_texture_format_upgrades = nullptr;
+
+#if DX12 // "ID3D12GraphicsCommandList::Reset()" resets all the state
+      cmd_list_data.d3d12_state = {};
+#if ENABLE_D3D12_PASSES
+      reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native())->SetPrivateData(D3D12State::GAME_DESCRIPTOR_HEAPS_GUID, 0, nullptr);
+#endif
+      // The root arguments are gone, and the pages they pointed at are free once the executions of the list finished
+      D3D12UploadRing::Retire(cmd_list_data.upload_ring.get(), &cmd_list_data.upload_pages);
+      cmd_list_data.luma_data_address = 0;
+#endif
 
       cmd_list_data.ResetUpgradedViews();
       // In DX11, ReShade only resets command lists on "FinishCommandList()", which clears the deferred context state, so there's no scaled viewports/scissors bound anymore
@@ -5011,10 +7734,20 @@ namespace
 
       cmd_list_data.temp_custom_depth_stencil = ShaderCustomDepthStencilType::None;
 
+#if DX12 // The capture entries and readback copies of a list reset before its execution never ran
+      if (D3D12Readback::recorded_copies != 0)
+      {
+         D3D12Readback::OnReset(&cmd_list->get_device()->get_private_data<DeviceData>()->readback, cmd_list);
+      }
+      const std::unique_lock lock_trace(cmd_list_data.mutex_trace);
+      cmd_list_data.trace_draw_calls_data.clear();
+#else
       Trace::AddEvent(cmd_list_data, (ID3D11DeviceContext*)(cmd_list->get_native()), TraceDrawCallData::TraceDrawCallType::ResetCommmandList);
-#endif
+#endif // DX11
+#endif // DEVELOPMENT
    }
 
+#if DX11
 #if DEVELOPMENT
    // "queue" and "cmd_list" both point to the device context in DX11
    // For DX11, this is only called on the immediately device context, for "D3D11DeviceContext::Flush()" and similar.
@@ -5103,6 +7836,2080 @@ namespace
          cmd_list_data.write_finished.store(true, std::memory_order_release);
       }
    }
+#endif // DX11
+
+#if DX12
+   // What a bundle bound carries over into the command list that executes it (its draws ran their callbacks while it was recorded)
+   void OnExecuteSecondaryCommandList(reshade::api::command_list* cmd_list, reshade::api::command_list* secondary_cmd_list)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api());
+      CommandListData& bundle_data = *secondary_cmd_list->get_private_data<CommandListData>();
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+#if DEVELOPMENT
+      // The bundle's draws join the capture after an "Append Command List" entry, as copies (a bundle runs many times), with what a bundle inherits from the list that executes
+      // it: targets, viewports, scissors, stencil reference and blend constants
+      if (const auto lock_trace = LockTraceIfRunning(); lock_trace && Trace::running)
+      {
+         DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+         const std::shared_lock lock_generic(s_mutex_generic);
+         const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
+         const std::shared_lock lock_trace_3(bundle_data.mutex_trace);
+         TraceDrawCallData& marker = cmd_list_data.trace_draw_calls_data.emplace_back();
+         marker.type = TraceDrawCallData::TraceDrawCallType::AppendCommandList;
+         marker.command_list = secondary_cmd_list;
+         for (const TraceDrawCallData& bundle_entry : bundle_data.trace_draw_calls_data)
+         {
+            TraceDrawCallData& entry = cmd_list_data.trace_draw_calls_data.emplace_back(bundle_entry);
+            const auto pipeline_it = device_data.pipeline_cache_by_pipeline_handle.find(entry.pipeline_handle);
+            const Shader::CachedPipeline* const pipeline = (pipeline_it != device_data.pipeline_cache_by_pipeline_handle.end() ? pipeline_it->second : nullptr);
+            D3D12Trace::FillOutputState(cmd_list->get_device(), &device_data, &entry, cmd_list_data.d3d12_state, D3D12Trace::FillRenderState(&entry, pipeline));
+         }
+      }
+#endif
+      if (bundle_data.d3d12_state.pipeline.handle == 0) // It bound no pipeline, the executing command list keeps its own
+      {
+         return;
+      }
+      cmd_list_data.d3d12_state.pipeline = bundle_data.d3d12_state.pipeline;
+      // A bundle that set no root signature uses the one of the command list executing it
+      if (bundle_data.d3d12_state.graphics.layout.handle != 0)
+      {
+         D3D12State::SetRootSignature(&cmd_list_data.d3d12_state.graphics, bundle_data.d3d12_state.graphics.layout);
+      }
+      if (bundle_data.d3d12_state.compute.layout.handle != 0)
+      {
+         D3D12State::SetRootSignature(&cmd_list_data.d3d12_state.compute, bundle_data.d3d12_state.compute.layout);
+      }
+      cmd_list_data.pipeline_state_original_vertex_shader = bundle_data.pipeline_state_original_vertex_shader;
+      cmd_list_data.pipeline_state_original_pixel_shader = bundle_data.pipeline_state_original_pixel_shader;
+      cmd_list_data.pipeline_state_original_compute_shader = bundle_data.pipeline_state_original_compute_shader;
+      cmd_list_data.pipeline_state_original_graphics_shader_hashes = bundle_data.pipeline_state_original_graphics_shader_hashes;
+      cmd_list_data.pipeline_state_original_compute_shader_hashes = bundle_data.pipeline_state_original_compute_shader_hashes;
+      cmd_list_data.pipeline_state_has_custom_vertex_shader = bundle_data.pipeline_state_has_custom_vertex_shader;
+      cmd_list_data.pipeline_state_has_custom_pixel_shader = bundle_data.pipeline_state_has_custom_pixel_shader;
+      cmd_list_data.pipeline_state_has_custom_graphics_shader = bundle_data.pipeline_state_has_custom_graphics_shader;
+      cmd_list_data.pipeline_state_has_custom_compute_shader = bundle_data.pipeline_state_has_custom_compute_shader;
+      cmd_list_data.draw_callback = bundle_data.draw_callback;
+      cmd_list_data.dispatch_callback = bundle_data.dispatch_callback;
+      cmd_list_data.is_known_ui_shader_bound = bundle_data.is_known_ui_shader_bound;
+      cmd_list_data.auto_graphics_texture_format_upgrades = bundle_data.auto_graphics_texture_format_upgrades;
+      cmd_list_data.luma_settings_param = bundle_data.luma_settings_param;
+      cmd_list_data.luma_data_param = bundle_data.luma_data_param;
+      // Its pipeline is the list's now (a bundle keeps the base, see "OnDrawOrDispatchD3D12()"), the next draw looks at the formats of the list's render targets
+      cmd_list_data.bound_cached_pipeline = bundle_data.bound_cached_pipeline;
+      cmd_list_data.bound_base_pipeline = bundle_data.bound_base_pipeline;
+      cmd_list_data.bound_current_pipeline = bundle_data.bound_current_pipeline;
+      cmd_list_data.render_target_formats_dirty = true;
+   }
+
+   // The upload ring signals a fence on each queue that can run lists setting root CBVs, to know when the GPU is done with a page
+   void OnInitCommandQueue(reshade::api::command_queue* queue)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(queue->get_device()->get_api());
+      D3D12UploadRing::RegisterQueue(queue->get_device()->get_private_data<DeviceData>()->upload_ring.get(), reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()));
+   }
+
+   void OnDestroyCommandQueue(reshade::api::command_queue* queue)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(queue->get_device()->get_api());
+      D3D12UploadRing::UnregisterQueue(queue->get_device()->get_private_data<DeviceData>()->upload_ring.get(), reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()));
+   }
+#endif // DX12
+
+
+#if ENABLE_SR
+   // The first supported SR type (the implementations are in order of preference), what "Auto" picks
+   SR::Type GetSRAutoType(const DeviceData& device_data)
+   {
+      return SR::GetAutoType(device_data.sr_implementations_instances);
+   }
+
+   // The upscaler's jitter phase count (at least 1), or the native TAA default without an upscaler instance
+   int GetSRJitterPhases(const DeviceData& device_data, const SR::InstanceData* sr_instance_data)
+   {
+      return sr_instance_data ? (std::max)(sr_implementations[device_data.sr_type]->GetJitterPhases(sr_instance_data), 1) : SR::GetDefaultJitterPhases();
+   }
+
+   // This frame's Halton (2, 3) jitter in pixels, over "GetSRJitterPhases()"
+   std::array<float, 2> GetSRJitter(const DeviceData& device_data, const SR::InstanceData* sr_instance_data)
+   {
+      const unsigned int phase = cb_luma_global_settings.FrameIndex % unsigned(GetSRJitterPhases(device_data, sr_instance_data));
+      return {SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)};
+   }
+
+   // The SR a game's draw records with, read as one under "DeviceData::sr_mutex" (shared): until this goes out of scope "ApplySRType()" can't switch the type,
+   // its implementation and its instance, nor can retired upscaler objects go. Held over "UpdateSettings()" and "Draw()", not over calls that raise ReShade
+   // events. "implementation" and "instance_data" are null without an SR instance.
+   struct SRDrawLock
+   {
+      std::shared_lock<std::shared_mutex> lock;
+      SR::Type type = SR::Type::None;
+      SR::SuperResolutionImpl* implementation = nullptr;
+      SR::InstanceData* instance_data = nullptr;
+   };
+   SRDrawLock LockSRForDraw(DeviceData& device_data)
+   {
+      std::shared_lock lock(device_data.sr_mutex);
+      SR::InstanceData* const instance_data = device_data.GetSRInstanceData();
+      return {.lock = std::move(lock), .type = device_data.sr_type, .implementation = (instance_data ? sr_implementations[device_data.sr_type].get() : nullptr), .instance_data = instance_data};
+   }
+
+   // Switches the SR, with "device_data.sr_mutex" held exclusively. Core applies the overlay's and the MCP's "sr_type_selected" at present, before the game's
+   // "OnPresent", so a frame's draws never see two types and the game can release its resources there.
+   // We wouldn't really need to do anything other than clearing "sr_output_color",
+   // but to avoid wasting memory allocated by SR texture and other resources, clear it up once disabled.
+   // Note that we keep these textures in memory if the user temporarily changed away from an AA method that supports SR, or if users unloaded shaders (there's no reason to, and it'd cause stutters).
+   void ApplySRType(DeviceData& device_data, SR::Type sr_type)
+   {
+      if (device_data.sr_type == sr_type)
+         return;
+#if DEVELOPMENT
+      // An upscaler starting over (the SR bridge's helper restarts silently otherwise)
+      reshade::log::message(reshade::log::level::info, std::format("SR selection {} -> {}", int(device_data.sr_type), int(sr_type)).c_str());
+#endif
+      auto* sr_instance_data = device_data.GetSRInstanceData();
+      if (sr_instance_data)
+      {
+         // Its own resources (e.g. DLSS's feature, the SR bridge's helper) go, the implementation stays loaded
+         sr_implementations[device_data.sr_type]->ReleaseResources(sr_instance_data);
+#if 0 // This would actually unload the previously selected SR DLL and all, making the game hitch, so it's better to just keep it in memory, especially because otherwise we need to check for compatibily again and load them again etc
+         sr_implementations[device_data.sr_type]->Deinit(sr_instance_data);
+         sr_instance_data = nullptr;
+#endif
+      }
+
+      device_data.sr_type = sr_type;
+      device_data.sr_suppressed = false;
+      sr_instance_data = device_data.GetSRInstanceData(); // Take new instance data
+
+      if (device_data.sr_type != SR::Type::None)
+      {
+         ASSERT_ONCE(sr_instance_data && sr_implementations[device_data.sr_type]->HasInit(sr_instance_data)); // Should never happen
+      }
+      else
+      {
+         device_data.sr_output_color = nullptr;
+         device_data.sr_exposure = nullptr;
+         device_data.sr_render_resolution_scale = 1.f; // Reset this to 1 when SR is toggled, even if dynamic resolution scaling is active (e.g. in Prey), we'll set it back to a low value if DRS is used again.
+         device_data.sr_scene_exposure = 1.f;
+         device_data.sr_scene_pre_exposure = 1.f;
+         device_data.release_sr_resources = true;
+         game->CleanExtraSRResources(device_data);
+      }
+   }
+
+   // The per-frame SR latches of a game that draws SR at most once a frame, from its "OnPresent": a frame SR didn't draw (menus, loading,
+   // just picked) restarts the history at the next one. Returns whether SR is on for the next frame (a failure suppresses it mid frame).
+   bool LatchSRFrame(DeviceData& device_data)
+   {
+      device_data.force_reset_sr = !device_data.has_drawn_sr;
+      device_data.has_drawn_sr = false;
+      return device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
+   }
+
+   // Selects and switches the SR right away: for a game's own pick (e.g. its "Performance Test" sweeps), from its "OnPresent". A pick
+   // starts over, also of the same type after a failure suppressed it.
+   void SetSRType(DeviceData& device_data, SR::Type sr_type)
+   {
+      device_data.sr_type_selected = sr_type;
+      const std::unique_lock sr_lock(device_data.sr_mutex);
+      ApplySRType(device_data, sr_type);
+      device_data.sr_suppressed = false;
+   }
+#endif // ENABLE_SR
+
+#if DEVELOPMENT
+#include "includes/mcp_server.inl"
+#endif // DEVELOPMENT
+
+
+
+#if DX12
+   // A fullscreen pipeline of the natives "vertex_shader_hash" and "shader_hash" (a pixel shader) on "root_signature", which renders into "format" with "blend", or
+   // without a vertex shader (0) the compute pipeline of "shader_hash". Null if the device refused it, or if the natives aren't compiled (yet), which "natives_found"
+   // tells apart.
+   com_ptr<ID3D12PipelineState> CreateD3D12NativePipeline(ID3D12Device* native_device, ID3D12RootSignature* root_signature, uint32_t vertex_shader_hash, uint32_t shader_hash, DXGI_FORMAT format, bool* natives_found, const D3D12_RENDER_TARGET_BLEND_DESC& blend = D3D12Passes::OPAQUE_BLEND)
+   {
+      // The DXIL of the natives, from the cache the D3D11 shader objects are made of. Its lock holds for as long as the pipeline needs the code
+      const std::shared_lock lock_loading(s_mutex_loading);
+      const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+      const auto has_code = [](const auto& shader)
+      {
+         return shader != custom_shaders_cache.end() && shader->second && !shader->second->code.empty();
+      };
+      const auto shader = custom_shaders_cache.find(Shader::ShiftHash32ToHash64(shader_hash));
+      const auto vertex_shader = custom_shaders_cache.find(Shader::ShiftHash32ToHash64(vertex_shader_hash));
+      *natives_found = has_code(shader) && (vertex_shader_hash == 0 || has_code(vertex_shader));
+      if (!*natives_found || !root_signature)
+      {
+         return nullptr;
+      }
+      const std::vector<uint8_t>& code = shader->second->code;
+      if (vertex_shader_hash == 0)
+      {
+         return D3D12Passes::CreateComputePipeline(native_device, root_signature, {code.data(), code.size()});
+      }
+      const std::vector<uint8_t>& vertex_code = vertex_shader->second->code;
+      return D3D12Passes::CreateFullscreenPipeline(native_device, root_signature, {vertex_code.data(), vertex_code.size()}, {code.data(), code.size()}, format, blend);
+   }
+
+   // The common start of Luma's fullscreen passes at present on D3D12 (the display composition and the swapchain encode): they draw "Copy VS" and the
+   // native "pixel_shader_hash" on a command list of the pass's own that runs on the present queue (see "includes/d3d12_passes.h"). The caller holds
+   // "pass->mutex". Makes that command list on the first draw, and the root signature and pipeline again for a new render target format and when the
+   // natives changed, one attempt each: Luma's settings and data as root CBVs 0 and 1, a table of "srv_count" SRVs from t0, and a linear clamp sampler.
+   // With "compute", "pixel_shader_hash" is a compute shader and the table has u0 after the SRVs.
+   // Then resets the pass's LumaData for this present and begins its recording. Nothing if the pass can't draw, each reason logged once per pass with "skipped",
+   // what the user sees then.
+   std::optional<D3D12Passes::Recording> PrepareD3D12NativePass(DeviceData::NativePassD3D12* pass, DeviceData& device_data, ID3D12Device* native_device, uint32_t pixel_shader_hash, UINT srv_count, DXGI_FORMAT format, const char* name, const char* skipped, bool compute = false)
+   {
+      const auto fail = [name](std::atomic_flag* logged, std::string_view reason)
+      {
+         if (!logged->test_and_set())
+         {
+            reshade::log::message(reshade::log::level::error, std::format("[{}] {}", name, reason).c_str());
+         }
+         return std::nullopt;
+      };
+
+      if (!pass->passes.fence)
+      {
+         if (!D3D12Passes::Create(&pass->passes, native_device))
+         {
+            return fail(&pass->logged_no_passes, std::format("The device refused the fence and the descriptor heaps of its command list, so {}", skipped));
+         }
+         pass->cmd_list_data.upload_ring = device_data.upload_ring;
+         pass->cmd_list_data.luma_settings_param = 0;
+         pass->cmd_list_data.luma_data_param = 1;
+      }
+
+      const uint32_t natives_generation = device_data.native_shaders_generation.load(std::memory_order_acquire);
+      if (pass->pipeline_format != format || pass->pipeline_generation != natives_generation || pass->pipeline_compute != compute)
+      {
+         // The GPU can still run the commands that use them
+         D3D12Passes::Retire(&pass->passes, pass->pipeline.get());
+         D3D12Passes::Retire(&pass->passes, pass->root_signature.get());
+         pass->pipeline.reset();
+         pass->root_signature.reset();
+         pass->pipeline_format = format;
+         pass->pipeline_generation = natives_generation;
+         pass->pipeline_compute = compute;
+         // At the registers the natives were compiled with
+         const D3D12_DESCRIPTOR_RANGE1 ranges[] = {
+            {.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV, .NumDescriptors = srv_count, .OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
+            {.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV, .NumDescriptors = 1, .OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
+         };
+         const D3D12_SHADER_VISIBILITY visibility = (compute ? D3D12_SHADER_VISIBILITY_ALL : D3D12_SHADER_VISIBILITY_PIXEL);
+         const D3D12_ROOT_PARAMETER1 parameters[] = {
+            {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV, .Descriptor = {.ShaderRegister = luma_settings_cbuffer_define_index}, .ShaderVisibility = visibility},
+            {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV, .Descriptor = {.ShaderRegister = luma_data_cbuffer_define_index}, .ShaderVisibility = visibility},
+            {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, .DescriptorTable = {.NumDescriptorRanges = (compute ? 2u : 1u), .pDescriptorRanges = ranges}, .ShaderVisibility = visibility},
+         };
+         const D3D12_STATIC_SAMPLER_DESC linear_clamp_sampler = {.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR, .AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP, .AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP, .AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP, .MaxAnisotropy = 1, .ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER, .MaxLOD = D3D12_FLOAT32_MAX, .ShaderVisibility = visibility};
+         pass->root_signature = D3D12Passes::CreateRootSignature(native_device, {.Version = D3D_ROOT_SIGNATURE_VERSION_1_1, .Desc_1_1 = {.NumParameters = UINT(std::size(parameters)), .pParameters = parameters, .NumStaticSamplers = 1, .pStaticSamplers = &linear_clamp_sampler}});
+         bool natives_found = false;
+         pass->pipeline = CreateD3D12NativePipeline(native_device, pass->root_signature.get(), (compute ? 0 : CompileTimeStringHash("Copy VS")), pixel_shader_hash, format, &natives_found);
+         if (!natives_found)
+         {
+            static std::atomic_flag warned;
+            if (!warned.test_and_set())
+            {
+               const std::string warn_message = "Some of the shader files are missing from the \"" + std::string(NAME) + "\" folder, or failed to compile for some unknown reason (D3D12 compiles them with DXC: dxcompiler.dll may be missing from that folder too), please re-install the mod.";
+               reshade::log::message(reshade::log::level::error, warn_message.c_str());
+#if DEVELOPMENT
+               ASSERT_MSG(false, warn_message);
+#else
+               MessageBoxA(nullptr, warn_message.c_str(), NAME, MB_SETFOREGROUND);
+#endif
+            }
+         }
+         else if (!pass->pipeline)
+         {
+            reshade::log::message(reshade::log::level::error, std::format("[{}] The device refused its root signature or its pipeline for {} (the debug layer says why), so {}", name, GetFormatNameSafe(format), skipped).c_str());
+         }
+         else
+         {
+            reshade::log::message(reshade::log::level::info, std::format("[{}] Made its pipeline for {} (natives generation {})", name, GetFormatNameSafe(format), natives_generation).c_str());
+         }
+      }
+      if (!pass->pipeline)
+      {
+         return std::nullopt;
+      }
+      // The pages of the pass's previous LumaData are free once the GPU ran it
+      D3D12UploadRing::Retire(pass->cmd_list_data.upload_ring.get(), &pass->cmd_list_data.upload_pages);
+      pass->cmd_list_data.luma_data_address = 0;
+      std::optional<D3D12Passes::Recording> recording = D3D12Passes::Begin(&pass->passes);
+      if (!recording)
+      {
+         return fail(&pass->logged_no_frame, std::format("No frame of its command list is free (the GPU is {} presents behind), or the device refused it, so {} at this present", D3D12Passes::MAX_FRAMES, skipped));
+      }
+      return recording;
+   }
+
+   // Records the draw of "pass" (see "PrepareD3D12NativePass()") on "recording": Luma's settings, its LumaData of the custom values and the frame's table, then
+   // 8x8 groups over "width" x "height" for a compute pass, else the fullscreen triangle strip into the frame's RTV of that size
+   void DrawD3D12NativePass(DeviceData::NativePassD3D12* pass, const D3D12Passes::Recording& recording, DeviceData& device_data, UINT64 width, UINT height, uint32_t custom_data_1 = 0, uint32_t custom_data_2 = 0, float custom_data_3 = 0.f, float custom_data_4 = 0.f)
+   {
+      ID3D12GraphicsCommandList* const list = recording.list;
+      const reshade::api::shader_stage stage = (pass->pipeline_compute ? reshade::api::shader_stage::compute : reshade::api::shader_stage::pixel);
+      if (pass->pipeline_compute)
+      {
+         list->SetComputeRootSignature(pass->root_signature.get());
+      }
+      else
+      {
+         list->SetGraphicsRootSignature(pass->root_signature.get());
+      }
+      list->SetPipelineState(pass->pipeline.get());
+      SetLumaConstantBuffers(list, pass->cmd_list_data, device_data, stage, LumaConstantBufferType::LumaSettings);
+      SetLumaConstantBuffers(list, pass->cmd_list_data, device_data, stage, LumaConstantBufferType::LumaData, custom_data_1, custom_data_2, custom_data_3, custom_data_4);
+      if (pass->pipeline_compute)
+      {
+         list->SetComputeRootDescriptorTable(2, recording.srv_gpu);
+         list->Dispatch(UINT((width + 7) / 8), (height + 7) / 8, 1);
+         return;
+      }
+      list->SetGraphicsRootDescriptorTable(2, recording.srv_gpu);
+      list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+      const D3D12_VIEWPORT viewport = {0.f, 0.f, float(width), float(height), 0.f, 1.f};
+      const D3D12_RECT scissor = {0, 0, LONG(width), LONG(height)};
+      list->RSSetViewports(1, &viewport);
+      list->RSSetScissorRects(1, &scissor);
+      list->OMSetRenderTargets(1, &recording.rtv_cpu, FALSE, nullptr);
+      list->DrawInstanced(4, 1, 0, 0);
+   }
+
+   // Executes the recording of "pass" (from "PrepareD3D12NativePass()") on "native_queue", with what the pass retired kept alive by the frame.
+   // The caller holds "pass->mutex". False, logged once per pass with "skipped" (see "PrepareD3D12NativePass()"), if its command list failed to close.
+   bool SubmitD3D12NativePass(DeviceData::NativePassD3D12* pass, ID3D12CommandQueue* native_queue, DeviceData& device_data, const char* name, const char* skipped)
+   {
+      if (!D3D12Passes::Submit(&pass->passes, native_queue))
+      {
+         if (!pass->logged_no_submit.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::error, std::format("[{}] Its command list failed to close (a command it recorded is invalid, the debug layer says which), so {} at this present", name, skipped).c_str());
+         }
+         return false;
+      }
+      D3D12UploadRing::OnExecute(&pass->cmd_list_data.upload_pages, native_queue, device_data.present_count);
+      return true;
+   }
+
+   // Whether Luma changed the format of a texture: one of "resource_upgrades.upgraded_resources", or a back buffer whose format family the swapchain upgrade changed ("device_data.mutex" must be held)
+   bool IsUpgradedTexture(const DeviceData& device_data, reshade::api::resource resource)
+   {
+      return device_data.resource_upgrades.upgraded_resources.contains(resource.handle) || device_data.upgraded_back_buffers.contains(resource.handle);
+   }
+
+#if ENABLE_D3D12_PASSES
+   // The descriptors of the passes drawn on the game's command lists rotate over this many presents (how far behind a game list may run), with this many draws
+   // of a pass per present
+   // ponytail: a game list executed later than that uses the pipelines and textures the pass retired, which are destroyed by then, and reads descriptors that were
+   // written again (valid views, of the wrong textures), as do more draws in a present
+   constexpr uint32_t D3D12_GAME_PASS_FRAMES = 16;
+   constexpr uint32_t D3D12_GAME_PASS_DRAWS_PER_FRAME = 4;
+
+   // Keeps "resource" (if any) for "D3D12_GAME_PASS_FRAMES" presents (a game list that still runs may read it), after which "PrepareD3D12GamePass()" destroys it. Then clears it
+   void RetireD3D12GamePassResource(DeviceData::GamePassD3D12* pass, uint64_t present_count, reshade::api::resource* resource)
+   {
+      if (resource->handle != 0)
+      {
+         pass->retired_resources.emplace_back(present_count, *resource);
+         *resource = {};
+      }
+   }
+
+   // Destroys and clears "views" (they only hold CPU descriptors, which the tables and the bindings copied), then retires "resources" (see "RetireD3D12GamePassResource()")
+   void RetireD3D12GamePassTextures(DeviceData::GamePassD3D12* pass, reshade::api::device* device, uint64_t present_count, std::initializer_list<reshade::api::resource*> resources, std::initializer_list<reshade::api::resource_view*> views)
+   {
+      for (reshade::api::resource_view* const view : views)
+      {
+         device->destroy_resource_view(*view);
+         *view = {};
+      }
+      for (reshade::api::resource* const resource : resources)
+      {
+         RetireD3D12GamePassResource(pass, present_count, resource);
+      }
+   }
+
+   // Destroys the resources "pass" retired that no list can read anymore, with "pass->mutex" held
+   void DestroyRetiredD3D12GamePassResources(DeviceData::GamePassD3D12* pass, reshade::api::device* device, uint64_t present_count)
+   {
+      std::erase_if(pass->retired_resources, [device, present_count](const std::pair<uint64_t, reshade::api::resource>& retired)
+         {
+            if (present_count < retired.first + D3D12_GAME_PASS_FRAMES)
+               return false;
+            device->destroy_resource(retired.second);
+            return true; });
+      std::erase_if(pass->retired, [present_count](const std::pair<uint64_t, com_ptr<ID3D12PipelineState>>& retired)
+         { return present_count >= retired.first + D3D12_GAME_PASS_FRAMES; });
+   }
+
+   // A pass' textures that sit unused this many presents (another mode picked, e.g. DLAA instead of SMAA) are retired: its next draw makes them again
+   constexpr uint64_t D3D12_GAME_PASS_IDLE_PRESENTS = 120;
+
+   // At present: the textures Core's passes retired go once no list can read them, also when the pass doesn't draw anymore (its draws destroy them
+   // too), and SMAA's intermediates go after "D3D12_GAME_PASS_IDLE_PRESENTS" without a draw
+   void ReleaseIdleD3D12GamePassResources(DeviceData& device_data, reshade::api::device* device)
+   {
+      const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
+#if ENABLE_SMAA
+      {
+         auto& smaa = device_data.smaa;
+         const std::unique_lock lock(smaa.mutex);
+         if (smaa.width != 0 && smaa.frame != UINT64_MAX && present_count > smaa.frame + D3D12_GAME_PASS_IDLE_PRESENTS)
+         {
+            RetireD3D12GamePassTextures(&smaa, device, present_count, {&smaa.edges, &smaa.weights, &smaa.output}, {&smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv, &smaa.output_rtv, &smaa.output_srv});
+            smaa.width = 0;
+            smaa.height = 0;
+            smaa.output_format = reshade::api::format::unknown;
+         }
+         DestroyRetiredD3D12GamePassResources(&smaa, device, present_count);
+      }
+#endif
+      DeviceData::GamePassD3D12* const passes[] = {
+         &device_data.texture_copy,
+#if ENABLE_RCAS
+         &device_data.rcas,
+#endif
+#if ENABLE_BLOOM
+         &device_data.karis_average,
+         &device_data.bloom,
+#endif
+      };
+      for (DeviceData::GamePassD3D12* const pass : passes)
+      {
+         const std::unique_lock lock(pass->mutex);
+         DestroyRetiredD3D12GamePassResources(pass, device, present_count);
+      }
+   }
+
+   // The common start of the passes drawn on the game's command lists ("DrawRCAS()", "DrawSMAA()", "DrawBloom()"...), with "pass->mutex" held: makes the layout of "params"
+   // (the descriptor table is its parameter "table_param") and "tables_per_draw" descriptor tables per draw, for "draws_per_frame" draws a present (the same for every call),
+   // on the first draw, one attempt, drops the pipelines of older natives and destroys the retired resources no list can read anymore. Then the tables of this draw, or null
+   // if the pass can't draw.
+   const reshade::api::descriptor_table* PrepareD3D12GamePass(DeviceData::GamePassD3D12* pass, DeviceData& device_data, reshade::api::device* device, std::span<const reshade::api::pipeline_layout_param> params, uint32_t table_param, uint32_t tables_per_draw, const char* name, uint32_t draws_per_frame = D3D12_GAME_PASS_DRAWS_PER_FRAME)
+   {
+      if (pass->failed)
+      {
+         return nullptr;
+      }
+      if (pass->layout.handle == 0)
+      {
+         pass->tables.resize(D3D12_GAME_PASS_FRAMES * draws_per_frame * tables_per_draw);
+         if (!device->create_pipeline_layout(uint32_t(params.size()), params.data(), &pass->layout) || !device->allocate_descriptor_tables(uint32_t(pass->tables.size()), pass->layout, table_param, pass->tables.data()))
+         {
+            if (pass->layout.handle != 0)
+            {
+               device->destroy_pipeline_layout(pass->layout);
+               pass->layout = {};
+            }
+            pass->tables.clear();
+            pass->failed = true;
+            reshade::log::message(reshade::log::level::error, std::format("[{}] ReShade refused its root signature or its descriptor tables, so it doesn't draw", name).c_str());
+            return nullptr;
+         }
+      }
+
+      const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
+      const uint32_t natives_generation = device_data.native_shaders_generation.load(std::memory_order_acquire);
+      if (pass->pipelines_generation != natives_generation)
+      {
+         for (auto& [key, pipeline] : pass->pipelines)
+         {
+            pass->retired.emplace_back(present_count, std::move(pipeline));
+         }
+         pass->pipelines.clear();
+         pass->pipelines_generation = natives_generation;
+      }
+
+      if (pass->frame != present_count)
+      {
+         // What it retired can only become destroyable at a new present
+         DestroyRetiredD3D12GamePassResources(pass, device, present_count);
+         pass->frame = present_count;
+         pass->frame_draws = 0;
+      }
+      return &pass->tables[((present_count % D3D12_GAME_PASS_FRAMES) * draws_per_frame + (pass->frame_draws++ % draws_per_frame)) * tables_per_draw];
+   }
+
+   // The pipeline of "pass" of the natives "vertex_shader_hash" and "pixel_shader_hash" (a pass pairs each pixel shader with one vertex shader) into "format", after
+   // "PrepareD3D12GamePass()": one attempt per format and natives generation, except while the natives aren't compiled. Null if there is none.
+   // A compute pass has no vertex shader (0, see "CreateD3D12NativePipeline()"). "blend" is that of the pixel shader's every pipeline.
+   ID3D12PipelineState* GetD3D12GamePassPipeline(DeviceData::GamePassD3D12* pass, ID3D12Device* native_device, uint32_t vertex_shader_hash, uint32_t pixel_shader_hash, DXGI_FORMAT format, const char* name, const D3D12_RENDER_TARGET_BLEND_DESC& blend = D3D12Passes::OPAQUE_BLEND)
+   {
+      const auto [pipeline, inserted] = pass->pipelines.try_emplace((uint64_t(pixel_shader_hash) << 32) | format);
+      if (inserted)
+      {
+         bool natives_found = false;
+         pipeline->second = CreateD3D12NativePipeline(native_device, reinterpret_cast<ID3D12RootSignature*>(pass->layout.handle), vertex_shader_hash, pixel_shader_hash, format, &natives_found, blend);
+         if (!natives_found)
+         {
+            pass->pipelines.erase(pipeline);
+            return nullptr;
+         }
+         if (!pipeline->second)
+         {
+            reshade::log::message(reshade::log::level::error, std::format("[{}] The device refused its pipeline for {} (the debug layer says why), so it doesn't draw into that format", name, GetFormatNameSafe(format)).c_str());
+         }
+      }
+      return pipeline->second.get();
+   }
+
+   // After a Luma pass on a game list: the game's graphics state again ("D3D12State::RestoreGraphics()"). Its own viewports and scissors come back, so a draw into a scaled clone scales
+   // them again, and the next draw checks its pipeline against the render targets again. A replaced graphics pipeline gets its Luma constant buffers back too: "SetLumaConstantBuffers()"
+   // sets them natively before the game's draw callback, so the tracker doesn't know them, and the game's root signature bound again resets every root argument (the replaced
+   // shader would read unset root CBVs)
+   void RestoreGameGraphicsD3D12(CommandListData& cmd_list_data)
+   {
+      D3D12State::RestoreGraphics(cmd_list_data.cmd_list, cmd_list_data.d3d12_state, reshade::api::pipeline{cmd_list_data.bound_current_pipeline});
+      if (cmd_list_data.luma_settings_param >= 0 && cmd_list_data.pipeline_state_original_compute_shader.handle == 0)
+      {
+         auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list_data.cmd_list->get_native());
+         const DeviceData& device_data = *cmd_list_data.cmd_list->get_device()->get_private_data<DeviceData>();
+         const D3D12_GPU_VIRTUAL_ADDRESS settings_address = device_data.settings_address.load(std::memory_order_acquire);
+         if (settings_address != 0)
+         {
+            native_list->SetGraphicsRootConstantBufferView(cmd_list_data.luma_settings_param, settings_address);
+         }
+         if (cmd_list_data.luma_data_param >= 0 && cmd_list_data.luma_data_address != 0)
+         {
+            native_list->SetGraphicsRootConstantBufferView(cmd_list_data.luma_data_param, cmd_list_data.luma_data_address);
+         }
+      }
+      cmd_list_data.render_target_formats_dirty = true;
+      cmd_list_data.viewports_scaled = false;
+      cmd_list_data.scissors_scaled = false;
+   }
+
+   // The D3D12 counterparts of the "RSSetViewports()" and "RSSetScissorRects()" of the D3D11 render scale code in games, which reads the bound ones from the tracker
+   // ("cmd_list_data.d3d12_state.viewports" and "scissor_rects"): set on the game's list and in the tracker, so a Luma pass on the list binds these back ("RestoreGameGraphicsD3D12()"),
+   // not the ones they replaced. A draw into a scaled clone scales them again, as the game's own
+   void SetGameViewportsD3D12(CommandListData& cmd_list_data, uint32_t count, const reshade::api::viewport* viewports)
+   {
+      static_assert(sizeof(reshade::api::viewport) == sizeof(D3D12_VIEWPORT), "ReShade's viewports are D3D12's");
+      reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list_data.cmd_list->get_native())->RSSetViewports(count, reinterpret_cast<const D3D12_VIEWPORT*>(viewports));
+      D3D12State::BindViewports(&cmd_list_data.d3d12_state, 0, count, viewports);
+      cmd_list_data.viewports_scaled = false;
+   }
+
+   void SetGameScissorRectsD3D12(CommandListData& cmd_list_data, uint32_t count, const reshade::api::rect* rects)
+   {
+      static_assert(sizeof(reshade::api::rect) == sizeof(D3D12_RECT), "ReShade's rectangles are D3D12's");
+      reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list_data.cmd_list->get_native())->RSSetScissorRects(count, reinterpret_cast<const D3D12_RECT*>(rects));
+      D3D12State::BindScissorRects(&cmd_list_data.d3d12_state, 0, count, rects);
+      cmd_list_data.scissors_scaled = false;
+   }
+
+   // A texture a fullscreen pass reads, viewed as 2D "format" with its first "levels" mips
+   struct D3D12FullscreenSource
+   {
+      reshade::api::resource resource;
+      reshade::api::format format;
+      uint32_t levels = 1;
+   };
+   constexpr size_t D3D12_FULLSCREEN_MAX_SOURCES = 8;
+
+   // A fullscreen pass of the native "pixel_shader_hash" (drawn with "Copy VS") of "sources" (viewed as 2D with their formats, one table of t0, t1... in their order) into the whole "target" (through the
+   // view "target_desc"), with root constants at b0: the target's width and height, then "params" (as many each draw of "pass" as on its first). Recorded on the game's command list from a game's
+   // "OnDrawOrDispatch()": the sources must be readable by pixel shaders and "target" be a render target, in the states the game left them in at that draw (it records no
+   // barrier). It records through ReShade's API, with the descriptor tables of "pass" and the game's graphics state bound again after it ("D3D12State::RestoreGraphics()").
+   // The number of sources (1 to "D3D12_FULLSCREEN_MAX_SOURCES") is fixed by the first draw of "pass", which makes its layout: another count is refused.
+   // False, with nothing recorded, if it can't draw (the natives aren't compiled yet, the list is in a render pass): the caller then lets the game's draw run.
+   // "blend": that of every draw of "pixel_shader_hash" (see "GetD3D12GamePassPipeline()").
+   bool DrawFullscreenPassD3D12(CommandListData& cmd_list_data, DeviceData& device_data, DeviceData::GamePassD3D12* pass, uint32_t pixel_shader_hash, const char* name, const char* trace_name, std::span<const D3D12FullscreenSource> sources, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, std::span<const float> params, const D3D12_RENDER_TARGET_BLEND_DESC& blend = D3D12Passes::OPAQUE_BLEND)
+   {
+      reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
+      if (!cmd_list || sources.empty() || sources.size() > D3D12_FULLSCREEN_MAX_SOURCES || RefusedInRenderPass(cmd_list_data, name))
+      {
+         return false;
+      }
+      reshade::api::device* const device = cmd_list->get_device();
+      auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+      const std::unique_lock lock(pass->mutex);
+      if (pass->layout.handle != 0 && pass->fullscreen_source_count != sources.size())
+      {
+         ASSERT_ONCE_MSG(false, "A fullscreen pass keeps the number of sources of its first draw");
+         return false;
+      }
+      const reshade::api::descriptor_range source_range = {.count = uint32_t(sources.size()), .visibility = reshade::api::shader_stage::pixel, .type = reshade::api::descriptor_type::texture_shader_resource_view};
+      // A linear clamp sampler at s0 for the shaders that filter (static: no root DWORD, nothing to bind)
+      const reshade::api::sampler_desc linear_sampler = {.filter = reshade::api::filter_mode::min_mag_mip_linear};
+      reshade::api::descriptor_range_with_flags sampler_range;
+      sampler_range.count = 1;
+      sampler_range.visibility = reshade::api::shader_stage::pixel;
+      sampler_range.type = reshade::api::descriptor_type::sampler;
+      sampler_range.static_samplers = &linear_sampler;
+      // D3D12 root signatures hold 64 DWORDs, the table takes one
+      std::array<float, 62> constants;
+      ASSERT_ONCE(2 + params.size() <= constants.size());
+      const uint32_t constant_count = uint32_t((std::min)(2 + params.size(), constants.size()));
+      const reshade::api::pipeline_layout_param layout_params[] = {reshade::api::constant_range{.count = constant_count, .visibility = reshade::api::shader_stage::pixel}, {1, &source_range}, {1, &sampler_range}};
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(pass, device_data, device, layout_params, 1, 1, name);
+      if (!tables)
+      {
+         return false;
+      }
+      pass->fullscreen_source_count = uint32_t(sources.size());
+      ID3D12PipelineState* const pipeline = GetD3D12GamePassPipeline(pass, native_device, CompileTimeStringHash("Copy VS"), pixel_shader_hash, DXGI_FORMAT(target_desc.format), name, blend);
+      if (!pipeline)
+      {
+         return false;
+      }
+
+      std::array<reshade::api::resource_view, D3D12_FULLSCREEN_MAX_SOURCES> source_views = {};
+      const auto destroy_source_views = [&]
+      {
+         for (const reshade::api::resource_view& source_view : source_views)
+         {
+            if (source_view.handle != 0)
+            {
+               device->destroy_resource_view(source_view);
+            }
+         }
+      };
+      for (size_t i = 0; i < sources.size(); ++i)
+      {
+         if (!device->create_resource_view(sources[i].resource, reshade::api::resource_usage::shader_resource, reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d, sources[i].format, 0, sources[i].levels, 0, 1), &source_views[i]))
+         {
+            destroy_source_views();
+            return false;
+         }
+      }
+      reshade::api::resource_view target_view = {};
+      if (!device->create_resource_view(target, reshade::api::resource_usage::render_target, target_desc, &target_view))
+      {
+         destroy_source_views();
+         return false;
+      }
+      const reshade::api::descriptor_table table = tables[0];
+      const reshade::api::descriptor_table_update source_update = {.table = table, .count = uint32_t(sources.size()), .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = source_views.data()};
+      device->update_descriptor_tables(1, &source_update);
+      // The table and the render target binding take copies of the descriptors
+      destroy_source_views();
+
+      const reshade::api::resource_desc target_resource_desc = device->get_resource_desc(target);
+      const uint32_t width = (std::max)(target_resource_desc.texture.width >> target_desc.texture.first_level, 1u);
+      const uint32_t height = (std::max)(target_resource_desc.texture.height >> target_desc.texture.first_level, 1u);
+      constants[0] = float(width);
+      constants[1] = float(height);
+      std::copy_n(params.begin(), constant_count - 2, constants.begin() + 2);
+      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipeline)});
+      cmd_list->push_constants(reshade::api::shader_stage::pixel, pass->layout, 0, 0, constant_count, constants.data());
+      cmd_list->bind_descriptor_tables(reshade::api::shader_stage::pixel, pass->layout, 1, 1, &table);
+      cmd_list->bind_render_targets_and_depth_stencil(1, &target_view);
+      device->destroy_resource_view(target_view);
+      const reshade::api::viewport viewport = {0.f, 0.f, float(width), float(height), 0.f, 1.f};
+      const reshade::api::rect scissor = {0, 0, int32_t(width), int32_t(height)};
+      cmd_list->bind_viewports(0, 1, &viewport);
+      cmd_list->bind_scissor_rects(0, 1, &scissor);
+      const reshade::api::dynamic_state topology_state = reshade::api::dynamic_state::primitive_topology;
+      const uint32_t topology = uint32_t(reshade::api::primitive_topology::triangle_strip);
+      cmd_list->bind_pipeline_states(1, &topology_state, &topology);
+      cmd_list->draw(4, 1, 0, 0);
+
+#if DEVELOPMENT
+      std::array<D3D12State::ViewInfo, D3D12_FULLSCREEN_MAX_SOURCES> trace_views = {};
+      for (size_t i = 0; i < sources.size(); ++i)
+      {
+         trace_views[i] = {.resource = sources[i].resource.handle, .format = sources[i].format};
+      }
+      const std::span<const D3D12State::ViewInfo> trace_inputs(trace_views.data(), sources.size());
+#else
+      constexpr std::span<const D3D12State::ViewInfo> trace_inputs;
+#endif
+      TraceLumaPass(&cmd_list_data, device_data, trace_name, trace_inputs,
+         {{.resource = target.handle, .format = target_desc.format, .first_level = target_desc.texture.first_level, .first_layer = target_desc.texture.first_layer, .layer_count = (std::max)(target_desc.texture.layers, 1u)}});
+      RestoreGameGraphicsD3D12(cmd_list_data);
+      return true;
+   }
+
+   // The pass of one source (its t0) into "target": see the form with several
+   bool DrawFullscreenPassD3D12(CommandListData& cmd_list_data, DeviceData& device_data, DeviceData::GamePassD3D12* pass, uint32_t pixel_shader_hash, const char* name, const char* trace_name, reshade::api::resource source, reshade::api::format source_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, std::span<const float> params, const D3D12_RENDER_TARGET_BLEND_DESC& blend = D3D12Passes::OPAQUE_BLEND)
+   {
+      const D3D12FullscreenSource sources[] = {{.resource = source, .format = source_format}};
+      return DrawFullscreenPassD3D12(cmd_list_data, device_data, pass, pixel_shader_hash, name, trace_name, sources, target, target_desc, params, blend);
+   }
+
+#if ENABLE_RCAS
+   // RCAS sharpening ("Luma_RCAS_PS") of "source" into "target": the D3D12 counterpart of the D3D11 "DrawRCAS()", with the contract of "DrawFullscreenPassD3D12()"
+   bool DrawRCAS(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource source, reshade::api::format source_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, float sharpness)
+   {
+      const float params[] = {sharpness, 0.f};
+      return DrawFullscreenPassD3D12(cmd_list_data, device_data, &device_data.rcas, CompileTimeStringHash("RCAS PS"), "RCAS", "Luma RCAS", source, source_format, target, target_desc, params);
+   }
+#endif // ENABLE_RCAS
+
+#if ENABLE_SMAA
+   // The area and search textures of the D3D12 "DrawSMAA()", once a draw asked for them: ReShade uploads their data on its immediate list, which it flushes
+   // and waits for, which only a present may do. One attempt
+   void CreateSMAATexturesD3D12(reshade::api::device* device, DeviceData& device_data)
+   {
+      auto& smaa = device_data.smaa;
+      if (!smaa.textures_wanted.exchange(false, std::memory_order_relaxed))
+      {
+         return;
+      }
+      const std::unique_lock lock(smaa.mutex);
+      if (smaa.area_texture.handle != 0 || smaa.failed)
+      {
+         return;
+      }
+      std::vector<uint8_t> area_texture_bytes(std::begin(areaTexBytes), std::end(areaTexBytes));
+#if !SMAA_SMOOTH_U_SHAPES
+      for (const auto& [offset, value] : areaTexSharpUPatch)
+      {
+         area_texture_bytes[offset] = value;
+      }
+#endif
+      const reshade::api::subresource_data area_data = {.data = area_texture_bytes.data(), .row_pitch = AREATEX_PITCH, .slice_pitch = AREATEX_SIZE};
+      const reshade::api::subresource_data search_data = {.data = const_cast<unsigned char*>(searchTexBytes), .row_pitch = SEARCHTEX_PITCH, .slice_pitch = SEARCHTEX_SIZE};
+      constexpr reshade::api::resource_usage usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest;
+      const bool created = device->create_resource({AREATEX_WIDTH, AREATEX_HEIGHT, 1, 1, reshade::api::format::r8g8_unorm, 1, reshade::api::memory_heap::gpu_only, usage}, &area_data, reshade::api::resource_usage::shader_resource, &smaa.area_texture) &&
+                           device->create_resource({SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, 1, 1, reshade::api::format::r8_unorm, 1, reshade::api::memory_heap::gpu_only, usage}, &search_data, reshade::api::resource_usage::shader_resource, &smaa.search_texture) &&
+                           device->create_resource_view(smaa.area_texture, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, reshade::api::format::r8g8_unorm, 0, 1, 0, 1}, &smaa.area_srv) &&
+                           device->create_resource_view(smaa.search_texture, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, reshade::api::format::r8_unorm, 0, 1, 0, 1}, &smaa.search_srv);
+      if (!created)
+      {
+         // What was made is destroyed with the device
+         smaa.failed = true;
+         reshade::log::message(reshade::log::level::error, "[SMAA] ReShade refused its area or search texture, so it doesn't draw");
+      }
+   }
+
+   // SMAA T2x on D3D12, the counterpart of the D3D11 "SMAAT2xPasses": the natives (the hashes of their names) of the game's blending weight and neighborhood blending pixel shaders built
+   // with "SMAA_SUBSAMPLE_INDICES" and "SMAA_REPROJECTION" (see "SMAA_Passes.hlsl"), and "velocity" (viewed as 2D "velocity_format", in a pixel shader readable state as "color" is), which the
+   // neighborhood blend reads at t2. Its target then holds the velocity length in alpha, for the game's temporal resolve.
+   struct SMAAT2xD3D12
+   {
+      uint32_t blending_weight_calculation_ps = 0;
+      uint32_t neighborhood_blending_ps = 0;
+      reshade::api::resource velocity = {};
+      reshade::api::format velocity_format = reshade::api::format::unknown;
+   };
+
+   // SMAA of "color" (viewed as 2D "color_format") into the whole "target" (through the view "target_desc"), recorded on the game's command list from a game's
+   // "OnDrawOrDispatch()": the D3D12 counterpart of the D3D11 "DrawSMAA()", with the contract of "DrawRCAS()" (resource states, restore, false = nothing recorded).
+   // The edge detection reads "color" too: a gamma encoded one is filtered in linear light with "SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR". "predication" (optional, as 2D
+   // "predication_format") is the edge detection's t1. The game's "Luma_SMAA_impl.hlsl" gets "SMAA_RT_METRICS" (the target's) then "game_constants" as cbuffer b1.
+   // It doesn't draw on its first call, which asks the next present for its area and search textures. With "rcas_sharpness" > 0 (and "ENABLE_RCAS"), the blend goes
+   // into an intermediate of the target's format that "DrawRCAS()" sharpens into the target (the blend goes into the target if RCAS can't draw).
+   // With "t2x" the blends are the variants of that, and RCAS isn't applied (the target's alpha is the velocity length, which the game's resolve reads).
+   // ponytail: no stencil mask of the edges (the blending weights run on every pixel, with the same result)
+   bool DrawSMAA(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource color, reshade::api::format color_format, reshade::api::resource predication, reshade::api::format predication_format, reshade::api::resource target, const reshade::api::resource_view_desc& target_desc, const float (&game_constants)[4], float rcas_sharpness = 0.f, const SMAAT2xD3D12* t2x = nullptr)
+   {
+      ASSERT_ONCE(ENABLE_RCAS || rcas_sharpness == 0.f);
+      reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
+      if (!cmd_list || RefusedInRenderPass(cmd_list_data, "SMAA"))
+      {
+         return false;
+      }
+      reshade::api::device* const device = cmd_list->get_device();
+      auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+      auto& smaa = device_data.smaa;
+      const std::unique_lock lock(smaa.mutex);
+      if (smaa.area_texture.handle == 0)
+      {
+         smaa.textures_wanted = true;
+         return false;
+      }
+      const reshade::api::descriptor_range texture_range = {.count = 3, .visibility = reshade::api::shader_stage::pixel, .type = reshade::api::descriptor_type::texture_shader_resource_view};
+      const reshade::api::sampler_desc samplers[] = {{.filter = reshade::api::filter_mode::min_mag_mip_linear}, {.filter = reshade::api::filter_mode::min_mag_mip_point}};
+      reshade::api::descriptor_range_with_flags sampler_range;
+      sampler_range.count = uint32_t(std::size(samplers));
+      sampler_range.visibility = reshade::api::shader_stage::pixel;
+      sampler_range.type = reshade::api::descriptor_type::sampler;
+      sampler_range.static_samplers = samplers;
+      const reshade::api::pipeline_layout_param params[] = {reshade::api::constant_range{.dx_register_index = 1, .count = 8, .visibility = reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel}, {1, &texture_range}, {1, &sampler_range}};
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&smaa, device_data, device, params, 1, 3, "SMAA");
+      if (!tables)
+      {
+         return false;
+      }
+      const DXGI_FORMAT target_format = DXGI_FORMAT(target_desc.format);
+      ID3D12PipelineState* const edge_detection_pipeline = GetD3D12GamePassPipeline(&smaa, native_device, CompileTimeStringHash("SMAA Edge Detection VS"), CompileTimeStringHash("SMAA Edge Detection PS"), DXGI_FORMAT_R8G8_UNORM, "SMAA");
+      ID3D12PipelineState* const blending_weight_pipeline = GetD3D12GamePassPipeline(&smaa, native_device, CompileTimeStringHash("SMAA Blending Weight Calculation VS"), (t2x ? t2x->blending_weight_calculation_ps : CompileTimeStringHash("SMAA Blending Weight Calculation PS")), DXGI_FORMAT_R8G8B8A8_UNORM, "SMAA");
+      ID3D12PipelineState* const neighborhood_blending_pipeline = GetD3D12GamePassPipeline(&smaa, native_device, CompileTimeStringHash("SMAA Neighborhood Blending VS"), (t2x ? t2x->neighborhood_blending_ps : CompileTimeStringHash("SMAA Neighborhood Blending PS")), target_format, "SMAA");
+      if (!edge_detection_pipeline || !blending_weight_pipeline || !neighborhood_blending_pipeline)
+      {
+         return false;
+      }
+
+      const reshade::api::resource_desc target_resource_desc = device->get_resource_desc(target);
+      const uint32_t width = (std::max)(target_resource_desc.texture.width >> target_desc.texture.first_level, 1u);
+      const uint32_t height = (std::max)(target_resource_desc.texture.height >> target_desc.texture.first_level, 1u);
+      const bool sharpen = ENABLE_RCAS && rcas_sharpness > 0.f && !t2x;
+      const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
+      // The intermediates follow the target's size (and format, for the blend's)
+      const auto create_intermediate = [&](reshade::api::format format, reshade::api::resource* resource, reshade::api::resource_view* rtv, reshade::api::resource_view* srv)
+      {
+         const reshade::api::resource_view_desc view_desc(reshade::api::resource_view_type::texture_2d, format, 0, 1, 0, 1);
+         return device->create_resource({width, height, 1, 1, format, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource}, nullptr, reshade::api::resource_usage::shader_resource, resource) &&
+                device->create_resource_view(*resource, reshade::api::resource_usage::render_target, view_desc, rtv) && device->create_resource_view(*resource, reshade::api::resource_usage::shader_resource, view_desc, srv);
+      };
+      const auto log_refused = [width, height]()
+      {
+         static std::atomic_flag logged;
+         if (!logged.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::error, std::format("[SMAA] ReShade refused its {}x{} intermediates, so it doesn't draw", width, height).c_str());
+         }
+         return false;
+      };
+      if (smaa.width != width || smaa.height != height)
+      {
+         RetireD3D12GamePassTextures(&smaa, device, present_count, {&smaa.edges, &smaa.weights, &smaa.output}, {&smaa.edges_rtv, &smaa.edges_srv, &smaa.weights_rtv, &smaa.weights_srv, &smaa.output_rtv, &smaa.output_srv});
+         smaa.width = width;
+         smaa.height = height;
+         if (!create_intermediate(reshade::api::format::r8g8_unorm, &smaa.edges, &smaa.edges_rtv, &smaa.edges_srv) || !create_intermediate(reshade::api::format::r8g8b8a8_unorm, &smaa.weights, &smaa.weights_rtv, &smaa.weights_srv))
+         {
+            // What was made is destroyed with the device, or with the next size
+            smaa.width = 0;
+            smaa.height = 0;
+            return log_refused();
+         }
+      }
+      if (sharpen && (smaa.output.handle == 0 || smaa.output_format != target_desc.format))
+      {
+         RetireD3D12GamePassTextures(&smaa, device, present_count, {&smaa.output}, {&smaa.output_rtv, &smaa.output_srv});
+         smaa.output_format = target_desc.format;
+         if (!create_intermediate(target_desc.format, &smaa.output, &smaa.output_rtv, &smaa.output_srv))
+         {
+            return log_refused();
+         }
+      }
+
+      reshade::api::resource_view color_view = {};
+      reshade::api::resource_view predication_view = {};
+      reshade::api::resource_view target_view = {};
+      reshade::api::resource_view velocity_view = {};
+      const bool created_views = device->create_resource_view(color, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, color_format, 0, 1, 0, 1}, &color_view) &&
+                                 (predication == 0 || device->create_resource_view(predication, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, predication_format, 0, 1, 0, 1}, &predication_view)) &&
+                                 (!t2x || device->create_resource_view(t2x->velocity, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, t2x->velocity_format, 0, 1, 0, 1}, &velocity_view)) &&
+                                 device->create_resource_view(target, reshade::api::resource_usage::render_target, target_desc, &target_view);
+      if (!created_views)
+      {
+         for (const reshade::api::resource_view view : {color_view, predication_view, velocity_view, target_view})
+         {
+            device->destroy_resource_view(view);
+         }
+         return false;
+      }
+      // The descriptors a pass doesn't read are left as they were
+      const reshade::api::resource_view edge_detection_srvs[] = {color_view, predication_view};
+      const reshade::api::resource_view blending_weight_srvs[] = {smaa.edges_srv, smaa.area_srv, smaa.search_srv};
+      const reshade::api::resource_view neighborhood_blending_srvs[] = {color_view, smaa.weights_srv, velocity_view};
+      const reshade::api::descriptor_table_update updates[] = {
+         {.table = tables[0], .count = predication == 0 ? 1u : 2u, .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = edge_detection_srvs},
+         {.table = tables[1], .count = uint32_t(std::size(blending_weight_srvs)), .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = blending_weight_srvs},
+         {.table = tables[2], .count = (t2x ? uint32_t(std::size(neighborhood_blending_srvs)) : 2u), .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = neighborhood_blending_srvs},
+      };
+      device->update_descriptor_tables(uint32_t(std::size(updates)), updates);
+      device->destroy_resource_view(color_view);
+      device->destroy_resource_view(predication_view);
+      device->destroy_resource_view(velocity_view);
+
+      const float constants[8] = {1.f / float(width), 1.f / float(height), float(width), float(height), game_constants[0], game_constants[1], game_constants[2], game_constants[3]};
+      cmd_list->push_constants(reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, smaa.layout, 0, 0, uint32_t(std::size(constants)), constants);
+      const reshade::api::viewport viewport = {0.f, 0.f, float(width), float(height), 0.f, 1.f};
+      const reshade::api::rect scissor = {0, 0, int32_t(width), int32_t(height)};
+      cmd_list->bind_viewports(0, 1, &viewport);
+      cmd_list->bind_scissor_rects(0, 1, &scissor);
+      const reshade::api::dynamic_state topology_state = reshade::api::dynamic_state::primitive_topology;
+      const uint32_t topology = uint32_t(reshade::api::primitive_topology::triangle_list);
+      cmd_list->bind_pipeline_states(1, &topology_state, &topology);
+      const auto draw = [&](ID3D12PipelineState* pipeline, const reshade::api::descriptor_table& table, const reshade::api::resource_view& rtv)
+      {
+         cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipeline)});
+         cmd_list->bind_descriptor_tables(reshade::api::shader_stage::pixel, smaa.layout, 1, 1, &table);
+         cmd_list->bind_render_targets_and_depth_stencil(1, &rtv);
+         cmd_list->draw(3, 1, 0, 0);
+      };
+
+      // The edge detection discards the pixels without edges, which have to read as none
+      cmd_list->barrier(smaa.edges, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::render_target);
+      static constexpr float clear_color[4] = {};
+      cmd_list->clear_render_target_view(smaa.edges_rtv, clear_color);
+      draw(edge_detection_pipeline, tables[0], smaa.edges_rtv);
+      cmd_list->barrier(smaa.edges, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
+
+      cmd_list->barrier(smaa.weights, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::render_target);
+      draw(blending_weight_pipeline, tables[1], smaa.weights_rtv);
+      cmd_list->barrier(smaa.weights, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
+
+      // Before its sharpening ("DrawRCAS()" traces itself)
+      TraceLumaPass(&cmd_list_data, device_data, "Luma SMAA", {{.resource = color.handle, .format = color_format}, {.resource = predication.handle, .format = predication_format}, {.resource = (t2x ? t2x->velocity.handle : 0), .format = (t2x ? t2x->velocity_format : reshade::api::format::unknown)}},
+         {{.resource = target.handle, .format = target_desc.format, .first_level = target_desc.texture.first_level, .first_layer = target_desc.texture.first_layer, .layer_count = (std::max)(target_desc.texture.layers, 1u)}});
+#if ENABLE_RCAS
+      if (sharpen)
+      {
+         cmd_list->barrier(smaa.output, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::render_target);
+         draw(neighborhood_blending_pipeline, tables[2], smaa.output_rtv);
+         cmd_list->barrier(smaa.output, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
+         // It binds the game's state back itself. "rcas.mutex" is only ever taken after "smaa.mutex"
+         if (DrawRCAS(cmd_list_data, device_data, smaa.output, target_desc.format, target, target_desc, rcas_sharpness))
+         {
+            device->destroy_resource_view(target_view);
+            return true;
+         }
+         // It recorded nothing, so the blend's bindings still hold
+      }
+#endif
+      draw(neighborhood_blending_pipeline, tables[2], target_view);
+      device->destroy_resource_view(target_view);
+
+      RestoreGameGraphicsD3D12(cmd_list_data);
+      return true;
+   }
+#endif // ENABLE_SMAA
+
+#if ENABLE_BLOOM
+   // The Karis average of "source" (viewed as 2D "source_format", in the state "source_state") into an fp16 texture of its size, which "output" gets, recorded on
+   // the game's command list: the D3D12 counterpart of the D3D11 "DrawKarisAverage()", to feed "DrawBloom()". The source goes into a state compute shaders read
+   // and back; the output is in a shader resource state after it. The game's compute state is bound again after it ("D3D12State::RestoreCompute()"). False, with
+   // nothing recorded, if it can't draw.
+   bool DrawKarisAverage(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource source, reshade::api::format source_format, reshade::api::resource_usage source_state, reshade::api::resource* output)
+   {
+      reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
+      if (!cmd_list || RefusedInRenderPass(cmd_list_data, "Karis Average"))
+      {
+         return false;
+      }
+      reshade::api::device* const device = cmd_list->get_device();
+      auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+      auto& karis = device_data.karis_average;
+      const std::unique_lock lock(karis.mutex);
+      const reshade::api::descriptor_range ranges[] = {{.count = 1, .visibility = reshade::api::shader_stage::compute, .type = reshade::api::descriptor_type::texture_shader_resource_view}, {.binding = 1, .count = 1, .visibility = reshade::api::shader_stage::compute, .type = reshade::api::descriptor_type::texture_unordered_access_view}};
+      const reshade::api::pipeline_layout_param params[] = {{uint32_t(std::size(ranges)), ranges}};
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&karis, device_data, device, params, 0, 1, "Karis Average");
+      if (!tables)
+      {
+         return false;
+      }
+      ID3D12PipelineState* const pipeline = GetD3D12GamePassPipeline(&karis, native_device, 0, CompileTimeStringHash("Karis Average CS"), DXGI_FORMAT_UNKNOWN, "Karis Average");
+      if (!pipeline)
+      {
+         return false;
+      }
+
+      const reshade::api::resource_desc source_desc = device->get_resource_desc(source);
+      const uint32_t width = source_desc.texture.width;
+      const uint32_t height = source_desc.texture.height;
+      if (karis.width != width || karis.height != height)
+      {
+         RetireD3D12GamePassTextures(&karis, device, device_data.present_count.load(std::memory_order_relaxed), {&karis.output}, {&karis.output_srv, &karis.output_uav});
+         karis.width = width;
+         karis.height = height;
+         const reshade::api::resource_view_desc view_desc(reshade::api::resource_view_type::texture_2d, reshade::api::format::r16g16b16a16_float, 0, 1, 0, 1);
+         const bool created = device->create_resource({width, height, 1, 1, reshade::api::format::r16g16b16a16_float, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access}, nullptr, reshade::api::resource_usage::shader_resource, &karis.output) &&
+                              device->create_resource_view(karis.output, reshade::api::resource_usage::shader_resource, view_desc, &karis.output_srv) && device->create_resource_view(karis.output, reshade::api::resource_usage::unordered_access, view_desc, &karis.output_uav);
+         if (!created)
+         {
+            // What was made is destroyed with the device, or with the next size
+            karis.width = 0;
+            karis.height = 0;
+            static std::atomic_flag logged;
+            if (!logged.test_and_set())
+            {
+               reshade::log::message(reshade::log::level::error, std::format("[Karis Average] ReShade refused its {}x{} output, so it doesn't draw", width, height).c_str());
+            }
+            return false;
+         }
+      }
+
+      reshade::api::resource_view source_view = {};
+      if (!device->create_resource_view(source, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, source_format, 0, 1, 0, 1}, &source_view))
+      {
+         return false;
+      }
+      const reshade::api::descriptor_table_update updates[] = {
+         {.table = tables[0], .count = 1, .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = &source_view},
+         {.table = tables[0], .binding = 1, .count = 1, .type = reshade::api::descriptor_type::texture_unordered_access_view, .descriptors = &karis.output_uav},
+      };
+      device->update_descriptor_tables(uint32_t(std::size(updates)), updates);
+      device->destroy_resource_view(source_view);
+
+      const reshade::api::resource_usage source_compute_state = source_state | reshade::api::resource_usage::shader_resource_non_pixel;
+      if (source_compute_state != source_state)
+      {
+         cmd_list->barrier(source, source_state, source_compute_state);
+      }
+      cmd_list->barrier(karis.output, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipeline)});
+      cmd_list->bind_descriptor_tables(reshade::api::shader_stage::compute, karis.layout, 0, 1, &tables[0]);
+      cmd_list->dispatch((width + 7) / 8, (height + 7) / 8, 1);
+      cmd_list->barrier(karis.output, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+      if (source_compute_state != source_state)
+      {
+         cmd_list->barrier(source, source_compute_state, source_state);
+      }
+
+      TraceLumaPass(&cmd_list_data, device_data, "Luma Karis Average", {{.resource = source.handle, .format = source_format}}, {{.resource = karis.output.handle, .format = reshade::api::format::r16g16b16a16_float}}, true);
+      D3D12State::RestoreCompute(cmd_list, cmd_list_data.d3d12_state, reshade::api::pipeline{cmd_list_data.bound_current_pipeline});
+      *output = karis.output;
+      return true;
+   }
+
+   // The most levels "DrawBloom()" takes (each level draws at most 3 times)
+   constexpr uint32_t BLOOM_MAX_MIPS = 16;
+
+   // The bloom of "scene" (viewed as 2D "scene_format", readable by pixel shaders) over "mip_count" levels (at most "BLOOM_MAX_MIPS"), with the gaussian sigma of each
+   // level in "sigmas", recorded on the game's command list: the D3D12 counterpart of the D3D11 "DrawBloom()", with the same passes and sizes. The game's
+   // "Luma_Bloom_impl.hlsl" can only read "LumaBloom" and its texture: the game's cbuffers aren't bound. "bloom" gets the texture whose mip 0 is the bloom (fp16,
+   // half the scene's size), in a shader resource state. The game's graphics state is bound again after it (its blend factor too, see "D3D12State::RestoreGraphics()").
+   // False, with nothing recorded, if it can't draw.
+   bool DrawBloom(CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::resource scene, reshade::api::format scene_format, uint32_t mip_count, const float* sigmas, reshade::api::resource* bloom_output)
+   {
+      reshade::api::command_list* const cmd_list = cmd_list_data.cmd_list;
+      if (!cmd_list || RefusedInRenderPass(cmd_list_data, "Bloom") || mip_count == 0 || mip_count > BLOOM_MAX_MIPS)
+      {
+         ASSERT_ONCE(mip_count != 0 && mip_count <= BLOOM_MAX_MIPS);
+         return false;
+      }
+      reshade::api::device* const device = cmd_list->get_device();
+      auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+      auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+      auto& bloom = device_data.bloom;
+      const std::unique_lock lock(bloom.mutex);
+      const reshade::api::descriptor_range texture_range = {.count = 1, .visibility = reshade::api::shader_stage::pixel, .type = reshade::api::descriptor_type::texture_shader_resource_view};
+      const reshade::api::sampler_desc linear_sampler = {.filter = reshade::api::filter_mode::min_mag_mip_linear};
+      reshade::api::descriptor_range_with_flags sampler_range;
+      sampler_range.count = 1;
+      sampler_range.visibility = reshade::api::shader_stage::pixel;
+      sampler_range.type = reshade::api::descriptor_type::sampler;
+      sampler_range.static_samplers = &linear_sampler;
+      const reshade::api::pipeline_layout_param params[] = {reshade::api::constant_range{.dx_register_index = 11, .count = 8, .visibility = reshade::api::shader_stage::pixel}, {1, &texture_range}, {1, &sampler_range}};
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&bloom, device_data, device, params, 1, 3 * BLOOM_MAX_MIPS, "Bloom");
+      if (!tables)
+      {
+         return false;
+      }
+      // Both blend factors 0.5: an energy preserving average of the upsampled level and the one below
+      const D3D12_RENDER_TARGET_BLEND_DESC average_blend = {.BlendEnable = TRUE, .SrcBlend = D3D12_BLEND_BLEND_FACTOR, .DestBlend = D3D12_BLEND_BLEND_FACTOR, .BlendOp = D3D12_BLEND_OP_ADD, .SrcBlendAlpha = D3D12_BLEND_ONE, .DestBlendAlpha = D3D12_BLEND_ZERO, .BlendOpAlpha = D3D12_BLEND_OP_ADD, .LogicOp = D3D12_LOGIC_OP_NOOP, .RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL};
+      ID3D12PipelineState* const downsample_pipeline = GetD3D12GamePassPipeline(&bloom, native_device, CompileTimeStringHash("Bloom VS"), CompileTimeStringHash("Bloom Downsample PS"), DXGI_FORMAT_R16G16B16A16_FLOAT, "Bloom");
+      ID3D12PipelineState* const prefilter_pipeline = GetD3D12GamePassPipeline(&bloom, native_device, CompileTimeStringHash("Bloom VS"), CompileTimeStringHash("Bloom Prefilter PS"), DXGI_FORMAT_R16G16B16A16_FLOAT, "Bloom");
+      ID3D12PipelineState* const upsample_pipeline = GetD3D12GamePassPipeline(&bloom, native_device, CompileTimeStringHash("Bloom VS"), CompileTimeStringHash("Bloom Upsample PS"), DXGI_FORMAT_R16G16B16A16_FLOAT, "Bloom", average_blend);
+      if (!downsample_pipeline || !prefilter_pipeline || !upsample_pipeline)
+      {
+         return false;
+      }
+
+      const reshade::api::resource_desc scene_desc = device->get_resource_desc(scene);
+      const uint32_t scene_width = scene_desc.texture.width;
+      const uint32_t scene_height = scene_desc.texture.height;
+      const uint32_t x_mip0_width = scene_width / 2;
+      const uint32_t x_mip0_height = scene_height;
+      const uint32_t y_mip0_width = scene_width / 2;
+      const uint32_t y_mip0_height = scene_height / 2;
+      if (bloom.scene_width != scene_width || bloom.scene_height != scene_height || bloom.mip_count != mip_count)
+      {
+         for (std::vector<reshade::api::resource_view>* const views : {&bloom.rtvs_y, &bloom.srvs_y, &bloom.rtvs_x, &bloom.srvs_x})
+         {
+            for (const reshade::api::resource_view view : *views)
+            {
+               device->destroy_resource_view(view);
+            }
+            views->assign(mip_count, {});
+         }
+         const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
+         RetireD3D12GamePassResource(&bloom, present_count, &bloom.mips_y);
+         for (reshade::api::resource& resource : bloom.mips_x)
+         {
+            RetireD3D12GamePassResource(&bloom, present_count, &resource);
+         }
+         bloom.mips_x.assign(mip_count, {});
+         bloom.scene_width = scene_width;
+         bloom.scene_height = scene_height;
+         bloom.mip_count = mip_count;
+         constexpr reshade::api::format format = reshade::api::format::r16g16b16a16_float;
+         constexpr reshade::api::resource_usage usage = reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource;
+         bool created = device->create_resource({y_mip0_width, y_mip0_height, 1, uint16_t(mip_count), format, 1, reshade::api::memory_heap::gpu_only, usage}, nullptr, reshade::api::resource_usage::shader_resource, &bloom.mips_y);
+         for (uint32_t i = 0; created && i < mip_count; i++)
+         {
+            const reshade::api::resource_view_desc y_desc(reshade::api::resource_view_type::texture_2d, format, i, 1, 0, 1);
+            const reshade::api::resource_view_desc x_desc(reshade::api::resource_view_type::texture_2d, format, 0, 1, 0, 1);
+            created = device->create_resource_view(bloom.mips_y, reshade::api::resource_usage::render_target, y_desc, &bloom.rtvs_y[i]) && device->create_resource_view(bloom.mips_y, reshade::api::resource_usage::shader_resource, y_desc, &bloom.srvs_y[i]) &&
+                      device->create_resource({(std::max)(x_mip0_width >> i, 1u), (std::max)(x_mip0_height >> i, 1u), 1, 1, format, 1, reshade::api::memory_heap::gpu_only, usage}, nullptr, reshade::api::resource_usage::shader_resource, &bloom.mips_x[i]) &&
+                      device->create_resource_view(bloom.mips_x[i], reshade::api::resource_usage::render_target, x_desc, &bloom.rtvs_x[i]) && device->create_resource_view(bloom.mips_x[i], reshade::api::resource_usage::shader_resource, x_desc, &bloom.srvs_x[i]);
+         }
+         if (!created)
+         {
+            // What was made is destroyed with the device, or with the next size
+            bloom.mip_count = 0;
+            static std::atomic_flag logged;
+            if (!logged.test_and_set())
+            {
+               reshade::log::message(reshade::log::level::error, std::format("[Bloom] ReShade refused its {} levels for a {}x{} scene, so it doesn't draw", mip_count, scene_width, scene_height).c_str());
+            }
+            return false;
+         }
+      }
+
+      reshade::api::resource_view scene_view = {};
+      if (!device->create_resource_view(scene, reshade::api::resource_usage::shader_resource, {reshade::api::resource_view_type::texture_2d, scene_format, 0, 1, 0, 1}, &scene_view))
+      {
+         return false;
+      }
+
+      const reshade::api::dynamic_state topology_state = reshade::api::dynamic_state::primitive_topology;
+      const uint32_t topology = uint32_t(reshade::api::primitive_topology::triangle_list);
+      cmd_list->bind_pipeline_states(1, &topology_state, &topology);
+      uint32_t draws = 0;
+      // "source" is read at "source_size", "target" written at "target_size" (both whole)
+      const auto draw = [&](ID3D12PipelineState* pipeline, reshade::api::resource_view source, uint32_t source_width, uint32_t source_height, reshade::api::resource_view target, uint32_t target_width, uint32_t target_height, bool vertical, float sigma)
+      {
+         const reshade::api::descriptor_table table = tables[draws++];
+         const reshade::api::descriptor_table_update update = {.table = table, .count = 1, .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = &source};
+         device->update_descriptor_tables(1, &update);
+         // "LumaBloom": src_size, inv_src_size, axis, sigma
+         const float constants[8] = {float(source_width), float(source_height), 1.f / float(source_width), 1.f / float(source_height), vertical ? 0.f : 1.f, vertical ? 1.f : 0.f, sigma, 0.f};
+         cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipeline)});
+         cmd_list->push_constants(reshade::api::shader_stage::pixel, bloom.layout, 0, 0, uint32_t(std::size(constants)), constants);
+         cmd_list->bind_descriptor_tables(reshade::api::shader_stage::pixel, bloom.layout, 1, 1, &table);
+         cmd_list->bind_render_targets_and_depth_stencil(1, &target);
+         const reshade::api::viewport viewport = {0.f, 0.f, float(target_width), float(target_height), 0.f, 1.f};
+         const reshade::api::rect scissor = {0, 0, int32_t(target_width), int32_t(target_height)};
+         cmd_list->bind_viewports(0, 1, &viewport);
+         cmd_list->bind_scissor_rects(0, 1, &scissor);
+         cmd_list->draw(3, 1, 0, 0);
+      };
+      // Between the draws every texture and level is readable, the one drawn into goes to a render target state around its draw
+      auto* const native_mips_y = reinterpret_cast<ID3D12Resource*>(bloom.mips_y.handle);
+      const auto to_target = [&](ID3D12Resource* resource, UINT subresource)
+      {
+         D3D12Passes::Transition(native_list, resource, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, subresource);
+      };
+      const auto to_shader_resource = [&](ID3D12Resource* resource, UINT subresource)
+      {
+         D3D12Passes::Transition(native_list, resource, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, subresource);
+      };
+      const auto mip_x = [&](uint32_t i)
+      {
+         return reinterpret_cast<ID3D12Resource*>(bloom.mips_x[i].handle);
+      };
+      // The size of level "i" of a chain of "mip0_size"
+      const auto level = [](uint32_t mip0_size, uint32_t i)
+      {
+         return (std::max)(mip0_size >> i, 1u);
+      };
+
+      // Prefilter and downsample: the scene into X0 (horizontally), X0 into Y0 (vertically, with the threshold)
+      to_target(mip_x(0), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+      draw(downsample_pipeline, scene_view, scene_width, scene_height, bloom.rtvs_x[0], level(x_mip0_width, 0), level(x_mip0_height, 0), false, sigmas[0]);
+      to_shader_resource(mip_x(0), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+      to_target(native_mips_y, 0);
+      draw(prefilter_pipeline, bloom.srvs_x[0], level(x_mip0_width, 0), level(x_mip0_height, 0), bloom.rtvs_y[0], level(y_mip0_width, 0), level(y_mip0_height, 0), true, sigmas[0]);
+      to_shader_resource(native_mips_y, 0);
+      // Downsample: Y(i - 1) into Xi, Xi into Yi
+      for (uint32_t i = 1; i < mip_count; i++)
+      {
+         to_target(mip_x(i), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+         draw(downsample_pipeline, bloom.srvs_y[i - 1], level(y_mip0_width, i - 1), level(y_mip0_height, i - 1), bloom.rtvs_x[i], level(x_mip0_width, i), level(x_mip0_height, i), false, sigmas[i]);
+         to_shader_resource(mip_x(i), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+         to_target(native_mips_y, i);
+         draw(downsample_pipeline, bloom.srvs_x[i], level(x_mip0_width, i), level(x_mip0_height, i), bloom.rtvs_y[i], level(y_mip0_width, i), level(y_mip0_height, i), true, sigmas[i]);
+         to_shader_resource(native_mips_y, i);
+      }
+      // Upsample: Yi averaged into Y(i - 1), from the smallest level (its sigma is that of the last downsample, as the D3D11 one)
+      static constexpr float blend_factor[4] = {0.5f, 0.5f, 0.5f, 0.f};
+      native_list->OMSetBlendFactor(blend_factor);
+      for (uint32_t i = mip_count - 1; i > 0; i--)
+      {
+         to_target(native_mips_y, i - 1);
+         draw(upsample_pipeline, bloom.srvs_y[i], level(y_mip0_width, i), level(y_mip0_height, i), bloom.rtvs_y[i - 1], level(y_mip0_width, i - 1), level(y_mip0_height, i - 1), true, sigmas[mip_count - 1]);
+         to_shader_resource(native_mips_y, i - 1);
+      }
+      device->destroy_resource_view(scene_view);
+
+      TraceLumaPass(&cmd_list_data, device_data, "Luma Bloom", {{.resource = scene.handle, .format = scene_format}}, {{.resource = bloom.mips_y.handle, .format = reshade::api::format::r16g16b16a16_float}});
+      RestoreGameGraphicsD3D12(cmd_list_data);
+      *bloom_output = bloom.mips_y;
+      return true;
+   }
+#endif // ENABLE_BLOOM
+
+   // The texture "desc" asks for (its usage, size and format are the key) that the copy conversions go through, made on first use in "initial_usage" and kept: a game converts textures of different
+   // sizes and formats in one frame. The least recently used goes (retired, see "RetireD3D12GamePassResource()") when there are too many. "device_data.texture_copy.mutex" is held. Null if the device refuses it.
+   reshade::api::resource GetD3D12CopyIntermediate(DeviceData& device_data, reshade::api::device* device, const reshade::api::resource_desc& desc, reshade::api::resource_usage initial_usage)
+   {
+      auto& texture_copy = device_data.texture_copy;
+      // The rest of the desc is the same for every whole single subresource texture (a "memcmp()" would compare the padding too)
+      const auto found = std::ranges::find_if(texture_copy.intermediates, [&](const DeviceData::TextureCopyD3D12::Intermediate& intermediate)
+         { return intermediate.usage == desc.usage && intermediate.width == desc.texture.width && intermediate.height == desc.texture.height && intermediate.format == desc.texture.format; });
+      if (found != texture_copy.intermediates.end())
+      {
+         std::rotate(found, found + 1, texture_copy.intermediates.end());
+         return texture_copy.intermediates.back().resource;
+      }
+      constexpr size_t MAX_INTERMEDIATES = 16;
+      if (texture_copy.intermediates.size() >= MAX_INTERMEDIATES)
+      {
+         RetireD3D12GamePassResource(&texture_copy, device_data.present_count.load(std::memory_order_relaxed), &texture_copy.intermediates.front().resource);
+         texture_copy.intermediates.erase(texture_copy.intermediates.begin());
+      }
+      reshade::api::resource made = {};
+      if (!device->create_resource(desc, nullptr, initial_usage, &made))
+      {
+         return {};
+      }
+      texture_copy.intermediates.push_back({.resource = made, .usage = desc.usage, .width = desc.texture.width, .height = desc.texture.height, .format = desc.texture.format});
+      return made;
+   }
+
+   // The copy of a texture Luma upgraded into one of another format family, or back (see "SkipUpgradedFormatCopy()"), which D3D12's copies can't make: "Copy PS" draws it instead, like the D3D11
+   // "OnCopyResource_Internal()", and the destination keeps its own precision. Whole 2D textures of the same size with one mip, layer and sample, R16G16B16A16 FLOAT against the R8G8B8A8, B8G8R8A8,
+   // B8G8R8X8, R10G10B10A2 and R11G11B10 families, and against a typed R16G16B16A16 UNORM. With "scaled" (one of them is a clone of another size, see "includes/d3d12_clones.h") the sizes differ and the families can be the same:
+   // "Scale PS" stretches it bilinearly. The textures are in the states of the game's copy (copy source and copy destination): a destination that can't be a render target is drawn through an
+   // intermediate of its desc that can, then copied. False, with nothing recorded, if it can't (the caller skips the copy then).
+   // States ("Using Resource Barriers to Synchronize Resource States in Direct3D 12", "Implicit State Transitions"): a texture in the common state is promoted to a copy state by the copy it is the
+   // source or destination of, and a barrier on a resource in the common state may name any promotable state as its before state (COPY_SOURCE, COPY_DEST and the shader resource states are, for
+   // textures), so the copy states below hold for the textures a game copies through promotion too. A source promoted to a read state decays to the common state when the list executes, a
+   // destination promoted to a write state stays in COPY_DEST: the destination ends in COPY_DEST, as the copy it replaces leaves it, and the source in the common state, from which the game's
+   // later barriers (before state COPY_SOURCE or COMMON) and promotions are valid whether it transitioned the source explicitly or relied on promotion. "dest_state" is the state the destination is
+   // in and stays in: the copy destination one, or the resolve destination one of a resolve's ("ConvertResolveD3D12()"), which the copy into a destination that can't be drawn into goes through.
+   // A texture created with an enhanced barriers layout ("D3D12ResourceCreation::MayBeInLayout()") can't take legacy barriers, and the layout the game's copy found it in isn't known: a source
+   // like that is copied (the copy the game's own is, valid in whatever layout) into an intermediate, which the draw samples, and a destination like that is drawn into through an intermediate
+   // that is then copied into it, so the game's textures are only ever copied.
+   // ponytail: that is a copy more than known layouts would need; track them (barrier events) to transition the textures instead
+   bool ConvertTextureCopyD3D12(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest, bool scaled, reshade::api::resource_usage dest_state = reshade::api::resource_usage::copy_dest)
+   {
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      if (RefusedInRenderPass(cmd_list_data, "Texture Copy"))
+      {
+         return false;
+      }
+      // The format a texture is viewed in (copies move bytes, so the typeless and sRGB ones read as UNORM), unknown for the ones that aren't converted
+      const auto view_format = [](reshade::api::format format)
+      {
+         switch (DXGI_FORMAT(format))
+         {
+         case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+         case DXGI_FORMAT_R8G8B8A8_UNORM:
+         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+            return DXGI_FORMAT_R8G8B8A8_UNORM;
+         case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+         case DXGI_FORMAT_B8G8R8A8_UNORM:
+         case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+            return DXGI_FORMAT_B8G8R8A8_UNORM;
+         case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+         case DXGI_FORMAT_B8G8R8X8_UNORM:
+         case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+            return DXGI_FORMAT_B8G8R8X8_UNORM;
+         case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+         case DXGI_FORMAT_R10G10B10A2_UNORM:
+            return DXGI_FORMAT_R10G10B10A2_UNORM;
+         case DXGI_FORMAT_R11G11B10_FLOAT:
+            return DXGI_FORMAT_R11G11B10_FLOAT;
+         case DXGI_FORMAT_R16G16B16A16_UNORM:
+            return DXGI_FORMAT_R16G16B16A16_UNORM;
+         case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+         case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            return DXGI_FORMAT_R16G16B16A16_FLOAT;
+         default:
+            return DXGI_FORMAT_UNKNOWN;
+         }
+      };
+      const auto is_whole_2d = [](const reshade::api::resource_desc& desc)
+      { return desc.type == reshade::api::resource_type::texture_2d && desc.texture.depth_or_layers == 1 && desc.texture.levels == 1 && desc.texture.samples == 1; };
+      reshade::api::device* const device = cmd_list->get_device();
+      const reshade::api::resource_desc source_desc = device->get_resource_desc(source);
+      const reshade::api::resource_desc dest_desc = device->get_resource_desc(dest);
+      const DXGI_FORMAT source_view_format = view_format(source_desc.texture.format);
+      const DXGI_FORMAT dest_view_format = view_format(dest_desc.texture.format);
+      const bool same_size = (source_desc.texture.width == dest_desc.texture.width && source_desc.texture.height == dest_desc.texture.height);
+#if ENABLE_MINHOOK
+      const bool source_in_layout = D3D12ResourceCreation::MayBeInLayout(source.handle);
+      const bool dest_in_layout = D3D12ResourceCreation::MayBeInLayout(dest.handle);
+#else
+      constexpr bool source_in_layout = false;
+      constexpr bool dest_in_layout = false;
+#endif
+      if (source_view_format == DXGI_FORMAT_UNKNOWN || dest_view_format == DXGI_FORMAT_UNKNOWN || (!scaled && (source_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT) == (dest_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT))
+         || !is_whole_2d(source_desc) || !is_whole_2d(dest_desc) || (!scaled && !same_size)
+         || (!source_in_layout && (source_desc.usage & reshade::api::resource_usage::shader_resource) == 0))
+      {
+         return false;
+      }
+      if (dest_in_layout && dest_state != reshade::api::resource_usage::copy_dest) // No layout to put a resolve's destination in to copy into it
+      {
+         return false;
+      }
+
+      auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+      DeviceData& device_data = *device->get_private_data<DeviceData>();
+      auto& texture_copy = device_data.texture_copy;
+      const std::unique_lock lock(texture_copy.mutex);
+      const reshade::api::descriptor_range source_range = {.count = 1, .visibility = reshade::api::shader_stage::pixel, .type = reshade::api::descriptor_type::texture_shader_resource_view};
+      // "Scale PS"'s bilinear sampler (s0), which "Copy PS" doesn't read
+      const reshade::api::sampler_desc linear_sampler = {.filter = reshade::api::filter_mode::min_mag_mip_linear};
+      reshade::api::descriptor_range_with_flags sampler_range;
+      sampler_range.count = 1;
+      sampler_range.visibility = reshade::api::shader_stage::pixel;
+      sampler_range.type = reshade::api::descriptor_type::sampler;
+      sampler_range.static_samplers = &linear_sampler;
+      const reshade::api::pipeline_layout_param params[] = {{1, &source_range}, {1, &sampler_range}};
+      // A game can copy many textures a frame: one descriptor each
+      constexpr uint32_t TEXTURE_COPY_DRAWS_PER_FRAME = 64;
+      const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&texture_copy, device_data, device, params, 0, 1, "Texture Copy", TEXTURE_COPY_DRAWS_PER_FRAME);
+      if (!tables)
+      {
+         return false;
+      }
+      ID3D12PipelineState* const pipeline = GetD3D12GamePassPipeline(&texture_copy, native_device, (same_size ? CompileTimeStringHash("Copy VS") : CompileTimeStringHash("Scale VS")),
+         (same_size ? CompileTimeStringHash("Copy PS") : CompileTimeStringHash("Scale PS")), dest_view_format, "Texture Copy");
+      if (!pipeline)
+      {
+         return false;
+      }
+
+      reshade::api::resource sampled_source = source;
+      if (source_in_layout)
+      {
+         reshade::api::resource_desc copied_desc = source_desc;
+         copied_desc.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest;
+         copied_desc.flags = reshade::api::resource_flags::none;
+         sampled_source = GetD3D12CopyIntermediate(device_data, device, copied_desc, reshade::api::resource_usage::copy_dest);
+         if (sampled_source.handle == 0)
+         {
+            return false;
+         }
+      }
+      const bool draws_into_dest = (!dest_in_layout && (dest_desc.usage & reshade::api::resource_usage::render_target) != 0);
+      reshade::api::resource target = dest;
+      if (!draws_into_dest)
+      {
+         reshade::api::resource_desc target_desc = dest_desc;
+         target_desc.usage = reshade::api::resource_usage::render_target | reshade::api::resource_usage::copy_source;
+         target_desc.flags = reshade::api::resource_flags::none;
+         target = GetD3D12CopyIntermediate(device_data, device, target_desc, reshade::api::resource_usage::render_target);
+         if (target.handle == 0)
+         {
+            return false;
+         }
+      }
+
+      const reshade::api::resource_view_desc source_view_desc(reshade::api::resource_view_type::texture_2d, reshade::api::format(source_view_format), 0, 1, 0, 1);
+      const reshade::api::resource_view_desc target_view_desc(reshade::api::resource_view_type::texture_2d, reshade::api::format(dest_view_format), 0, 1, 0, 1);
+      reshade::api::resource_view source_view = {};
+      reshade::api::resource_view target_view = {};
+      if (!device->create_resource_view(sampled_source, reshade::api::resource_usage::shader_resource, source_view_desc, &source_view) || !device->create_resource_view(target, reshade::api::resource_usage::render_target, target_view_desc, &target_view))
+      {
+         if (source_view.handle != 0)
+         {
+            device->destroy_resource_view(source_view);
+         }
+         return false;
+      }
+      const reshade::api::descriptor_table table = tables[0];
+      const reshade::api::descriptor_table_update source_update = {.table = table, .count = 1, .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = &source_view};
+      device->update_descriptor_tables(1, &source_update);
+      // The table and the render target binding take copies of the descriptors
+      device->destroy_resource_view(source_view);
+
+      if (source_in_layout)
+      {
+         cmd_list->copy_resource(source, sampled_source);
+         cmd_list->barrier(sampled_source, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::shader_resource_pixel);
+      }
+      else
+      {
+         cmd_list->barrier(source, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::shader_resource_pixel);
+      }
+      if (draws_into_dest)
+      {
+         cmd_list->barrier(dest, dest_state, reshade::api::resource_usage::render_target);
+      }
+      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipeline)});
+      cmd_list->bind_descriptor_tables(reshade::api::shader_stage::pixel, texture_copy.layout, 0, 1, &table);
+      cmd_list->bind_render_targets_and_depth_stencil(1, &target_view);
+      device->destroy_resource_view(target_view);
+      const reshade::api::viewport viewport = {0.f, 0.f, float(dest_desc.texture.width), float(dest_desc.texture.height), 0.f, 1.f};
+      const reshade::api::rect scissor = {0, 0, int32_t(dest_desc.texture.width), int32_t(dest_desc.texture.height)};
+      cmd_list->bind_viewports(0, 1, &viewport);
+      cmd_list->bind_scissor_rects(0, 1, &scissor);
+      const reshade::api::dynamic_state topology_state = reshade::api::dynamic_state::primitive_topology;
+      const uint32_t topology = uint32_t(reshade::api::primitive_topology::triangle_strip);
+      cmd_list->bind_pipeline_states(1, &topology_state, &topology);
+      cmd_list->draw(4, 1, 0, 0);
+
+      cmd_list->barrier(sampled_source, reshade::api::resource_usage::shader_resource_pixel, (source_in_layout ? reshade::api::resource_usage::copy_dest : reshade::api::resource_usage::general));
+      if (draws_into_dest)
+      {
+         cmd_list->barrier(dest, reshade::api::resource_usage::render_target, dest_state);
+      }
+      else
+      {
+         const bool dest_needs_copy_state = (dest_state != reshade::api::resource_usage::copy_dest);
+         cmd_list->barrier(target, reshade::api::resource_usage::render_target, reshade::api::resource_usage::copy_source);
+         if (dest_needs_copy_state)
+         {
+            cmd_list->barrier(dest, dest_state, reshade::api::resource_usage::copy_dest);
+         }
+         cmd_list->copy_resource(target, dest);
+         if (dest_needs_copy_state)
+         {
+            cmd_list->barrier(dest, reshade::api::resource_usage::copy_dest, dest_state);
+         }
+         cmd_list->barrier(target, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::render_target);
+      }
+
+      TraceLumaPass(&cmd_list_data, device_data, "Luma Texture Copy", {{.resource = source.handle, .format = reshade::api::format(source_view_format)}}, {{.resource = dest.handle, .format = reshade::api::format(dest_view_format)}});
+      RestoreGameGraphicsD3D12(cmd_list_data);
+      return true;
+   }
+
+   // The whole resolve of a multisampled texture into a single sample one of another format family (an upgraded one and a plain one) or of another size (a clone, see "includes/d3d12_clones.h"),
+   // which D3D12's resolve can't make: the source is resolved into an intermediate of its own format and size ("GetD3D12CopyIntermediate()", a resolve destination), in "mode" (a resolve is a
+   // resolve of the game's: MIN and MAX included), and "ConvertTextureCopyD3D12()" draws that into the destination, in the resolve destination state the game's resolve found it in and leaves it in.
+   // The source stays as it is: the resolve of the intermediate is valid wherever the game's is. "format" is the one the game resolves in, which is the source's own unless Luma upgraded it (then the
+   // upgraded format: the game named the original one). False if it can't be converted (the caller skips the resolve then): the intermediate may have been resolved into, which nothing reads.
+   bool ConvertResolveD3D12(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest, bool scaled, DXGI_FORMAT format, D3D12_RESOLVE_MODE mode)
+   {
+      CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+      if (RefusedInRenderPass(cmd_list_data, "Texture Copy"))
+      {
+         return false;
+      }
+      reshade::api::device* const device = cmd_list->get_device();
+      const reshade::api::resource_desc source_desc = device->get_resource_desc(source);
+      const reshade::api::resource_desc dest_desc = device->get_resource_desc(dest);
+      if (source_desc.type != reshade::api::resource_type::texture_2d || source_desc.texture.samples <= 1 || source_desc.texture.depth_or_layers != 1 || source_desc.texture.levels != 1 || dest_desc.type != reshade::api::resource_type::texture_2d || dest_desc.texture.samples != 1)
+      {
+         return false;
+      }
+      DeviceData& device_data = *device->get_private_data<DeviceData>();
+      reshade::api::resource_desc resolved_desc = source_desc;
+      resolved_desc.texture.samples = 1;
+      resolved_desc.usage = reshade::api::resource_usage::copy_source | reshade::api::resource_usage::resolve_dest | reshade::api::resource_usage::shader_resource;
+      resolved_desc.flags = reshade::api::resource_flags::none;
+      reshade::api::resource resolved = {};
+      {
+         const std::unique_lock lock(device_data.texture_copy.mutex); // "ConvertTextureCopyD3D12()" takes it again
+         resolved = GetD3D12CopyIntermediate(device_data, device, resolved_desc, reshade::api::resource_usage::general);
+      }
+      if (resolved.handle == 0)
+      {
+         return false;
+      }
+      auto* const native_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+      auto* const native_resolved = reinterpret_cast<ID3D12Resource*>(resolved.handle);
+      auto* const native_source = reinterpret_cast<ID3D12Resource*>(source.handle);
+      // The game named the format it created the source with: an upgraded source resolves in its own (typed, of another family), a clone that only has another size (maybe typeless) in the game's
+      const DXGI_FORMAT source_format = DXGI_FORMAT(source_desc.texture.format);
+      const DXGI_FORMAT resolve_format = ((!IsTypelessFormat(source_format) && GetTypelessFormat(source_format) != GetTypelessFormat(format)) ? source_format : format);
+      // In the common state, as "ConvertTextureCopyD3D12()" leaves the texture it samples
+      cmd_list->barrier(resolved, reshade::api::resource_usage::general, reshade::api::resource_usage::resolve_dest);
+      com_ptr<ID3D12GraphicsCommandList1> native_list_1;
+      native_list->QueryInterface(IID_PPV_ARGS(&native_list_1));
+      if (native_list_1)
+      {
+         native_list_1->ResolveSubresourceRegion(native_resolved, 0, 0, 0, native_source, 0, nullptr, resolve_format, mode);
+      }
+      else
+      {
+         native_list->ResolveSubresource(native_resolved, 0, native_source, 0, resolve_format);
+      }
+      cmd_list->barrier(resolved, reshade::api::resource_usage::resolve_dest, reshade::api::resource_usage::copy_source);
+      return ConvertTextureCopyD3D12(cmd_list, resolved, dest, scaled, reshade::api::resource_usage::resolve_dest);
+   }
+#endif // ENABLE_D3D12_PASSES
+
+   // The format of a texture as the device has it (the upgraded one), unknown for a buffer
+   DXGI_FORMAT GetTextureFormat(reshade::api::device* device, reshade::api::resource resource)
+   {
+      const reshade::api::resource_desc desc = device->get_resource_desc(resource);
+      return (desc.type == reshade::api::resource_type::buffer ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT(desc.texture.format));
+   }
+
+   // Whether "box" (none: all of it) is all of the first subresource of "texture": the resolves that end an emulated render pass ("D3D12Clones") always name a box
+   bool BoxCoversTexture(reshade::api::device* device, reshade::api::resource texture, const reshade::api::subresource_box* box)
+   {
+      if (!box)
+      {
+         return true;
+      }
+      const reshade::api::resource_desc desc = device->get_resource_desc(texture);
+      return (box->left == 0 && box->top == 0 && box->front == 0 && box->right == desc.texture.width && box->bottom == desc.texture.height && box->back == 1);
+   }
+
+   // The game's placed textures are drawn and sampled through their clones (see "includes/d3d12_clones.h"), so its copies and resolves have to use the clones too: the originals hold nothing. Replaces
+   // each texture that has a clone, true if any was.
+   bool RedirectToClones(reshade::api::resource* source, reshade::api::resource* dest)
+   {
+      bool redirected = false;
+#if ENABLE_MINHOOK
+      for (reshade::api::resource* texture : {source, dest})
+      {
+         if (ID3D12Resource* const clone = D3D12Clones::FindActive(reinterpret_cast<ID3D12Resource*>(texture->handle)))
+         {
+            texture->handle = reinterpret_cast<uint64_t>(clone);
+            redirected = true;
+         }
+      }
+#endif
+      return redirected;
+   }
+
+   // How a copy covers its textures, for "SkipUpgradedFormatCopy()"
+   enum class CopyExtent : uint8_t
+   {
+      Whole,        // All of both textures, which can be converted
+      WholeResolve, // A resolve of all of both textures, which can be converted too
+      Part,         // A subresource or a region of one, or a resolve of those
+      ThroughBuffer // An upload or a readback, through a buffer's footprint
+   };
+
+   // D3D12 can't copy between a texture Luma upgraded and a resource of another format family (it tells by the typeless formats: R16G16B16A16 FLOAT against R8G8B8A8 UNORM). The uploads and readbacks through
+   // a buffer are never valid for an upgraded texture: ReShade doesn't pass the footprint's format, and the game's is the texture's original one. A whole texture copy is converted by a draw where it can
+   // ("ConvertTextureCopyD3D12()", with "enable_upgraded_texture_resource_copy_redirection"), the others are skipped, with a log line once for each kind and pair of formats. The resolves between textures
+   // of the same family only name the game's format: see "OnResolveTextureRegion()".
+   // Returns true to skip the game's copy (it was converted, or can't be made).
+   // A clone of another size (custom dimensions, see "includes/d3d12_clones.h") takes part in the copy: D3D12 can't copy it into (or from) the game's size either, whatever the formats,
+   // so a whole copy is stretched by a draw and the others are skipped. "resolve_format" and "resolve_mode" are the game's for a resolve ("ConvertResolveD3D12()").
+   bool SkipUpgradedFormatCopy(reshade::api::command_list* cmd_list, const char* copy_kind, reshade::api::resource source, reshade::api::resource dest, CopyExtent extent, DXGI_FORMAT resolve_format = DXGI_FORMAT_UNKNOWN, D3D12_RESOLVE_MODE resolve_mode = D3D12_RESOLVE_MODE_AVERAGE)
+   {
+      const bool through_buffer = (extent == CopyExtent::ThroughBuffer);
+      if (swapchain_format_upgrade_type == TextureFormatUpgradesType::None && texture_format_upgrades_type == TextureFormatUpgradesType::None) // Optimization
+      {
+         return false;
+      }
+      reshade::api::device* const device = cmd_list->get_device();
+      bool source_upgraded = false;
+      {
+         DeviceData& device_data = *device->get_private_data<DeviceData>();
+         const std::shared_lock lock(device_data.mutex);
+         source_upgraded = IsUpgradedTexture(device_data, source);
+         if (!source_upgraded && !IsUpgradedTexture(device_data, dest))
+         {
+            return false;
+         }
+      }
+      const DXGI_FORMAT source_format = GetTextureFormat(device, source);
+      const DXGI_FORMAT dest_format = GetTextureFormat(device, dest);
+#if ENABLE_MINHOOK
+      const bool scaled = (D3D12Clones::FindScale(reinterpret_cast<ID3D12Resource*>(source.handle)).has_value() != D3D12Clones::FindScale(reinterpret_cast<ID3D12Resource*>(dest.handle)).has_value());
+#else
+      constexpr bool scaled = false;
+#endif
+      // A copy moves bytes: right within a typeless family, but for typed FLOAT and UNORM R16G16B16A16 (as on D3D11)
+      const bool float_unorm_16 = ((source_format == DXGI_FORMAT_R16G16B16A16_FLOAT && dest_format == DXGI_FORMAT_R16G16B16A16_UNORM) || (source_format == DXGI_FORMAT_R16G16B16A16_UNORM && dest_format == DXGI_FORMAT_R16G16B16A16_FLOAT));
+      if (!through_buffer && !scaled && !float_unorm_16 && GetTypelessFormat(source_format) == GetTypelessFormat(dest_format))
+      {
+         return false;
+      }
+#if ENABLE_MINHOOK
+      // Chain upgrades: an upgraded texture copied into one whose clone waits for its promotion (seed mode) promotes it. This copy is still converted (or skipped), from the
+      // next present it is a plain one between the clones
+      if (source_upgraded && !through_buffer && enable_chain_indirect_texture_format_upgrades >= ChainTextureFormatUpgradesType::DirectDependencies)
+      {
+         D3D12Clones::RequestPromotion(reinterpret_cast<ID3D12Resource*>(dest.handle));
+      }
+#endif
+#if ENABLE_D3D12_PASSES
+      // The conversions draw: a copy or compute list can't
+      const bool direct_list = (reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native())->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT);
+      const bool converted = (enable_upgraded_texture_resource_copy_redirection && direct_list && ((extent == CopyExtent::Whole && ConvertTextureCopyD3D12(cmd_list, source, dest, scaled)) || (extent == CopyExtent::WholeResolve && ConvertResolveD3D12(cmd_list, source, dest, scaled, resolve_format, resolve_mode))));
+#else
+      constexpr bool converted = false;
+#endif
+
+      static std::mutex warned_mutex;
+      static std::set<std::tuple<std::string_view, DXGI_FORMAT, DXGI_FORMAT, bool>> warned_copies;
+      const std::unique_lock lock_warned(warned_mutex);
+      if (converted && warned_copies.emplace(copy_kind, source_format, dest_format, true).second)
+      {
+         const char* const reason = (scaled ? "a clone of another size takes part" : "D3D12 can't copy between an upgraded texture and another format");
+         reshade::log::message(reshade::log::level::info, std::format("[Texture upgrades] Converted a {} from {} to {} by a draw: {}", copy_kind, GetFormatNameSafe(source_format), GetFormatNameSafe(dest_format), reason).c_str());
+      }
+      if (!converted && warned_copies.emplace(copy_kind, source_format, dest_format, false).second)
+      {
+         const std::string what = (through_buffer ? std::format("of an upgraded {} texture: the footprint of the buffer has the format the game created the texture with", GetFormatNameSafe(source_format != DXGI_FORMAT_UNKNOWN ? source_format : dest_format))
+                                                  : std::format("from {} to {}: D3D12 can't copy between an upgraded texture and another format{}, and this copy can't be converted", GetFormatNameSafe(source_format), GetFormatNameSafe(dest_format), (scaled ? " or size" : "")));
+         reshade::log::message(reshade::log::level::warning, std::format("[Texture upgrades] Skipped a {} {}", copy_kind, what).c_str());
+      }
+      return true;
+   }
+
+   // The copies, uploads and resolves, skipped when they would mix the formats of an upgrade (all builds). Development builds also trace them in the frame capture, and read back what the copies,
+   // resolves and render target and depth stencil clears wrote: their handlers return true when "ReadbackCopyOrClear()" re-issued them
+   bool OnCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+#if DEVELOPMENT
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resource}); });
+#endif
+      const reshade::api::resource game_source = source;
+      const reshade::api::resource game_dest = dest;
+      RedirectToClones(&source, &dest);
+      // Like D3D11, the game can make the copy itself or change what it copies (then the copy is re-issued with them)
+      if (game->OverrideCopyResource(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, source.handle))
+      {
+         return true;
+      }
+      const bool redirected = (source != game_source || dest != game_dest);
+      if (SkipUpgradedFormatCopy(cmd_list, "copy_resource", source, dest, CopyExtent::Whole))
+      {
+         return true;
+      }
+      const auto copy = [&](ID3D12GraphicsCommandList* native_list)
+      { native_list->CopyResource(reinterpret_cast<ID3D12Resource*>(dest.handle), reinterpret_cast<ID3D12Resource*>(source.handle)); };
+#if DEVELOPMENT
+      if (ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::CopyResource}, {}, copy))
+      {
+         return true;
+      }
+#endif
+      if (redirected)
+      {
+         copy(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
+      }
+      return redirected;
+   }
+
+#if DEVELOPMENT
+   bool OnCopyBufferRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint64_t source_offset, reshade::api::resource dest, uint64_t dest_offset, uint64_t size)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::BufferRegion, .dest_offset = uint3{uint32_t(dest_offset), 0, 0}, .has_box = true, .box = {.left = uint32_t(source_offset), .right = uint32_t(source_offset + size), .bottom = 1, .back = 1}}); });
+      return false;
+   }
+#endif
+
+   // ReShade only passes the footprint's offset and size (no row pitch), so uploads can't be re-issued from this event
+   bool OnCopyBufferToTexture(reshade::api::command_list* cmd_list, reshade::api::resource source, uint64_t source_offset, uint32_t row_length, uint32_t slice_height, reshade::api::resource dest, uint32_t dest_subresource, const reshade::api::subresource_box* dest_box)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+#if DEVELOPMENT
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::BufferToTexture, .dest_subresource = dest_subresource, .dest_offset = (dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}), .has_box = dest_box != nullptr, .box = (dest_box ? D3D12_BOX{.right = dest_box->width(), .bottom = dest_box->height(), .back = dest_box->depth()} : D3D12_BOX{})}); });
+#endif
+      RedirectToClones(&source, &dest); // So a texture with a clone counts as upgraded
+      return SkipUpgradedFormatCopy(cmd_list, "copy_buffer_to_texture", source, dest, CopyExtent::ThroughBuffer);
+   }
+
+   // "dest_box" is only there when the destination offset isn't zero
+   bool OnCopyTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, const reshade::api::subresource_box* dest_box, reshade::api::filter_mode filter)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+#if DEVELOPMENT
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Region, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = (dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}), .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box)}); });
+#endif
+      const reshade::api::resource game_source = source;
+      const reshade::api::resource game_dest = dest;
+      RedirectToClones(&source, &dest);
+      if (game->OverrideCopyTextureRegion(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, dest_subresource, reinterpret_cast<const D3D12_BOX*>(dest_box), source.handle,
+             source_subresource, reinterpret_cast<const D3D12_BOX*>(source_box)))
+      {
+         return true;
+      }
+      const bool redirected = (source != game_source || dest != game_dest);
+      // The conversion checks that subresource 0 is the whole texture. The box is the game's, of its texture
+      const bool whole = (source_subresource == 0 && dest_subresource == 0 && !dest_box && BoxCoversTexture(cmd_list->get_device(), game_source, source_box));
+      if (SkipUpgradedFormatCopy(cmd_list, "copy_texture_region", source, dest, (whole ? CopyExtent::Whole : CopyExtent::Part)))
+      {
+         return true;
+      }
+      const auto copy = [&](ID3D12GraphicsCommandList* native_list)
+      {
+         const D3D12_TEXTURE_COPY_LOCATION destination = {.pResource = reinterpret_cast<ID3D12Resource*>(dest.handle), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = dest_subresource};
+         const D3D12_TEXTURE_COPY_LOCATION source_location = {.pResource = reinterpret_cast<ID3D12Resource*>(source.handle), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = source_subresource};
+         native_list->CopyTextureRegion(&destination, (dest_box ? dest_box->left : 0), (dest_box ? dest_box->top : 0), (dest_box ? dest_box->front : 0), &source_location, reinterpret_cast<const D3D12_BOX*>(source_box));
+      };
+#if DEVELOPMENT
+      if (ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::CopyRegion, .subresource = dest_subresource}, {}, copy))
+      {
+         return true;
+      }
+#endif
+      if (redirected)
+      {
+         copy(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
+      }
+      return redirected;
+   }
+
+   bool OnCopyTextureToBuffer(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint64_t dest_offset, uint32_t row_length, uint32_t slice_height)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+#if DEVELOPMENT
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::TextureToBuffer, .source_subresource = source_subresource, .dest_offset = uint3{uint32_t(dest_offset), 0, 0}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box)}); });
+#endif
+      RedirectToClones(&source, &dest);
+      return SkipUpgradedFormatCopy(cmd_list, "copy_texture_to_buffer", source, dest, CopyExtent::ThroughBuffer);
+   }
+
+   // A resolve names the format to resolve in, which the game took from the textures it created: once Luma upgraded them it is the wrong one, and D3D12 rejects it. When the two textures are of the same format
+   // family (an upgraded multisampled target resolved into an upgraded target or back buffer: both R16G16B16A16 FLOAT now) only the format is wrong, and the resolve is re-issued with the textures' own, like
+   // the D3D11 path does, in the mode of the game's ("D3D12Clones::current_resolve_mode": ReShade's event doesn't carry it). Textures of other families, or of another size (a clone), can't be resolved into
+   // each other: "SkipUpgradedFormatCopy()" has the whole resolve between them made by a draw ("ConvertResolveD3D12()"), and skips the others.
+   bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z, reshade::api::format format)
+   {
+      SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
+#if DEVELOPMENT
+      TraceCopyOrClear(cmd_list, [&](TraceDrawCallData* entry)
+         { D3D12Trace::FillCopy(cmd_list->get_device(), entry, source, dest, {.kind = TraceDrawCallData::CopyKind::Resolve, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = uint3{dest_x, dest_y, dest_z}, .has_box = source_box != nullptr, .box = D3D12Trace::ToD3D12Box(source_box), .resolve_format = DXGI_FORMAT(format)}); });
+#endif
+      // Of the game's texture, which the box is of
+      const bool whole = (source_subresource == 0 && dest_subresource == 0 && dest_x == 0 && dest_y == 0 && dest_z == 0 && BoxCoversTexture(cmd_list->get_device(), source, source_box));
+      const bool redirected = RedirectToClones(&source, &dest);
+#if ENABLE_MINHOOK
+      const D3D12_RESOLVE_MODE resolve_mode = D3D12Clones::current_resolve_mode;
+#else
+      constexpr D3D12_RESOLVE_MODE resolve_mode = D3D12_RESOLVE_MODE_AVERAGE;
+#endif
+      // Like D3D11 (where it is only for the indirect upgrades' mirrors): a whole resolve between substituted resources can be made by the game
+      if (redirected && whole &&
+          game->OverrideResolveTextureRegion(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()), reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, source.handle,
+             GetTextureFormat(cmd_list->get_device(), source)))
+      {
+         return true;
+      }
+      DXGI_FORMAT resolve_format = DXGI_FORMAT(format);
+      bool format_corrected = false;
+      if (swapchain_format_upgrade_type > TextureFormatUpgradesType::None || texture_format_upgrades_type > TextureFormatUpgradesType::None) // Optimization
+      {
+         reshade::api::device* const device = cmd_list->get_device();
+         bool any_upgraded = false;
+         {
+            DeviceData& device_data = *device->get_private_data<DeviceData>();
+            const std::shared_lock lock(device_data.mutex);
+            any_upgraded = IsUpgradedTexture(device_data, source) || IsUpgradedTexture(device_data, dest);
+         }
+         if (any_upgraded)
+         {
+            const DXGI_FORMAT source_format = GetTextureFormat(device, source);
+            const DXGI_FORMAT dest_format = GetTextureFormat(device, dest);
+            const DXGI_FORMAT textures_format = (IsTypelessFormat(source_format) ? dest_format : source_format); // The upgraded ones are never typeless
+            format_corrected = (GetTypelessFormat(source_format) == GetTypelessFormat(dest_format) && GetTypelessFormat(resolve_format) != GetTypelessFormat(textures_format) && !IsTypelessFormat(textures_format));
+            if (format_corrected)
+            {
+               resolve_format = textures_format;
+            }
+         }
+      }
+      if (SkipUpgradedFormatCopy(cmd_list, "resolve_texture_region", source, dest, (whole ? CopyExtent::WholeResolve : CopyExtent::Part), DXGI_FORMAT(format), resolve_mode))
+      {
+         return true;
+      }
+      // False, with nothing recorded, if the list can't take it: a region or a mode needs "ID3D12GraphicsCommandList1"
+      const auto resolve = [&](ID3D12GraphicsCommandList* native_list)
+      {
+         auto* native_dest = reinterpret_cast<ID3D12Resource*>(dest.handle);
+         auto* native_source = reinterpret_cast<ID3D12Resource*>(source.handle);
+         if (!source_box && dest_x == 0 && dest_y == 0 && resolve_mode == D3D12_RESOLVE_MODE_AVERAGE)
+         {
+            native_list->ResolveSubresource(native_dest, dest_subresource, native_source, source_subresource, resolve_format);
+            return true;
+         }
+         com_ptr<ID3D12GraphicsCommandList1> native_list_1;
+         native_list->QueryInterface(IID_PPV_ARGS(&native_list_1));
+         if (!native_list_1)
+         {
+            return false;
+         }
+         D3D12_RECT source_rect = (source_box ? D3D12_RECT{.left = LONG(source_box->left), .top = LONG(source_box->top), .right = LONG(source_box->right), .bottom = LONG(source_box->bottom)} : D3D12_RECT{});
+         native_list_1->ResolveSubresourceRegion(native_dest, dest_subresource, dest_x, dest_y, native_source, source_subresource, (source_box ? &source_rect : nullptr), resolve_format, resolve_mode);
+         return true;
+      };
+#if DEVELOPMENT
+      // The readback's target is the command as the game gave it (with its format), what it re-issues is the corrected one
+      if (ReadbackCopyOrClear(cmd_list, {.resource = dest.handle, .source = source.handle, .kind = D3D12Readback::WriteKind::Resolve, .subresource = dest_subresource, .resolve_format = DXGI_FORMAT(format)}, {}, resolve))
+      {
+         return true;
+      }
+#endif
+      if (format_corrected || redirected)
+      {
+         return resolve(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
+      }
+      return false;
+   }
+
+   // What the D3D12 display composition draws as the debug draw (see "FindD3D12DebugDrawSource()"): a texture of one 2D view, sampled in "srv_format"
+   struct D3D12DebugDrawSource
+   {
+      com_ptr<ID3D12Resource> texture;
+      D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE; // Where it rests between its writers and readers
+      DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
+   };
+
+#if DEVELOPMENT
+   // Arms the debug draw's target from the overlay's settings (the globals the D3D11 draw hook reads on each draw), at each present: the draws
+   // of the hash's pipelines are copied from now on, the one that is the "debug_draw_pipeline_target_instance"th (all if negative), of the signature
+   // the overlay stored for this hash if any. Also starts the count of the instances over, as on D3D11 ("debug_draw_pipeline_instance").
+   void SyncD3D12DebugDraw(DeviceData& device_data)
+   {
+      using Kind = D3D12Readback::Kind;
+      D3D12Readback::State& readback = device_data.readback;
+      std::optional<D3D12Readback::Target> wanted;
+      std::string error;
+      if (Trace::debug_draw_shader_hash != 0 && debug_draw_registered_texture.empty())
+      {
+         std::optional<Kind> kind;
+         switch (Trace::debug_draw_mode)
+         {
+         case Trace::DebugDrawMode::RenderTarget:
+            kind = Kind::RenderTarget;
+            break;
+         case Trace::DebugDrawMode::UnorderedAccessView:
+            kind = Kind::UnorderedAccess;
+            break;
+         case Trace::DebugDrawMode::Depth:
+            kind = Kind::Depth;
+            break;
+         case Trace::DebugDrawMode::Stencil:
+            kind = Kind::Stencil;
+            break;
+         case Trace::DebugDrawMode::ShaderResource:
+            break; // The draw that wrote the SRV gives the kind, below
+         default:
+            error = "D3D12 shows a draw's render target, unordered access view, depth, stencil, or the output of the draw that wrote its shader resource: pick one of those modes";
+            break;
+         }
+         const bool shows_shader_resource = (Trace::debug_draw_mode == Trace::DebugDrawMode::ShaderResource);
+         const std::optional<D3D12Readback::DrawSignature> signature = (debug_draw_signature_hash == Trace::debug_draw_shader_hash ? debug_draw_signature : std::nullopt);
+         const std::shared_lock lock_generic(s_mutex_generic);
+         const auto it = device_data.pipeline_caches_by_shader_hash.find(Trace::debug_draw_shader_hash);
+         if ((kind || shows_shader_resource) && (it == device_data.pipeline_caches_by_shader_hash.end() || it->second.empty()))
+         {
+            error = "The shader has no live pipeline";
+         }
+         else if (shows_shader_resource)
+         {
+            // Followed in the last capture at every present: ponytail, cache it per capture if a capture of thousands of entries makes the overlay slow
+            wanted = Mcp::FindDebugDrawSRVTarget(device_data, it->second, Trace::debug_draw_pipeline_target_instance, signature, uint32_t(Trace::debug_draw_view_index), &error);
+         }
+         else if (kind)
+         {
+            wanted = {.signature = signature, .instance = Trace::debug_draw_pipeline_target_instance, .kind = *kind, .slot = (*kind == Kind::Depth || *kind == Kind::Stencil ? 0 : uint32_t(Trace::debug_draw_view_index))};
+            for (const Shader::CachedPipeline* pipeline : it->second)
+            {
+               wanted->pipelines.push_back(pipeline->pipeline.handle);
+            }
+         }
+      }
+      const std::unique_lock lock(readback.mutex);
+      readback.debug_instances = 0;
+      const auto& current = readback.debug_target;
+      const bool same = (current.has_value() == wanted.has_value()) && (!wanted || (current->pipelines == wanted->pipelines && current->instance == wanted->instance && current->kind == wanted->kind && current->slot == wanted->slot && current->signature == wanted->signature));
+      if (!same)
+      {
+         readback.debug_target = std::move(wanted);
+         D3D12Readback::UpdateArmed(readback);
+      }
+      // The draw hook's refusals are in "debug_error" too (cleared by its next copy), this one is the settings'
+      if (!error.empty())
+      {
+         if (error != readback.debug_error)
+         {
+            reshade::log::message(reshade::log::level::warning, ("[Debug draw] " + error).c_str());
+            readback.debug_error = error;
+         }
+      }
+      else if (!readback.debug_target)
+      {
+         readback.debug_error.clear();
+      }
+   }
+
+   // The texture the display composition draws as the debug draw: a registered Luma texture ("debug_draw_registered_texture") in the state it rests in, or the
+   // copy of the target draw's view once its command list went to the queue. Null if there is none.
+   D3D12DebugDrawSource FindD3D12DebugDrawSource(DeviceData& device_data)
+   {
+      if (!debug_draw_registered_texture.empty())
+      {
+         Mcp::DevTexture registered;
+         {
+            const std::lock_guard lock(Mcp::s_mutex_dev_values);
+            const Mcp::DevValue* dev_value = Mcp::FindDevValue(debug_draw_registered_texture);
+            if (dev_value && dev_value->kind == Mcp::DevValueKind::Texture)
+            {
+               registered = dev_value->texture(device_data);
+            }
+         }
+         return {.texture = registered.resource, .state = registered.state, .srv_format = (registered.resource ? registered.resource->GetDesc().Format : DXGI_FORMAT_UNKNOWN)};
+      }
+      const std::shared_lock lock(device_data.readback.mutex);
+      const std::optional<D3D12Readback::Copy>& copy = device_data.readback.debug_copy;
+      if (device_data.readback.debug_target && copy && copy->status == D3D12Readback::Copy::Status::Executed)
+      {
+         return {.texture = copy->debug_texture, .srv_format = copy->data_format};
+      }
+      return {};
+   }
+#endif // DEVELOPMENT
+
+   // The D3D12 display composition, the counterpart of the D3D11 one in "OnPresent()" (its UI composition isn't ported yet): copies the back buffer, then draws
+   // the "Display Composition" shader over it (see "PrepareD3D12NativePass()"). A back buffer that allows unordered access,
+   // of a format with typed UAV loads, is composed in place by its compute shader instead, without the copy (64 MB at 4K fp16, and a copy per present). What it needs is the device's
+   // ("DeviceData::display_composition"), made when it first draws.
+   // Each reason it doesn't draw is logged once.
+   void DrawDisplayCompositionD3D12(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, DeviceData& device_data, uint32_t custom_data_1, float custom_data_4, const D3D12DebugDrawSource& debug_source)
+   {
+      auto* const native_device = reinterpret_cast<ID3D12Device*>(queue->get_device()->get_native());
+      auto* const native_queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+      // What the game drew into
+      const com_ptr<ID3D12Resource> game_back_buffer = GetGameBackBuffer(reinterpret_cast<IDXGISwapChain*>(swapchain->get_native()), swapchain->get_current_back_buffer_index());
+      ID3D12Resource* const back_buffer = game_back_buffer.get();
+      if (!back_buffer)
+      {
+         return;
+      }
+
+      const D3D12_RESOURCE_DESC back_buffer_desc = back_buffer->GetDesc();
+      auto& composition = device_data.display_composition;
+      const std::unique_lock lock(composition.mutex);
+      const bool allows_unordered_access = (back_buffer_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+      if (allows_unordered_access && composition.typed_load_format != back_buffer_desc.Format)
+      {
+         D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {.Format = back_buffer_desc.Format};
+         composition.typed_load_format = back_buffer_desc.Format;
+         composition.typed_load = SUCCEEDED(native_device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) && (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
+      }
+      const bool in_place = allows_unordered_access && composition.typed_load;
+      // The table's SRVs: t0 the source, t1 the UI texture, t2 to t9 the debug draw ones (see below), then u0 the back buffer in place
+      const uint32_t shader_hash = (in_place ? CompileTimeStringHash("Display Composition CS") : CompileTimeStringHash("Display Composition"));
+      const std::optional<D3D12Passes::Recording> recording = PrepareD3D12NativePass(&composition, device_data, native_device, shader_hash, 10, back_buffer_desc.Format, "Display composition", "the image isn't composed", in_place);
+      if (!recording)
+      {
+         return;
+      }
+
+      // The pixel shader reads a copy of the back buffer while it writes the back buffer. The GPU can still run the commands that use the one replaced here.
+      const D3D12_RESOURCE_DESC source_desc = {.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D, .Width = back_buffer_desc.Width, .Height = back_buffer_desc.Height, .DepthOrArraySize = 1, .MipLevels = 1, .Format = back_buffer_desc.Format, .SampleDesc = {.Count = 1}};
+      const D3D12_RESOURCE_DESC current_source_desc = (composition.source ? composition.source->GetDesc() : D3D12_RESOURCE_DESC{});
+      if (in_place)
+      {
+         D3D12Passes::Retire(&composition.passes, composition.source.get());
+         composition.source.reset();
+      }
+      else if (current_source_desc.Width != source_desc.Width || current_source_desc.Height != source_desc.Height || current_source_desc.Format != source_desc.Format)
+      {
+         D3D12Passes::Retire(&composition.passes, composition.source.get());
+         composition.source.reset();
+         const D3D12_HEAP_PROPERTIES default_heap = {.Type = D3D12_HEAP_TYPE_DEFAULT};
+         if (FAILED(native_device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &source_desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&composition.source))))
+         {
+            static std::atomic_flag no_source;
+            if (!no_source.test_and_set())
+            {
+               reshade::log::message(reshade::log::level::error, "[Display composition] The device refused the copy of the back buffer, so the image isn't composed");
+            }
+            return;
+         }
+      }
+
+      // The table's SRVs: the source, then null views of the dimensions the shader declares for the others (t1 the UI texture, t2 to t9 the debug draw ones), the runtime checks the descriptors against them
+      native_device->CreateRenderTargetView(back_buffer, nullptr, recording->rtv_cpu);
+      const D3D12_SHADER_RESOURCE_VIEW_DESC source_srv = {.Format = back_buffer_desc.Format, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2D = {.MipLevels = 1}};
+      static constexpr D3D12_SHADER_RESOURCE_VIEW_DESC null_srvs[] = {
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2D = {.MipLevels = 1}},
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2D = {.MipLevels = 1}},
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2DMS = {}},
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2DArray = {.MipLevels = 1, .ArraySize = 1}},
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2DMSArray = {.ArraySize = 1}},
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture3D = {.MipLevels = 1}},
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture1D = {.MipLevels = 1}},
+         {.Format = DXGI_FORMAT_R8G8B8A8_UNORM, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture1DArray = {.MipLevels = 1, .ArraySize = 1}},
+         {.Format = DXGI_FORMAT_R8_UINT, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2D = {.MipLevels = 1}},
+      };
+      D3D12_CPU_DESCRIPTOR_HANDLE srv = recording->srv_cpu;
+      native_device->CreateShaderResourceView(composition.source.get(), &source_srv, srv); // A null view in place
+      for (const D3D12_SHADER_RESOURCE_VIEW_DESC& null_srv : null_srvs)
+      {
+         srv.ptr += recording->srv_increment;
+         native_device->CreateShaderResourceView(nullptr, &null_srv, srv);
+      }
+      if (in_place)
+      {
+         srv.ptr += recording->srv_increment;
+         const D3D12_UNORDERED_ACCESS_VIEW_DESC back_buffer_uav = {.Format = back_buffer_desc.Format, .ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D};
+         native_device->CreateUnorderedAccessView(back_buffer, nullptr, &back_buffer_uav, srv);
+      }
+
+      // The debug draw's texture takes the slot of its dimension (t2 or t4, see the shader), t9 for the stencil plane (R8_UINT, plain 2D only), with the options and mip the settings ask for
+      uint32_t debug_options = 0;
+      float debug_mip = 0.f;
+      const bool shows_debug_texture = debug_source.texture && debug_source.srv_format != DXGI_FORMAT_UNKNOWN && !IsTypelessFormat(debug_source.srv_format);
+#if DEVELOPMENT
+      if (shows_debug_texture)
+      {
+         const D3D12_RESOURCE_DESC debug_desc = debug_source.texture->GetDesc();
+         const bool is_array = debug_desc.DepthOrArraySize > 1;
+         const bool is_uint = (debug_source.srv_format == DXGI_FORMAT_R8_UINT);
+         if (debug_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && debug_desc.SampleDesc.Count == 1 && !(is_uint && is_array))
+         {
+            D3D12_SHADER_RESOURCE_VIEW_DESC debug_srv = {.Format = debug_source.srv_format, .ViewDimension = (is_array ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D), .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+            if (is_array)
+            {
+               debug_srv.Texture2DArray = {.MostDetailedMip = 0, .MipLevels = debug_desc.MipLevels, .FirstArraySlice = 0, .ArraySize = debug_desc.DepthOrArraySize};
+            }
+            else
+            {
+               debug_srv.Texture2D = {.MostDetailedMip = 0, .MipLevels = debug_desc.MipLevels};
+            }
+            D3D12_CPU_DESCRIPTOR_HANDLE debug_handle = recording->srv_cpu;
+            debug_handle.ptr += SIZE_T(recording->srv_increment) * (is_uint ? 9 : (is_array ? 4 : 2));
+            native_device->CreateShaderResourceView(debug_source.texture.get(), &debug_srv, debug_handle);
+            Trace::debug_draw_options |= (uint32_t)Trace::DebugDrawTextureOptionsMask::Texture2D;
+            Trace::debug_draw_options &= ~((uint32_t)Trace::DebugDrawTextureOptionsMask::Texture3D | (uint32_t)Trace::DebugDrawTextureOptionsMask::TextureMultiSample | (uint32_t)Trace::DebugDrawTextureOptionsMask::TextureArray | (uint32_t)Trace::DebugDrawTextureOptionsMask::TextureUint);
+            Trace::debug_draw_options |= (is_array ? (uint32_t)Trace::DebugDrawTextureOptionsMask::TextureArray : 0u) | (is_uint ? (uint32_t)Trace::DebugDrawTextureOptionsMask::TextureUint : 0u);
+            debug_options = GetDebugDrawShaderOptions(debug_source.srv_format);
+            debug_mip = float(Trace::debug_draw_mip);
+            device_data.debug_draw_texture_format = debug_source.srv_format;
+            device_data.debug_draw_texture_size = {uint32_t(debug_desc.Width), debug_desc.Height, debug_desc.DepthOrArraySize, debug_desc.MipLevels};
+         }
+      }
+#endif
+      // A registered texture that doesn't rest where the shader can read it
+      const D3D12_RESOURCE_STATES read_state = (in_place ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      ID3D12Resource* const debug_transition_resource = ((shows_debug_texture && (debug_source.state & read_state) == 0) ? debug_source.texture.get() : nullptr);
+      if (shows_debug_texture)
+      {
+         D3D12Passes::Retire(&composition.passes, debug_source.texture.get());
+      }
+
+      // The back buffer is in PRESENT at present, after the game's command lists on this queue
+      ID3D12GraphicsCommandList* const list = recording->list;
+      if (debug_transition_resource)
+      {
+         D3D12Passes::Transition(list, debug_transition_resource, debug_source.state, read_state);
+      }
+      if (in_place)
+      {
+         D3D12Passes::Transition(list, back_buffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+         DrawD3D12NativePass(&composition, *recording, device_data, back_buffer_desc.Width, back_buffer_desc.Height, custom_data_1, debug_options, debug_mip, custom_data_4);
+         D3D12Passes::Transition(list, back_buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PRESENT);
+      }
+      else
+      {
+         D3D12Passes::Transition(list, back_buffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+         D3D12Passes::Transition(list, composition.source.get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+         list->CopyResource(composition.source.get(), back_buffer);
+         D3D12Passes::Transition(list, back_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+         D3D12Passes::Transition(list, composition.source.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+         DrawD3D12NativePass(&composition, *recording, device_data, back_buffer_desc.Width, back_buffer_desc.Height, custom_data_1, debug_options, debug_mip, custom_data_4);
+         D3D12Passes::Transition(list, back_buffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+      }
+      if (debug_transition_resource)
+      {
+         D3D12Passes::Transition(list, debug_transition_resource, read_state, debug_source.state);
+      }
+
+      if (SubmitD3D12NativePass(&composition, native_queue, device_data, "Display composition", "the image isn't composed"))
+      {
+         composition.drawn_frame = cb_luma_global_settings.FrameIndex;
+         TraceLumaPass(nullptr, device_data, "Luma Display Composition", {{.resource = reinterpret_cast<uint64_t>(in_place ? back_buffer : composition.source.get()), .format = reshade::api::format(back_buffer_desc.Format)}},
+            {{.resource = reinterpret_cast<uint64_t>(back_buffer), .format = reshade::api::format(back_buffer_desc.Format)}});
+      }
+   }
+
+#endif // DX12
 
    void OnPresent(
       reshade::api::command_queue* queue,
@@ -5115,19 +9922,49 @@ namespace
    {
       SKIP_UNSUPPORTED_DEVICE_API(swapchain->get_device()->get_api());
 
-      ID3D11Device* native_device = (ID3D11Device*)(queue->get_device()->get_native());
-      ID3D11DeviceContext* native_device_context = (ID3D11DeviceContext*)(queue->get_immediate_command_list()->get_native());
+#if DX12 && ENABLE_MINHOOK
+      D3D12Clones::OnPresent(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()));
+      if (const D3D12Clones::Promotion promotion = D3D12Clones::PromotePending(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native())); promotion.timed_out)
+      {
+         static std::atomic_flag logged_promotion_timeout;
+         if (!logged_promotion_timeout.test_and_set())
+         {
+            reshade::log::message(reshade::log::level::warning, "[Texture upgrades] The GPU didn't finish the present queue within 2 seconds, the promotion of the clones is postponed (it is retried at each present)");
+         }
+      }
+      else
+      {
+         for (const D3D12Clones::PromotedClone& promoted : promotion.clones)
+         {
+            const std::string message = std::format("[Texture upgrades] Promoted the clone of a {} texture ({} views, waited {:.1f} ms)", GetFormatNameSafe(promoted.original_format), promoted.view_count, promotion.waited_ms);
+            reshade::log::message(reshade::log::level::info, message.c_str());
+         }
+      }
+#endif
+
+      NativeDevice* native_device = (NativeDevice*)(queue->get_device()->get_native());
       DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
       SwapchainData& swapchain_data = *swapchain->get_private_data<SwapchainData>();
+#if DX12 && ENABLE_SMAA
+      CreateSMAATexturesD3D12(queue->get_device(), device_data);
+#endif
+#if DX11 // On D3D12 the queue's immediate command list is ReShade's own, it has no "CommandListData"
+      ID3D11DeviceContext* native_device_context = (ID3D11DeviceContext*)(queue->get_immediate_command_list()->get_native());
       CommandListData& cmd_list_data = *queue->get_immediate_command_list()->get_private_data<CommandListData>();
+#endif
+
 
 #if DEVELOPMENT
       // Allow to tank performance to test auto rendering resolution scaling etc
       if (frame_sleep_ms > 0 && cb_luma_global_settings.FrameIndex % frame_sleep_interval == 0)
          Sleep(frame_sleep_ms);
 
+#if DX11
       // Before display composition, so a debug draw copy requested over MCP is read back and cleared before it's drawn
-      Mcp::OnPresent(device_data, cmd_list_data, native_device_context, swapchain);
+      Mcp::OnPresent(device_data, cmd_list_data, queue, swapchain);
+#else
+      Mcp::OnPresent(device_data, device_data.trace_command_list_data, queue, swapchain);
+#endif
 #endif  // DEVELOPMENT
 
       // If there are no shaders being currently replaced in the game,
@@ -5161,43 +9998,55 @@ namespace
       bool ui_needs_scaling = mod_active && GetShaderDefineCompiledNumericalValue(UI_DRAW_TYPE_HASH) == 2;
       // If this is true, the UI was drawn on a separate buffer and needs to be composed onto the scene (which allows for UI background tonemapping, for increased visibility in HDR)
       // Note: we could skip this if "device_data.has_drawn_main_post_processing" is false and our scene and UI paper whites are matching, however, let's not make it any more complicated.
+#if DX11
       bool ui_needs_composition = mod_active && enable_ui_separation && GetShaderDefineCompiledNumericalValue(UI_DRAW_TYPE_HASH) >= 3 && device_data.ui_texture.get();
+#else
+      constexpr bool ui_needs_composition = false; // The UI separation isn't ported to D3D12 yet
+#endif
       bool needs_gamut_mapping = mod_active && GetShaderDefineCompiledNumericalValue(GAMUT_MAPPING_TYPE_HASH) != 0;
 
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11
       bool needs_debug_draw_texture = device_data.debug_draw_texture.get() != nullptr; // Note that this might look wrong if "output_linear" is false
+#elif DEVELOPMENT
+      SyncD3D12DebugDraw(device_data);
+      const D3D12DebugDrawSource debug_draw_source = FindD3D12DebugDrawSource(device_data);
+      const bool needs_debug_draw_texture = debug_draw_source.texture != nullptr;
 #else
       constexpr bool needs_debug_draw_texture = false;
 #endif
       // TODO: add "TEST_SDR_HDR_SPLIT_VIEW_MODE" and "TEST_2X_ZOOM" as drawing conditions etc
 
-      if (!force_disable_display_composition && (needs_debug_draw_texture || needs_reencoding || needs_gamma_correction || ui_needs_scaling || ui_needs_composition || needs_gamut_mapping))
+      // Force a custom display mode in case we have no game custom shaders loaded, so the custom linearization shader can linearize anyway, independently of "POST_PROCESS_SPACE_TYPE"
+      uint32_t custom_const_buffer_data_1 = 0;
+      if (!mod_active) // We ignore "s_mutex_generic", it doesn't matter
       {
+         // No need for "s_mutex_reshade" here, given that they are generally only also changed by the user manually changing the settings in ImGUI, which runs at the very end of the frame
+         custom_const_buffer_data_1 = input_linear ? 2 : 1;
+      }
+      const float custom_const_buffer_data_4 = (ui_needs_composition && device_data.has_drawn_main_post_processing) ? 1.f : 0.f;
+
+      // The composition shader writes linear (scRGB) or PQ values: a swapchain left in gamma space (not upgraded) already shows the
+      // vanilla image, so only the debug draw goes there
+      const bool output_composable = output_linear || output_pq_bt2020;
+      if (!force_disable_display_composition && (needs_debug_draw_texture || (output_composable && (needs_reencoding || needs_gamma_correction || ui_needs_scaling || ui_needs_composition || needs_gamut_mapping))))
+      {
+#if DX11
          const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
          if (device_data.native_vertex_shaders[CompileTimeStringHash("Copy VS")] && device_data.native_pixel_shaders[CompileTimeStringHash("Display Composition")])
          {
             IDXGISwapChain* native_swapchain = (IDXGISwapChain*)(swapchain->get_native());
 
-            UINT back_buffer_index = 0;
-            com_ptr<IDXGISwapChain3> native_swapchain3;
-            // The cast pointer is actually the same, we are just making sure the type is right (it should always be).
-            // This would always be 1 in DX11, even if two buffers were requested.
-            if (SUCCEEDED(native_swapchain->QueryInterface(&native_swapchain3)))
-            {
-               back_buffer_index = native_swapchain3->GetCurrentBackBufferIndex();
-            }
-            com_ptr<ID3D11Texture2D> back_buffer;
-            native_swapchain->GetBuffer(back_buffer_index, IID_PPV_ARGS(&back_buffer));
+            constexpr UINT back_buffer_index = 0; // See "GetGameBackBuffer()"
+            com_ptr<ID3D11Texture2D> back_buffer = GetGameBackBuffer(native_swapchain);
             assert(back_buffer != nullptr && swapchain_data.back_buffers.size() >= back_buffer_index + 1);
             assert(swapchain_data.display_composition_rtvs.size() >= back_buffer_index + 1);
 
             D3D11_TEXTURE2D_DESC target_desc;
             back_buffer->GetDesc(&target_desc);
             ASSERT_ONCE((target_desc.BindFlags & D3D11_BIND_RENDER_TARGET) != 0);
-            // For now we only support these formats, nothing else wouldn't really make sense
-            ASSERT_ONCE(target_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || target_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
+            // For now we only support these formats, nothing else wouldn't really make sense (other swapchains only get the debug draw)
+            ASSERT_ONCE(!output_composable || target_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || target_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
 
-            uint32_t custom_const_buffer_data_1 = 0;
             uint32_t custom_const_buffer_data_2 = 0;
             float custom_const_buffer_data_3 = 0.f;
 
@@ -5326,25 +10175,6 @@ namespace
                   Trace::debug_draw_options &= ~(uint32_t)Trace::DebugDrawTextureOptionsMask::Texture2D;
                }
 
-               if (Trace::debug_draw_auto_gamma)
-               {
-                  // TODO: if this is depth and depth is inverted (or not), should we flip the gamma direction? Gamma to linear looks good on direct/linear depth
-                  if (!IsLinearFormat(device_data.debug_draw_texture_format)) // We don't use the view format as we create a new view with the native format
-                  {
-                     Trace::debug_draw_options |= (uint32_t)Trace::DebugDrawTextureOptionsMask::GammaToLinear;
-                  }
-                  else
-                  {
-                     Trace::debug_draw_options &= ~(uint32_t)Trace::DebugDrawTextureOptionsMask::LinearToGamma;
-                     Trace::debug_draw_options &= ~(uint32_t)Trace::DebugDrawTextureOptionsMask::GammaToLinear;
-                     // If the game rendering or post processing was in gamma space, automatically linearize color textures (just a guess, it's usually right)
-                     if (IsRGBAFormat(device_data.debug_draw_texture_format, false) && GetShaderDefineCompiledNumericalValue(POST_PROCESS_SPACE_TYPE_HASH) == 0)
-                     {
-                        Trace::debug_draw_options |= (uint32_t)Trace::DebugDrawTextureOptionsMask::GammaToLinear;
-                     }
-                  }
-               }
-
                com_ptr<ID3D11ShaderResourceView> debug_srv;
                // We recreate this every frame, it doesn't really matter (and this is allowed to fail in case of quirky formats)
                HRESULT hr = native_device->CreateShaderResourceView(device_data.debug_draw_texture.get(), &debug_srv_desc, &debug_srv);
@@ -5360,15 +10190,7 @@ namespace
                ID3D11ShaderResourceView* const debug_srv_const = debug_srv.get();
                native_device_context->PSSetShaderResources(debug_draw_srv_slot, 1, &debug_srv_const); // Use index 1 (0 is already used)
 
-               auto temp_debug_draw_options = Trace::debug_draw_options;
-               bool debug_draw_saturate = (Trace::debug_draw_options & (uint32_t)Trace::DebugDrawTextureOptionsMask::Saturate) != 0;
-               // TODO: save two versions of "Trace::debug_draw_options", one that matches the user settings and one that is the current automated version of it
-               if (debug_draw_saturate || !IsFloatFormat(device_data.debug_draw_texture_format))
-               {
-                  temp_debug_draw_options &= ~(uint32_t)Trace::DebugDrawTextureOptionsMask::Tonemap;
-               }
-               custom_const_buffer_data_2 = temp_debug_draw_options;
-
+               custom_const_buffer_data_2 = GetDebugDrawShaderOptions(device_data.debug_draw_texture_format);
                custom_const_buffer_data_3 = float(Trace::debug_draw_mip);
             }
             // Empty the shader resources so the shader can tell there isn't one
@@ -5483,14 +10305,6 @@ namespace
             {
                DeviceData& device_data = *queue->get_device()->get_private_data<DeviceData>();
                const std::shared_lock lock(s_mutex_reshade); // TODO: why is this locked here? It could cause a deadlock with the device below!
-               // Force a custom display mode in case we have no game custom shaders loaded, so the custom linearization shader can linearize anyway, independently of "POST_PROCESS_SPACE_TYPE"
-               bool force_reencoding_or_gamma_correction = !mod_active; // We ignore "s_mutex_generic", it doesn't matter
-               if (force_reencoding_or_gamma_correction)
-               {
-                  // No need for "s_mutex_reshade" here or above, given that they are generally only also changed by the user manually changing the settings in ImGUI, which runs at the very end of the frame
-                  custom_const_buffer_data_1 = input_linear ? 2 : 1;
-               }
-               float custom_const_buffer_data_4 = (ui_needs_composition && device_data.has_drawn_main_post_processing) ? 1.f : 0.f;
                SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
                SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, custom_const_buffer_data_1, custom_const_buffer_data_2, custom_const_buffer_data_3, custom_const_buffer_data_4);
             }
@@ -5544,7 +10358,15 @@ namespace
             }
 #endif // DEVELOPMENT
          }
+#else
+#if DEVELOPMENT
+         DrawDisplayCompositionD3D12(queue, swapchain, device_data, custom_const_buffer_data_1, custom_const_buffer_data_4, debug_draw_source);
+#else
+         DrawDisplayCompositionD3D12(queue, swapchain, device_data, custom_const_buffer_data_1, custom_const_buffer_data_4, {});
+#endif
+#endif // DX11
       }
+#if DX11
       else
       {
          device_data.display_composition_texture = nullptr;
@@ -5564,10 +10386,43 @@ namespace
 #if DEVELOPMENT
       Trace::EndFrame(device_data);
 #endif // DEVELOPMENT
+#endif // DX11
+
+#if DEVELOPMENT && DX12
+      // The jobs that read the composed back buffer run here, the others ran before the composition
+      {
+         const auto lock_trace = LockTraceIfRunning();
+         if (lock_trace && Trace::running && &device_data == trace_device_data)
+         {
+            CommandListData& trace_cmd_list_data = device_data.trace_command_list_data;
+            const std::unique_lock lock_trace_2(trace_cmd_list_data.mutex_trace);
+            TraceDrawCallData& entry = trace_cmd_list_data.trace_draw_calls_data.emplace_back();
+            entry.command_list = trace_cmd_list_data.cmd_list;
+            entry.type = TraceDrawCallData::TraceDrawCallType::Present;
+            // The back buffer it shows, as the entry's source (see "D3D12Trace::FillCopy()"): the overlay highlights it, the back buffer current then has rotated
+            D3D12Trace::FillView(device_data.reshade_device, &entry, 't', 0, false, 0, {.resource = swapchain->get_current_back_buffer().handle});
+         }
+      }
+      Mcp::OnPresent(device_data, device_data.trace_command_list_data, queue, swapchain, true);
+#endif
 
       device_data.has_drawn_main_post_processing_previous = device_data.has_drawn_main_post_processing;
+      // Per frame: the game's draws set it again (a game that always has a scene sets it in its "OnPresent", as "_Template" does; reads in
+      // "OnPresent" use "has_drawn_main_post_processing_previous")
+      device_data.has_drawn_main_post_processing = false;
 #if ENABLE_SR
       device_data.has_drawn_sr_imgui = device_data.has_drawn_sr;
+      {
+         const std::unique_lock sr_lock(device_data.sr_mutex);
+         ApplySRType(device_data, device_data.sr_type_selected);
+         for (const auto& [type, instance] : device_data.sr_implementations_instances)
+         {
+            if (instance)
+            {
+               sr_implementations[type]->ReleaseRetired(instance);
+            }
+         }
+      }
 #endif // ENABLE_SR
 
       // Free mirrors queued this frame: all command lists have executed by now (usually).
@@ -5576,8 +10431,40 @@ namespace
       device_data.resource_upgrades.FlushPendingDestructions(queue->get_device(), device_data.mutex);
 
       game->OnPresent(native_device, device_data);
+#if DX12 && ENABLE_D3D12_PASSES
+      ReleaseIdleD3D12GamePassResources(device_data, queue->get_device());
+#endif
 
+#if DX12 && ENABLE_MINHOOK
+      // A change of the sampler upgrade (the mip bias of super resolution, the dev settings) reaches the sampler descriptors the game wrote before it.
+      // ponytail: one wait for the GPU per change; a game whose bias follows a dynamic resolution every frame would stall every frame (quantize the bias then)
+      if (enable_samplers_upgrade)
+      {
+         if (const auto samplers_upgrade = GetSamplersUpgradeState(device_data); samplers_upgrade != device_data.applied_samplers_upgrade)
+         {
+            const D3D12Clones::SamplerRewrite rewrite = D3D12Clones::RewriteSamplers(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()));
+            if (rewrite.timed_out)
+            {
+               static std::atomic_flag logged_rewrite_timeout;
+               if (!logged_rewrite_timeout.test_and_set())
+               {
+                  reshade::log::message(reshade::log::level::warning, "[Samplers] The GPU didn't finish the present queue within 2 seconds, the game's samplers keep their previous upgrade for now (it is retried at each present)");
+               }
+            }
+            else
+            {
+               device_data.applied_samplers_upgrade = samplers_upgrade;
 #if DEVELOPMENT
+               const std::string message = std::format("[Samplers] Wrote the game's {} sampler descriptors again with the mip bias {} (waited {:.1f} ms)", rewrite.count, std::get<0>(samplers_upgrade), rewrite.waited_ms);
+               reshade::log::message(reshade::log::level::info, message.c_str());
+#endif
+            }
+         }
+      }
+#endif
+
+
+#if DEVELOPMENT && DX11
       // Luma passes the game drew at present (or outside its draw hooks) on this thread
       Trace::FlushQueued(device_data.primary_command_list_data, device_data.primary_command_list.get());
 #endif
@@ -5606,14 +10493,340 @@ namespace
       }
 #endif
 
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11
       Trace::AddEvent(*queue->get_immediate_command_list()->get_private_data<CommandListData>(), native_device_context, TraceDrawCallData::TraceDrawCallType::Present);
 #endif // DEVELOPMENT
 
+#if DX12
+      // The upload ring frees its pages by the fences it signals with this count on the queues
+      D3D12UploadRing::Present(device_data.upload_ring.get(), ++device_data.present_count);
+#endif
       cb_luma_global_settings.FrameIndex++;
       device_data.cb_luma_global_settings_dirty = true;
    }
 
+   //TODOFT3: merge all the shader permutations that use the same code in Prey (and then move shader binaries to bin folder? Add shader files to VS project?)
+
+   // The sampler Luma's upgrade makes of a game's one ("samplers_upgrade_mode", "texture_mip_lod_bias_offset"): "desc" is a "D3D11_SAMPLER_DESC" or a "D3D12_SAMPLER_DESC",
+   // whose members and filter, comparison, anisotropy and bias values are the same. False if it isn't one to upgrade (it can still come out unchanged).
+   // Expects "s_mutex_samplers" to already be locked.
+   template <typename SamplerDesc>
+   bool UpgradeSamplerDesc(const DeviceData& device_data, SamplerDesc* desc_pointer)
+   {
+      using Filter = decltype(SamplerDesc::Filter);
+      constexpr Filter FILTER_ANISOTROPIC = Filter(reshade::api::filter_mode::anisotropic);
+      constexpr Filter FILTER_COMPARISON_ANISOTROPIC = Filter(reshade::api::filter_mode::compare_anisotropic);
+      constexpr Filter FILTER_MIN_MAG_MIP_LINEAR = Filter(reshade::api::filter_mode::min_mag_mip_linear);
+      constexpr Filter FILTER_COMPARISON_MIN_MAG_MIP_LINEAR = Filter(reshade::api::filter_mode::compare_min_mag_mip_linear);
+      constexpr Filter FILTER_MIN_MAG_LINEAR_MIP_POINT = Filter(reshade::api::filter_mode::min_mag_linear_mip_point);
+      constexpr Filter FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT = Filter(reshade::api::filter_mode::compare_min_mag_linear_mip_point);
+      constexpr Filter FILTER_MIN_MAG_MIP_POINT = Filter(reshade::api::filter_mode::min_mag_mip_point);
+      constexpr Filter FILTER_COMPARISON_MIN_MAG_MIP_POINT = Filter(reshade::api::filter_mode::compare_min_mag_mip_point);
+      constexpr UINT REQ_MAXANISOTROPY = 16;
+      constexpr float MIP_LOD_BIAS_MIN = -16.f; // Setting the bias out of range (~ +/- 16) will make DX11 crash
+      constexpr float MIP_LOD_BIAS_MAX = 15.99f;
+
+      SamplerDesc& desc = *desc_pointer;
+      const SamplerDesc original_desc = desc;
+#if !DEVELOPMENT
+      if (desc.Filter == FILTER_ANISOTROPIC || desc.Filter == FILTER_COMPARISON_ANISOTROPIC || (force_upgrade_linear_samplers && desc.Filter == FILTER_MIN_MAG_MIP_LINEAR))
+      {
+         if (desc.Filter == FILTER_MIN_MAG_MIP_LINEAR)
+         {
+            desc.Filter = FILTER_ANISOTROPIC;
+         }
+
+         desc.MaxAnisotropy = REQ_MAXANISOTROPY;
+
+         if (samplers_upgrade_mode >= 5) // Bruteforce the offset
+         {
+            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
+         }
+         else if (samplers_upgrade_mode == 4)
+         {
+            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
+         }
+         else if (samplers_upgrade_mode == 3) // Only change the offset when the original value is zero
+         {
+             desc.MipLODBias = (desc.MipLODBias == 0.0f) ? device_data.texture_mip_lod_bias_offset : desc.MipLODBias;
+             desc.MipLODBias = std::clamp(desc.MipLODBias, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
+         }
+
+         float bias_difference = desc.MipLODBias - original_desc.MipLODBias;
+         desc.MinLOD = (std::max)(desc.MinLOD + (std::min)(bias_difference, 0.f), 0.f);
+
+         // TODO: Clean up the code. Other "samplers_upgrade_mode" values aren't supported outside of development (because they aren't even needed, until proven otherwise)
+      }
+      else
+      {
+         return false;
+      }
+#else
+      // Prey's CryEngine (and most games) only uses:
+      // D3D11_FILTER_ANISOTROPIC
+      // D3D11_FILTER_COMPARISON_ANISOTROPIC
+      // D3D11_FILTER_MIN_MAG_MIP_POINT
+      // D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT
+      // D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT
+      // D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT
+      // D3D11_FILTER_MIN_MAG_MIP_LINEAR
+      // D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR
+
+      // This could theoretically make some textures that have moire patters, or were purposely blurry, "worse", but the positives of upgrading still outweight the negatives.
+      // Note that this might not fix all cases because there's still "ID3D11DeviceContext::SetResourceMinLOD()" and textures that are blurry for other reasons
+      // because they use other types of samplers (unfortunately it seems like some decals use "D3D11_FILTER_MIN_MAG_MIP_LINEAR").
+      // Note that the AF on different textures in the game seems is possibly linked with other graphics settings than just AF (maybe textures or objects quality).
+      if (desc.Filter == FILTER_ANISOTROPIC || desc.Filter == FILTER_COMPARISON_ANISOTROPIC || (force_upgrade_linear_samplers && desc.Filter == FILTER_MIN_MAG_MIP_LINEAR))
+      {
+         if (desc.Filter == FILTER_MIN_MAG_MIP_LINEAR)
+         {
+            desc.Filter = FILTER_ANISOTROPIC;
+         }
+
+         desc.MaxAnisotropy = REQ_MAXANISOTROPY;
+
+         // Note: this is the main ingredient in making textures less blurry
+         if (samplers_upgrade_mode == 3) // Only change the offset when the original value is zero (as outside of development)
+         {
+            desc.MipLODBias = std::clamp((desc.MipLODBias == 0.f) ? device_data.texture_mip_lod_bias_offset : desc.MipLODBias, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
+            desc.MinLOD = (std::max)(desc.MinLOD + (std::min)(desc.MipLODBias - original_desc.MipLODBias, 0.f), 0.f);
+         }
+         else if (samplers_upgrade_mode == 4)
+         {
+            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
+         }
+         else if (samplers_upgrade_mode >= 5)
+         {
+            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
+         }
+         // Note: this never seems to affect anything in Prey, probably also doesn't in most games
+         if (samplers_upgrade_mode >= 6)
+         {
+            desc.MinLOD = (std::min)(desc.MinLOD, 0.f);
+         }
+      }
+      else if ((desc.Filter == FILTER_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 1) // This is the most common (main/only) format being used other than AF
+         || (desc.Filter == FILTER_COMPARISON_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 2)
+         || (desc.Filter == FILTER_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 3)
+         || (desc.Filter == FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 4)
+         || (desc.Filter == FILTER_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 5)
+         || (desc.Filter == FILTER_COMPARISON_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 6))
+      {
+         //TODOFT: research. Force this on to see how it behaves. Doesn't work, it doesn't really help any further with (e.g.) blurry decal textures
+         // Note: this doesn't seem to do anything really, it doesn't help with the occasional blurry texture (probably because all samplers that needed anisotropic already had it set)
+         if (samplers_upgrade_mode >= 7)
+         {
+            // A comparison sampler (SampleCmp, shadows) stays one
+            const bool comparison = (desc.Filter == FILTER_COMPARISON_MIN_MAG_MIP_LINEAR || desc.Filter == FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT || desc.Filter == FILTER_COMPARISON_MIN_MAG_MIP_POINT);
+            desc.Filter = (comparison ? FILTER_COMPARISON_ANISOTROPIC : FILTER_ANISOTROPIC);
+            desc.MaxAnisotropy = REQ_MAXANISOTROPY;
+         }
+         // Note: changing the lod bias of non anisotropic filters makes reflections (cubemap samples?) a lot more specular (shiny) in Prey (and probably does in other games too), so it's best avoided (it can look better is some screenshots, but it's likely not intended).
+         // Even if we only fix up textures that didn't have a positive bias, we run into the same problem.
+         if (samplers_upgrade_mode == 4 && desc.MipLODBias <= 0.f)
+         {
+            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
+         }
+         else if (samplers_upgrade_mode >= 5)
+         {
+            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
+         }
+         if (samplers_upgrade_mode >= 6)
+         {
+            desc.MinLOD = 0.f;
+         }
+         else
+         {
+            float bias_difference = desc.MipLODBias - original_desc.MipLODBias;
+            desc.MinLOD = (std::max)(desc.MinLOD + (std::min)(bias_difference, 0.f), 0.f);
+         }
+      }
+#endif // !DEVELOPMENT
+      return true;
+   }
+
+#if DX12
+   // D3D12 samplers are descriptors, which the game writes ("CreateSampler()", "CreateSampler2()"): the heap ones are upgraded as they are written, and written
+   // again when the upgrade changes ("D3D12Clones::RewriteSamplers()"). ReShade also passes the static samplers of root signatures 1.0 and 1.1 here, which the
+   // root signature hook upgraded already ("UpgradeStaticSamplerD3D12()"). Static samplers are immutable: they keep the upgrade of when their root signature was created.
+   bool OnCreateSampler(reshade::api::device* device, reshade::api::sampler_desc& desc)
+   {
+      if (ignore_upgraded_samplers)
+      {
+         return false;
+      }
+#if ENABLE_MINHOOK
+      if (D3D12RootSignatures::static_samplers_upgraded)
+      {
+         return false;
+      }
+#endif
+      D3D12_SAMPLER_DESC native_desc = {.Filter = D3D12_FILTER(desc.filter), .AddressU = D3D12_TEXTURE_ADDRESS_MODE(desc.address_u), .AddressV = D3D12_TEXTURE_ADDRESS_MODE(desc.address_v), .AddressW = D3D12_TEXTURE_ADDRESS_MODE(desc.address_w), .MipLODBias = desc.mip_lod_bias, .MaxAnisotropy = UINT(desc.max_anisotropy), .ComparisonFunc = D3D12_COMPARISON_FUNC(desc.compare_op), .MinLOD = desc.min_lod, .MaxLOD = desc.max_lod};
+      const DeviceData* const device_data = device->get_private_data<DeviceData>();
+      if (!device_data)
+      {
+         return false;
+      }
+      {
+         const std::shared_lock lock(s_mutex_samplers);
+         if (!UpgradeSamplerDesc(*device_data, &native_desc))
+         {
+            return false;
+         }
+      }
+      desc.filter = reshade::api::filter_mode(native_desc.Filter);
+      desc.mip_lod_bias = native_desc.MipLODBias;
+      desc.max_anisotropy = float(native_desc.MaxAnisotropy);
+      desc.min_lod = native_desc.MinLOD;
+      return true;
+   }
+
+#if ENABLE_MINHOOK
+   // The root signature hook's upgrade of static samplers, made in the blob ReShade gets (see "D3D12RootSignatures::Hook"). The bias is the first device's: games have one
+   bool UpgradeStaticSamplerD3D12(D3D12_STATIC_SAMPLER_DESC1* desc)
+   {
+      if (ignore_upgraded_samplers)
+      {
+         return false;
+      }
+      const std::shared_lock lock_device(s_mutex_device);
+      if (global_devices_data.empty())
+      {
+         return false;
+      }
+      const std::shared_lock lock(s_mutex_samplers);
+      return UpgradeSamplerDesc(*global_devices_data.front(), desc);
+   }
+#endif
+#endif
+
+#if DX11 // D3D11 only: D3D12 upgrades its sampler descriptors as the game writes them ("OnCreateSampler()"), and has its own draw and copy handlers
+   // Expects "s_mutex_samplers" to already be locked
+   com_ptr<ID3D11SamplerState> CreateCustomSampler(const DeviceData& device_data, ID3D11Device* device, const D3D11_SAMPLER_DESC& original_desc)
+   {
+      D3D11_SAMPLER_DESC desc = original_desc;
+      if (!UpgradeSamplerDesc(device_data, &desc))
+      {
+         return nullptr;
+      }
+
+#if DEVELOPMENT && !defined(NDEBUG) && 0 // Make sure that the device we are using to create samples is the "native" one (the final one), not the proxy created by ReShade // TODO: delete if ReShade doesn't take my PR for this
+      ID3D11Device* parent_device = nullptr;
+      // Special ID used by ReShade (and possibly other applications) that returns the parent object of a proxy
+      constexpr GUID ID_IDeviceChildParent = { 0x7f2c9a11, 0x3b4e, 0x4d6a, { 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
+      struct __declspec(uuid("7F2C9A11-3B4E-4D6A-812F-5E9CD37A1B42")) IDeviceChildParent : IUnknown { };
+      device->QueryInterface(__uuidof(IDeviceChildParent), (void**)&parent_device);
+      if (parent_device)
+      {
+         ASSERT_ONCE_MSG(false, "We are possibly creating a sampler through the ReShade proxy device, which means ReShade will see it and call the init function on it, which we don't want"); // Note that if other applications implemented "ID_IDeviceChildParent", this could result in false positives
+         parent_device->Release();
+      }
+#endif
+
+      // Nothing to upgrade. Creating it anyway would return the original sampler itself (DX11 shares identical state objects),
+      // making the map hold a strong ref to its own key, which certainly won't help with ref counting.
+      if (std::memcmp(&desc, &original_desc, sizeof(D3D11_SAMPLER_DESC)) == 0)
+      {
+         return nullptr;
+      }
+
+      com_ptr<ID3D11SamplerState> sampler;
+      device->CreateSamplerState(&desc, &sampler); // Note: in DX11 all state objects are shared, so if we create one with the same desc as an existing one, it will return the ptr to that one instead.
+      ASSERT_ONCE(sampler != nullptr);
+      return sampler;
+   }
+
+   // Core swaps the game's samplers for upgraded ones only as they're bound (the descriptor push of "sampler" type below), so after a
+   // change of "texture_mip_lod_bias_offset" a sampler that stayed bound keeps the previous bias until the game rebinds it, which a game
+   // or wrapper skipping redundant binds may never do (The Witcher 2 under dgVoodoo: the scene kept the shadow pass's unbiased samplers).
+   // Swaps every stage's bound samplers for the current bias's variants. Expects "s_mutex_samplers" to be locked exclusively.
+   void RebindUpgradedSamplers(ID3D11DeviceContext* native_device_context, DeviceData& device_data)
+   {
+      using GetSamplers = void (STDMETHODCALLTYPE ID3D11DeviceContext::*)(UINT, UINT, ID3D11SamplerState**);
+      using SetSamplers = void (STDMETHODCALLTYPE ID3D11DeviceContext::*)(UINT, UINT, ID3D11SamplerState* const*);
+      constexpr std::pair<GetSamplers, SetSamplers> stages[] = {
+         {&ID3D11DeviceContext::VSGetSamplers, &ID3D11DeviceContext::VSSetSamplers},
+         {&ID3D11DeviceContext::HSGetSamplers, &ID3D11DeviceContext::HSSetSamplers},
+         {&ID3D11DeviceContext::DSGetSamplers, &ID3D11DeviceContext::DSSetSamplers},
+         {&ID3D11DeviceContext::GSGetSamplers, &ID3D11DeviceContext::GSSetSamplers},
+         {&ID3D11DeviceContext::PSGetSamplers, &ID3D11DeviceContext::PSSetSamplers},
+         {&ID3D11DeviceContext::CSGetSamplers, &ID3D11DeviceContext::CSSetSamplers},
+      };
+      const float bias = device_data.texture_mip_lod_bias_offset;
+      for (const auto& [get_samplers, set_samplers] : stages)
+      {
+         ID3D11SamplerState* samplers[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
+         (native_device_context->*get_samplers)(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, samplers);
+         bool swapped = false;
+         for (ID3D11SamplerState*& sampler : samplers)
+         {
+            if (!sampler)
+               continue;
+            // The game's sampler: the bound one, or the one whose variant is bound
+            auto original = device_data.custom_sampler_by_original_sampler.find(reinterpret_cast<uint64_t>(sampler));
+            if (original == device_data.custom_sampler_by_original_sampler.end())
+            {
+               original = std::find_if(device_data.custom_sampler_by_original_sampler.begin(), device_data.custom_sampler_by_original_sampler.end(), [sampler](const auto& entry)
+                  { return std::any_of(entry.second.begin(), entry.second.end(), [sampler](const auto& variant)
+                       { return variant.second.get() == sampler; }); });
+               if (original == device_data.custom_sampler_by_original_sampler.end())
+                  continue;
+            }
+            auto& [original_handle, variants] = *original;
+            auto variant = variants.find(bias);
+            if (variant == variants.end())
+            {
+               D3D11_SAMPLER_DESC desc;
+               reinterpret_cast<ID3D11SamplerState*>(original_handle)->GetDesc(&desc);
+               variant = variants.emplace(bias, CreateCustomSampler(device_data, device_data.native_device, desc)).first;
+            }
+            // No variant: a sampler Core doesn't upgrade, the game's own
+            ID3D11SamplerState* const replacement = (variant->second ? variant->second.get() : reinterpret_cast<ID3D11SamplerState*>(original_handle));
+            if (replacement != sampler)
+            {
+               sampler->Release();
+               sampler = replacement;
+               sampler->AddRef();
+               swapped = true;
+            }
+         }
+         if (swapped)
+         {
+            (native_device_context->*set_samplers)(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, samplers);
+         }
+         for (ID3D11SamplerState* sampler : samplers)
+         {
+            if (sampler)
+            {
+               sampler->Release();
+            }
+         }
+      }
+   }
+
+#endif // DX11
+
+   // Sets the mip bias of the upgraded samplers. Core's per-draw check swaps the bound samplers at the next draw; from inside a draw
+   // (after that check: pass "cmd_list_data") they're swapped right away, and recorded so the check doesn't swap them again.
+   // On D3D12 the bias reaches the sampler descriptors as Core writes them ("OnCreateSampler()"), so only the value is set.
+   void SetTextureMipLodBias([[maybe_unused]] NativeCommandList* native_device_context, DeviceData& device_data, float bias, [[maybe_unused]] CommandListData* cmd_list_data = nullptr)
+   {
+      if (custom_texture_mip_lod_bias_offset)
+         return;
+      const std::unique_lock lock(s_mutex_samplers);
+      if (device_data.texture_mip_lod_bias_offset == bias)
+         return;
+      device_data.texture_mip_lod_bias_offset = bias;
+#if DX11
+      if (cmd_list_data && enable_samplers_upgrade && !ignore_upgraded_samplers)
+      {
+         RebindUpgradedSamplers(native_device_context, device_data);
+         cmd_list_data->applied_texture_mip_lod_bias_offset = bias;
+      }
+#endif
+   }
+
+#if DX11
    // Called for draws/dispatches with a custom pipeline clone selected (custom shader files or patches), before the game's draw callbacks.
    // Binds the resources the clones' recipes need, and swaps a clone missing any of them for its original shader for this draw (game callbacks can do the same through "Shader::UsePipelineVariant()").
    DrawOrDispatchOverrideType OnDrawOrDispatchCustomPipeline(ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool is_dispatch, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func)
@@ -5682,7 +10895,6 @@ namespace
       return game->OnDrawOrDispatchCustomPipeline(native_device_context, cmd_list_data, device_data, is_dispatch ? cmd_list_data.pipeline_state_original_compute_shader_hashes : cmd_list_data.pipeline_state_original_graphics_shader_hashes, original_draw_dispatch_func);
    }
 
-   //TODOFT3: merge all the shader permutations that use the same code in Prey (and then move shader binaries to bin folder? Add shader files to VS project?)
 
    // Return false to prevent the original draw call from running (e.g. if you replaced it or just want to skip it)
    // Most games (e.g. Prey, Dishonored 2) always draw in direct mode (as opposed to indirect), but uses different command lists on different threads (e.g. on Prey, that's almost only used for the shadow projection maps, in Dishonored 2, for almost every separate pass).
@@ -5701,6 +10913,14 @@ namespace
       bool is_custom_pass = false;
 
       CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+
+      // A mip bias changed since this context's last draw: its bound samplers still have the previous one (see "RebindUpgradedSamplers")
+      if (enable_samplers_upgrade && !ignore_upgraded_samplers && cmd_list_data.applied_texture_mip_lod_bias_offset != device_data.texture_mip_lod_bias_offset)
+      {
+         const std::unique_lock lock(s_mutex_samplers);
+         RebindUpgradedSamplers(native_device_context, device_data);
+         cmd_list_data.applied_texture_mip_lod_bias_offset = device_data.texture_mip_lod_bias_offset;
+      }
 
       const auto& original_shader_hashes = is_dispatch ? cmd_list_data.pipeline_state_original_compute_shader_hashes : cmd_list_data.pipeline_state_original_graphics_shader_hashes;
 
@@ -5753,7 +10973,7 @@ namespace
          }
          else
          {
-            if (!cmd_list_data.any_dispatch_done)
+            if (!cmd_list_data.any_draw_done)
             {
                ASSERT_ONCE_MSG(cmd_list_data.pipeline_state_original_graphics_shader_hashes.HasAny(reshade::api::shader_stage::pixel) || cmd_list_data.pipeline_state_original_graphics_shader_hashes.HasAny(reshade::api::shader_stage::vertex),
                   "A draw was triggered on a fresh deferred device context without previously setting a vertex/pixel shader, it could be that the engine relies on whatever pipeline state will be set on the immediate device context at the time of joining the deferred context");
@@ -6029,6 +11249,9 @@ namespace
 
                bool any_changed = false;
                bool any_changed_inline = false;
+#if DEVELOPMENT
+               bool any_rtv_redirected = false; // By this draw: an already mirrored target (bound before) is kept as it is
+#endif
                std::shared_lock lock_device_read(device_data.mutex);
                if (!is_dispatch)
                {
@@ -6068,6 +11291,7 @@ namespace
                               rtvs[slot] = reinterpret_cast<ID3D11RenderTargetView*>(resource_view);
                               any_changed = true;
 #if DEVELOPMENT
+                              any_rtv_redirected = true;
                               if (Trace::running)
                               {
                                  // Diagnostic: log when a hash-based (seed) RTV is redirected to a mirror, and at what size.
@@ -6169,8 +11393,9 @@ namespace
 #if DEVELOPMENT
                      // If we upgrade the target textures from the source texture, make sure blending is disabled and that the viewport is fullscreen,
                      // otherwise we might not be writing to the whole screen, and we'd miss the starting color of the background (unless we copied it),
-                     // so it'd make it weird/unnecessary/wrong to upgrade the target.
-                     if (inline_texture_upgrades)
+                     // so it'd make it weird/unnecessary/wrong to upgrade the target. Only when this draw redirects one: a target mirrored before
+                     // already holds the background (e.g. Bayonetta's bloom composite, blended onto the canvas its scene copy mirrored).
+                     if (inline_texture_upgrades && any_rtv_redirected)
                      {
                         com_ptr<ID3D11BlendState> blend_state;
                         native_device_context->OMGetBlendState(&blend_state, nullptr, nullptr);
@@ -6585,19 +11810,21 @@ namespace
    bool HandlePipelineRedirections(ID3D11DeviceContext* native_device_context, const DeviceData& device_data, const CommandListData& cmd_list_data, bool is_dispatch, std::function<void()>& draw_func)
    {
       CachedPipeline::RedirectData redirect_data;
-      if (is_dispatch)
+      // The pipeline "OnBindPipeline()" found, unless one was destroyed since (then the locked lookup)
+      const CachedPipeline* const bound_pipeline = (is_dispatch ? cmd_list_data.bound_compute_cached_pipeline : cmd_list_data.bound_pixel_cached_pipeline);
+      const uint32_t bound_generation = (is_dispatch ? cmd_list_data.bound_compute_cached_pipeline_generation : cmd_list_data.bound_pixel_cached_pipeline_generation);
+      if (bound_generation == pipeline_cache_generation)
       {
-         const std::shared_lock lock(s_mutex_generic);
-         const auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(cmd_list_data.pipeline_state_original_compute_shader.handle);
-         if (pipeline_pair != device_data.pipeline_cache_by_pipeline_handle.end() && pipeline_pair->second != nullptr)
+         if (bound_pipeline)
          {
-            redirect_data = pipeline_pair->second->redirect_data;
+            redirect_data = bound_pipeline->redirect_data;
          }
       }
       else
       {
+         const uint64_t pipeline_handle = (is_dispatch ? cmd_list_data.pipeline_state_original_compute_shader.handle : cmd_list_data.pipeline_state_original_pixel_shader.handle);
          const std::shared_lock lock(s_mutex_generic);
-         const auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(cmd_list_data.pipeline_state_original_pixel_shader.handle);
+         const auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(pipeline_handle);
          if (pipeline_pair != device_data.pipeline_cache_by_pipeline_handle.end() && pipeline_pair->second != nullptr)
          {
             redirect_data = pipeline_pair->second->redirect_data;
@@ -7033,144 +12260,6 @@ namespace
       return cancelled_or_replaced;
    }
 
-   // Expects "s_mutex_samplers" to already be locked
-   com_ptr<ID3D11SamplerState> CreateCustomSampler(const DeviceData& device_data, ID3D11Device* device, const D3D11_SAMPLER_DESC& original_desc)
-   {
-      D3D11_SAMPLER_DESC desc = original_desc;
-#if !DEVELOPMENT
-      if (desc.Filter == D3D11_FILTER_ANISOTROPIC || desc.Filter == D3D11_FILTER_COMPARISON_ANISOTROPIC || (force_upgrade_linear_samplers && desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR))
-      {
-         if (desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR)
-         {
-            desc.Filter = D3D11_FILTER_ANISOTROPIC;
-         }
-
-         desc.MaxAnisotropy = D3D11_REQ_MAXANISOTROPY;
-
-         if (samplers_upgrade_mode >= 5) // Bruteforce the offset
-         {
-            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX); // Setting this out of range (~ +/- 16) will make DX11 crash
-         }
-         else if (samplers_upgrade_mode == 4)
-         {
-            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX); // Setting this out of range (~ +/- 16) will make DX11 crash
-         }
-         else if (samplers_upgrade_mode == 3) // Only change the offset when the original value is zero
-         {
-             desc.MipLODBias = (desc.MipLODBias == 0.0f) ? device_data.texture_mip_lod_bias_offset : desc.MipLODBias;
-             desc.MipLODBias = std::clamp(desc.MipLODBias, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX); // Setting this out of range (~ +/- 16) will make DX11 crash
-         }
-
-         float bias_difference = desc.MipLODBias - original_desc.MipLODBias;
-         desc.MinLOD = max(desc.MinLOD + min(bias_difference, 0.f), 0.f);
-
-         // TODO: Clean up the code. Other "samplers_upgrade_mode" values aren't supported outside of development (because they aren't even needed, until proven otherwise)
-      }
-      else
-      {
-         return nullptr;
-      }
-#else
-      // Prey's CryEngine (and most games) only uses:
-      // D3D11_FILTER_ANISOTROPIC
-      // D3D11_FILTER_COMPARISON_ANISOTROPIC
-      // D3D11_FILTER_MIN_MAG_MIP_POINT
-      // D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT
-      // D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT
-      // D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT
-      // D3D11_FILTER_MIN_MAG_MIP_LINEAR
-      // D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR
-
-      // This could theoretically make some textures that have moire patters, or were purposely blurry, "worse", but the positives of upgrading still outweight the negatives.
-      // Note that this might not fix all cases because there's still "ID3D11DeviceContext::SetResourceMinLOD()" and textures that are blurry for other reasons
-      // because they use other types of samplers (unfortunately it seems like some decals use "D3D11_FILTER_MIN_MAG_MIP_LINEAR").
-      // Note that the AF on different textures in the game seems is possibly linked with other graphics settings than just AF (maybe textures or objects quality).
-      if (desc.Filter == D3D11_FILTER_ANISOTROPIC || desc.Filter == D3D11_FILTER_COMPARISON_ANISOTROPIC || (force_upgrade_linear_samplers && desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR))
-      {
-         if (desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR)
-         {
-            desc.Filter = D3D11_FILTER_ANISOTROPIC;
-         }
-
-         desc.MaxAnisotropy = D3D11_REQ_MAXANISOTROPY;
-
-         // Note: this is the main ingredient in making textures less blurry
-         if (samplers_upgrade_mode == 4)
-         {
-            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
-         }
-         else if (samplers_upgrade_mode >= 5)
-         {
-            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
-         }
-         // Note: this never seems to affect anything in Prey, probably also doesn't in most games
-         if (samplers_upgrade_mode >= 6)
-         {
-            desc.MinLOD = min(desc.MinLOD, 0.f);
-         }
-      }
-      else if ((desc.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 1) // This is the most common (main/only) format being used other than AF
-         || (desc.Filter == D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 2)
-         || (desc.Filter == D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 3)
-         || (desc.Filter == D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 4)
-         || (desc.Filter == D3D11_FILTER_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 5)
-         || (desc.Filter == D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 6))
-      {
-         //TODOFT: research. Force this on to see how it behaves. Doesn't work, it doesn't really help any further with (e.g.) blurry decal textures
-         // Note: this doesn't seem to do anything really, it doesn't help with the occasional blurry texture (probably because all samplers that needed anisotropic already had it set)
-         if (samplers_upgrade_mode >= 7)
-         {
-            desc.Filter == (desc.ComparisonFunc != D3D11_COMPARISON_NEVER && samplers_upgrade_mode == 7) ? D3D11_FILTER_COMPARISON_ANISOTROPIC : D3D11_FILTER_ANISOTROPIC;
-            desc.MaxAnisotropy = D3D11_REQ_MAXANISOTROPY;
-         }
-         // Note: changing the lod bias of non anisotropic filters makes reflections (cubemap samples?) a lot more specular (shiny) in Prey (and probably does in other games too), so it's best avoided (it can look better is some screenshots, but it's likely not intended).
-         // Even if we only fix up textures that didn't have a positive bias, we run into the same problem.
-         if (samplers_upgrade_mode == 4 && desc.MipLODBias <= 0.f)
-         {
-            desc.MipLODBias = std::clamp(desc.MipLODBias + device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
-         }
-         else if (samplers_upgrade_mode >= 5)
-         {
-            desc.MipLODBias = std::clamp(device_data.texture_mip_lod_bias_offset, D3D11_MIP_LOD_BIAS_MIN, D3D11_MIP_LOD_BIAS_MAX);
-         }
-         if (samplers_upgrade_mode >= 6)
-         {
-            desc.MinLOD = 0.f;
-         }
-         else
-         {
-            float bias_difference = desc.MipLODBias - original_desc.MipLODBias;
-            desc.MinLOD = max(desc.MinLOD + min(bias_difference, 0.f), 0.f);
-         }
-      }
-#endif // !DEVELOPMENT
-
-#if DEVELOPMENT && !defined(NDEBUG) && 0 // Make sure that the device we are using to create samples is the "native" one (the final one), not the proxy created by ReShade // TODO: delete if ReShade doesn't take my PR for this
-      ID3D11Device* parent_device = nullptr;
-      // Special ID used by ReShade (and possibly other applications) that returns the parent object of a proxy
-      constexpr GUID ID_IDeviceChildParent = { 0x7f2c9a11, 0x3b4e, 0x4d6a, { 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
-      struct __declspec(uuid("7F2C9A11-3B4E-4D6A-812F-5E9CD37A1B42")) IDeviceChildParent : IUnknown { };
-      device->QueryInterface(__uuidof(IDeviceChildParent), (void**)&parent_device);
-      if (parent_device)
-      {
-         ASSERT_ONCE_MSG(false, "We are possibly creating a sampler through the ReShade proxy device, which means ReShade will see it and call the init function on it, which we don't want"); // Note that if other applications implemented "ID_IDeviceChildParent", this could result in false positives
-         parent_device->Release();
-      }
-#endif
-
-      // Nothing to upgrade. Creating it anyway would return the original sampler itself (DX11 shares identical state objects),
-      // making the map hold a strong ref to its own key, which certainly won't help with ref counting.
-      if (std::memcmp(&desc, &original_desc, sizeof(D3D11_SAMPLER_DESC)) == 0)
-      {
-         return nullptr;
-      }
-
-      com_ptr<ID3D11SamplerState> sampler;
-      device->CreateSamplerState(&desc, &sampler); // Note: in DX11 all state objects are shared, so if we create one with the same desc as an existing one, it will return the ptr to that one instead.
-      ASSERT_ONCE(sampler != nullptr);
-      return sampler;
-   }
-
    void OnInitSampler(reshade::api::device* device, const reshade::api::sampler_desc& desc, reshade::api::sampler sampler)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
@@ -7244,6 +12333,11 @@ namespace
       s_mutex_samplers.unlock();
    }
 
+#endif // DX11
+
+   // The resource view hook and the helpers it needs (until "OnCreateResourceView()") are shared with D3D12: the swapchain upgrade fixes the views of the back buffers there too,
+   // and so do the texture upgrades, for the committed textures "OnCreateResource()" upgrades there
+
    // Takes a view desc the game would have tried to use with a resource we upgraded (directly or indirectly),
    // and returns the best suitable format for an upgraded view.
    // Note that some games already acknowledge direct texture upgrade format changes, and try to create views accordingly.
@@ -7302,6 +12396,7 @@ namespace
       return original_view_desc.format; // Unchanged
    }
 
+#if DX11
    // TODO: if the source format was like R8G8_UNORM, only upgrade it to R16G16_FLOAT unless otherwise specified? Just expose the format! We could hardcode a list of in/out format upgrades here for example! Update "GetBestResourceViewUpgradeFormat()" accordingly!
    // Note: this doesn't have any fallbacks, it always picks an upgraded format, so only call when you actually want to upgrade a format.
    // Avoid returning typeless formats here, because then we'd need to pick a non typeless view format, and we wouldn't know how to make that choice.
@@ -7324,6 +12419,8 @@ namespace
       return reshade::api::format::r16g16b16a16_float;
    }
 
+#endif // DX11
+
    // TODO: cache the last "almost" upgraded texture resolution to make sure that when the swapchain changes res, we didn't fail to upgrade resources before (needed even with indirect upgrades)
    std::optional<reshade::api::resource_desc> GetOptionalResourceUpgradeDesc(const reshade::api::resource_desc& desc, const DeviceData& device_data, bool has_initial_data /*= false*/)
    {
@@ -7340,61 +12437,74 @@ namespace
       return device_data.resource_upgrades.GetOptionalResourceUpgradeDesc(desc, state, has_initial_data);
    }
 
+#if DX11
+   // The format pairs "ConvertResourceData()" converts (mapped textures only get the pitch of their original format for these)
+   bool CanConvertResourceData(reshade::api::format format, reshade::api::format new_format)
+   {
+      if (new_format != reshade::api::format::r16g16b16a16_float)
+      {
+         return false;
+      }
+      switch (format)
+      {
+      case reshade::api::format::r8g8b8a8_unorm:
+      case reshade::api::format::r8g8b8a8_unorm_srgb:
+      case reshade::api::format::r8g8b8x8_unorm:
+      case reshade::api::format::r8g8b8x8_unorm_srgb:
+      case reshade::api::format::b8g8r8a8_unorm:
+      case reshade::api::format::b8g8r8a8_unorm_srgb:
+      case reshade::api::format::b8g8r8x8_unorm:
+      case reshade::api::format::b8g8r8x8_unorm_srgb:
+      {
+         return true;
+      }
+      default:
+      {
+         return false;
+      }
+      }
+   }
+
    // Returns true if it changed the data.
    // Remember to manually de-allocate the data later.
    bool ConvertResourceData(const reshade::api::subresource_data* data, reshade::api::subresource_data& new_data, const reshade::api::resource_desc& desc, reshade::api::format new_format, bool pre_allocated = false)
    {
       ASSERT_ONCE(data->data != nullptr);
 
-      // Only supported format atm
-      if (new_format != reshade::api::format::r16g16b16a16_float)
+      if (!CanConvertResourceData(desc.texture.format, new_format))
       {
-         ASSERT_ONCE_MSG(false, "Unsupported target resource data format (due to texture upgrades)");
+         ASSERT_ONCE_MSG(desc.texture.format == new_format, "Unsupported resource data format conversion (due to texture upgrades)"); // TODO: add support for these
          return false;
       }
 
       constexpr size_t bytes_per_pixel = 8; // 4 for 8bpc, 8 for 16bpc
-      const size_t buffer_size = desc.texture.width * desc.texture.height * desc.texture.depth_or_layers * bytes_per_pixel;
-
+      if (!pre_allocated)
+      {
+         new_data.data = new uint8_t[desc.texture.width * desc.texture.height * desc.texture.depth_or_layers * bytes_per_pixel];
+      }
+      new_data.row_pitch = desc.texture.width * bytes_per_pixel;
+      new_data.slice_pitch = new_data.row_pitch * desc.texture.height;
       switch (desc.texture.format)
       {
-      case reshade::api::format::r8g8b8a8_unorm:
-      case reshade::api::format::r8g8b8a8_unorm_srgb:
-      case reshade::api::format::r8g8b8x8_unorm:
-      case reshade::api::format::r8g8b8x8_unorm_srgb:
-      {
-         if (!pre_allocated)
-            new_data.data = new uint8_t[buffer_size];
-         new_data.row_pitch = desc.texture.width * bytes_per_pixel;
-         new_data.slice_pitch = new_data.row_pitch * desc.texture.height;
-         ConvertR8G8B8A8toR16G16B16A16((R8G8B8A8_UNORM*)data->data, (R16G16B16A16_FLOAT*)new_data.data, desc.texture.width, desc.texture.height, desc.texture.depth_or_layers);
-         return true;
-      }
       case reshade::api::format::b8g8r8a8_unorm:
       case reshade::api::format::b8g8r8a8_unorm_srgb:
       case reshade::api::format::b8g8r8x8_unorm:
       case reshade::api::format::b8g8r8x8_unorm_srgb:
       {
-         if (!pre_allocated)
-            new_data.data = new uint8_t[buffer_size];
-         new_data.row_pitch = desc.texture.width * bytes_per_pixel;
-         new_data.slice_pitch = new_data.row_pitch * desc.texture.height;
          ConvertR8G8B8A8toR16G16B16A16((B8G8R8A8_UNORM*)data->data, (R16G16B16A16_FLOAT*)new_data.data, desc.texture.width, desc.texture.height, desc.texture.depth_or_layers);
-         return true;
-      }
-      case reshade::api::format::r16g16b16a16_float:
-      {
          break;
       }
       default:
       {
-         ASSERT_ONCE_MSG(false, "Unsupported source resource data format (due to texture upgrades)"); // TODO: add support for these
+         ConvertR8G8B8A8toR16G16B16A16((R8G8B8A8_UNORM*)data->data, (R16G16B16A16_FLOAT*)new_data.data, desc.texture.width, desc.texture.height, desc.texture.depth_or_layers);
          break;
       }
       }
-      return false;
+      return true;
    }
+#endif // DX11
 
+   // Shared with D3D12, where the textures the game creates directly are upgraded the same way (see "OnCreateResource()" for its rules there)
    void OnInitResource(
       reshade::api::device* device,
       const reshade::api::resource_desc& desc,
@@ -7405,6 +12515,70 @@ namespace
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
 
       DeviceData& device_data = *device->get_private_data<DeviceData>();
+#if DX12 && DEVELOPMENT
+      // Root SRVs and UAVs are GPU virtual addresses, the capture resolves them to their buffer. Textures are kept with how the game created them, for the MCP: ReShade fires this inside the
+      // game's create call (see "includes/d3d12_resource_creation.h")
+      if (desc.type == reshade::api::resource_type::buffer)
+      {
+         D3D12State::AddBuffer(&device_data.buffer_addresses, resource, desc.buffer.size);
+      }
+#if ENABLE_MINHOOK
+      else
+      {
+         const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
+         device_data.texture_kinds.by_resource[resource.handle] = D3D12ResourceCreation::KindOf(desc);
+      }
+#endif
+#endif
+#if DX12 && ENABLE_MINHOOK
+      if (D3D12ResourceCreation::current_creation_arguments.uses_layouts && desc.type != reshade::api::resource_type::buffer)
+      {
+         D3D12ResourceCreation::RememberLayoutTexture(resource.handle);
+      }
+      // The clone of a placed texture, or of a committed one with indirect upgrades (see "includes/d3d12_clones.h"): the original stays as the game made it, the clone is the upgraded one
+      if (const PendingClone pending = std::exchange(pending_clone, {}); pending.format != DXGI_FORMAT_UNKNOWN)
+      {
+         // Seed mode (writer shaders listed): the clone waits for its promotion, until then the game keeps using the original
+         ID3D12Resource* const clone = D3D12Clones::Create(reinterpret_cast<ID3D12Device*>(device->get_native()), reinterpret_cast<ID3D12Resource*>(resource.handle), pending.format, pending.width, pending.height, D3D12ResourceCreation::current_creation_arguments, auto_texture_format_upgrade_shader_hashes.empty());
+         if (clone)
+         {
+            const uint64_t clone_handle = reinterpret_cast<uint64_t>(clone);
+            {
+               const std::unique_lock lock_upgrades(device_data.mutex);
+               device_data.resource_upgrades.upgraded_resources.emplace(clone_handle);
+               device_data.resource_upgrades.original_upgraded_resources_formats[clone_handle] = desc.texture.format;
+            }
+            if (D3D12ResourceCreation::current_creation_arguments.uses_layouts)
+            {
+               D3D12ResourceCreation::RememberLayoutTexture(clone_handle);
+            }
+#if DEVELOPMENT
+            const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
+            device_data.texture_kinds.by_resource[clone_handle] = D3D12ResourceCreation::Kind::Clone;
+#endif
+         }
+         static std::mutex logged_mutex;
+         static std::set<std::tuple<bool, D3D12ResourceCreation::Kind, reshade::api::format, DXGI_FORMAT, uint32_t, uint32_t>> logged_clones;
+         const std::unique_lock lock_logged(logged_mutex);
+         const D3D12ResourceCreation::Kind creation_kind = D3D12ResourceCreation::KindOf(desc);
+         const bool resized = (pending.width != desc.texture.width || pending.height != desc.texture.height);
+         if (logged_clones.emplace(clone != nullptr, creation_kind, desc.texture.format, pending.format, (resized ? pending.width : 0), (resized ? pending.height : 0)).second)
+         {
+            const char* const original_name = GetFormatNameSafe(DXGI_FORMAT(desc.texture.format));
+            const char* const kind_name = D3D12ResourceCreation::KIND_NAMES[size_t(creation_kind)];
+            const std::string clone_name = (resized ? std::format("{} at {}x{} (from {}x{})", GetFormatNameSafe(pending.format), pending.width, pending.height, desc.texture.width, desc.texture.height) : std::string(GetFormatNameSafe(pending.format)));
+            const std::string message = (clone ? std::format("[Texture upgrades] Cloned a {} {} texture as {}", kind_name, original_name, clone_name) : std::format("[Texture upgrades] The device refused the clone of a {} {} texture as {}, it stays as the game made it", kind_name, original_name, clone_name));
+            reshade::log::message(clone ? reshade::log::level::info : reshade::log::level::warning, message.c_str());
+         }
+      }
+#endif
+#if DX12
+      // D3D12 fires this right after the "OnCreateResource()" of the same call. The shared resources the game opens come without one (and are never upgraded)
+      if (!waiting_on_upgraded_resource_init || (desc.flags & reshade::api::resource_flags::shared) != 0)
+      {
+         return;
+      }
+#endif
       std::unique_lock lock(device_data.mutex);
 
       if (waiting_on_upgraded_resource_init)
@@ -7429,6 +12603,7 @@ namespace
             upgraded_resource_init_data = nullptr; // optional, avoid dangling pointer
          }
 
+#if DX11
          if (enable_indirect_texture_format_upgrades)
          {
             // The "desc" we got as input is not upgraded in this case
@@ -7441,7 +12616,7 @@ namespace
             if (initial_data)
             {
                new_initial_data = *initial_data;
-               assert(upgraded_desc.texture.width == desc.texture.width && upgraded_desc.texture.height == desc.texture.height); // TODO: handle resizing too...
+               assert(upgraded_desc.texture.width == desc.texture.width && upgraded_desc.texture.height == desc.texture.height); // Custom dimensions skip textures with initial data ("GetOptionalResourceUpgradeDesc()")
                if (ConvertResourceData(initial_data, new_initial_data, desc, upgraded_desc.texture.format))
                   new_initial_data_ptr = &new_initial_data;
             }
@@ -7456,19 +12631,20 @@ namespace
                lock.lock();
                ASSERT(!device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.contains(resource.handle)); // The game re-used the ptr (can rarely happen), and we haven't cleared our mirrored verson yet
                device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.emplace(resource.handle, ResourceUpgradeManager::IndirectUpgradedResource{ mirrored_upgraded_resource.handle, texture_scaled, desc.texture.width, desc.texture.height, upgraded_desc.texture.width, upgraded_desc.texture.height });
+               device_data.resource_upgrades.any_mirror.store(true, std::memory_order_release);
             }
             if (new_initial_data_ptr)
                delete[] static_cast<uint8_t*>(new_initial_data_ptr->data);
          }
          else
+#endif // DX11
          {
             device_data.resource_upgrades.upgraded_resources.emplace(resource.handle);
-#if DEVELOPMENT
             device_data.resource_upgrades.original_upgraded_resources_formats[resource.handle] = last_attempted_upgraded_resource_creation_format;
-#endif
          }
          waiting_on_upgraded_resource_init = false;
       }
+#if DX11
       else
       {
          // Code mirrored from "OnCreateResource()" (though some filter cases are still missing)
@@ -7482,10 +12658,13 @@ namespace
             }
          }
       }
+#endif // DX11
    }
 
-   // This is called before "OnInitResource()"
+   // This is called before "OnInitResource()". D3D12 fires both inside the call of the game, and ReShade can't tell its committed resources from the placed ones: the hooks of
+   // "includes/d3d12_resource_creation.h" do (so without MinHook D3D12 upgrades nothing, and nothing registers this)
    // Note that swapchain textures (backbuffer) don't pass through here!
+#if DX11 || ENABLE_MINHOOK
    bool OnCreateResource(
       reshade::api::device* device,
       reshade::api::resource_desc& desc,
@@ -7494,29 +12673,115 @@ namespace
    {
 #if CHECK_GRAPHICS_API_COMPATIBILITY
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api(), false);
-#else // Check this one anyway
+#elif DX11 // Check this one anyway
       ASSERT_ONCE(device->get_api() == reshade::api::device_api::d3d11);
+#else
+      ASSERT_ONCE(device->get_api() == reshade::api::device_api::d3d12);
 #endif
 
       // No need to clear "upgraded_resource_init_desc"/"upgraded_resource_init_data" from its last value
       waiting_on_upgraded_resource_init = false; // If the same thread called another "OnCreateResource()" before we got a "OnInitResource()", it implies the resource creation has failed and we didn't get that event (we have to do it by thread as device objects creation is thread safe and can be done by multiple threads concurrently)
+#if DX12 && ENABLE_MINHOOK
+      pending_clone = {};
+#endif
+
+#if DX12
+      // D3D12 games create thousands of buffers, none of them is a texture. Only the textures of the default heap are candidates (a reserved one has no heap, the custom ones are for the CPU: the filters
+      // below assert on those)
+      if (desc.type == reshade::api::resource_type::buffer || desc.heap != reshade::api::memory_heap::default_)
+      {
+         return false;
+      }
+#endif
 
       DeviceData& device_data = *device->get_private_data<DeviceData>();
       std::shared_lock lock(device_data.mutex); // Note: we possibly don't even need this (or well, we might want to use a different mutex)
       
-      if (std::optional<reshade::api::resource_desc> upgraded_desc = GetOptionalResourceUpgradeDesc(desc, device_data, initial_data && initial_data->data))
+      if (std::optional<reshade::api::resource_desc> upgraded_desc = (texture_format_upgrades_on_creation ? GetOptionalResourceUpgradeDesc(desc, device_data, initial_data && initial_data->data) : std::nullopt))
       {
          lock.unlock();
 
+         const bool upgrade_directly = !enable_indirect_texture_format_upgrades;
+#if DX11
          const reshade::api::resource_desc original_desc = desc;
+#endif
 
-#if DEVELOPMENT
          last_attempted_upgraded_resource_creation_format = desc.texture.format;
+
+#if DX12
+         // The D3D12 rules, on top of the filters: a texture is only upgraded in place if the game creates it committed (it owns its memory, whereas a placed one is in a heap the game sized and shares with other
+         // resources, so a bigger one would overflow it or alias them: it keeps its desc and gets a clone in "OnInitResource()". A reserved one has none until the game maps tiles to it), a depth
+         // texture only through a clone of custom dimensions (its format isn't upgraded: the DSV variants aren't made), not shared (another process or API opens it) and without castable formats
+         // (ReShade passes them on as the game gave them, and the upgraded format isn't one of the formats they can be cast to). With indirect upgrades a committed one gets a clone too, the mirror
+         // of D3D11's (views live in descriptor heaps, so they can't be swapped at bind)
+         if (std::memcmp(&upgraded_desc.value(), &desc, sizeof(desc)) == 0)
+         {
+            return false; // The filters chose a texture the upgrade leaves as it is
+         }
+         const D3D12ResourceCreation::Kind creation_kind = D3D12ResourceCreation::KindOf(desc);
+         // Custom dimensions ("texture_custom_dimensions_upgrades") always go through a clone: the game's views and copies keep the original's size, and the draws into the clone get scaled
+         // viewports ("OnDrawOrDispatchD3D12()"). Its subresources stay the original's, so its barriers can follow the original's
+         const bool resized = (upgraded_desc->texture.width != desc.texture.width || upgraded_desc->texture.height != desc.texture.height);
+         const bool is_depth = (desc.usage & reshade::api::resource_usage::depth_stencil) != 0;
+         const char* refusal = nullptr;
+         if (creation_kind != D3D12ResourceCreation::Kind::Committed && creation_kind != D3D12ResourceCreation::Kind::Placed)
+         {
+            refusal = "the reserved ones aren't upgraded yet";
+         }
+         else if (is_depth && !resized)
+         {
+            refusal = "depth textures are only cloned for custom dimensions on D3D12 (their formats aren't upgraded yet)";
+         }
+         else if (is_depth && !auto_texture_format_upgrade_shader_hashes.empty())
+         {
+            // A scaled depth next to the original size of a render target whose clone waits would clip or misplace more than an unscaled one
+            refusal = "with writer shaders listed the clones of its render targets wait for their promotion, which a depth clone can't follow";
+         }
+         else if ((desc.flags & reshade::api::resource_flags::shared) != 0)
+         {
+            refusal = "it is shared";
+         }
+         else if (D3D12ResourceCreation::current_castable_format_count != 0)
+         {
+            refusal = "it takes castable formats, which ReShade passes on as the game gave them and the upgraded format isn't one of";
+         }
+         else if (upgraded_desc->texture.depth_or_layers != desc.texture.depth_or_layers || upgraded_desc->texture.samples != desc.texture.samples)
+         {
+            refusal = "its custom dimensions change its layers or samples, which the barriers of its clone couldn't follow";
+         }
+         // ponytail: width and height only, the depth of a 3D texture isn't counted in its mip chain
+         else if (resized && std::bit_width((std::max)(upgraded_desc->texture.width, upgraded_desc->texture.height)) < (desc.texture.levels != 0 ? int(desc.texture.levels) : std::bit_width((std::max)(desc.texture.width, desc.texture.height))))
+         {
+            refusal = "its custom dimensions are too small for its mip levels, which its clone keeps so its barriers can follow the original's";
+         }
+         else if (resized && !ENABLE_D3D12_PASSES)
+         {
+            refusal = "its custom dimensions need the scaled viewports of the D3D12 passes' state tracking (\"ENABLE_D3D12_PASSES\")";
+         }
+         if (refusal)
+         {
+#if DEVELOPMENT
+            static std::mutex refused_mutex;
+            static std::set<std::tuple<D3D12ResourceCreation::Kind, reshade::api::format, std::string_view>> refused_textures;
+            const std::unique_lock lock_refused(refused_mutex);
+            if (refused_textures.emplace(creation_kind, desc.texture.format, refusal).second)
+            {
+               reshade::log::message(reshade::log::level::info, std::format("[Texture upgrades] A {} {} texture matched the upgrade filters but isn't upgraded: {}", D3D12ResourceCreation::KIND_NAMES[size_t(creation_kind)], GetFormatNameSafe(DXGI_FORMAT(desc.texture.format)), refusal).c_str());
+            }
+#endif
+            return false;
+         }
+         if (creation_kind == D3D12ResourceCreation::Kind::Placed || !upgrade_directly || resized)
+         {
+            // A depth clone keeps the game's format, whatever the depth format filters chose: only its size follows the custom dimensions
+            pending_clone = {.format = DXGI_FORMAT(is_depth ? desc.texture.format : upgraded_desc->texture.format), .width = upgraded_desc->texture.width, .height = upgraded_desc->texture.height};
+            return false; // The desc stays the game's
+         }
 #endif
 
          // Direct upgrade (inline).
          // Note that upgrading typeless texture could have unforeseen consequences in some games, especially when the textures are then used as unsigned int or signed int etc (e.g. Trine 5)
-         if (!enable_indirect_texture_format_upgrades)
+         if (upgrade_directly)
          {
             desc = upgraded_desc.value();
          }
@@ -7524,12 +12789,13 @@ namespace
          waiting_on_upgraded_resource_init = true;
          upgraded_resource_init_desc = desc; // Purposely left to the original value if "enable_indirect_texture_format_upgrades" is true, because we need to compare it against the direct upgraded desc we get back from reshade
          forced_upgraded_resource_init_desc = upgraded_desc.value();
+#if DX11
          bool converted_initial_data = false;
          // We need to convert the initial data to the new format
-         if (initial_data != nullptr && !enable_indirect_texture_format_upgrades)
+         if (initial_data != nullptr && upgrade_directly)
          {
             reshade::api::subresource_data new_initial_data = *initial_data;
-            assert(original_desc.texture.width == upgraded_desc.value().texture.width && original_desc.texture.height == upgraded_desc.value().texture.height); // TODO: handle resizing too...
+            assert(original_desc.texture.width == upgraded_desc.value().texture.width && original_desc.texture.height == upgraded_desc.value().texture.height); // Custom dimensions skip textures with initial data ("GetOptionalResourceUpgradeDesc()")
             converted_initial_data = ConvertResourceData(initial_data, new_initial_data, original_desc, upgraded_desc.value().texture.format);
             if (converted_initial_data)
             {
@@ -7538,12 +12804,17 @@ namespace
          }
          // Note: this expects a "uint8_t" c array
          upgraded_resource_init_data = converted_initial_data ? initial_data->data : nullptr;
+#else
+         upgraded_resource_init_data = nullptr; // D3D12 creates come with no initial data
+#endif
 
-         return !enable_indirect_texture_format_upgrades;
+         return upgrade_directly;
       }
       return false;
    }
+#endif // DX11 || ENABLE_MINHOOK
 
+   // Shared with D3D12, where the development builds' capture forgets the buffers and textures here too
    void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
@@ -7556,16 +12827,50 @@ namespace
          return;
       }
       DeviceData& device_data = *device->get_private_data<DeviceData>();
-      if (&device_data == nullptr)
-         return;
+#if DX12 && DEVELOPMENT
+      D3D12State::RemoveBuffer(&device_data.buffer_addresses, resource);
+#if ENABLE_MINHOOK
+      {
+         const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
+         device_data.texture_kinds.by_resource.erase(resource.handle);
+      }
+#endif
+#endif
+#if DX12 && ENABLE_MINHOOK
+      D3D12ResourceCreation::ForgetLayoutTexture(resource.handle);
+      // A placed texture's clone is released once the GPU is done with it, and unregistered like an upgraded texture
+      if (const ID3D12Resource* const clone = D3D12Clones::Retire(reinterpret_cast<ID3D12Resource*>(resource.handle)))
+      {
+         const uint64_t clone_handle = reinterpret_cast<uint64_t>(clone);
+         D3D12ResourceCreation::ForgetLayoutTexture(clone_handle);
+         {
+            const std::unique_lock lock_upgrades(device_data.mutex);
+            device_data.resource_upgrades.OnResourceDestroyed(clone_handle);
+         }
+#if DEVELOPMENT
+         const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
+         device_data.texture_kinds.by_resource.erase(clone_handle);
+#endif
+      }
+#endif
+#if DX12
+      // D3D12 engines destroy transient resources (often placed ones) every frame, while the draw threads read these sets under the shared lock (the copy and view hooks): only an upgraded texture needs the
+      // exclusive one
+      {
+         const std::shared_lock lock_read(device_data.mutex);
+         if (!device_data.resource_upgrades.upgraded_resources.contains(resource.handle))
+         {
+            return;
+         }
+      }
+#endif
       std::unique_lock lock(device_data.mutex);
       // Unlinks its mirror (and the mirror views) and defers their destruction to the next present, as they may still be in flight in hooks or bound on recorded lists
       device_data.resource_upgrades.OnResourceDestroyed(resource.handle);
 
+#if DX11 && DEVELOPMENT
       // TODO: thread safe
-      int count = 0;
-#if DEVELOPMENT
-      count = device_data.cb_per_view_global_buffers.erase(reinterpret_cast<ID3D11Buffer*>(resource.handle));
+      device_data.cb_per_view_global_buffers.erase(reinterpret_cast<ID3D11Buffer*>(resource.handle));
 #endif
    }
 
@@ -7576,6 +12881,24 @@ namespace
       reshade::api::resource_view_desc& desc)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api(), false);
+
+#if DX12
+      // A view without a desc takes the format of its resource, the upgraded one on D3D12: nothing to fix. Converting it to an explicit one would also leave the shader resource views ReShade makes
+      // of it without a component mapping (it only knows the descs the game passes)
+      if (desc.type == reshade::api::resource_view_type::unknown)
+      {
+         return false;
+      }
+      // D3D12 games create views all the time and nearly none are of the resources upgraded: they are found without asking the device for the desc of the resource
+      {
+         DeviceData& device_data = *device->get_private_data<DeviceData>();
+         const std::shared_lock lock(device_data.mutex);
+         if (!device_data.back_buffers.contains(resource.handle) && !device_data.resource_upgrades.upgraded_resources.contains(resource.handle))
+         {
+            return false;
+         }
+      }
+#endif
 
 		reshade::api::resource_view_type lut_dimensions = reshade::api::resource_view_type::unknown;
       switch (texture_format_upgrades_lut_dimensions)
@@ -7745,7 +13068,7 @@ namespace
          }
       }
 
-#if DEVELOPMENT
+#if DEVELOPMENT && DX11
       const reshade::api::resource_desc resource_desc = device->get_resource_desc(resource);
       reshade::api::format upgraded_format = GetBestResourceUpgradeFormat(resource_desc);
 
@@ -7825,10 +13148,11 @@ namespace
          desc.format = format;
          return true;
       }
-#endif // DEVELOPMENT
+#endif // DEVELOPMENT && DX11
       return false;
    }
 
+#if DX11
    void OnInitResourceView(
       reshade::api::device* device,
       reshade::api::resource resource,
@@ -7919,7 +13243,11 @@ namespace
             break;
 
          reshade::api::descriptor_table_update replaced_update = update;
-         std::vector<reshade::api::resource_view> replaced_descriptors;
+         // On the stack: games bind views every draw, and a heap copy per replaced bind showed in CPU profiles (MELE). D3D11 binds at
+         // most 128 SRVs (or 64 UAVs) per call.
+         std::array<reshade::api::resource_view, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> replaced_descriptors;
+         if (update.count > replaced_descriptors.size())
+            break;
          bool any_replaced = false;
          bool any_upgraded = false;
 
@@ -7927,6 +13255,9 @@ namespace
 
          {
             DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+            // Only replacements to do, and nothing to replace a view with yet
+            if (enable_chain_indirect_texture_format_upgrades < ChainTextureFormatUpgradesType::DirectAndIndirectDependencies && !device_data.resource_upgrades.any_mirror.load(std::memory_order_acquire))
+               break;
             std::shared_lock lock_device_read(device_data.mutex);
 
             const reshade::api::resource_view* original_rvs = (reshade::api::resource_view*)update.descriptors;
@@ -7985,10 +13316,7 @@ namespace
                      // Copy the descriptor array before replacing any view: in DX11 the event's descriptor pointer aliases
                      // the game's own bind array (reshade reinterprets the original objects array), so writing mirror view
                      // handles through it would leak our pointers into the game's memory (stale-pointer hazards downstream).
-                     // Do this lazily because it's very expensive.
-                     replaced_descriptors = std::vector<reshade::api::resource_view>(
-                        reinterpret_cast<const reshade::api::resource_view*>(update.descriptors),
-                        reinterpret_cast<const reshade::api::resource_view*>(update.descriptors) + update.count);
+                     std::copy_n(original_rvs, update.count, replaced_descriptors.data());
                      replaced_update.descriptors = replaced_descriptors.data();
                      replaced_rvs = (reshade::api::resource_view*)replaced_update.descriptors;
                   }
@@ -8114,11 +13442,12 @@ namespace
          // Copy the sampler array before replacing any sampler: reshade
          // reinterprets the game's own bind array as the descriptor pointer (the same
          // aliasing as the SRV/UAV case above), so an in-place write would leak custom
-         // sampler handles into the game's memory.
+         // sampler handles into the game's memory. On the stack, as every sampler bind runs this.
          reshade::api::descriptor_table_update custom_update = update;
-         std::vector<reshade::api::sampler> replaced_samplers(
-            reinterpret_cast<const reshade::api::sampler*>(update.descriptors),
-            reinterpret_cast<const reshade::api::sampler*>(update.descriptors) + update.count);
+         std::array<reshade::api::sampler, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> replaced_samplers;
+         if (update.count > replaced_samplers.size())
+            break;
+         std::copy_n(static_cast<const reshade::api::sampler*>(update.descriptors), update.count, replaced_samplers.data());
          custom_update.descriptors = replaced_samplers.data();
          bool any_modified = false;
          std::shared_lock shared_lock_samplers(s_mutex_samplers);
@@ -8277,30 +13606,41 @@ namespace
 #endif // DEVELOPMENT
 
       bool needs_downgrade = false;
-      bool needs_conversion = false;
+      bool has_mirror = false;
+      reshade::api::format original_format = reshade::api::format::unknown;
       {
          const std::shared_lock lock(device_data.mutex);
          needs_downgrade = device_data.resource_upgrades.upgraded_resources.contains(resource.handle); // TODO: also check the swapchain for stuff like this... We should add it to this list!
-         needs_conversion = needs_downgrade || device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.contains(resource.handle);
+         has_mirror = device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.contains(resource.handle);
+         if (needs_downgrade)
+         {
+            original_format = MapFindOrDefaultValue(device_data.resource_upgrades.original_upgraded_resources_formats, resource.handle, reshade::api::format::unknown);
+            ASSERT_ONCE(original_format != reshade::api::format::unknown); // Every directly upgraded resource has its creation format
+         }
+      }
+      reshade::api::resource_desc desc = {};
+      bool convert_directly = false;
+      if (needs_downgrade && original_format != reshade::api::format::unknown)
+      {
+         desc = device->get_resource_desc(resource);
+         convert_directly = CanConvertResourceData(original_format, desc.texture.format);
       }
       // If this happened, we need to upgrade the data passed in to match the new format!
       // This happens in Dishonored 2 and Thief on boot, to update videos or splash screens.
-      if (needs_conversion)
+      if (convert_directly || has_mirror)
       {
          ASSERT_ONCE(access == reshade::api::map_access::write_only || access == reshade::api::map_access::write_discard); // For now we only support write, games generally don't read back textures from the CPU if not for screenshots or for save game snapshots. Note: this happens in Shenmue 2 photo mode. It should be ok as long as we have indirect texture upgrades (the photo will be black or garbage data), otherwise we'd need to covert the data inline here!
          ASSERT_ONCE(data && data->data); // If this is nullptr, it might be a "ID3D11DeviceContext3::WriteToSubresource", which we don't support!
 
          upgraded_mapped_resources[resource.handle] = data;
 
-         if (needs_downgrade)
+         if (convert_directly)
          {
-            reshade::api::resource_desc desc = device->get_resource_desc(resource);
             // Update the stride to match the original format, we want the game to write to the resource as if it was the original format (we'll convert the data later).
             // This assumes two things:
             // -The new format is wider and thus there will be enough memory.
             // -The game doesn't dynamically branch on mapping behaviour based on the current (upgraded) resource format, already acknowledging the upgraded format (most games wouldn't, especially not the old ones)
-            constexpr size_t bytes_per_pixel = 4; // 4 for 8bpc, 8 for 16bpc // TODO: we are assuming the original was R8G8B8A8, that is not necessarily true, we need to map what was the original format of all upgraded resources. Same assumption in the unmap function.
-            data->row_pitch = desc.texture.width * bytes_per_pixel;
+            data->row_pitch = reshade::api::format_row_pitch(original_format, desc.texture.width);
          }
       }
    }
@@ -8345,27 +13685,25 @@ namespace
          {
             reshade::api::resource_desc upgraded_desc = device->get_resource_desc(resource);
             reshade::api::resource_desc original_desc = upgraded_desc;
-            original_desc.texture.format = reshade::api::format::r8g8b8a8_unorm; // Guessed
-#if DEVELOPMENT
             {
                const std::shared_lock lock(device_data.mutex);
-               if (device_data.resource_upgrades.original_upgraded_resources_formats.contains(resource.handle))
-               {
-                  original_desc.texture.format = device_data.resource_upgrades.original_upgraded_resources_formats[resource.handle];
-                  ASSERT_ONCE(original_desc.texture.format == reshade::api::format::r8g8b8a8_unorm); // Cache "original_upgraded_resources_formats" outside of development too if this happens! It probably will at some point!
-               }
+               original_desc.texture.format = MapFindOrDefaultValue(device_data.resource_upgrades.original_upgraded_resources_formats, resource.handle, reshade::api::format::unknown);
             }
-#endif
 
-            const size_t buffer_size = original_desc.texture.height * original_desc.texture.depth_or_layers * data->row_pitch; // Automatic reconstruction based on what we told the game
+            // "OnMapTextureRegion()" only gave the game the pitch of the original format if it can be converted
+            if (CanConvertResourceData(original_desc.texture.format, upgraded_desc.texture.format))
+            {
+               const size_t buffer_size = original_desc.texture.height * original_desc.texture.depth_or_layers * data->row_pitch; // Automatic reconstruction based on what we told the game
 
-            // Copy aside the data the game wrote for the texture format it thought this texture would have,
-            // and then write it back in the same mapped memory, where it was originally meant to be anyway.
-            reshade::api::subresource_data old_data = *data;
-            old_data.data = new uint8_t[buffer_size];
-            bool pre_allocated = true; // The "data" was already allocated by DirectX on the direct upgraded resource, so it's of the right size already, and we couldn't replace the pointer anyway.
-            ConvertResourceData(&old_data, *data, original_desc, upgraded_desc.texture.format, pre_allocated);
-            delete[] static_cast<uint8_t*>(old_data.data);
+               // Copy aside the data the game wrote for the texture format it thought this texture would have,
+               // and then write it back in the same mapped memory, where it was originally meant to be anyway.
+               reshade::api::subresource_data old_data = *data;
+               old_data.data = new uint8_t[buffer_size];
+               std::memcpy(old_data.data, data->data, buffer_size);
+               bool pre_allocated = true; // The "data" was already allocated by DirectX on the direct upgraded resource, so it's of the right size already, and we couldn't replace the pointer anyway.
+               ConvertResourceData(&old_data, *data, original_desc, upgraded_desc.texture.format, pre_allocated);
+               delete[] static_cast<uint8_t*>(old_data.data);
+            }
          }
 
          upgraded_mapped_resources.erase(it);
@@ -8409,16 +13747,9 @@ namespace
             upgraded_desc = device->get_resource_desc(resource);
             lock_device_read.lock();
             original_desc = upgraded_desc;
-            // TODO: stop randomly guessing the format and actually cache it aside! Note that some games might dynamically pre-convert the data to match the upgraded target format, however, that's unlikely
-            original_desc.texture.format = reshade::api::format::r8g8b8a8_unorm;
-#if DEVELOPMENT
-            if (device_data.resource_upgrades.original_upgraded_resources_formats.contains(resource.handle))
-            {
-               original_desc.texture.format = device_data.resource_upgrades.original_upgraded_resources_formats[resource.handle];
-               ASSERT_ONCE(original_desc.texture.format == reshade::api::format::r8g8b8a8_unorm); // Cache "original_upgraded_resources_formats" outside of development too if this happens! It probably will at some point!
-            }
-#endif
-            convert_data = true;
+            // Note that some games might dynamically pre-convert the data to match the upgraded target format, however, that's unlikely
+            original_desc.texture.format = MapFindOrDefaultValue(device_data.resource_upgrades.original_upgraded_resources_formats, resource.handle, reshade::api::format::unknown);
+            convert_data = original_desc.texture.format != reshade::api::format::unknown;
          }
          auto original_resource_to_mirrored_upgraded_resource = device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.find(resource.handle);
          if (!ignore_indirect_upgraded_textures && original_resource_to_mirrored_upgraded_resource != device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.end())
@@ -8608,7 +13939,7 @@ namespace
                // BEFORE the game's OnDrawOrDispatch executes SR and flips has_drawn_sr. So also treat a copy
                // as scaleable when either resource is a scaled mirror, so we don't mistake the scaled seed
                // (or a chain resource derived from it) for the game's own different-size copy.
-               if (!IsScaleChainActive(device_data) && texture_custom_dimensions_upgrades.empty() && !device_data.resource_upgrades.IsScaledMirrorResource(source.handle) && !device_data.resource_upgrades.IsScaledMirrorResource(dest.handle))
+               if (!device_data.resource_upgrades.IsScaleChainActive({.has_drawn_sr = device_data.has_drawn_sr}) && texture_custom_dimensions_upgrades.empty() && !device_data.resource_upgrades.IsScaledMirrorResource(source.handle) && !device_data.resource_upgrades.IsScaledMirrorResource(dest.handle))
                   return false;
                use_scale = true;
             }
@@ -8668,11 +13999,13 @@ namespace
             // If we detected incompatible formats that were likely caused by Luma upgrading texture formats (of render targets only...),
             // do the copy in shader. It should currently cover all texture formats upgradable with "texture_upgrade_formats".
             // If we ever made a new type of "swapchain_upgrade_type", this should be updated for that.
-            // Note that generally, formats of the same size might be supported as it simply does a byte copy,
-            // like DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_UNORM and DXGI_FORMAT_R16G16B16A16_FLOAT are all mutually compatible.
+            // Note that formats of the same typeless group are copied by byte, so DXGI_FORMAT_R16G16B16A16_UNORM <-> DXGI_FORMAT_R16G16B16A16_FLOAT also needs the shader
+            // (a typeless resource keeps the byte copy, its views decide how it's read).
             // TODO: add gamma to linear support (e.g. non sRGB views into sRGB views)? Also just use AreFormatsCopyCompatible(format1, format2)
             if (((isUnorm8(target_desc.Format) || isFloat11(target_desc.Format)) && isFloat16(source_desc.Format))
-               || ((isUnorm8(source_desc.Format) || isFloat11(source_desc.Format)) && isFloat16(target_desc.Format)))
+               || ((isUnorm8(source_desc.Format) || isFloat11(source_desc.Format)) && isFloat16(target_desc.Format))
+               || (!IsTypelessFormat(source_desc.Format) && !IsTypelessFormat(target_desc.Format)
+                  && ((isUnorm16(target_desc.Format) && isFloat16(source_desc.Format)) || (isUnorm16(source_desc.Format) && isFloat16(target_desc.Format)))))
             {
                ASSERT_ONCE_MSG(forced || upgraded_resources, "The game seemingly tried to copy incompatible resource formats for resources that were not upgraded by us");
 
@@ -8884,7 +14217,7 @@ namespace
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
 
-      OnCopyResource_Debug(cmd_list, source, dest, {.kind = TraceDrawCallData::CopyKind::BufferRegion, .dest_offset = uint3{uint32_t(dest_offset), 0, 0}, .has_box = true, .box = D3D11_BOX{uint32_t(source_offset), 0, 0, uint32_t(source_offset + size), 1, 1}});
+      OnCopyResource_Debug(cmd_list, source, dest, { .kind = TraceDrawCallData::CopyKind::BufferRegion, .dest_offset = uint3{ uint32_t(dest_offset), 0, 0 }, .has_box = true, .box = D3D11_BOX{ uint32_t(source_offset), 0, 0, uint32_t(source_offset + size), 1, 1 } });
       return false;
    }
 #endif // DEVELOPMENT
@@ -8942,7 +14275,7 @@ namespace
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
 
-      OnCopyResource_Debug(cmd_list, source, dest, {.kind = TraceDrawCallData::CopyKind::Region, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = (dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}), .has_box = source_box != nullptr, .box = (source_box ? D3D11_BOX{source_box->left, source_box->top, source_box->front, source_box->right, source_box->bottom, source_box->back} : D3D11_BOX{})});
+      OnCopyResource_Debug(cmd_list, source, dest, { .kind = TraceDrawCallData::CopyKind::Region, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = dest_box ? uint3{ dest_box->left, dest_box->top, dest_box->front } : uint3{}, .has_box = source_box != nullptr, .box = source_box ? D3D11_BOX{ source_box->left, source_box->top, source_box->front, source_box->right, source_box->bottom, source_box->back } : D3D11_BOX{} });
 
       {
          bool any_replaced = false;
@@ -9014,7 +14347,7 @@ namespace
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
 
-      OnCopyResource_Debug(cmd_list, source, dest, {.kind = TraceDrawCallData::CopyKind::Resolve, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = uint3{dest_x, dest_y, dest_z}, .has_box = source_box != nullptr, .box = (source_box ? D3D11_BOX{source_box->left, source_box->top, source_box->front, source_box->right, source_box->bottom, source_box->back} : D3D11_BOX{}), .resolve_format = DXGI_FORMAT(format)});
+      OnCopyResource_Debug(cmd_list, source, dest, { .kind = TraceDrawCallData::CopyKind::Resolve, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = uint3{ dest_x, dest_y, dest_z }, .has_box = source_box != nullptr, .box = source_box ? D3D11_BOX{ source_box->left, source_box->top, source_box->front, source_box->right, source_box->bottom, source_box->back } : D3D11_BOX{}, .resolve_format = DXGI_FORMAT(format) });
 
       // Indirect upgrades
       {
@@ -9045,6 +14378,9 @@ namespace
 #endif
 
             format = (reshade::api::format)format1; // Our upgrades "GetBestResourceUpgradeFormat()" are always non typeless so this is fine (this is the "view" format the MS resolve uses for the target and source textures)
+            if (source_subresource == 0 && dest_subresource == 0 && !source_box && dest_x == 0 && dest_y == 0 && dest_z == 0 &&
+                game->OverrideResolveTextureRegion((ID3D11Device*)(cmd_list->get_device()->get_native()), (ID3D11DeviceContext*)(cmd_list->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, source.handle, format1))
+               return true;
             cmd_list->resolve_texture_region(source, source_subresource, source_box, dest, dest_subresource, dest_x, dest_y, dest_z, format);
             return true;
          }
@@ -9105,6 +14441,7 @@ namespace
       ASSERT_ONCE(false);
       return false;
    }
+#endif // DX11
 
    void OnReShadePresent(reshade::api::effect_runtime* runtime)
    {
@@ -9112,7 +14449,17 @@ namespace
 
       DeviceData& device_data = *runtime->get_device()->get_private_data<DeviceData>();
 #if DEVELOPMENT
-      Trace::OnPresent(*runtime->get_command_queue()->get_immediate_command_list()->get_private_data<CommandListData>());
+#if DX12
+      {
+         // The capture records the overlay's device unless another one was picked ("trace_device_data")
+         const std::unique_lock lock_trace(Trace::s_mutex);
+         if (!trace_device_data)
+         {
+            trace_device_data = runtime->get_device()->get_private_data<DeviceData>();
+         }
+      }
+#endif
+      Trace::OnPresent(GetTraceCommandListData(runtime));
 #endif // DEVELOPMENT
 
       // Dump new shaders (checking the "shaders_to_dump" count is theoretically not thread safe but it should work nonetheless as this is run every frame)
@@ -9143,6 +14490,7 @@ namespace
          {
             const std::unique_lock lock_loading(s_mutex_loading);
             shaders_compilation_errors.clear();
+            shaders_compilation_failed = false;
          }
          UnloadCustomShaders(device_data);
 #if 1 // Optionally unload all custom shaders data
@@ -9184,7 +14532,12 @@ namespace
 
       if (!block_draw_until_device_custom_shaders_creation) s_mutex_shader_objects.lock_shared();
       // Force re-load shaders (which will also end up re-creating the custom device shaders) if async shaders loading on boot finished without being able to create custom shaders
-      if (needs_load_shaders || (!block_draw_until_device_custom_shaders_creation && !thread_auto_compiling_running && !device_data.created_native_shaders))
+#if DX11
+      const bool created_native_shaders = device_data.created_native_shaders;
+#else
+      constexpr bool created_native_shaders = true; // There are none yet
+#endif
+      if (needs_load_shaders || (!block_draw_until_device_custom_shaders_creation && !thread_auto_compiling_running && !created_native_shaders))
       {
          if (!block_draw_until_device_custom_shaders_creation) s_mutex_shader_objects.unlock_shared();
          // Cache the defines at compilation time
@@ -9559,6 +14912,88 @@ namespace
       return edited;
    }
 
+#ifndef LUMA_SETTINGS_SECTION
+#define LUMA_SETTINGS_SECTION NAME
+#endif
+
+   // Persisted user setting widgets: the control, its ini save, a tooltip (also shown while disabled) and a reset button.
+   // They save to LUMA_SETTINGS_SECTION, which must match the section the game's "LoadConfigs" reads. Each returns whether the value changed this frame.
+   bool DrawSettingSlider(const char* label, const char* key, float* value, float default_value, float min_value, float max_value, const char* tooltip, const char* format = "%.3f", ImGuiSliderFlags flags = 0)
+   {
+      bool changed = ImGui::SliderFloat(label, value, min_value, max_value, format, flags);
+      // Saved once the edit ends, not on every drag step
+      if (ImGui::IsItemDeactivatedAfterEdit())
+      {
+         reshade::set_config_value(nullptr, LUMA_SETTINGS_SECTION, key, *value);
+      }
+      if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("%s", tooltip);
+      }
+      if (DrawResetButton<float, false>(*value, default_value, key))
+      {
+         reshade::set_config_value(nullptr, LUMA_SETTINGS_SECTION, key, *value);
+         changed = true;
+      }
+      return changed;
+   }
+
+   // A bool, or a 0/1 float (usually a cbuffer field), shown as a checkbox. "forced": shown as "forced_value" and disabled (e.g. while
+   // another feature replaces it or always applies it), keeping the saved choice
+   template <typename T>
+   bool DrawSettingCheckbox(const char* label, const char* key, T* value, std::type_identity_t<T> default_value, const char* tooltip, bool forced = false, bool forced_value = false)
+   {
+      static_assert(std::is_same_v<T, bool> || std::is_same_v<T, float>);
+      bool shown = forced ? forced_value : (float(*value) > 0.5f);
+      ImGui::BeginDisabled(forced);
+      bool changed = ImGui::Checkbox(label, &shown);
+      ImGui::EndDisabled();
+      if (changed)
+      {
+         *value = T(shown);
+      }
+      if (tooltip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("%s", tooltip);
+      }
+      if (forced)
+      {
+         DrawResetButton<bool, false>(shown, shown, key); // Only its spacer, the saved choice can't be reset from here
+      }
+      else
+      {
+         changed |= DrawResetButton<T, false>(*value, default_value, key);
+      }
+      if (changed)
+      {
+         reshade::set_config_value(nullptr, LUMA_SETTINGS_SECTION, key, *value);
+      }
+      return changed;
+   }
+
+   // The "Render Scale (%)" slider of a Luma-driven render scale, saved as a 0-1 float ("RenderScale"). Applied on release: every
+   // render size recreates the DLSS/FSR feature, a hitch per 1% step while dragging. Draw it once per mod (it holds the dragged value).
+   void DrawRenderScaleSlider(float* render_scale, float min_render_scale, const char* tooltip)
+   {
+      static int held_render_scale = 0; // The slider's value while it's held, else 0
+      int render_scale_percent = (held_render_scale != 0 ? held_render_scale : int(std::round(*render_scale * 100.f)));
+      ImGui::SliderInt("Render Scale (%)", &render_scale_percent, int(min_render_scale * 100.f), 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
+      held_render_scale = (ImGui::IsItemActive() ? render_scale_percent : 0);
+      if (ImGui::IsItemDeactivatedAfterEdit())
+      {
+         *render_scale = float(render_scale_percent) / 100.f;
+         reshade::set_config_value(nullptr, LUMA_SETTINGS_SECTION, "RenderScale", *render_scale);
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("%s", tooltip);
+      }
+      if (DrawResetButton<float, false>(*render_scale, 1.f, "RenderScale"))
+      {
+         reshade::set_config_value(nullptr, LUMA_SETTINGS_SECTION, "RenderScale", *render_scale);
+      }
+   }
+
    void OnRegisterMessagesOverlay(reshade::api::effect_runtime* runtime)
    {
       OverlayLog::UnpauseMessages();
@@ -9578,6 +15013,72 @@ namespace
 
    // @see https://pthom.github.io/imgui_manual_online/manual/imgui_manual.html
    // This runs within the swapchain "Present()" function, and thus it's thread safe
+   // Switches Luma's display mode (and the display's HDR when asked), loading or defaulting the peak and paper white of the new mode
+   void ChangeDisplayMode(DeviceData& device_data, DisplayModeType display_mode, bool enable_hdr_on_display = true, IDXGISwapChain3* swapchain = nullptr, reshade::api::effect_runtime* runtime = nullptr)
+   {
+      int display_mode_i = int(display_mode);
+      reshade::set_config_value(runtime, NAME, "DisplayMode", display_mode_i);
+      cb_luma_global_settings.DisplayMode = display_mode;
+      OnDisplayModeChanged();
+      if (display_mode >= DisplayModeType::HDR)
+      {
+         if (enable_hdr_on_display)
+         {
+            Display::SetHDREnabled(game_window);
+            bool dummy_bool;
+            Display::IsHDRSupportedAndEnabled(game_window, dummy_bool, hdr_enabled_display, swapchain); // This should always succeed, so we don't fallback to SDR in case it didn't
+
+#if ENABLE_NVAPI
+            // Enable HDR10+ GAMING if supported, it generally makes Samsung displays more accurate, so there's no reason to not enable it really.
+            // For now we only do this if we are also enforcing HDR enabled on the display.
+            Display::NVAPI::SetDisplayOutputMode(game_window, NV_DISPLAY_OUTPUT_MODE_HDR10PLUS_GAMING, false, false);
+#endif
+         }
+         if (!reshade::get_config_value(runtime, NAME, "ScenePeakWhite", cb_luma_global_settings.ScenePeakWhite) || cb_luma_global_settings.ScenePeakWhite <= 0.f)
+         {
+            cb_luma_global_settings.ScenePeakWhite = device_data.default_user_peak_white;
+         }
+         if (use_os_reference_white_level)
+         {
+            float hdr_paper_white = 80.f;
+            if (Display::GetSDRWhiteLevel(game_window, hdr_paper_white))
+            {
+               cb_luma_global_settings.ScenePaperWhite = hdr_paper_white;
+               cb_luma_global_settings.UIPaperWhite = hdr_paper_white;
+            }
+            else
+            {
+               use_os_reference_white_level = false;
+            }
+         }
+         if (!use_os_reference_white_level)
+         {
+            if (!reshade::get_config_value(runtime, NAME, "ScenePaperWhite", cb_luma_global_settings.ScenePaperWhite))
+            {
+               cb_luma_global_settings.ScenePaperWhite = default_paper_white;
+            }
+            if (!reshade::get_config_value(runtime, NAME, "UIPaperWhite", cb_luma_global_settings.UIPaperWhite))
+            {
+               cb_luma_global_settings.UIPaperWhite = default_paper_white;
+            }
+         }
+         // Align all the parameters for the SDR on HDR mode (the game paper white can still be changed)
+         if (display_mode >= DisplayModeType::SDRInHDR)
+         {
+            // For now we don't default to 203 nits game paper white when changing to this mode
+            cb_luma_global_settings.UIPaperWhite = cb_luma_global_settings.ScenePaperWhite;
+            cb_luma_global_settings.ScenePeakWhite = cb_luma_global_settings.ScenePaperWhite; // No, we don't want "default_peak_white" here
+         }
+      }
+      else
+      {
+         cb_luma_global_settings.ScenePeakWhite = display_mode == DisplayModeType::SDR ? srgb_white_level : (display_mode >= DisplayModeType::SDRInHDR ? default_paper_white : default_peak_white);
+         cb_luma_global_settings.ScenePaperWhite = display_mode == DisplayModeType::SDR ? srgb_white_level : default_paper_white;
+         cb_luma_global_settings.UIPaperWhite = display_mode == DisplayModeType::SDR ? srgb_white_level : default_paper_white;
+      }
+      device_data.cb_luma_global_settings_dirty = true;
+   }
+
    void OnRegisterMainOverlay(reshade::api::effect_runtime* runtime)
    {
       SKIP_UNSUPPORTED_DEVICE_API(runtime->get_device()->get_api());
@@ -9592,6 +15093,36 @@ namespace
       {
          Trace::scheduled = true;
       }
+#if DX12
+      {
+         // A game with several devices: the one the capture records
+         const std::shared_lock lock_device(s_mutex_device);
+         if (global_devices_data.size() > 1)
+         {
+            const std::unique_lock lock_trace(Trace::s_mutex);
+            const DeviceData* const captured = (trace_device_data ? trace_device_data : &device_data);
+            const auto device_name = [&](size_t index)
+            { return std::format("Device {}{}", index, (global_devices_data[index] == &device_data ? " (overlay)" : "")); };
+            const size_t captured_index = std::ranges::find(global_devices_data, captured) - global_devices_data.begin();
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(200.f);
+            ImGui::BeginDisabled(Trace::running || Trace::scheduled);
+            if (ImGui::BeginCombo("Capture Device", device_name(captured_index).c_str()))
+            {
+               for (size_t i = 0; i < global_devices_data.size(); i++)
+               {
+                  if (ImGui::Selectable(device_name(i).c_str(), global_devices_data[i] == captured) && global_devices_data[i] != captured)
+                  {
+                     trace_device_data = global_devices_data[i];
+                     Trace::captured_count = 0; // The list was another device's
+                  }
+               }
+               ImGui::EndCombo();
+            }
+            ImGui::EndDisabled();
+         }
+      }
+#endif
 #if 0 // Currently not necessary
       SameLineIfFits("List Unique Shaders Only", true);
       ImGui::Checkbox("List Unique Shaders Only", &trace_list_unique_shaders_only);
@@ -10070,6 +15601,7 @@ namespace
             ImGui::EndTabItem(); // Custom Shaders
          }
 
+#if DX11
          if (ImGui::BeginTabItem("Upgraded Textures"))
          {
             static int32_t resources_selected_index = -1;
@@ -10356,6 +15888,242 @@ namespace
 
             ImGui::EndTabItem(); // Upgraded Textures
          }
+#else
+         // D3D12: the textures Luma upgraded (clones, in place upgrades, back buffers) and its own, with how they were made. A game texture's state isn't known
+         // outside of its writers, so it is shown through the last draw of the last frame capture that wrote it ("D3D12Readback::State::debug_target"); the textures
+         // of Luma's own are shown from the state they rest in.
+         if (ImGui::BeginTabItem("Upgraded Textures"))
+         {
+            struct GameTexture
+            {
+               uint64_t handle = 0;
+               bool swapchain = false;
+               uint4 size = {};
+               DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+               std::string type_name;
+               std::string hash;
+               std::string debug_name;
+            };
+            static uint64_t selected_texture = 0;
+            static std::string selected_luma_texture;
+            static std::string debug_draw_texture_status; // Why the last "Debug Draw Texture" showed nothing
+
+            // Read under the lock that keeps them from being destroyed meanwhile
+            std::vector<GameTexture> game_textures;
+            {
+               const std::shared_lock lock(device_data.mutex);
+               const auto add = [&](uint64_t handle, bool swapchain)
+               {
+                  GameTexture& texture = game_textures.emplace_back();
+                  texture.handle = handle;
+                  texture.swapchain = swapchain;
+                  GetResourceInfo(device_data.reshade_device, reshade::api::resource{handle}, texture.size, texture.format, &texture.type_name, &texture.hash, &texture.debug_name);
+               };
+               for (const uint64_t handle : device_data.resource_upgrades.upgraded_resources)
+               {
+                  add(handle, false);
+               }
+               for (const uint64_t handle : device_data.back_buffers)
+               {
+                  add(handle, true);
+               }
+            }
+            const auto selected_game_texture = std::ranges::find(game_textures, selected_texture, &GameTexture::handle);
+
+            if (ImGui::BeginChild("TexturesList", ImVec2(500, -FLT_MIN), ImGuiChildFlags_ResizeX))
+            {
+               if (ImGui::BeginListBox("##TexturesListBox", ImVec2(-FLT_MIN, -FLT_MIN)))
+               {
+                  for (const GameTexture& texture : game_textures)
+                  {
+                     ImU32 text_color = (texture.swapchain ? IM_COL32(0, 0, 255, 255) : IM_COL32(0, 255, 0, 255)); // Blue, Green
+                     if (Trace::highlighted_resource == texture.hash)
+                     {
+                        text_color = IM_COL32(255, 0, 0, 255); // Red
+                     }
+                     ImGui::PushStyleColor(ImGuiCol_Text, text_color);
+                     ImGui::PushID(int(texture.handle));
+                     if (ImGui::Selectable(texture.debug_name.empty() ? texture.hash.c_str() : texture.debug_name.c_str(), selected_luma_texture.empty() && selected_texture == texture.handle))
+                     {
+                        selected_texture = texture.handle;
+                        selected_luma_texture.clear();
+                     }
+                     ImGui::PopID();
+                     ImGui::PopStyleColor();
+                  }
+                  ImGui::SeparatorText("Luma textures");
+                  {
+                     const std::lock_guard lock(Mcp::s_mutex_dev_values);
+                     for (const Mcp::DevValue& dev_value : Mcp::dev_values)
+                     {
+                        if (dev_value.kind == Mcp::DevValueKind::Texture && ImGui::Selectable(dev_value.name.c_str(), selected_luma_texture == dev_value.name))
+                        {
+                           selected_luma_texture = dev_value.name;
+                        }
+                     }
+                  }
+                  ImGui::EndListBox();
+               }
+            }
+            ImGui::EndChild(); // TexturesList
+
+            ImGui::SameLine();
+            if (ImGui::BeginChild("##TexturesDetails", ImVec2(0, 0)))
+            {
+               if (!selected_luma_texture.empty())
+               {
+                  Mcp::DevTexture luma_texture;
+                  {
+                     const std::lock_guard lock(Mcp::s_mutex_dev_values);
+                     const Mcp::DevValue* dev_value = Mcp::FindDevValue(selected_luma_texture);
+                     if (dev_value && dev_value->kind == Mcp::DevValueKind::Texture)
+                     {
+                        luma_texture = dev_value->texture(device_data);
+                     }
+                  }
+                  ImGui::Text("Name: %s", selected_luma_texture.c_str());
+                  if (luma_texture.resource)
+                  {
+                     const D3D12_RESOURCE_DESC desc = luma_texture.resource->GetDesc();
+                     ImGui::Text("Format: %s", GetFormatNameSafe(desc.Format));
+                     ImGui::Text("Size: %ux%ux%ux%u", uint32_t(desc.Width), desc.Height, desc.DepthOrArraySize, desc.MipLevels);
+                  }
+                  else
+                  {
+                     ImGui::Text("Not allocated (its feature is off, or hasn't run yet)");
+                  }
+                  const bool shown = debug_draw_registered_texture == selected_luma_texture;
+                  if (shown ? ImGui::Button("Disable Debug Draw Texture") : ImGui::Button("Debug Draw Texture"))
+                  {
+                     debug_draw_registered_texture = (shown ? "" : selected_luma_texture);
+                     if (!shown)
+                     {
+                        // Reset all the settings we don't need anymore, as they were for a different debug draw mode
+                        Trace::debug_draw_shader_hash = 0;
+                        Trace::debug_draw_shader_hash_string[0] = 0;
+                        Trace::debug_draw_pipeline = 0;
+                        if (Trace::debug_draw_mode == Trace::DebugDrawMode::Depth || Trace::debug_draw_mode == Trace::DebugDrawMode::Stencil)
+                        {
+                           Trace::debug_draw_options &= ~(uint32_t)Trace::DebugDrawTextureOptionsMask::RedOnly;
+                        }
+                        Trace::debug_draw_mode = Trace::DebugDrawMode::Custom;
+                        Trace::debug_draw_view_index = 0;
+                        Trace::debug_draw_mip = 0;
+                        device_data.debug_draw_texture_format = DXGI_FORMAT_UNKNOWN;
+                        device_data.debug_draw_texture_size = {};
+                     }
+                  }
+               }
+               else if (selected_game_texture != game_textures.end())
+               {
+                  const GameTexture& texture = *selected_game_texture;
+                  ImGui::Text("Hash: %s", texture.hash.c_str());
+                  if (!texture.debug_name.empty())
+                  {
+                     ImGui::Text("Debug Name: %s", texture.debug_name.c_str());
+                  }
+                  ImGui::Text("Type: %s", texture.type_name.c_str());
+                  ImGui::Text("Format: %s", GetFormatNameSafe(texture.format));
+                  ImGui::Text("Size: %ux%ux%ux%u", texture.size.x, texture.size.y, texture.size.z, texture.size.w);
+                  if (texture.swapchain)
+                  {
+                     ImGui::Text("Swapchain back buffer: it is what the final image is drawn to");
+                  }
+#if ENABLE_MINHOOK
+                  else
+                  {
+                     bool is_clone = false;
+                     {
+                        const std::shared_lock lock_clones(D3D12Clones::registry.mutex);
+                        for (const auto& [original, clone] : D3D12Clones::registry.by_original)
+                        {
+                           if (reinterpret_cast<uint64_t>(clone.resource.get()) != texture.handle)
+                              continue;
+                           is_clone = true;
+                           ImGui::Text("Original Hash: %s", std::to_string(std::hash<void*>{}(original)).c_str());
+                           ImGui::Text("Upgrade Type: Clone%s%s", clone.active ? "" : " (inactive: waits for a listed writer shader)", (clone.scale_x != 1.f || clone.scale_y != 1.f) ? " (Scaled)" : "");
+                           if (clone.scale_x != 1.f || clone.scale_y != 1.f)
+                           {
+                              ImGui::Text("Clone Scale: %.3fx%.3f", clone.scale_x, clone.scale_y);
+                           }
+                           break;
+                        }
+                     }
+                     {
+                        const std::shared_lock lock(device_data.mutex);
+                        if (!is_clone)
+                        {
+                           ImGui::Text("Upgrade Type: In place");
+                        }
+                        if (const auto original_format = device_data.resource_upgrades.original_upgraded_resources_formats.find(texture.handle); original_format != device_data.resource_upgrades.original_upgraded_resources_formats.end())
+                        {
+                           ImGui::Text("Original Format: %s", GetFormatNameSafe(DXGI_FORMAT(original_format->second)));
+                        }
+                     }
+                     const std::shared_lock lock_kinds(device_data.texture_kinds.mutex);
+                     if (const auto kind = device_data.texture_kinds.by_resource.find(texture.handle); kind != device_data.texture_kinds.by_resource.end())
+                     {
+                        ImGui::Text("Created As: %s", D3D12ResourceCreation::KIND_NAMES[size_t(kind->second)]);
+                     }
+                  }
+#endif // ENABLE_MINHOOK
+
+                  // Works on direct and indirect upgrades!
+                  const bool is_highlighted_resource = Trace::highlighted_resource == texture.hash;
+                  if (is_highlighted_resource ? ImGui::Button("Unhighlight Resource") : ImGui::Button("Highlight Resource"))
+                  {
+                     Trace::highlighted_resource = is_highlighted_resource ? "" : texture.hash;
+                  }
+
+                  // The back buffer is what the final image is drawn to
+                  if (!texture.swapchain)
+                  {
+                     const bool shown = debug_draw_registered_texture.empty() && Trace::debug_draw_shader_hash != 0 && debug_draw_texture_status.empty();
+                     if (ImGui::Button("Debug Draw Texture"))
+                     {
+                        debug_draw_texture_status.clear();
+                        const std::shared_lock lock_generic(s_mutex_generic);
+                        CommandListData& capture_data = device_data.trace_command_list_data;
+                        const std::shared_lock lock_trace(capture_data.mutex_trace);
+                        const std::vector<TraceDrawCallData>& entries = capture_data.trace_draw_calls_data;
+                        D3D12Readback::Target view;
+                        std::string refusal;
+                        const std::optional<size_t> producer = (Trace::running ? std::nullopt : Mcp::FindProducer(entries, entries.size(), texture.hash, std::nullopt, DXGI_FORMAT_UNKNOWN, true, &view, &refusal));
+                        const Shader::CachedPipeline* pipeline = (producer ? Mcp::FindPipeline(device_data, entries[*producer].pipeline_handle) : nullptr);
+                        if (pipeline)
+                        {
+                           Mcp::SetD3D12DebugDrawFromTrace(device_data, entries, *producer, *pipeline, &view);
+                        }
+                        else
+                        {
+                           debug_draw_texture_status = "No draw of the last frame capture wrote it (capture a frame first): its state isn't known anywhere else";
+                        }
+                     }
+                     if (ImGui::IsItemHovered())
+                     {
+                        ImGui::SetTooltip("Shows the render target, unordered access view or depth of the last draw of the last frame capture that wrote this texture.");
+                     }
+                     if (shown)
+                     {
+                        ImGui::SameLine();
+                        if (ImGui::Button("Disable Debug Draw"))
+                        {
+                           Trace::debug_draw_shader_hash = 0;
+                           Trace::debug_draw_shader_hash_string[0] = 0;
+                        }
+                     }
+                     if (!debug_draw_texture_status.empty())
+                     {
+                        ImGui::TextColored(ImVec4(1.f, 0.3f, 0.3f, 1.f), "%s", debug_draw_texture_status.c_str());
+                     }
+                  }
+               }
+            }
+            ImGui::EndChild(); // TexturesDetails
+
+            ImGui::EndTabItem(); // Upgraded Textures
+         }
+#endif // DX11
 #endif // !GRAPHICS_ANALYZER
 #endif // DEVELOPMENT
 
@@ -10364,6 +16132,7 @@ namespace
             const std::unique_lock lock_reshade(s_mutex_reshade); // Lock the entire scope for extra safety, though we are mainly only interested in keeping "cb_luma_global_settings" safe
 
 #if ENABLE_SR
+            std::string selected_sr_name;
             const char* selected_sr_user_type = nullptr;
             switch (sr_user_type)
             {
@@ -10374,14 +16143,25 @@ namespace
             case SR::UserType::DLSS:
                selected_sr_user_type = "DLSS"; break;
             case SR::UserType::FSR_3:
-               selected_sr_user_type = "FSR 3"; break;
+               selected_sr_user_type = "FSR"; break;
+            case SR::UserType::XeSS:
+               selected_sr_user_type = "XeSS"; break;
             case SR::UserType::FSR_4:
                selected_sr_user_type = "FSR 4 (DX12 Interop)"; break;
             }
 
             SR::Type sr_type = device_data.sr_type;
+            // The running version, when the implementation knows it (e.g. "FSR (4.1.1)": FSR 4 where the GPU supports it on D3D12, 3.1 elsewhere)
+            if (const SR::InstanceData* sr_instance_data = device_data.GetSRInstanceData(); sr_instance_data && sr_user_type != SR::UserType::None)
+            {
+               if (const char* const version_name = sr_instance_data->version_name.load())
+               {
+                  selected_sr_name = std::format("{} ({})", selected_sr_user_type, version_name);
+                  selected_sr_user_type = selected_sr_name.c_str();
+               }
+            }
 
-            const SR::Type sr_auto_type = SR::GetAutoType(device_data.sr_implementations_instances);
+            const SR::Type sr_auto_type = GetSRAutoType(device_data);
 
             // Note: if we reached here, it's guaranteed that the selected SR type is supported
             if (ImGui::BeginCombo("Super Resolution", selected_sr_user_type))
@@ -10416,7 +16196,10 @@ namespace
                if (always_show_auto_sr || sr_auto_type != SR::Type::None)
                   AddComboItem("Auto", SR::UserType::Auto, sr_auto_type, !device_data.sr_implementations_instances.empty());
                AddComboItem("DLSS", SR::UserType::DLSS, SR::Type::DLSS, device_data.sr_implementations_instances.contains(SR::Type::DLSS));
-               AddComboItem("FSR 3", SR::UserType::FSR_3, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
+               AddComboItem("FSR", SR::UserType::FSR_3, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
+#if ENABLE_XESS // D3D12 only
+               AddComboItem("XeSS", SR::UserType::XeSS, SR::Type::XeSS, device_data.sr_implementations_instances.contains(SR::Type::XeSS));
+#endif
 #if ENABLE_FSR4
                AddComboItem("FSR 4 (DX12 Interop)", SR::UserType::FSR_4, SR::Type::FSR_4, device_data.sr_implementations_instances.contains(SR::Type::FSR_4));
 #endif
@@ -10434,7 +16217,7 @@ namespace
                if (ImGui::SmallButton(ICON_FK_UNDO))
                {
                   sr_user_type = SR::UserType::Auto;
-						int sr_user_type_i = int(sr_user_type);
+                  int sr_user_type_i = int(sr_user_type);
                   reshade::set_config_value(runtime, NAME, "SRUserType", sr_user_type_i);
 
                   sr_type = sr_auto_type;
@@ -10449,7 +16232,7 @@ namespace
                {
                   ImGui::PushID("Super Resolution Active");
                   ImGui::BeginDisabled();
-                  ImGui::SmallButton((device_data.taa_detected && device_data.has_drawn_sr_imgui && !device_data.sr_suppressed) ? ICON_FK_OK : ICON_FK_WARNING);
+                  ImGui::SmallButton((device_data.has_drawn_sr_imgui && !device_data.sr_suppressed) ? ICON_FK_OK : ICON_FK_WARNING);
                   ImGui::EndDisabled();
                   ImGui::PopID();
                }
@@ -10523,104 +16306,12 @@ namespace
                }
             }
 
-            // Init the new SR if the selection changed.
-            // We wouldn't really need to do anything other than clearing "sr_output_color",
-            // but to avoid wasting memory allocated by SR texture and other resources, clear it up once disabled.
-            // Note that we keep these textures in memory if the user temporarily changed away from an AA method that supports SR, or if users unloaded shaders (there's no reason to, and it'd cause stutters).
-            if (device_data.sr_type != sr_type)
+            if (sr_type != device_data.sr_type)
             {
-               auto* sr_instance_data = device_data.GetSRInstanceData();
-               if (sr_instance_data)
-               {
-#if 0 // This would actually unload the previously selected SR DLL and all, making the game hitch, so it's better to just keep it in memory, especially because otherwise we need to check for compatibily again and load them again etc
-                  sr_implementations[device_data.sr_type]->Deinit(sr_instance_data);
-                  sr_instance_data = nullptr;
-#endif
-               }
-
-               device_data.sr_type = sr_type;
-               device_data.sr_suppressed = false;
-               sr_instance_data = device_data.GetSRInstanceData(); // Take new instance data
-
-               if (device_data.sr_type != SR::Type::None)
-               {
-                  ASSERT_ONCE(sr_instance_data && sr_implementations[device_data.sr_type]->HasInit(sr_instance_data)); // Should never happen
-               }
-               else
-               {
-                  device_data.sr_output_color = nullptr;
-                  device_data.sr_exposure = nullptr;
-                  device_data.sr_render_resolution_scale = 1.f; // Reset this to 1 when SR is toggled, even if dynamic resolution scaling is active (e.g. in Prey), we'll set it back to a low value if DRS is used again.
-                  device_data.sr_scene_exposure = 1.f;
-                  device_data.sr_scene_pre_exposure = 1.f;
-                  game->CleanExtraSRResources(device_data);
-               }
+               device_data.sr_type_selected = sr_type;
             }
 #endif // ENABLE_SR
 
-            auto ChangeDisplayMode = [&](DisplayModeType display_mode, bool enable_hdr_on_display = true, IDXGISwapChain3* swapchain = nullptr)
-               {
-                  int display_mode_i = int(display_mode);
-                  reshade::set_config_value(runtime, NAME, "DisplayMode", display_mode_i);
-                  cb_luma_global_settings.DisplayMode = display_mode;
-                  OnDisplayModeChanged();
-                  if (display_mode >= DisplayModeType::HDR)
-                  {
-                     if (enable_hdr_on_display)
-                     {
-                        Display::SetHDREnabled(game_window);
-                        bool dummy_bool;
-                        Display::IsHDRSupportedAndEnabled(game_window, dummy_bool, hdr_enabled_display, swapchain); // This should always succeed, so we don't fallback to SDR in case it didn't
-
-#if ENABLE_NVAPI
-                        // Enable HDR10+ GAMING if supported, it generally makes Samsung displays more accurate, so there's no reason to not enable it really.
-                        // For now we only do this if we are also enforcing HDR enabled on the display.
-                        Display::NVAPI::SetDisplayOutputMode(game_window, NV_DISPLAY_OUTPUT_MODE_HDR10PLUS_GAMING, false, false);
-#endif
-                     }
-                     if (!reshade::get_config_value(runtime, NAME, "ScenePeakWhite", cb_luma_global_settings.ScenePeakWhite) || cb_luma_global_settings.ScenePeakWhite <= 0.f)
-                     {
-                        cb_luma_global_settings.ScenePeakWhite = device_data.default_user_peak_white;
-                     }
-                     if (use_os_reference_white_level)
-                     {
-                        float hdr_paper_white = 80.f;
-                        if (Display::GetSDRWhiteLevel(game_window, hdr_paper_white))
-                        {
-                           cb_luma_global_settings.ScenePaperWhite = hdr_paper_white;
-                           cb_luma_global_settings.UIPaperWhite = hdr_paper_white;
-                        }
-                        else
-                        {
-                           use_os_reference_white_level = false;
-                        }
-                     }
-                     if (!use_os_reference_white_level)
-                     {
-                        if (!reshade::get_config_value(runtime, NAME, "ScenePaperWhite", cb_luma_global_settings.ScenePaperWhite))
-                        {
-                           cb_luma_global_settings.ScenePaperWhite = default_paper_white;
-                        }
-                        if (!reshade::get_config_value(runtime, NAME, "UIPaperWhite", cb_luma_global_settings.UIPaperWhite))
-                        {
-                           cb_luma_global_settings.UIPaperWhite = default_paper_white;
-                        }
-                     }
-                     // Align all the parameters for the SDR on HDR mode (the game paper white can still be changed)
-                     if (display_mode >= DisplayModeType::SDRInHDR)
-                     {
-                        // For now we don't default to 203 nits game paper white when changing to this mode
-                        cb_luma_global_settings.UIPaperWhite = cb_luma_global_settings.ScenePaperWhite;
-                        cb_luma_global_settings.ScenePeakWhite = cb_luma_global_settings.ScenePaperWhite; // No, we don't want "default_peak_white" here
-                     }
-                  }
-                  else
-                  {
-                     cb_luma_global_settings.ScenePeakWhite = display_mode == DisplayModeType::SDR ? srgb_white_level : (display_mode >= DisplayModeType::SDRInHDR ? default_paper_white : default_peak_white);
-                     cb_luma_global_settings.ScenePaperWhite = display_mode == DisplayModeType::SDR ? srgb_white_level : default_paper_white;
-                     cb_luma_global_settings.UIPaperWhite = display_mode == DisplayModeType::SDR ? srgb_white_level : default_paper_white;
-                  }
-               };
 
             auto DrawScenePaperWhite = [&](bool has_separate_ui_paper_white = true)
                {
@@ -10715,11 +16406,11 @@ namespace
                Display::IsHDRSupportedAndEnabled(game_window, hdr_supported_display, hdr_enabled_display, device_data.GetMainNativeSwapchain().get());
             }
 
-            if (!force_disable_display_composition)
+            if (!force_disable_display_composition || show_display_settings_without_composition)
             {
                DisplayModeType display_mode = cb_luma_global_settings.DisplayMode;
                int display_mode_max = 1;
-               if (hdr_supported_display)
+               if (hdr_supported_display && !force_disable_display_composition)
                {
 #if DEVELOPMENT || TEST
                   display_mode_max++; // Add "SDR in HDR for HDR" mode
@@ -10729,7 +16420,7 @@ namespace
                static_assert(sizeof(display_mode) == sizeof(int));
                if (ImGui::SliderInt("Display Mode", reinterpret_cast<int*>(&display_mode), 0, display_mode_max, display_mode_preset_strings[(size_t)display_mode], ImGuiSliderFlags_NoInput))
                {
-                  ChangeDisplayMode(display_mode, true, device_data.GetMainNativeSwapchain().get());
+                  ChangeDisplayMode(device_data, display_mode, true, device_data.GetMainNativeSwapchain().get(), runtime);
                }
                ImGui::EndDisabled();
                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -10745,7 +16436,7 @@ namespace
                   {
                      display_mode = hdr_enabled_display ? DisplayModeType::HDR : DisplayModeType::SDR;
                      // Don't toggle HDR/SDR on the display here, we are matching the game state to the display state
-                     ChangeDisplayMode(display_mode, false, device_data.GetMainNativeSwapchain().get());
+                     ChangeDisplayMode(device_data, display_mode, false, device_data.GetMainNativeSwapchain().get(), runtime);
                   }
                   ImGui::PopID();
                }
@@ -10759,7 +16450,7 @@ namespace
                }
 
                const bool mod_active = IsModActive(device_data);
-               const bool has_separate_ui_paper_white = GetShaderDefineCompiledNumericalValue(UI_DRAW_TYPE_HASH) >= 1 && !use_os_reference_white_level;
+               const bool has_separate_ui_paper_white = (GetShaderDefineCompiledNumericalValue(UI_DRAW_TYPE_HASH) >= 1 || force_separate_ui_paper_white) && !use_os_reference_white_level;
                if (display_mode == DisplayModeType::HDR)
                {
                   ImGui::BeginDisabled(!mod_active);
@@ -11074,6 +16765,7 @@ namespace
             }
 
             game->DrawImGuiSettings(device_data);
+            device_data.cb_luma_global_settings_dirty = true; // Again after the game's settings, so their edits are never missed by an upload that ran in between
 
 #if DEVELOPMENT || TEST
             ImGui::SetNextItemOpen(true, ImGuiCond_Once);
@@ -11237,8 +16929,10 @@ namespace
                      static_assert(sizeof(enable_chain_indirect_texture_format_upgrades) == sizeof(int));
                      if (ImGui::SliderInt("Chain Indirect Texture Format Upgrades Types", reinterpret_cast<int*>(&enable_chain_indirect_texture_format_upgrades), 0, (int)ChainTextureFormatUpgradesType::DirectAndIndirectDependencies, chain_texture_format_upgrades_type_strings[(size_t)enable_chain_indirect_texture_format_upgrades], ImGuiSliderFlags_NoInput))
                      {
+#if DX11
                         // Reset the state to avoid pollutation at least in the primary command list (safe during present), in the others it might matter a lot less because they are constantly reset
                         device_data.primary_command_list_data->ResetUpgradedViews();
+#endif
                      }
                      ImGui::Checkbox("Ignore Indirect Upgraded Textures", &ignore_indirect_upgraded_textures);
                      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -11369,6 +17063,7 @@ namespace
 
                         {
                            const std::shared_lock lock_swapchain(swapchain_data.mutex);
+#if DX11
                            // Before resizing the swapchain, we need to make sure any of its resources/views are not bound to any state (at least from our side, we can't control the game side here)
                            if (!swapchain_data.display_composition_rtvs.empty())
                            {
@@ -11397,6 +17092,7 @@ namespace
                                  primary_command_list->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs_const, depth_stencil_view.get());
                               }
                            }
+#endif // DX11
                         }
 
                         native_swapchain->ResizeBuffers(0, new_width, new_height, DXGI_FORMAT_UNKNOWN, swap_chain_flags);
@@ -11436,6 +17132,7 @@ namespace
                {
                   enable_ui_separation = !enable_ui_separation;
 
+#if DX11
                   device_data.ui_texture = nullptr;
                   device_data.ui_texture_rtv = nullptr;
                   device_data.ui_texture_srv = nullptr;
@@ -11443,14 +17140,14 @@ namespace
                   {
                      if (auto native_swapchain = device_data.GetMainNativeSwapchain())
                      {
-                        com_ptr<ID3D11Texture2D> back_buffer;
-                        native_swapchain->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
+                        const com_ptr<ID3D11Texture2D> back_buffer = GetGameBackBuffer(native_swapchain.get());
                         ID3D11Device* native_device = (ID3D11Device*)runtime->get_device()->get_native();
                         device_data.ui_texture = CloneTexture<ID3D11Texture2D>(native_device, back_buffer.get(), ui_separation_format, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, D3D11_BIND_UNORDERED_ACCESS, true, false, nullptr);
                         native_device->CreateRenderTargetView(device_data.ui_texture.get(), nullptr, &device_data.ui_texture_rtv);
                         native_device->CreateShaderResourceView(device_data.ui_texture.get(), nullptr, &device_data.ui_texture_srv);
                      }
                   }
+#endif // DX11
                }
                if (enable_ui_separation || !shader_hashes_UI.Empty())
                   ImGui::Checkbox(enable_ui_separation ? "Hide Gameplay UI" : "Hide UI", &hide_ui);
@@ -11475,6 +17172,7 @@ namespace
                      const std::unique_lock lock_samplers(s_mutex_samplers);
                      samplers_changed |= ImGui::SliderFloat("Texture Samplers Mip LOD Bias", &device_data.texture_mip_lod_bias_offset, -8.f, +8.f);
                   }
+#if DX11
                   if (samplers_changed)
                   {
                      std::unique_lock lock_samplers(s_mutex_samplers);
@@ -11490,6 +17188,7 @@ namespace
                         samplers_handle.second[device_data.texture_mip_lod_bias_offset] = custom_sampler;
                      }
                   }
+#endif // DX11
                }
 
                ImGui::TreePop();
@@ -11864,9 +17563,11 @@ namespace
 
                ImGui::NewLine();
 
+#if DX11
                ImGui::Text("Upgraded Samplers: ", "");
                text = std::to_string((int)device_data.custom_sampler_by_original_sampler.size());
                ImGui::Text(text.c_str(), "");
+#endif
 #endif // !GRAPHICS_ANALYZER
             }
 
@@ -11957,13 +17658,18 @@ namespace
 #if DEVELOPMENT
 #include "includes/trace.inl"
 #include "includes/ui/trace_ui.inl"
-#include "includes/mcp_server.inl"
 #endif
 
 // "async" means that this is not called from the dll loading function ("DLL_PROCESS_ATTACH"), so we can do threading related stuff in the function
 void Init(bool async)
 {
    has_init = true;
+
+   // ReShade can unload and register the addon again without unloading the dll (it does on boot): the games' "OnInit()" appends their
+   // defines each time, so drop the previous run's (their duplicates would override edits of the first copy)
+   static const size_t core_shader_defines_count = shader_defines_data.size();
+   while (shader_defines_data.size() > core_shader_defines_count)
+      shader_defines_data.pop_back(); // The defines can't be assigned, which "erase()" needs
 
    for (int i = 0; i < shader_defines_data.size(); i++)
    {
@@ -11995,6 +17701,9 @@ void Init(bool async)
 #if ENABLE_FIDELITY_SK
    sr_implementations[SR::Type::FSR] = std::make_unique<FidelityFX::FSR>();
 #endif
+#if ENABLE_XESS
+   sr_implementations[SR::Type::XeSS] = std::make_unique<Intel::XeSS>();
+#endif
 #if ENABLE_FSR4
    sr_implementations[SR::Type::FSR_4] = std::make_unique<FidelityFX::FSR4>();
 #endif
@@ -12004,7 +17713,7 @@ void Init(bool async)
    // Games call through these pointers, so the MCP tap sees every settings update and draw
    for (auto& [type, implementation] : sr_implementations)
    {
-      implementation = Mcp::TapSuperResolution(type, std::move(implementation));
+      implementation = std::make_unique<Mcp::SrTap>(type, std::move(implementation));
    }
 #endif
 #endif
@@ -12267,6 +17976,7 @@ void Init(bool async)
             // Create custom device shaders if the device has already been created before custom shaders were loaded on boot, independently of "block_draw_until_device_custom_shaders_creation".
             // Note that this might be unsafe if "global_devices_data" was already being destroyed in "OnDestroyDevice()" (I'm not sure you can create device resources anymore at that point).
             // TODO: can this even ever happen? Having devices already created/added here? I don't think so... however, "async_shader_compilation_semaphore" below will hang in some games
+#if DX11
             for (auto global_device_data : global_devices_data)
             {
                const std::unique_lock lock_shader_objects(s_mutex_shader_objects);
@@ -12275,6 +17985,7 @@ void Init(bool async)
                   CreateDeviceNativeShaders(*global_device_data, nullptr, false);
                }
             }
+#endif
             thread_auto_compiling_running = false;
          });
       async_shader_compilation_semaphore.acquire();
@@ -12313,6 +18024,9 @@ void Uninit()
          }
       }
    }
+#if DEVELOPMENT
+   Mcp::Shutdown();
+#endif
 
 #if 0 // Unload any dll. For now we keep it loaded forever because we might load a custom version of DX shader compiler DLLs, and sometimes ReShade or ReShade addons load and unload multiple times on boot, so we wouldn't want to add any weight to further loads
    Shader::UnInitShaderCompiler();
@@ -12420,11 +18134,86 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
 
+#if DX11 // D3D12 only tracks lifetimes and pipelines for now
 #if (LUMA_PATCH_PROVIDERS & (LUMA_PATCH_PROVIDER_BYTECODE_SYNC | LUMA_PATCH_PROVIDER_RECIPE_SYNC)) && !LUMA_PATCH_SYNC_MODE_CLONE
       reshade::register_event<reshade::addon_event::create_pipeline>(OnCreatePipeline);
 #endif
+#endif // DX11
       reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
+#if DX12
+      reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
+      reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
+      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
+      reshade::register_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
+      reshade::register_event<reshade::addon_event::end_render_pass>(OnEndRenderPass);
+      reshade::register_event<reshade::addon_event::draw>(OnDraw);
+      reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+      reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
+      reshade::register_event<reshade::addon_event::dispatch_mesh>(OnDispatchMesh);
+      reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
+      reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
+      reshade::register_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
+      reshade::register_event<reshade::addon_event::destroy_command_queue>(OnDestroyCommandQueue);
+      reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
+#endif
+#if DX12 && (DEVELOPMENT || ENABLE_D3D12_PASSES)
+      reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
+      reshade::register_event<reshade::addon_event::push_constants>(OnPushConstants);
+      reshade::register_event<reshade::addon_event::bind_pipeline_states>(OnBindPipelineStates);
+#endif
+#if DX12 && ENABLE_D3D12_PASSES
+      reshade::register_event<reshade::addon_event::bind_viewports>(OnBindViewports);
+      reshade::register_event<reshade::addon_event::bind_scissor_rects>(OnBindScissorRects);
+#endif
+#if DX12 && (DEVELOPMENT || ENABLE_DRAW_DISPATCH_DATA_CACHE)
+      reshade::register_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
+#endif
+#if DX12 && DEVELOPMENT
+      reshade::register_event<reshade::addon_event::init_pipeline_layout>(OnInitPipelineLayout);
+      reshade::register_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
+      reshade::register_event<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables);
+      reshade::register_event<reshade::addon_event::init_sampler>(OnInitSamplerDescriptor);
+      reshade::register_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
+      reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
+      reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+      reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResource);
+      reshade::register_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegion);
+      reshade::register_event<reshade::addon_event::copy_buffer_to_texture>(OnCopyBufferToTexture);
+      reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
+      reshade::register_event<reshade::addon_event::copy_texture_to_buffer>(OnCopyTextureToBuffer);
+      reshade::register_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
+      reshade::register_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencilView);
+      reshade::register_event<reshade::addon_event::clear_render_target_view>(OnClearRenderTargetView);
+      reshade::register_event<reshade::addon_event::clear_unordered_access_view_uint>(OnClearUnorderedAccessViewUInt);
+      reshade::register_event<reshade::addon_event::clear_unordered_access_view_float>(OnClearUnorderedAccessViewFloat);
+#endif
+#if DX12
+      // The upgrades change the formats of the back buffers' and the textures' views, and leave copies that D3D12 can't make (the development builds registered the copies above)
+      if (texture_format_upgrades_type > TextureFormatUpgradesType::None || swapchain_format_upgrade_type > TextureFormatUpgradesType::None)
+      {
+         reshade::register_event<reshade::addon_event::create_resource_view>(OnCreateResourceView);
+#if ENABLE_MINHOOK
+         // The textures are upgraded as the game creates them (the development builds registered "init_resource" and "destroy_resource" above, for their capture)
+         if (texture_format_upgrades_type > TextureFormatUpgradesType::None)
+         {
+            reshade::register_event<reshade::addon_event::create_resource>(OnCreateResource);
+#if !DEVELOPMENT
+            reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
+            reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+#endif
+         }
+#endif
+#if !DEVELOPMENT
+         reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResource);
+         reshade::register_event<reshade::addon_event::copy_buffer_to_texture>(OnCopyBufferToTexture);
+         reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
+         reshade::register_event<reshade::addon_event::copy_texture_to_buffer>(OnCopyTextureToBuffer);
+         reshade::register_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
+#endif
+      }
+#endif
+#if DX11
 
       reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
 
@@ -12501,13 +18290,23 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
          reshade::register_event<reshade::addon_event::init_sampler>(OnInitSampler);
          reshade::register_event<reshade::addon_event::destroy_sampler>(OnDestroySampler);
       }
+#endif // DX11
+#if DX12
+      if (enable_samplers_upgrade)
+      {
+         reshade::register_event<reshade::addon_event::create_sampler>(OnCreateSampler);
+#if ENABLE_MINHOOK
+         D3D12RootSignatures::hook.upgrade_static_sampler = &UpgradeStaticSamplerD3D12;
+#endif
+      }
+#endif
 
       reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
       reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::register_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
-#if DEVELOPMENT
+#if DX11 && DEVELOPMENT
       reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
-#endif // DEVELOPMENT
+#endif // DX11 && DEVELOPMENT
       reshade::register_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
 
       reshade::register_event<reshade::addon_event::present>(OnPresent);
@@ -12529,7 +18328,6 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
    case DLL_PROCESS_DETACH:
    {
 #if DEVELOPMENT
-      Mcp::Shutdown();
       if (game_window_original_proc && game_window != NULL && IsWindow(game_window))
       {
          SetWindowLongPtr(game_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(game_window_original_proc));
@@ -12557,11 +18355,85 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
 
+#if DX11
 #if (LUMA_PATCH_PROVIDERS & (LUMA_PATCH_PROVIDER_BYTECODE_SYNC | LUMA_PATCH_PROVIDER_RECIPE_SYNC)) && !LUMA_PATCH_SYNC_MODE_CLONE
       reshade::unregister_event<reshade::addon_event::create_pipeline>(OnCreatePipeline);
 #endif
+#endif // DX11
       reshade::unregister_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
       reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
+#if DX12
+      reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
+      reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
+      reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
+      reshade::unregister_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
+      reshade::unregister_event<reshade::addon_event::end_render_pass>(OnEndRenderPass);
+      reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
+      reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+      reshade::unregister_event<reshade::addon_event::dispatch>(OnDispatch);
+      reshade::unregister_event<reshade::addon_event::dispatch_mesh>(OnDispatchMesh);
+      reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
+      reshade::unregister_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
+      reshade::unregister_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
+      reshade::unregister_event<reshade::addon_event::destroy_command_queue>(OnDestroyCommandQueue);
+      reshade::unregister_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
+#endif
+#if DX12 && (DEVELOPMENT || ENABLE_D3D12_PASSES)
+      reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
+      reshade::unregister_event<reshade::addon_event::push_constants>(OnPushConstants);
+      reshade::unregister_event<reshade::addon_event::bind_pipeline_states>(OnBindPipelineStates);
+#endif
+#if DX12 && ENABLE_D3D12_PASSES
+      reshade::unregister_event<reshade::addon_event::bind_viewports>(OnBindViewports);
+      reshade::unregister_event<reshade::addon_event::bind_scissor_rects>(OnBindScissorRects);
+#endif
+#if DX12 && (DEVELOPMENT || ENABLE_DRAW_DISPATCH_DATA_CACHE)
+      reshade::unregister_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
+#endif
+#if DX12 && DEVELOPMENT
+      reshade::unregister_event<reshade::addon_event::init_pipeline_layout>(OnInitPipelineLayout);
+      reshade::unregister_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
+      reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables);
+      reshade::unregister_event<reshade::addon_event::init_sampler>(OnInitSamplerDescriptor);
+      reshade::unregister_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
+      reshade::unregister_event<reshade::addon_event::init_resource>(OnInitResource);
+      reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+      reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResource);
+      reshade::unregister_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegion);
+      reshade::unregister_event<reshade::addon_event::copy_buffer_to_texture>(OnCopyBufferToTexture);
+      reshade::unregister_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
+      reshade::unregister_event<reshade::addon_event::copy_texture_to_buffer>(OnCopyTextureToBuffer);
+      reshade::unregister_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
+      reshade::unregister_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencilView);
+      reshade::unregister_event<reshade::addon_event::clear_render_target_view>(OnClearRenderTargetView);
+      reshade::unregister_event<reshade::addon_event::clear_unordered_access_view_uint>(OnClearUnorderedAccessViewUInt);
+      reshade::unregister_event<reshade::addon_event::clear_unordered_access_view_float>(OnClearUnorderedAccessViewFloat);
+#endif
+#if DX12
+      // The upgrades change the formats of the back buffers' and the textures' views, and leave copies that D3D12 can't make (the development builds registered the copies above)
+      if (texture_format_upgrades_type > TextureFormatUpgradesType::None || swapchain_format_upgrade_type > TextureFormatUpgradesType::None)
+      {
+         reshade::unregister_event<reshade::addon_event::create_resource_view>(OnCreateResourceView);
+#if ENABLE_MINHOOK
+         if (texture_format_upgrades_type > TextureFormatUpgradesType::None)
+         {
+            reshade::unregister_event<reshade::addon_event::create_resource>(OnCreateResource);
+#if !DEVELOPMENT
+            reshade::unregister_event<reshade::addon_event::init_resource>(OnInitResource);
+            reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+#endif
+         }
+#endif
+#if !DEVELOPMENT
+         reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResource);
+         reshade::unregister_event<reshade::addon_event::copy_buffer_to_texture>(OnCopyBufferToTexture);
+         reshade::unregister_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
+         reshade::unregister_event<reshade::addon_event::copy_texture_to_buffer>(OnCopyTextureToBuffer);
+         reshade::unregister_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
+#endif
+      }
+#endif
+#if DX11
 
       reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
 
@@ -12625,13 +18497,23 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
          reshade::unregister_event<reshade::addon_event::init_sampler>(OnInitSampler);
          reshade::unregister_event<reshade::addon_event::destroy_sampler>(OnDestroySampler);
       }
+#endif // DX11
+#if DX12
+      if (enable_samplers_upgrade)
+      {
+         reshade::unregister_event<reshade::addon_event::create_sampler>(OnCreateSampler);
+#if ENABLE_MINHOOK
+         D3D12RootSignatures::hook.upgrade_static_sampler = nullptr;
+#endif
+      }
+#endif
 
       reshade::unregister_event<reshade::addon_event::init_command_list>(OnInitCommandList);
       reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::unregister_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
-#if DEVELOPMENT
+#if DX11 && DEVELOPMENT
       reshade::unregister_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
-#endif // DEVELOPMENT
+#endif // DX11 && DEVELOPMENT
       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
 
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
@@ -12648,6 +18530,24 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_overlay(NAME, OnRegisterMainOverlay);
 
       reshade::unregister_addon(h_module);
+
+      // Not needed at process exit
+      if (lpv_reserved == nullptr)
+      {
+#if DX12
+         D3D12PsoCapture::Remove();
+         D3D12RootSignatures::Remove();
+         D3D12ResourceCreation::Remove();
+         D3D12Clones::Remove();
+#if DEVELOPMENT
+         D3D12CommandSignatures::Remove();
+#endif
+#endif
+#if ENABLE_MINHOOK
+         // The game's and Core's hooks are removed by now (see "includes/minhook.h"), this frees its heap
+         UninitializeMinHook();
+#endif
+      }
 
       // In case our threads are still not joined, detach them and safely do a busy loop
       // until they finished running, so we don't risk them reading/writing to stale memory.

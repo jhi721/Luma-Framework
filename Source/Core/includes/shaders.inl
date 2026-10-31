@@ -68,6 +68,7 @@ namespace Shader
       return CloneOrigin::None;
    }
 
+#if DX11
    void UsePipelineVariant(CommandListData& cmd_list_data, ID3D11DeviceContext* native_device_context, reshade::api::shader_stage stages, PipelineVariant variant)
    {
       const bool custom = variant == PipelineVariant::Custom;
@@ -85,4 +86,5 @@ namespace Shader
          [&](uint64_t handle) { native_device_context->CSSetShader(reinterpret_cast<ID3D11ComputeShader*>(handle), nullptr, 0); });
       cmd_list_data.pipeline_state_has_custom_graphics_shader = cmd_list_data.pipeline_state_has_custom_vertex_shader || cmd_list_data.pipeline_state_has_custom_pixel_shader;
    }
+#endif // DX11
 } // namespace Shader
