@@ -1,7 +1,8 @@
 // clang-format off
 #include "Includes/Common.hlsl" // game-local: LumaGameSettings before the shared Settings.hlsl, keep FIRST
-#include "../Includes/PsychoV31.hlsl" // PsychoVDisplayMap
 #include "../Includes/DgVoodoo.hlsl" // DGV_MAIN_SIGNATURE, ApplyDgvMask
+#include "../Includes/Reinhard.hlsl" // Reinhard::ReinhardPiecewise (hue reference)
+#include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020
 // clang-format on
 
 // MGR:R final pass "FilterShaderGather" (shader2.dat, D3D9 ps_3_0, dgVoodoo 2.87.5 -> ps_5_0 0x726E6E78 without alpha test;
@@ -12,9 +13,10 @@
 // g_Saido (c186 = cb4[194]) around Y' of the curved colour, the g_MulColor gain (c184 = cb4[192], with the light pre-scale's
 // inverse and the auto exposure: FUN_00eb50c0) and the vertical g_AddColor gradient (c185 = cb4[193]); then the bloom (t1) times
 // g_BloomColor (c187 = cb4[195]) is added and everything multiplied by g_Brightness (c188 = cb4[196], the brightness option).
-// HDR: the grade's curve as Bayonetta's (the same engine code): one max-channel scalar compresses values above the shoulder into
-// the curve's [0,1] domain and is divided back out, so every pixel below the shoulder stays vanilla exact. Then the display map
-// (PsychoV31 to the peak) and the UI paper white pre-scale (UI_DRAW_TYPE 2), encoded back for the Core composition.
+// HDR: one max-channel scalar compresses values above the shoulder into the curve's [0,1] domain and is divided back out, so every
+// pixel below the shoulder stays vanilla exact. Then the vanilla clip's hue turn (MacLeod-Boynton, hue only), the display map (a
+// max-channel C-infinity rolloff to the peak) and the UI paper white pre-scale (UI_DRAW_TYPE 2), encoded back for the Core
+// composition.
 
 cbuffer cb3 : register(b3)
 {
@@ -69,10 +71,10 @@ void main(DGV_MAIN_SIGNATURE)
    {
       ungraded = IsNaN_Strict(scene.rgb) ? 0.0 : max(scene.rgb, 0.0);
       const float peak = max3(ungraded);
-      // The max channel is what the curve's domain must hold
+      // The max channel is what the curve's domain must hold: asymptotic to its end
       if (peak > kCurveShoulder)
       {
-         const float scale = CurveDomainScale(peak);
+         const float scale = Tonemap::CInfinityRollOff::Apply(peak, 1.0, kCurveShoulder, kCurveShoulderStrength) / peak;
          curved = Curve(ungraded * scale) / scale;
       }
    }
@@ -122,7 +124,20 @@ void main(DGV_MAIN_SIGNATURE)
 #if TONEMAP_TYPE >= 1
    // The 8-bit targets floored the saturation's negatives
    float3 color = IsNaN_Strict(o0.rgb) ? 0.0 : max(o0.rgb, 0.0);
-   color = PsychoVDisplayMap(gamma_to_linear(color, GCT_MIRROR), LumaSettings.GameSettings.Contrast, LumaSettings.GameSettings.Saturation, LumaSettings.GameSettings.HighlightsDesaturation);
+   // Vanilla clipped per channel in 8-bit (the scene before the curve, the canvas here), turning bright highlights toward the
+   // primaries; the max-channel curve and map keep the unclipped hue. Restore only that hue turn, from a per-channel Reinhard
+   // (ceiling 5, shoulder 1.5: identity below it, so the scene under 1.5 stays exact), the reference our RenoDX ports ship. Hue 1 /
+   // chrominance 0: no vanilla whitening. Before the map on purpose: it is hue neutral and contains any channel the turn lifts.
+   // Below the shoulder the reference is the colour itself, so the solve (some 300 instructions) is skipped there.
+   color = gamma_to_linear(color, GCT_MIRROR);
+   const float3 color2020 = BT709_To_BT2020(color);
+   [branch] if (max3(color2020) > 1.5)
+   {
+      color = BT2020_To_BT709(MacLeodBoynton::HueOnlyBT2020(color2020, Reinhard::ReinhardPiecewise(color2020, 5.0, 1.5)));
+   }
+   // Linear BT.709, 1 = paper white; the peak can't go below paper white (the rolloff needs it above its 0.18 anchor)
+   const float paperWhite = max(GamePaperWhiteNits, 1.0);
+   color = Tonemap::CInfinityRollOff::MaxChannel(color, max(PeakWhiteNits, paperWhite) / paperWhite, 0.18, kDisplayMapStrength);
 #else
    // The vanilla clip, on the HDR canvas: only the UI paper white pre-scale the composition expects
    float3 color = gamma_to_linear(saturate(o0.rgb), GCT_MIRROR);

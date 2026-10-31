@@ -2,7 +2,7 @@
 
 #define GEOMETRY_SHADER_SUPPORT 0
 #define DISABLE_AUTO_DEBUGGER 1
-// "SceneMotionVectors" reads the shaders as created from the patch context (no game patch of its own here)
+// "SceneMotionVectors" reads the shaders as created from the patch context, after the output clamps ("PatchShaderBytecodeSync")
 #define LUMA_PATCH_BYTECODE_SYNC 1
 // Outside DEVELOPMENT only this define makes original_draw_dispatch_func non-null (the gather pass is drawn, then snapshotted)
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
@@ -44,6 +44,13 @@ const ShaderHashesList shader_hashes_FXAA = {.pixel_shaders = {0x14F88B41, 0x5F6
 // (modelshaderzmapscr and zmapscrnki, with their alpha test twins). Its single R32F target is the carrier of the scene's motion vectors:
 // the G-buffer draws have several targets, which Core's "SceneMotionVectors" refuses, and the velocity pass only exists with the game's
 // Motion Blur on.
+// The motion blur's velocity map (modelshadervelocitymap, mappl, mappl_ps3, mapscrnki, weight, fixed, directionvelocitymap) and its dilation
+// (modelshaderblurpass2..5): (ndc - previous ndc) * scale + 0.5 in o0.xy, which the 8-bit target clamped and quantized. Clamped as it
+// stored it now that the scene sized targets are fp16.
+const std::unordered_set<uint32_t> velocity_pixel_shaders = {
+   0xD6459C7A, 0xBF53671F, 0xD70457EA, 0x25928798, 0x9A548B81, 0x38A99388, 0x9BF3EB98, 0xBE302C8A, 0x0AF5AAD0, 0x5940BF0B, 0xF727984C,
+   0xFDA6E45C, 0x5FB1861B, 0xA2AC97CD, 0x9B28456F, 0xADA34A43, 0xF70D9E33, 0x91E4602E, 0x54B4AD50, 0x670A6C0E, 0xDB974526, 0x133DFF5C,
+   0x2243A7CF, 0x8D2C9DE2, 0x94845320, 0x9F29B50B, 0xA0C5CD2B, 0x8A3332B1, 0xEE3C798B, 0x5804E7AC, 0x13C80FDF, 0x73C2030B, 0xAF5C87AB};
 const ShaderHashesList shader_hashes_DepthPrepass = {.pixel_shaders = {0x522D69B1, 0x36772BFA, 0xAC6B358B, 0xCF1201CF, 0x3E5410CC, 0xE5B37BFF}};
 // FSR's and Luma TAA's masks, written by the scene's alpha blended draws past dgVoodoo's targets (their pixel shaders patched with
 // "PatchPixelShaderReactive", the slot max blended in every blend state: "PatchedDraws::OnCreateBlendState")
@@ -61,6 +68,7 @@ constexpr const char* PIXEL_SHADER_PATCH_NAMES[] = {"Coverage", "Mask", "Mask (a
 // "Luma MSAA Enable": the HDR-weighted resolve of the fp16 mirrors and the alpha tested materials' alpha to coverage (Bayonetta's)
 static bool g_msaa_resolve_enable = true;
 static bool g_smaa_enable = true;
+static bool g_smaa_t2x = false;      // SMAA T2x: a two phase jitter and the previous frame, through the upscalers' motion vectors
 static bool g_hide_ui = false;       // Session-only, never persisted: a stuck "on" would look like a broken HUD
 static float g_rcas_sharpness = 0.f; // RCAS on the antialiased scene, 0 = off
 #if DEVELOPMENT
@@ -104,6 +112,17 @@ struct MetalGearRisingRevengeanceGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11ShaderResourceView> smaa_predication_srv;
    com_ptr<ID3D11Buffer> smaa_predication_buffer;
    com_ptr<ID3D11Buffer> smaa_metrics_buffer;
+   // SMAA T2x (see "DrawSMAAOnScene"), set at present for the whole frame like "sr_active". The scene jitters ("jitter", see
+   // "OpenScene") only after a frame the resolve ran. The two scene sized frames (linear colour, velocity length in alpha) alternate;
+   // the other one is the history only if "t2x_frame", the last frame the resolve ran, was the frame before.
+   bool t2x_active = false;
+   bool mv_filled = false; // The fill wrote this frame's motion vectors for T2x (reset at present)
+   com_ptr<ID3D11Texture2D> t2x_frames[2];
+   com_ptr<ID3D11RenderTargetView> t2x_frame_rtvs[2];
+   com_ptr<ID3D11ShaderResourceView> t2x_frame_srvs[2];
+   uint32_t t2x_frame = 0;
+   // T2x's resolve writes RGB only: the gather target's alpha stays. Made at its first use.
+   com_ptr<ID3D11BlendState> rgb_blend_state;
    // "msaa_resolved" this frame, "msaa_active" the last one (the coverage draws come before this frame's resolves)
    std::atomic<bool> msaa_resolved = false;
    std::atomic<bool> msaa_active = false;
@@ -177,6 +196,16 @@ struct MetalGearRisingRevengeanceGameDeviceData final : public GameDeviceData
       transparency.reset();
       reactive_previous_uav.reset();
       reactive_previous.reset();
+   }
+
+   void ReleaseT2xFrames()
+   {
+      for (int i = 0; i < 2; i++)
+      {
+         t2x_frames[i].reset();
+         t2x_frame_rtvs[i].reset();
+         t2x_frame_srvs[i].reset();
+      }
    }
 };
 
@@ -271,9 +300,43 @@ class MetalGearRisingRevengeance final : public Game
       }
       const float tolerance[4] = {g_smaa_pred_tolerance, 0.f, 0.f, 0.f};
       predication = predication && gd.smaa_predication_srv && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.smaa_predication_buffer), tolerance, sizeof(tolerance));
-      // b1 ("Luma_SMAA_impl.hlsl"'s "SmaaMetricsCB")
-      const float metrics[8] = {1.f / float(size.x), 1.f / float(size.y), float(size.x), float(size.y), predication ? 2.f : 1.f, 0.f, 0.f, 0.f};
-      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.smaa_metrics_buffer), metrics, sizeof(metrics)))
+      // SMAA T2x: SMAA into this frame's linear target with the velocity, then the resolve with the previous frame into the gather
+      // target (Bayonetta's). It needs this frame's motion vectors from the fill, at the target's size. Without them this frame is 1x
+      // and the next one doesn't jitter.
+      auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
+      bool t2x = gd.t2x_active && gd.mv_filled && gd.mv.srv && copy_vs && GetViewTextureSize(gd.mv.srv.get()) == size;
+      ID3D11PixelShader* const t2x_weight_ps = (t2x ? FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("MGRR SMAA T2x Blending Weight Calculation PS")) : nullptr);
+      ID3D11PixelShader* const t2x_blend_ps = (t2x ? FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("MGRR SMAA T2x Neighborhood Blending PS")) : nullptr);
+      ID3D11PixelShader* const t2x_resolve_ps = (t2x ? FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("MGRR SMAA T2x Resolve PS")) : nullptr);
+      t2x = t2x && t2x_weight_ps && t2x_blend_ps && t2x_resolve_ps;
+      const uint32_t frame_index = cb_luma_global_settings.FrameIndex;
+      const int t2x_current = int(frame_index & 1);
+      bool t2x_history = gd.t2x_frames[0] && gd.t2x_frame + 1 == frame_index;
+      if (t2x && GetViewTextureSize(gd.t2x_frame_srvs[0].get()) != size)
+      {
+         t2x_history = false;
+         gd.ReleaseT2xFrames();
+         for (int i = 0; i < 2; i++)
+         {
+            const CD3D11_TEXTURE2D_DESC desc(DXGI_FORMAT_R16G16B16A16_FLOAT, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+            if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &gd.t2x_frames[i])) || FAILED(native_device->CreateRenderTargetView(gd.t2x_frames[i].get(), nullptr, &gd.t2x_frame_rtvs[i])) ||
+                FAILED(native_device->CreateShaderResourceView(gd.t2x_frames[i].get(), nullptr, &gd.t2x_frame_srvs[i])))
+            {
+               gd.ReleaseT2xFrames();
+               break;
+            }
+         }
+         t2x = gd.t2x_frames[0].get() != nullptr;
+      }
+      // b1 ("Luma_SMAA_impl.hlsl"'s "SmaaMetricsCB"): T2x's subsample indices for the jitter phase (see "OpenScene", the phase is the
+      // frame's parity), 0 for 1x or a scene that didn't jitter (only T2x jitters with it active)
+      const float subsample_indices = ((t2x && gd.jitter[0] != 0.f) ? float(t2x_current + 1) : 0.f);
+      const CB::SmaaMetrics metrics = {
+         .rt_metrics = {1.f / float(size.x), 1.f / float(size.y), float(size.x), float(size.y)},
+         .predication = {(predication ? 2.f : 1.f), 0.f, 0.f, 0.f},
+         .subsample_indices = {subsample_indices, subsample_indices, subsample_indices, 0.f},
+      };
+      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.smaa_metrics_buffer), &metrics, sizeof(metrics)))
          return;
 
       if (predication)
@@ -303,7 +366,6 @@ class MetalGearRisingRevengeance final : public Game
       // Calibration aid: predication's effect is the absence of smearing, which the eye misjudges; judge the mask instead (red)
       if (predication && g_smaa_pred_debug)
       {
-         auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
          auto* const copy_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Copy PS"));
          if (copy_vs && copy_ps)
          {
@@ -317,7 +379,35 @@ class MetalGearRisingRevengeance final : public Game
 #endif
 
       // Writing the gather target is safe: the chain samples the snapshot, never the target itself
-      DrawSMAA(native_device, native_device_context, device_data, target_rtv, gd.scene_srv.get(), gd.scene_srv.get(), predication ? gd.smaa_predication_srv.get() : nullptr, gd.smaa_metrics_buffer.get());
+      if (!t2x)
+      {
+         DrawSMAA(native_device, native_device_context, device_data, target_rtv, gd.scene_srv.get(), gd.scene_srv.get(), predication ? gd.smaa_predication_srv.get() : nullptr, gd.smaa_metrics_buffer.get());
+         return;
+      }
+      if (!gd.rgb_blend_state)
+      {
+         D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
+         blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
+         native_device->CreateBlendState(&blend_desc, &gd.rgb_blend_state);
+      }
+      // The game's state back after the resolve (dgVoodoo doesn't rebind what it thinks is bound)
+      DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
+      graphics_state.Cache(native_device_context, device_data.uav_max_count);
+      // The metrics at VS+PS b1, bound here rather than through "DrawSMAA()" (which restores the slot): the resolve reads them too
+      ID3D11Buffer* const metrics_buffer = gd.smaa_metrics_buffer.get();
+      native_device_context->VSSetConstantBuffers(1, 1, &metrics_buffer);
+      native_device_context->PSSetConstantBuffers(1, 1, &metrics_buffer);
+      const SMAAT2xPasses t2x_passes = {.blending_weight_calculation_ps = t2x_weight_ps, .neighborhood_blending_ps = t2x_blend_ps, .velocity = gd.mv.srv.get()};
+      DrawSMAA(native_device, native_device_context, device_data, gd.t2x_frame_rtvs[t2x_current].get(), gd.scene_srv.get(), gd.scene_srv.get(), predication ? gd.smaa_predication_srv.get() : nullptr, nullptr, &t2x_passes);
+      // The resolve: t0 this frame, t1 the previous one or this one again without a history, t2 the motion vectors, s0 linear and s1 point
+      native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
+      ID3D11ShaderResourceView* const resolve_srvs[2] = {gd.t2x_frame_srvs[t2x_history ? (t2x_current ^ 1) : t2x_current].get(), gd.mv.srv.get()};
+      native_device_context->PSSetShaderResources(1, 2, resolve_srvs);
+      ID3D11SamplerState* const resolve_samplers[2] = {device_data.sampler_state_linear.get(), device_data.sampler_state_point.get()};
+      native_device_context->PSSetSamplers(0, 2, resolve_samplers);
+      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), gd.rgb_blend_state.get(), nullptr, copy_vs, t2x_resolve_ps, gd.t2x_frame_srvs[t2x_current].get(), target_rtv, size.x, size.y, false);
+      graphics_state.Restore(native_device_context);
+      gd.t2x_frame = frame_index;
    }
 
    // The bound pixel shader's "patch", from the pipeline cache's bytecode on first use (null if it can't be patched, e.g. an alpha to
@@ -452,6 +542,14 @@ class MetalGearRisingRevengeance final : public Game
       }
       if (!SceneMotionVectors::BeginFrame(&gd.mv, native_device, native_device_context, dsv, depth_size, {}))
          return;
+      // SMAA T2x: the sample offsets (0.25, 0.25) then (-0.25, -0.25) in y down pixels, for "SMAA.hlsl"'s T2x subsample indices 1 and 2
+      // (Bayonetta's phases, in the upscalers' jitter convention, which the viewport applies). That is its table read with y up, which
+      // measured better (docs/SMAA-Lab.md).
+      if (gd.t2x_active && gd.t2x_frames[0] && gd.t2x_frame + 1 == cb_luma_global_settings.FrameIndex)
+      {
+         const float shift = ((cb_luma_global_settings.FrameIndex & 1) == 0 ? -0.25f : 0.25f);
+         gd.jitter = {shift, shift};
+      }
 
       // The masks at the scene's size; what the alpha blended draws write starts from zero every frame
       if (reactive && GetViewTextureSize(gd.mv.reactive_target_srv.get()) != depth_size)
@@ -815,12 +913,37 @@ public:
       }
    }
 
+   std::unique_ptr<std::byte[]> PatchShaderBytecodeSync(const std::byte* code, size_t& size, reshade::api::pipeline_subobject_type type, uint64_t shader_hash, const std::byte* shader_object, size_t shader_object_size) override
+   {
+      if (type != reshade::api::pipeline_subobject_type::pixel_shader)
+         return nullptr;
+      if (velocity_pixel_shaders.contains(uint32_t(shader_hash)))
+         return DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::UNORM8);
+      // Every other float target 0 (dgVoodoo's own R32_UINT outputs aside), Bayonetta's: the game's targets are A8R8G8B8 (upgraded to
+      // fp16, which doesn't clamp blend inputs) or R32F (depth in 0-1). Negative colour and alpha above 1 would make the
+      // SRC_ALPHA/INV_SRC_ALPHA blends' destination weight negative; colour above 1 is the scene's HDR and stays.
+      std::vector<DXBC::Chunk> chunks;
+      std::vector<DXBC::SignatureElement> outputs;
+      DXBC::Chunk* output_signature = nullptr;
+      if (DXBC::ReadChunks(reinterpret_cast<const uint8_t*>(shader_object), shader_object_size, &chunks))
+      {
+         output_signature = DXBC::FindChunk(&chunks, DXBC::FourCC("OSGN"));
+      }
+      if (!output_signature || !DXBC::ReadSignature(output_signature->data, &outputs))
+         return nullptr;
+      const auto target = std::ranges::find_if(outputs, [](const DXBC::SignatureElement& element)
+         { return MotionVectorPatch::IsTarget(element) && element.reg == 0; });
+      if (target == outputs.end() || target->component_type != D3D_REGISTER_COMPONENT_FLOAT32)
+         return nullptr;
+      return DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::BLEND_INPUT, target->mask);
+   }
+
    void OnInit(bool async) override
    {
       // The canvas stays gamma encoded (1 = paper white, gamma 2.2 in and out as the other dgVoodoo mods). The gather replacement does
       // the HDR display map and pre-scales the scene by the UI paper white, which the composition applies to the canvas.
       std::vector<ShaderDefineData> game_shader_defines_data = {
-         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: extended grade + PsychoV31 display map", 1},
+         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: extended grade + C-infinity display map", 1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
@@ -840,9 +963,6 @@ public:
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;
       default_luma_global_game_settings.Dithering = 1.f;
       // The gather pass' grading, neutral
-      default_luma_global_game_settings.Contrast = 1.f;
-      default_luma_global_game_settings.Saturation = 1.f;
-      default_luma_global_game_settings.HighlightsDesaturation = 0.f;
       default_luma_global_game_settings.ColorGradingIntensity = 1.f;
       default_luma_global_game_settings.BloomIntensity = 1.f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
@@ -853,6 +973,13 @@ public:
 
       // SMAA: Core registers its 6 passes ("Luma_SMAA_impl.hlsl"); the predication mask from the depth prepass
       native_shaders_definitions.emplace(CompileTimeStringHash("MGRR Depth Edges CS"), ShaderDefinition("Luma_MGRR_DepthEdges", reshade::api::pipeline_subobject_type::compute_shader));
+      // SMAA T2x's own passes ("SMAA_T2X" in Luma_SMAA_impl.hlsl). The edge detection and the vertex shaders are 1x's.
+      native_shaders_definitions.emplace(CompileTimeStringHash("MGRR SMAA T2x Blending Weight Calculation PS"),
+         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps", {{"SMAA_T2X", "1"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("MGRR SMAA T2x Neighborhood Blending PS"),
+         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps", {{"SMAA_T2X", "1"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("MGRR SMAA T2x Resolve PS"),
+         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_resolve_ps", {{"SMAA_T2X", "1"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("MGRR Motion Vector Fill CS"), ShaderDefinition("Luma_MGRR_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
 
       sr_game_tooltip = "Needs Anti-Aliasing off in the game's options. DLSS, FSR and XeSS require Luma-Upscaler.exe next to the game's exe.\n";
@@ -864,6 +991,7 @@ public:
          {"msaa_resolve_enable", &g_msaa_resolve_enable},
          {"msaa_coverage_enable", &g_msaa_coverage_enable},
          {"smaa_enable", &g_smaa_enable},
+         {"smaa_t2x", &g_smaa_t2x},
          {"smaa_predication", &g_smaa_predication},
          {"smaa_pred_debug", &g_smaa_pred_debug},
          {"mv_debug_view", &g_mv_debug_view},
@@ -1040,6 +1168,18 @@ public:
                game_device_data.mv.stats.sr_draws += (sr_output != nullptr);
 #endif
             }
+            // SMAA T2x's velocity, read after this pass ("DrawSMAAOnScene")
+            else if (game_device_data.t2x_active && std::exchange(game_device_data.mv.fill_pending, false))
+            {
+               const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+               DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
+               DrawStateStack<DrawStateStackType::Compute> compute_state;
+               graphics_state.Cache(native_device_context, device_data.uav_max_count);
+               compute_state.Cache(native_device_context, device_data.uav_max_count);
+               game_device_data.mv_filled = FillMotionVectors(native_device, native_device_context, device_data, /* write_reactive */ false);
+               compute_state.Restore(native_device_context);
+               graphics_state.Restore(native_device_context);
+            }
          }
          if (sr_output)
          {
@@ -1172,7 +1312,18 @@ public:
       // the motion vector state are fixed here for the next frame. The scene jitters only after a frame it drew.
       const bool jitter_allowed = device_data.has_drawn_sr;
       game_device_data.sr_active = LatchSRFrame(device_data) && !game_device_data.msaa_active;
-      if (!game_device_data.mv.active.exchange(game_device_data.sr_active) && game_device_data.sr_active)
+      // SMAA T2x runs on the upscalers' motion vectors and gives way to an upscaler. Turned off, its frames go, and the motion vectors
+      // go as when no upscaler is picked.
+      game_device_data.mv_filled = false;
+      const bool t2x_was_active = game_device_data.t2x_active;
+      game_device_data.t2x_active = g_smaa_enable && g_smaa_t2x && !game_device_data.sr_active && !game_device_data.msaa_active;
+      if (t2x_was_active && !game_device_data.t2x_active)
+      {
+         game_device_data.ReleaseT2xFrames();
+         device_data.release_sr_resources = true;
+      }
+      const bool mv_active = game_device_data.sr_active || game_device_data.t2x_active;
+      if (!game_device_data.mv.active.exchange(mv_active) && mv_active)
       {
          game_device_data.mv.constants.Restart();
       }
@@ -1291,6 +1442,7 @@ public:
    {
       reshade::get_config_value(nullptr, NAME, "MSAAResolveEnable", g_msaa_resolve_enable);
       reshade::get_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
+      reshade::get_config_value(nullptr, NAME, "SMAAT2x", g_smaa_t2x);
       reshade::get_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
 #if DEVELOPMENT // Development settings only (see "DrawImGuiSettings"): a saved "off" must not outlive its control
       reshade::get_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
@@ -1299,9 +1451,6 @@ public:
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", cb_luma_global_settings.GameSettings.VideoAutoHDRBoost);
       reshade::get_config_value(nullptr, NAME, "Dithering", cb_luma_global_settings.GameSettings.Dithering);
-      reshade::get_config_value(nullptr, NAME, "Contrast", cb_luma_global_settings.GameSettings.Contrast);
-      reshade::get_config_value(nullptr, NAME, "Saturation", cb_luma_global_settings.GameSettings.Saturation);
-      reshade::get_config_value(nullptr, NAME, "HighlightsDesaturation", cb_luma_global_settings.GameSettings.HighlightsDesaturation);
       reshade::get_config_value(nullptr, NAME, "ColorGradingIntensity", cb_luma_global_settings.GameSettings.ColorGradingIntensity);
       reshade::get_config_value(nullptr, NAME, "BloomIntensity", cb_luma_global_settings.GameSettings.BloomIntensity);
    }
@@ -1324,6 +1473,10 @@ public:
       ImGui::BeginDisabled(gd.sr_active);
       DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own MSAA (or alone with it off; not used with DLAA/FSR/XeSS).", gd.sr_active);
       ImGui::EndDisabled();
+      const bool t2x_unavailable = gd.sr_active || msaa_active;
+      ImGui::BeginDisabled(!g_smaa_enable || t2x_unavailable);
+      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLAA/FSR/XeSS or the game's MSAA (Anti-Aliasing in the game's options).", t2x_unavailable);
+      ImGui::EndDisabled();
 #if DEVELOPMENT
       // Predication only relaxes the edge threshold back to ULTRA's on geometry, never below: off is strictly worse (MoH 2010, ME1)
       if (g_smaa_enable)
@@ -1343,9 +1496,6 @@ public:
 
       // Read in Gather_0x726E6E78.ps_5_0.hlsl
       ImGui::SeparatorText("Grade");
-      DrawSettingSlider("Contrast", "Contrast", &gs.Contrast, default_luma_global_game_settings.Contrast, 0.f, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
-      DrawSettingSlider("Saturation", "Saturation", &gs.Saturation, default_luma_global_game_settings.Saturation, 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).");
-      DrawSettingSlider("Highlights Desaturation", "HighlightsDesaturation", &gs.HighlightsDesaturation, default_luma_global_game_settings.HighlightsDesaturation, 0.f, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
       DrawSettingSlider("Color Grading Intensity", "ColorGradingIntensity", &gs.ColorGradingIntensity, default_luma_global_game_settings.ColorGradingIntensity, 0.f, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
       DrawSettingSlider("Bloom Intensity", "BloomIntensity", &gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, 0.f, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
 
@@ -1468,13 +1618,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       samplers_upgrade_mode = 3;
       force_upgrade_linear_samplers = true;
 
-      // Every target is A8R8G8B8 (FUN_00a21920, offline), the G-buffer too. Only the output chain is upgraded for now, by its writers: the
-      // gather pass (its bloom adds values above 1 to the curve's output, which the 8-bit target clipped) and the copy into the canvas.
-      // Indirect, as TW2 and Bayonetta (changing dgVoodoo's own creation formats breaks its bookkeeping); their resolves follow by chain.
-      // The scene targets before the gather stay 8-bit until a capture proves which ones carry the scene.
+      // Every target is A8R8G8B8 (FUN_00a21920, offline), the G-buffer too. The scene and post targets become fp16 mirrors at creation
+      // (the swapchain sized and shaped ones: the bloom pyramid, the exposure readback and the shadow maps stay 8-bit), as Bayonetta's:
+      // the engine scales its lights down to fit the 8-bit targets and the grade's g_MulColor scales them back, so the scene's highlights
+      // carry values above 1. Indirect, as TW2 and Bayonetta (changing dgVoodoo's own creation formats breaks its bookkeeping); their
+      // resolves follow by chain. The gather target and the canvas copy also upgrade by their writers: dgVoodoo creates its D3D9 back
+      // buffer before it sizes the swapchain, so the size filters miss it at creation.
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
       enable_indirect_texture_format_upgrades = true;
-      texture_format_upgrades_on_creation = false;
       enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::DirectDependencies;
       texture_upgrade_formats = {
          reshade::api::format::r8g8b8a8_typeless,

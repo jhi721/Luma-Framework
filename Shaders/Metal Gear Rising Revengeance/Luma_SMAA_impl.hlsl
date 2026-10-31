@@ -5,19 +5,32 @@
 // Edges are detected on the gamma snapshot, the neighborhood blend filters it in linear light and re-encodes. The predication mask
 // comes from Luma_MGRR_DepthEdges.
 
+// "SMAA_T2X" 1 is SMAA T2x (main.cpp's "MGRR SMAA T2x" passes, Bayonetta's): the scene jitters by a quarter pixel diagonally in two
+// phases, the blending weights take the phase's area texture subsamples, the neighborhood blend stays in linear light with the
+// velocity length in alpha, and the resolve blends it with the previous frame reprojected by Luma's motion vectors. The output hook
+// below runs at the resolve.
+#ifndef SMAA_T2X
+#define SMAA_T2X 0
+#endif
+
 #include "Includes/Common.hlsl"
 
 cbuffer SmaaMetricsCB : register(b1)
 {
-   float4 SmaaRtMetrics; // 1/W, 1/H, W, H
-   // x = predication threshold scale: 2 with the predication mask, 1 with a null one (plain ULTRA threshold). yzw unused.
-   float4 SmaaPredication;
+   CB::SmaaMetrics smaa_metrics;
 }
 
-#define SMAA_RT_METRICS SmaaRtMetrics
+#if SMAA_T2X
+#define SMAA_SUBSAMPLE_INDICES smaa_metrics.subsample_indices
+#define SMAA_REPROJECTION      1
+// The motion vector target holds the UV delta from the current to the previous position. SMAA's velocity is the opposite.
+#define SMAA_DECODE_VELOCITY(sample) (-(sample).rg)
+#endif
+
+#define SMAA_RT_METRICS smaa_metrics.rt_metrics
 #define SMAA_PRESET_ULTRA
 #define SMAA_PREDICATION       1
-#define SMAA_PREDICATION_SCALE SmaaPredication.x
+#define SMAA_PREDICATION_SCALE smaa_metrics.predication.x
 // Predication is live (CS mask, SCALE 2.0), so both values below are load-bearing: flat = SCALE * SMAA_THRESHOLD =
 // 0.10, silhouette = flat * (1 - STRENGTH) = 0.05 (ULTRA base). SMAA_PREDICATION_THRESHOLD 0.5 is scale-free; tune the CS.
 #define SMAA_PREDICATION_STRENGTH  0.5
@@ -31,6 +44,7 @@ cbuffer SmaaMetricsCB : register(b1)
 
 // SMAAEdgeDetection: tex0 = the gamma snapshot, tex1 = the predication edge-ness in [0,1] (null: reads 0, scale 1)
 // SMAANeighborhoodBlending: tex0 = the same snapshot, filtered in linear light, tex1 = blendTex; re-encoded to the target's gamma
+// (with T2x the alpha is the velocity length at the resolve, which main.cpp doesn't write)
 #define SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR         1
 #define SMAA_NEIGHBORHOOD_OUTPUT(color, position) color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
 
