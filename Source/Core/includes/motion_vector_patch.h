@@ -483,7 +483,9 @@ namespace MotionVectorPatch
       const bool additive = mode == ReactiveMode::ADDITIVE;
       const bool motion_vectors = mode == ReactiveMode::ALPHA_MOTION_VECTORS;
       const bool mask = !motion_vectors && reactive_slot != UINT32_MAX;
-      if (outputs.size() != 1 || (!mask && !motion_vectors))
+      // The game's other targets are written as they were (UE3's translucents also write o1.x, Mass Effect Legendary Edition); the
+      // blended color, and its alpha, must then be RT0's
+      if ((outputs.size() > 1 && target.reg != 0) || (!mask && !motion_vectors))
          return (*error = "targets", std::vector<uint8_t>());
       // The color is copied whole and its alpha read: a float4 target only (not e.g. dgVoodoo's own R32_UINT .x outputs, where the
       // NVIDIA driver's compiler crashed on the result and removed the device)
@@ -532,8 +534,10 @@ namespace MotionVectorPatch
                uint32_t& token = declarations[offset + token_position - instruction.begin];
                if (DECODE_D3D10_SB_OPERAND_TYPE(token) != D3D10_SB_OPERAND_TYPE_OUTPUT)
                   return true;
-               if (index_position == no_index || DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, token) != D3D10_SB_OPERAND_INDEX_IMMEDIATE32 || tokens[index_position] != target.reg)
+               if (index_position == no_index || DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, token) != D3D10_SB_OPERAND_INDEX_IMMEDIATE32)
                   return supported = false;
+               if (tokens[index_position] != target.reg)
+                  return true;
                token = (token & ~D3D10_SB_OPERAND_TYPE_MASK) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_TEMP);
                declarations[offset + index_position - instruction.begin] = color;
                return true; });
