@@ -587,6 +587,7 @@ static bool g_mv_enable = false;
 static bool g_mv_debug_view = false;
 static bool g_mv_force_jitter = false;   // The projection jitter without an upscaler
 static bool g_mv_disable_jitter = false; // No projection jitter under the upscaler (A/B of jitter-dependent artifacts)
+static int g_sr_jitter_phases = 0;       // Halton phase count override (A/B of the period's flicker), 0 = the upscaler's
 static bool g_mv_skip_fill = false;      // No camera fill (the debug view then shows the patched draws alone)
 static bool g_mv_dump = false;           // One shot: the motion vectors, depth and cameras to "Luma_MV_Dump", written at present
 static bool g_mv_probe = false;          // The scene's readers to ReShade.log (see "OnDrawOrDispatch"): reads every draw's bindings
@@ -607,6 +608,7 @@ static constexpr float g_sr_reactive_threshold = 0.6f;
 static constexpr bool g_mv_enable = false;
 static constexpr bool g_mv_force_jitter = false;
 static constexpr bool g_mv_disable_jitter = false;
+static constexpr int g_sr_jitter_phases = 0;
 static constexpr bool g_mv_buffer_filter = true;
 static constexpr bool g_mv_constants_pool = true;
 static constexpr bool g_mv_read_sizes = true;
@@ -1860,6 +1862,11 @@ class MassEffectLE final : public Game
       jitter &= perf_test_modes[Perf::g_test].motion_vector_draws >= 1; // "Performance Test" without jitter draws
 #endif
       game_device_data.mv_jitter = (jitter ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{});
+      if (jitter && g_sr_jitter_phases > 0)
+      {
+         const unsigned int phase = cb_luma_global_settings.FrameIndex % unsigned(g_sr_jitter_phases);
+         game_device_data.mv_jitter = {SR::HaltonSequence(phase, 2), SR::HaltonSequence(phase, 3)};
+      }
       D3D11_VIEWPORT viewport = {};
       UINT viewport_count = 1;
       native_device_context->RSGetViewports(&viewport_count, &viewport);
@@ -2880,7 +2887,7 @@ public:
       Mcp::RegisterValues({{"render_scale", &EngineScale::g_render_scale, EngineScale::MIN_RENDER_SCALE, 1.f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f},
          {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_depth_scale", &g_gtao_depth_scale, 10.f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 3.f},
          {"gtao_history_weight", &g_gtao_history_weight, 0.f, 0.98f}, {"sr_reactive_scale", &g_sr_reactive_scale, 0.f, 4.f}, {"sr_reactive_threshold", &g_sr_reactive_threshold, 0.f, 1.f}});
-      Mcp::RegisterInts({{"opt_shadow_check", &g_opt_shadow_check, 0, 1000}});
+      Mcp::RegisterInts({{"opt_shadow_check", &g_opt_shadow_check, 0, 1000}, {"sr_jitter_phases", &g_sr_jitter_phases, 0, 64}});
       Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}, {"gtao_temporal", &g_gtao_temporal, 0, 2}, {"sr_reactive_debug_view", &g_sr_reactive_debug_view, 0, 3},
          { "perf_test",
             &Perf::g_test,
