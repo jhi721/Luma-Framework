@@ -132,15 +132,16 @@ static bool g_mv_debug_view = false;     // Core's debug draw of the motion vect
 static bool g_mv_force_jitter = false;   // The projection jitter without an upscaler
 static bool g_bound_state_check = false; // The tracked bindings against the bound ones ("mv.bound_state_mismatches")
 static bool g_sr_reactive_enable = true;
-static float g_sr_reactive_scale = 1.f;      // The alpha blended draws' reactivity, scaled (AMD's default 1)
-static float g_sr_reactive_threshold = 0.5f; // Under it 0, over it 0.9 (AMD's 0.2; Mass Effect 2007's and Borderlands 2's 0.5); 0: the scaled reactivity, capped at 0.9
+// The additive draws' reactivity, scaled and capped at 0.9 (laser cores write ~0.3, glows 0.05-0.2: under a threshold they smeared)
+static float g_sr_reactive_scale = 2.f;
+static float g_sr_reactive_threshold = 0.5f; // The alpha blended draws': under it 0, over it 0.9 (Mass Effect 2007's and Borderlands 2's 0.5)
 static bool g_sr_reactive_debug_view = false;
 #else
 constexpr bool g_mv_enable = false;
 constexpr bool g_mv_force_jitter = false;
 constexpr bool g_bound_state_check = false;
 constexpr bool g_sr_reactive_enable = true;
-constexpr float g_sr_reactive_scale = 1.f;
+constexpr float g_sr_reactive_scale = 2.f;
 constexpr float g_sr_reactive_threshold = 0.5f;
 #endif
 // "DrawWithMotionVectors" refusals, counted per frame in DEVELOPMENT ("mv.rejected.*")
@@ -572,6 +573,10 @@ struct BayonettaGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11UnorderedAccessView> mv_reactive_uav;
    com_ptr<ID3D11Texture2D> mv_transparency;
    com_ptr<ID3D11UnorderedAccessView> mv_transparency_uav;
+   // The additive draws' mask of the previous frame, which the fill reads and replaces: a laser that went out wrote nothing this
+   // frame but is still in the upscaler's history (R32_FLOAT: typed UAV loads of other formats are optional in D3D11)
+   com_ptr<ID3D11Texture2D> mv_reactive_previous;
+   com_ptr<ID3D11UnorderedAccessView> mv_reactive_previous_uav;
    // What the alpha blended draws wrote (x reactive, y transparency & composition; max blended, see "OnCreateBlendState"), read by the
    // fill. Created when a mask user first runs, gone "IDLE_RELEASE_FRAMES" after the fill last wrote them.
    com_ptr<ID3D11Texture2D> mv_reactive_target;
@@ -750,6 +755,8 @@ struct BayonettaGameDeviceData final : public GameDeviceData
       mv_reactive_uav.reset();
       mv_transparency.reset();
       mv_transparency_uav.reset();
+      mv_reactive_previous.reset();
+      mv_reactive_previous_uav.reset();
       mv_reactive_target.reset();
       mv_reactive_target_rtv.reset();
       mv_reactive_target_srv.reset();
@@ -1838,9 +1845,16 @@ class Bayonetta final : public Game
       auto* const fill_shader = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta Motion Vector Fill CS"));
       if (!fill_shader || !gd.mv_camera || !gd.prepass_drawn || !gd.prepass_depth_srv)
          return false;
+#if ENABLE_LUMA_TAA
+      // Luma TAA without its 2x history (Medium; the game renders at the output size, so no TAAU) flickered on lasers at the High
+      // scale in the TAA lab: half of it balanced flicker and smear (_tools/taa_lab/reactive_bayo_eval.py, 2026-10-31)
+      const float reactive_scale = (device_data.sr_type == SR::Type::LumaTAA && LumaTAA::quality.load() < LumaTAA::history_2x_quality ? 0.5f : 1.f) * g_sr_reactive_scale;
+#else
+      const float reactive_scale = g_sr_reactive_scale;
+#endif
       CB::MotionVectorFillConstants constants = {
          .jitter_ndc = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1]},
-         .reactive_scale = g_sr_reactive_scale,
+         .reactive_scale = reactive_scale,
          .reactive_threshold = g_sr_reactive_threshold,
          .reactive_enabled = (write_reactive ? 1.f : 0.f),
       };
@@ -1854,7 +1868,8 @@ class Bayonetta final : public Game
       native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
       ID3D11Buffer* const buffer = gd.mv_fill_buffer.get();
       ID3D11ShaderResourceView* const srvs[2] = {gd.prepass_depth_srv.get(), write_reactive ? gd.mv_reactive_target_srv.get() : nullptr};
-      ID3D11UnorderedAccessView* const uavs[4] = {gd.mv_uav.get(), gd.mv_device_depth_uav.get(), write_reactive ? gd.mv_reactive_uav.get() : nullptr, write_reactive ? gd.mv_transparency_uav.get() : nullptr};
+      ID3D11UnorderedAccessView* const uavs[5] = {gd.mv_uav.get(), gd.mv_device_depth_uav.get(), write_reactive ? gd.mv_reactive_uav.get() : nullptr, write_reactive ? gd.mv_transparency_uav.get() : nullptr,
+         write_reactive ? gd.mv_reactive_previous_uav.get() : nullptr};
       native_device_context->CSSetConstantBuffers(0, 1, &buffer);
       native_device_context->CSSetShaderResources(0, UINT(std::size(srvs)), srvs);
       native_device_context->CSSetUnorderedAccessViews(0, UINT(std::size(uavs)), uavs, nullptr);
@@ -1898,6 +1913,8 @@ class Bayonetta final : public Game
             gd.mv_reactive_uav.reset();
             gd.mv_transparency.reset();
             gd.mv_transparency_uav.reset();
+            gd.mv_reactive_previous.reset();
+            gd.mv_reactive_previous_uav.reset();
             desc = CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_R8_UNORM, gd.mv_scene_size.x, gd.mv_scene_size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
             if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, desc, &gd.mv_reactive)))
             {
@@ -1907,9 +1924,16 @@ class Bayonetta final : public Game
             {
                native_device->CreateUnorderedAccessView(gd.mv_transparency.get(), nullptr, &gd.mv_transparency_uav);
             }
+            const CD3D11_TEXTURE2D_DESC previous_desc(DXGI_FORMAT_R32_FLOAT, gd.mv_scene_size.x, gd.mv_scene_size.y, 1, 1, D3D11_BIND_UNORDERED_ACCESS);
+            if (SUCCEEDED(native_device->CreateTexture2D(&previous_desc, nullptr, &gd.mv_reactive_previous)) &&
+                SUCCEEDED(native_device->CreateUnorderedAccessView(gd.mv_reactive_previous.get(), nullptr, &gd.mv_reactive_previous_uav)))
+            {
+               constexpr float zero[4] = {};
+               native_device_context->ClearUnorderedAccessViewFloat(gd.mv_reactive_previous_uav.get(), zero);
+            }
          }
       }
-      const bool write_reactive = reactive && gd.mv_reactive_uav && gd.mv_transparency_uav;
+      const bool write_reactive = reactive && gd.mv_reactive_uav && gd.mv_transparency_uav && gd.mv_reactive_previous_uav;
       const bool filled = std::exchange(gd.mv_fill_pending, false) && FillMotionVectors(native_device, native_device_context, device_data, write_reactive);
       gd.mv_filled = filled;
       // The upscaler's depth comes from the fill
