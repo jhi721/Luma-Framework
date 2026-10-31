@@ -950,20 +950,7 @@ public:
                   com_ptr<ID3D11Resource> color;
                   rtvs[0]->GetResource(&color);
                   offered = color == game_device_data.mv.scene_color || color == game_device_data.scene_color_hints[0] || color == game_device_data.scene_color_hints[1];
-#if DEVELOPMENT
-                  if (!offered)
-                  {
-                     Mcp::Annotate(cmd_list_data, "mv_offer_color", int(uint32_t(reinterpret_cast<uintptr_t>(color.get()))));
-                     Mcp::Annotate(cmd_list_data, "mv_offer_hint", int(uint32_t(reinterpret_cast<uintptr_t>(game_device_data.scene_color_hints[0].get()))));
-                  }
-#endif
                }
-#if DEVELOPMENT
-               else if (!offered)
-               {
-                  Mcp::Annotate(cmd_list_data, "mv_offer_blend", int(game_device_data.depth_write));
-               }
-#endif
                const bool motion_vectors = offered && SceneMotionVectors::DrawWithMotionVectors<MotionVectorGame>(&game_device_data.mv, native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv.get());
                // An alpha blending state blends the motion vector target by the alpha written there: a draw that doesn't write it
                // must not have it bound
