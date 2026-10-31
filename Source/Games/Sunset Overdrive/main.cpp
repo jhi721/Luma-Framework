@@ -368,8 +368,8 @@ public:
       native_shaders_definitions.emplace(shader_hash_ReactiveMask, ShaderDefinition{"Luma_SO_ReactiveMask", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(shader_hash_SRExposure, ShaderDefinition{"Luma_SO_SRExposure", reshade::api::pipeline_subobject_type::compute_shader});
 
-      // "ToneMap.hlsl": 0 the vanilla curve's shoulder stretched to the peak, 1 PsychoV31
-      hdr_tone_mapper_names = {"Vanilla+", "PsychoV-31"};
+      // "ToneMap.hlsl": 0 PsychoV31, 1 DICE by channel in PQ
+      hdr_tone_mapper_names = {"PsychoV-31", "DICE by channel (PQ)"};
 
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
