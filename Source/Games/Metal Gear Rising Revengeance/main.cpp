@@ -30,7 +30,7 @@
 // in its place (seen in game), follows. In game (2026-10-28, title screen, MSAA 4x): it writes the render resolution scene target (MSAA),
 // the movie and the UI draw on that target, it is resolved, then the game's copy (filtershadercopytex) scales it into dgVoodoo's D3D9
 // back buffer (the canvas, the output resolution), which is resolved and presented by dgVoodoo's blit.
-const ShaderHashesList shader_hashes_Gather = {.pixel_shaders = {0x726E6E78, 0x562F84D7, 0xDD1B4599, 0xCE6E1597, 0x970F67BD, 0xF263AE82}};
+const ShaderHashesList shader_hashes_Gather = {.pixel_shaders = {0x726E6E78, 0x562F84D7, 0xDD1B4599, 0xCE6E1597, 0x970F67BD, 0xF263AE82, 0xC9453909, 0x0CDD2BDB, 0x252B2AE7, 0xD7D5CA35, 0xB3BB0D35, 0xFF4AFD3B}};
 // filtershadercopytex, the copy into the canvas
 const ShaderHashesList shader_hashes_Copy = {.pixel_shaders = {0x91A6C437}};
 // dgVoodoo's present blit of the canvas into the swapchain (Bayonetta's hash)
@@ -1498,6 +1498,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
               {"CE6E1597", "Gather Noise (grade + bloom)"},
               {"970F67BD", "Gather Noise (grade + bloom)"},
               {"F263AE82", "Gather Noise (grade + bloom)"},
+              {"C9453909", "Gather Noise, PC Fix noise off (grade + bloom)"},
+              {"0CDD2BDB", "Gather Noise, PC Fix noise off (grade + bloom)"},
+              {"252B2AE7", "Gather Noise, PC Fix noise off (grade + bloom)"},
+              {"D7D5CA35", "Gather Noise, no noise texture (grade + bloom)"},
+              {"B3BB0D35", "Gather Noise, no noise texture (grade + bloom)"},
+              {"FF4AFD3B", "Gather Noise, no noise texture (grade + bloom)"},
               {"52502A77", "Video Y'CbCr + A (hwshaderpftyuva)"},
               {"C1C26B88", "Video Y'CbCr (hwshaderpftyuv)"},
               {"14F88B41", "FXAA (filter09)"},

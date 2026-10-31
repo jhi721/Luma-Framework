@@ -41,7 +41,8 @@ SamplerState s3_s : register(s3);
 #define GATHER_ALPHA_TEST 0
 #endif
 // 1: "FilterShaderGatherNoise" (GatherNoise_0xCE6E1597), the same pass times a noise texture: g_NoiseOffset (c189 = cb4[197]) scales
-// and offsets its UV, g_NoiseColor (c190 = cb4[198]) its value and .w its strength
+// and offsets its UV, g_NoiseColor (c190 = cb4[198]) its value and .w its strength. 2: the same with no texture on s3 (dgVoodoo's
+// GatherNoise_0xD7D5CA35 translation reads (0, 0, 0, 1) there)
 #ifndef GATHER_NOISE
 #define GATHER_NOISE 0
 #endif
@@ -90,7 +91,11 @@ void main(DGV_MAIN_SIGNATURE)
    const float3 graded = ((curved - luma) * saturation + curved) * cb4[192].xyz + gradient;
    o0 = (float4(graded, 0.0) + bloom * cb4[195] * LumaSettings.GameSettings.BloomIntensity) * cb4[196];
 #if GATHER_NOISE
+#if GATHER_NOISE == 2
+   const float4 noise = float4(0.0, 0.0, 0.0, 1.0);
+#else
    const float4 noise = ApplyDgvMask(t3.Sample(s3_s, v5.xy * cb4[197].xy + cb4[197].zw), cb3[50], cb3[51]);
+#endif
    o0 *= 1.0 + cb4[198].w * (noise * cb4[198] - 1.0);
 #endif
 
