@@ -611,6 +611,11 @@ float4 LoadHistory2x(bool from_tile, int2 texel, int2 tile_origin, int2 max_texe
    }
    return value;
 }
+#elif TAA_UPSCALE
+// This frame's colors of the group's render pixels and their 3x3 neighborhoods: a group's 8x8 output pixels fall in at most 8
+// render pixels per axis (9 with the rounding of their positions at a scale of ~1)
+#define COLOR_TILE (TAA_GROUP_SIZE + 3)
+groupshared float3 color_tile[COLOR_TILE * COLOR_TILE];
 #endif
 
 [numthreads(TAA_GROUP_SIZE, TAA_GROUP_SIZE, 1)] void reconstruct_previous_depth_cs(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_GroupID, uint group_index : SV_GroupIndex) {
@@ -707,10 +712,16 @@ void shading_change_cs(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 gro
    if (!(Flags & TAA_FLAG_RESET) && all(previous_position >= 0.0) && all(previous_position < RenderResolution))
    {
       const int2 previous_pixel = int2(previous_position);
-      float previous[5];
+      // The cross from two gathers, at the corners above left and below right of its center. The luminance is at the render
+      // resolution, so clamp addressing returns the same edge texels as clamped loads. Gather order: x bottom left, y bottom
+      // right, z top right, w top left.
+      const float2 previous_uv = previous_pixel * InvRenderResolution;
+      const float4 top_left = PreviousLuminance.GatherRed(LinearClampSampler, previous_uv);
+      const float4 bottom_right = PreviousLuminance.GatherRed(LinearClampSampler, previous_uv + InvRenderResolution);
+      float previous[5] = {top_left.y, top_left.x, bottom_right.z, top_left.z, bottom_right.x}; // In "cross_offsets" order
       [unroll] for (uint previous_tap = 0; previous_tap < 5; previous_tap++)
       {
-         previous[previous_tap] = max(PreviousLuminance.Load(int3(clamp(previous_pixel + cross_offsets[previous_tap], 0, max_pixel), 0)), TAA_SHADING_CHANGE_EPSILON);
+         previous[previous_tap] = max(previous[previous_tap], TAA_SHADING_CHANGE_EPSILON);
       }
       const float difference = SmallestCrossDifference(current, previous);
       change = float2(difference, sign(difference));
@@ -754,9 +765,9 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
 // clang-format on
 {
 #if TAA_UPSCALE
-   const int2 output_pixel = dispatch_thread_id.xy;
-   if (any(output_pixel >= int2(OutputResolution)))
-      return;
+   // The group shares its colors, so every thread reaches the barrier: threads past the edge resolve the edge pixel again
+   // and write the same values
+   const int2 output_pixel = min(int2(dispatch_thread_id.xy), int2(OutputResolution) - 1);
    const float2 render_scale = OutputResolution * InvRenderResolution; // Output pixels per render pixel
    // The output pixel's center in render pixels, and the render pixel it falls in
    const float2 sample_center = (output_pixel + 0.5) / render_scale;
@@ -800,10 +811,29 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
       const uint color_index = group_index + color_load * TAA_GROUP_SIZE * TAA_GROUP_SIZE;
       if (color_index < COLOR_TILE * COLOR_TILE)
       {
-         color_tile[color_index] = ToHalfRange(SourceColor.Load(int3(clamp(group_origin - 1 + int2(color_index % COLOR_TILE, color_index / COLOR_TILE), 0, max_pixel), 0)));
+         float3 color = SourceColor.Load(int3(clamp(group_origin - 1 + int2(color_index % COLOR_TILE, color_index / COLOR_TILE), 0, max_pixel), 0));
+         // One test of the whole color and the guard behind a branch: faster here than its select per channel
+         [branch] if (!all(abs(color) <= FLT16_MAX))
+         {
+            color = ToHalfRange(color);
+         }
+         color_tile[color_index] = color;
       }
    }
    const int color_tile_center = (pixel.y - group_origin.y + 1) * COLOR_TILE + (pixel.x - group_origin.x + 1);
+#elif TAA_UPSCALE
+   // The 3x3 neighborhoods overlap more when upscaling (~2.25 output pixels per render pixel at 1.5x): the group loads its
+   // render pixels once into "color_tile", from the render pixel of its first output pixel, minus the 3x3's border
+   const int2 group_origin = min(int2((int2(group_id.xy) * TAA_GROUP_SIZE + 0.5) / render_scale), max_pixel) - 1;
+   [unroll] for (uint color_load = 0; color_load * TAA_GROUP_SIZE * TAA_GROUP_SIZE < COLOR_TILE * COLOR_TILE; color_load++)
+   {
+      const uint color_index = group_index + color_load * TAA_GROUP_SIZE * TAA_GROUP_SIZE;
+      if (color_index < COLOR_TILE * COLOR_TILE)
+      {
+         color_tile[color_index] = ToHalfRange(SourceColor.Load(int3(clamp(group_origin + int2(color_index % COLOR_TILE, color_index / COLOR_TILE), 0, max_pixel), 0)));
+      }
+   }
+   const int color_tile_center = (pixel.y - group_origin.y) * COLOR_TILE + (pixel.x - group_origin.x);
 #endif
 
    float closest_depth;
@@ -877,7 +907,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
    }
 #endif
 
-#if TAA_HISTORY_2X
+#if TAA_HISTORY_2X || TAA_UPSCALE
    GroupMemoryBarrierWithGroupSync(); // The tiles are loaded
 #endif
 
@@ -977,7 +1007,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
    {
       [unroll] for (int x = -1; x <= 1; x++)
       {
-#if TAA_HISTORY_2X
+#if TAA_HISTORY_2X || TAA_UPSCALE
          const float3 color = color_tile[color_tile_center + y * COLOR_TILE + x];
 #else
          const float3 color = ToHalfRange(SourceColor.Load(int3(clamp(pixel + int2(x, y), 0, max_pixel), 0)));
@@ -1216,6 +1246,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
    }
    float3 output_sum = 0.0;
    bool any_history = false;
+   float4 resolved_texels[4]; // Stored after the loop, past their guard
    [unroll] for (uint sub = 0; sub < 4; sub++)
    {
       const int2 sub_offset = int2(sub & 1, sub >> 1);
@@ -1249,11 +1280,23 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
       }
       // Rejected history (depth clip, offscreen) is replaced even in texels that got no sample this frame
       const float blend = ((history_samples > 0.0) ? (history_samples / (history_samples + sample_weight)) : 0.0) * history_validity;
-      const float3 resolved_2x = ToHalfRange(lerp(current_2x, history_2x, blend));
+      const float3 resolved_2x = lerp(current_2x, history_2x, blend);
       const float accumulated = history_weight_2x + sample_weight;
-      OutputHistory[pixel * 2 + sub_offset] = float4(resolved_2x, accumulated / (accumulated + 1.0));
-      output_sum += resolved_2x;
+      resolved_texels[sub] = float4(resolved_2x, accumulated / (accumulated + 1.0));
       any_history = any_history || (history_weight_2x > 0.0);
+   }
+   // The guard of the 4 texels behind one branch on their half range test: faster than its select per channel
+   [branch] if (!(all(abs(resolved_texels[0].rgb) <= FLT16_MAX) && all(abs(resolved_texels[1].rgb) <= FLT16_MAX) && all(abs(resolved_texels[2].rgb) <= FLT16_MAX) && all(abs(resolved_texels[3].rgb) <= FLT16_MAX)))
+   {
+      [unroll] for (uint fix = 0; fix < 4; fix++)
+      {
+         resolved_texels[fix].rgb = ToHalfRange(resolved_texels[fix].rgb);
+      }
+   }
+   [unroll] for (uint store = 0; store < 4; store++)
+   {
+      OutputHistory[pixel * 2 + int2(store & 1, store >> 1)] = resolved_texels[store];
+      output_sum += resolved_texels[store].rgb;
    }
    OutputColor[pixel] = float4(output_sum * 0.25, 1.0);
 #else
