@@ -20,7 +20,7 @@
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
 #define SMAA_SMOOTH_U_SHAPES 0
 // A third "Super Resolution" choice next to the bridge's DLSS and FSR 3, drawn in process on any GPU, upscaling under the render scale
-#define ENABLE_LUMA_TAA 0
+#define ENABLE_LUMA_TAA 1
 #define ENABLE_RCAS 1
 // SMAA runs POST-final-grade via the post-draw callback, so it needs original_draw_dispatch_func non-null.
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1

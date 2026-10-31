@@ -22,7 +22,7 @@
 #define ENABLE_SMAA 1     // SMAA ULTRA (+RCAS) injected post-tonemap; core auto-registers the 6 "SMAA ..." passes from Luma_SMAA_impl
 #define ENABLE_RCAS 1     // core registers the "RCAS PS" pass, drawn by DrawRCAS after SMAA or the upscaler
 #define ENABLE_BLOOM 1    // core auto-registers the Bloom VS/Prefilter/Downsample/Upsample passes -> Luma_Bloom_impl
-#define ENABLE_LUMA_TAA 0 // A third "Super Resolution" choice next to the bridge's DLSS and FSR 3, drawn in process on any GPU
+#define ENABLE_LUMA_TAA 1 // A third "Super Resolution" choice next to the bridge's DLSS and FSR 3, drawn in process on any GPU
 // SMAA runs POST-tonemap through the post-draw callback (see RunPostTonemapSMAA); needs original_draw_dispatch_func.
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")

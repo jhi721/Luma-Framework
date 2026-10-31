@@ -22,6 +22,8 @@
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
 #define SMAA_SMOOTH_U_SHAPES 0
 #define ENABLE_RCAS 1
+// A third "Super Resolution" choice next to DLAA and FSR 3, drawn in process on any GPU, on the same inputs
+#define ENABLE_LUMA_TAA 1
 // The motion vector and jitter draws wrap the game's own draws, so they need "original_draw_dispatch_func"
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
@@ -2403,7 +2405,7 @@ public:
             {
                std::string aa = g_smaa_enable ? "SMAA" : "None";
                if (IsSRActive(device_data))
-                  aa = device_data.sr_type == SR::Type::FSR ? "FSR" : (dlss_render_preset != 0 ? std::format("DLSS_{}", char('A' + dlss_render_preset - 1)) : "DLSS_Default");
+                  aa = device_data.sr_type == SR::Type::FSR ? "FSR" : (device_data.sr_type == SR::Type::LumaTAA ? "LumaTAA" : (dlss_render_preset != 0 ? std::format("DLSS_{}", char('A' + dlss_render_preset - 1)) : "DLSS_Default"));
                // In "PerfColumn" order
                const Perf::Sweep<PERF_COLUMN_COUNT>::Row row = {stats.frame.Average(), stats.scene.Average(), stats.sr.Average(), window.HookMs(), stats.fill.Average(), stats.dof.Average()};
                reshade::log::message(reshade::log::level::info, std::format("[BL Perf] mode=\"{}\" aa={} hook_timers={} gtao={} rcas={:.2f} output={}x{} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) sr avg/max={:.3f}/{:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame fill={:.3f} dof={:.3f} ms ({}) samples={}/{} disjoint={}", perf_test_modes[Perf::g_test].name, aa, Perf::g_hook_timers, g_gtao_enable, g_rcas_sharpness, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y), row[PERF_COLUMN_FRAME], stats.frame.max_ms, row[PERF_COLUMN_SCENE], stats.scene.max_ms, stats.scene.samples, row[PERF_COLUMN_SR], stats.sr.max_ms, stats.sr.samples, window.CpuFrameMs(), row[PERF_COLUMN_HOOKS], row[PERF_COLUMN_FILL], row[PERF_COLUMN_DOF], stats.dof.samples, stats.frame.samples, window.frames, window.disjoint).c_str());

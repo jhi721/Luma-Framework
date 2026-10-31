@@ -19,6 +19,8 @@
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
+// A third "Super Resolution" choice next to the SR bridge's DLSS and FSR 3, drawn in process on any GPU
+#define ENABLE_LUMA_TAA 1
 
 #include "..\..\Core\core.hpp"
 #include "..\..\External\WDK\includes\d3d11TokenizedProgramFormat.hpp"
@@ -1053,6 +1055,12 @@ class MassEffect final : public Game
       return GetGameDeviceData(device_data).sr_active;
    }
 
+   // The reactive mask feeds FSR and Luma TAA; DLSS's current presets ignore it
+   static bool IsReactiveMaskUsed(DeviceData& device_data)
+   {
+      return g_sr_reactive_enable && IsSRActive(device_data) && (device_data.sr_type == SR::Type::FSR || device_data.sr_type == SR::Type::LumaTAA);
+   }
+
    // Motion vectors: a registered vc4 buffer mapped for a whole rewrite, remembered until its Unmap
    static void OnMapBufferRegion(reshade::api::device* device,
       reshade::api::resource resource, uint64_t offset,
@@ -1653,7 +1661,7 @@ class MassEffect final : public Game
       // An alpha blended draw into the scene writes its mask, reactive or transparency & composition (its pixel shader patched,
       // the mask target added past the motion vector one)
       ID3D11PixelShader* reactive_shader = nullptr;
-      if (g_sr_reactive_enable && IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR &&
+      if (IsReactiveMaskUsed(device_data) &&
           gd.mv_reactive_target_rtv && rtvs[0] && rtvs[0] == gd.mv_scene_rtv)
       {
          ClassifyBoundBlend(native_device_context, &gd);
@@ -1889,9 +1897,9 @@ class MassEffect final : public Game
          if (srv_resource != gd.mv_scene_color)
             gd.mv_scene_srv.reset();
       }
-      // The reactive and transparency & composition masks, written by the fill from what the alpha blended draws wrote. FSR only:
-      // DLSS's current presets ignore them (DLSS-Best-Practices TRN-2)
-      const bool reactive = IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR && g_sr_reactive_enable && gd.mv_reactive_target_srv && !g_sr_reactive_skip_fill;
+      // The reactive and transparency & composition masks, written by the fill from what the alpha blended draws wrote. FSR and Luma
+      // TAA only: DLSS's current presets ignore them (DLSS-Best-Practices TRN-2)
+      const bool reactive = IsReactiveMaskUsed(device_data) && gd.mv_reactive_target_srv && !g_sr_reactive_skip_fill;
       if (reactive)
       {
          D3D11_TEXTURE2D_DESC desc = {};
@@ -2069,7 +2077,7 @@ public:
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
 
-      sr_game_tooltip = "Requires Luma-Upscaler.exe next to the game's exe.\n";
+      sr_game_tooltip = "DLSS and FSR require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
 
 #if ENABLE_SMAA
       // Core auto-registers the 6 SMAA passes. Added here: the predication CS turning scene alpha into R16F edge-ness in [0,1].

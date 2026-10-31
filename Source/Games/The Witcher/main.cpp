@@ -10,6 +10,8 @@
 
 #define ENABLE_NGX 0 // NGX is x64-only and the game is 32-bit: DLSS and FSR run in the SR bridge's x64 helper
 #define ENABLE_FIDELITY_SK 0
+// A third "Super Resolution" choice next to the SR bridge's DLSS and FSR 3, drawn in process on any GPU
+#define ENABLE_LUMA_TAA 1
 #define GEOMETRY_SHADER_SUPPORT 0
 // Outside DEVELOPMENT only this define makes original_draw_dispatch_func non-null (the motion vector draws redo the game's)
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
@@ -1151,7 +1153,7 @@ public:
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
 
-      sr_game_tooltip = "Requires Luma-Upscaler.exe next to the game's exe.\n";
+      sr_game_tooltip = "DLSS and FSR require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
 
       // DLSS/FSR: its depth and the camera motion from the scene depth, the CPU copies of vc4 (dgVoodoo maps it or updates it), the
       // motion vector target written by every blend state, and the scene's end before the UI
@@ -1383,7 +1385,7 @@ public:
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: shown off, the saved choice is kept
       const bool sr_active = IsSRActive(device_data);
       ImGui::BeginDisabled(sr_active);
-      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing (the game has none of its own; not used with DLSS/FSR).", sr_active);
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing (the game has none of its own; not used with DLSS/FSR/Luma TAA).", sr_active);
       ImGui::EndDisabled();
 #if DEVELOPMENT
       if (g_smaa_enable && !sr_active)
@@ -1431,7 +1433,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"The Witcher Enhanced Edition\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds DLAA or FSR 3 native anti-aliasing and SMAA anti-aliasing.\n"
+         "It adds DLAA, FSR 3 or Luma TAA native anti-aliasing and SMAA anti-aliasing.\n"
          "It runs through dgVoodoo2 (DirectX 9 -> 11).\n"
          "Thanks to the Luma team and contributors.\n"
          "If you enjoy it, consider donating.");

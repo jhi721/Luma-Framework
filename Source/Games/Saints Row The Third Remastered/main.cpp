@@ -7,7 +7,7 @@
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
 #define SMAA_SMOOTH_U_SHAPES 0
 // A third "Super Resolution" choice next to DLAA and FSR 3, drawn in process on any GPU, on the same inputs
-#define ENABLE_LUMA_TAA 0
+#define ENABLE_LUMA_TAA 1
 
 #include "..\..\Core\core.hpp"
 #if DEVELOPMENT

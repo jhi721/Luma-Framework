@@ -11,6 +11,8 @@
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
 #define SMAA_SMOOTH_U_SHAPES 0
 #define ENABLE_BLOOM 1
+// A "Super Resolution" choice next to DLSS and FSR 3, drawn in process on any GPU, on the same inputs
+#define ENABLE_LUMA_TAA 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
 

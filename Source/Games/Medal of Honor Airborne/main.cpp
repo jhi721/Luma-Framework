@@ -31,6 +31,8 @@
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
+// A third "Super Resolution" choice next to the SR bridge's DLSS and FSR 3, drawn in process on any GPU
+#define ENABLE_LUMA_TAA 1
 
 #include "..\..\Core\core.hpp"
 #include "MotionVectorPatches.h"
@@ -819,7 +821,7 @@ class MedalOfHonorAirborne final : public Game
       gd.mv_blend_state = nullptr;
       gd.mv_blend_opaque = true;
       gd.mv_reactive_blend = 0;
-      gd.mv_fsr_masks = g_sr_reactive_enable && IsSRActive(device_data) && device_data.sr_type == SR::Type::FSR;
+      gd.mv_fsr_masks = g_sr_reactive_enable && IsSRActive(device_data) && (device_data.sr_type == SR::Type::FSR || device_data.sr_type == SR::Type::LumaTAA);
       // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up). None until the upscaler is ready (the bridge's helper
       // starting shows the scene as it is, antialiased with SMAA).
       const SR::InstanceData* sr_instance_data = (IsSRActive(device_data) ? device_data.GetSRInstanceData() : nullptr);
@@ -1130,7 +1132,7 @@ class MedalOfHonorAirborne final : public Game
       if (!vertex_shader)
          return false;
       // An alpha blended draw into the scene writes its mask, reactive or transparency & composition (its pixel shader patched, the
-      // mask target added past the motion vector one). FSR only: DLSS's current presets ignore them (DLSS-Best-Practices TRN-2).
+      // mask target added past the motion vector one). FSR and Luma TAA: DLSS's current presets ignore them (DLSS-Best-Practices TRN-2).
       ID3D11PixelShader* reactive_shader = nullptr;
       if (gd.mv_fsr_masks && gd.mv_reactive_target_rtv && rtvs[0] && rtvs[0] == gd.mv_scene_rtv)
       {
@@ -1648,7 +1650,7 @@ class MedalOfHonorAirborne final : public Game
             gd.mv_scene_srv.reset();
          }
       }
-      // The reactive and transparency & composition masks, written by the fill from what the alpha blended draws wrote (FSR only)
+      // The reactive and transparency & composition masks, written by the fill from what the alpha blended draws wrote (FSR and Luma TAA)
       const bool reactive = gd.mv_fsr_masks && gd.mv_reactive_target_srv;
       if (reactive)
       {
@@ -1776,7 +1778,7 @@ public:
          ShaderDefinition("Luma_MOHA_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
 #endif
 
-      sr_game_tooltip = "Requires Luma-Upscaler.exe next to the game's exe.\n";
+      sr_game_tooltip = "DLSS and FSR require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
 
       // DLSS/FSR: its depth and the camera motion from the scene's alpha, the CPU copies of vc4 (dgVoodoo maps it or updates it), and the
       // motion vector target written by every blend state
