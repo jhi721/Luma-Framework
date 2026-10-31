@@ -46,19 +46,57 @@ Source/Games/**/vcpkg_installed/**
 
 # Compiled, Disassembled and Dumped Shaders
 *.cso
-**/Dump*/**.asm
-**/Dump*/**.spv
-**/Dump*/**.cso
-**/Dump*/**.meta
-**/Dump*/**/*.hlsl
+**/Dump*/**
 
 # Misc
 [Bb]uild/
 [Bb]inaries/
 *.zip
+# Original dgVoodoo2 packages, the package script takes the shipped files from them
+!Source/External/dgVoodoo/*.zip
+# AMD's signed FidelityFX API dlls, shipped with D3D12 FSR
+!Source/External/FidelityFX-API/signedbin/*.dll
+# Intel's signed XeSS dll, shipped with D3D12 XeSS
+!Source/External/XeSS/bin/*.dll
+# NVIDIA's signed Streamline dlls, shipped with the SR bridge helper's DLSS frame generation
+!Source/External/Streamline/bin/*.dll
 *.timestamp
 deploy-*.ps1
 *.log
+
+# Local AI tooling / assistant config - not tracked
+.agents/
+.claude/
+.codex/
+.gemini/
+.mcp.json
+.rtk/
+AGENTS.md
+CLAUDE.md
+.github/copilot-instructions.md
+.github/instructions/
+Scripts/sync-agent-skills.ps1
+Scripts/validate-agent-guidance.ps1
+
+# Local docs, notes and reviews - not tracked
+docs/
+NOTES.md
+NOTES_*.md
+*_NOTES.md
+CODE_REVIEW*.md
+*_REVIEW.md
+*_RESEARCH.md
+*_ANALYSIS.md
+*_VALIDATION.md
+
+# Local tools + scratch - not tracked
+_tools/
+_dlaa_calib/
+Source/Games/**/tools/
+Scripts/dxbc.py
+__pycache__/
+*.pyc
+*.patch
 
 # Forced not ignored (e.g. !./Source/Core/Luma.vcxproj)
 
