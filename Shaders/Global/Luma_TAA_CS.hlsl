@@ -333,6 +333,13 @@
 #ifndef TAA_SHADING_CHANGE_SCALE
 #define TAA_SHADING_CHANGE_SCALE 1.0
 #endif
+// Changes up to this are taken for none, the rest rescaled to 0-1. Stochastic shading noise and static aliasing leave small
+// values with a random sign in the 2x2 blocks (p99 0.04 under 20% per frame noise, 0.1 under 50%), against 0.4 and more for
+// a lighting change, but the weight cap near 1 amplifies them: 0.014 cut the history from 24 to 17.5 samples, and a static
+// textured railing (ME3LE) flickered at 7x DLAA's level. 0 disables.
+#ifndef TAA_SHADING_CHANGE_THRESHOLD
+#define TAA_SHADING_CHANGE_THRESHOLD 0.05
+#endif
 // FSR 3.1's luminance floor and smallest difference (the smallest normal half)
 #define TAA_SHADING_CHANGE_EPSILON 6.10e-5
 
@@ -1071,7 +1078,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
          const float2 block = ShadingChangePyramid.SampleLevel(LinearClampSampler, pyramid_uv, mip);
          shading_change = max(shading_change, abs(block.x * block.y));
       }
-      shading_change = saturate(shading_change * TAA_SHADING_CHANGE_SCALE);
+      shading_change = saturate((shading_change * TAA_SHADING_CHANGE_SCALE - TAA_SHADING_CHANGE_THRESHOLD) / (1.0 - TAA_SHADING_CHANGE_THRESHOLD));
    }
 #endif
    float3 box_min = 0.5 * (min_3x3 + min_cross);
