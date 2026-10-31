@@ -7,15 +7,16 @@
 namespace LumaTAA
 {
    // "TAA_QUALITY" of the resolve: 0 Low, 1 Medium (adds the shading change and a depth clip against the previous frame's depth),
-   // 2 High (adds the 2x history), 3 Ultra (adds a depth clip with a previous depth reconstruction pass). Core's UI sets it (saved as
+   // 2 High (adds the 2x history), 3 Ultra (adds a depth clip against a previous depth reconstructed by the shading change pass). Core's UI sets it (saved as
    // "LumaTAAQuality"); "UpdateSettings()" applies it.
    inline std::atomic<int> quality = 2;
    constexpr const char* quality_names[] = {"Low", "Medium", "High", "Ultra"};
    constexpr uint32_t resolve_shader_hashes[] = {Math::CompileTimeStringHash("Luma TAA Low CS"), Math::CompileTimeStringHash("Luma TAA Medium CS"), Math::CompileTimeStringHash("Luma TAA High CS"), Math::CompileTimeStringHash("Luma TAA Ultra CS")};
    // "TAA_UPSCALE" (one thread per output pixel; the history and the per pixel states at the output resolution, so High equals Medium)
    constexpr uint32_t upscale_shader_hashes[] = {Math::CompileTimeStringHash("Luma TAA Low Upscale CS"), Math::CompileTimeStringHash("Luma TAA Medium Upscale CS"), Math::CompileTimeStringHash("Luma TAA High Upscale CS"), Math::CompileTimeStringHash("Luma TAA Ultra Upscale CS")};
-   constexpr uint32_t reconstruct_depth_shader_hash = Math::CompileTimeStringHash("Luma TAA Reconstruct Depth CS");
    constexpr uint32_t shading_change_shader_hash = Math::CompileTimeStringHash("Luma TAA Shading Change CS");
+   // Ultra's shading change also reconstructs the previous depth (one pass reads the depth and motion vectors once)
+   constexpr uint32_t shading_change_ultra_shader_hash = Math::CompileTimeStringHash("Luma TAA Shading Change Ultra CS");
    // From Medium quality the resolve reads the shading change ("TAA_SHADING_CHANGE") that a pass at the render resolution writes
    // first. The flickering analysis ("TAA_FLICKER") is off at every level, so its state textures aren't created or bound.
    constexpr int medium_quality = 1;
@@ -237,7 +238,7 @@ namespace LumaTAA
          const int level = taa_data->level;
          const auto& shaders = taa_data->device_data->native_compute_shaders;
          const uint32_t* const shader_hashes = (IsUpscaling(taa_data->settings_data) ? upscale_shader_hashes : resolve_shader_hashes);
-         return FindShader(shaders, shader_hashes[level]) && (level < ultra_quality || FindShader(shaders, reconstruct_depth_shader_hash)) && (level < medium_quality || FindShader(shaders, shading_change_shader_hash));
+         return FindShader(shaders, shader_hashes[level]) && (level < medium_quality || FindShader(shaders, (level >= ultra_quality ? shading_change_ultra_shader_hash : shading_change_shader_hash)));
       }
 
       int GetJitterPhases(const SR::InstanceData* data) const override
@@ -273,8 +274,8 @@ namespace LumaTAA
          const auto& shaders = taa_data->device_data->native_compute_shaders;
          const uint32_t* const shader_hashes = (IsUpscaling(taa_data->settings_data) ? upscale_shader_hashes : resolve_shader_hashes);
          ID3D11ComputeShader* const resolve_shader = FindShader(shaders, shader_hashes[level]);
-         ID3D11ComputeShader* const reconstruct_depth_shader = (level >= ultra_quality ? FindShader(shaders, reconstruct_depth_shader_hash) : nullptr);
-         ID3D11ComputeShader* const shading_change_shader = (level >= medium_quality ? FindShader(shaders, shading_change_shader_hash) : nullptr);
+         const bool reconstruct_depth = (level >= ultra_quality);
+         ID3D11ComputeShader* const shading_change_shader = (level >= medium_quality ? FindShader(shaders, (reconstruct_depth ? shading_change_ultra_shader_hash : shading_change_shader_hash)) : nullptr);
          const SR::SettingsData& settings_data = taa_data->settings_data;
 
          com_ptr<ID3D11Device> device;
@@ -363,29 +364,22 @@ namespace LumaTAA
          command_list->CSSetSamplers(0, 1, &sampler);
          ID3D11ShaderResourceView* const null_srvs[10] = {};
          ID3D11UnorderedAccessView* const null_uavs[5] = {};
-         if (reconstruct_depth_shader)
-         {
-            const UINT clear_value[4] = {reconstructed_depth_clear_value, reconstructed_depth_clear_value, reconstructed_depth_clear_value, reconstructed_depth_clear_value};
-            command_list->ClearUnorderedAccessViewUint(taa_data->reconstructed_depth_uav.get(), clear_value);
-            ID3D11ShaderResourceView* const srvs[3] = {nullptr, taa_data->depth_srv.get(), taa_data->motion_vectors_srv.get()};
-            ID3D11UnorderedAccessView* const reconstructed_depth_uav = taa_data->reconstructed_depth_uav.get();
-            command_list->CSSetShaderResources(0, 3, srvs);
-            command_list->CSSetUnorderedAccessViews(0, 3, null_uavs, nullptr);
-            command_list->CSSetUnorderedAccessViews(2, 1, &reconstructed_depth_uav, nullptr);
-            command_list->CSSetShader(reconstruct_depth_shader, nullptr, 0);
-            command_list->Dispatch(render_groups_x, render_groups_y, 1);
-            command_list->CSSetUnorderedAccessViews(0, 3, null_uavs, nullptr);
-         }
          const uint32_t write_index = taa_data->history_index;
          if (shading_change_shader)
          {
+            // At Ultra it also scatters the reconstructed previous depth (u4) with InterlockedMin, so that starts cleared
+            if (reconstruct_depth)
+            {
+               const UINT clear_value[4] = {reconstructed_depth_clear_value, reconstructed_depth_clear_value, reconstructed_depth_clear_value, reconstructed_depth_clear_value};
+               command_list->ClearUnorderedAccessViewUint(taa_data->reconstructed_depth_uav.get(), clear_value);
+            }
             ID3D11ShaderResourceView* const srvs[9] = {taa_data->source_color_srv.get(), taa_data->depth_srv.get(), taa_data->motion_vectors_srv.get(), nullptr, nullptr, nullptr, nullptr, nullptr, taa_data->luminance_srvs[write_index ^ 1].get()};
-            ID3D11UnorderedAccessView* const uavs[4] = {taa_data->luminance_uavs[write_index].get(), taa_data->shading_change_uavs[0].get(), taa_data->shading_change_uavs[1].get(), taa_data->shading_change_uavs[2].get()};
+            ID3D11UnorderedAccessView* const uavs[5] = {taa_data->luminance_uavs[write_index].get(), taa_data->shading_change_uavs[0].get(), taa_data->shading_change_uavs[1].get(), taa_data->shading_change_uavs[2].get(), (reconstruct_depth ? taa_data->reconstructed_depth_uav.get() : nullptr)};
             command_list->CSSetShaderResources(0, 9, srvs);
-            command_list->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
+            command_list->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
             command_list->CSSetShader(shading_change_shader, nullptr, 0);
             command_list->Dispatch(render_groups_x, render_groups_y, 1);
-            command_list->CSSetUnorderedAccessViews(0, 4, null_uavs, nullptr);
+            command_list->CSSetUnorderedAccessViews(0, 5, null_uavs, nullptr);
          }
          ID3D11ShaderResourceView* const srvs[10] = {taa_data->source_color_srv.get(), taa_data->depth_srv.get(), taa_data->motion_vectors_srv.get(), taa_data->history_srvs[write_index ^ 1].get(), taa_data->reconstructed_depth_srv.get(), taa_data->lock_srvs[write_index ^ 1].get(), nullptr, taa_data->reactive_mask_srv.get(), nullptr, taa_data->shading_change_srv.get()};
          ID3D11UnorderedAccessView* const uavs[4] = {taa_data->history_uavs[write_index].get(), taa_data->output_uav.get(), nullptr, taa_data->lock_uavs[write_index].get()};

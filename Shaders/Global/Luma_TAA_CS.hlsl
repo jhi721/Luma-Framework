@@ -23,8 +23,8 @@
 // - "SampleHistory" and "BicubicWeights": MJP's "SampleTextureCatmullRom". Copyright (c) 2019 MJP
 // - "ClipToBox" and the rounded box: Playdead's "temporal". Copyright (c) 2015 Playdead
 // - the weight rcp(2 - w): Microsoft MiniEngine's "TemporalBlendCS.hlsl". Copyright (c) 2015 Microsoft
-// - "reconstruct_previous_depth_cs" and the depth clip: AMD FidelityFX FSR 2. Copyright (c) 2022-2023 Advanced Micro
-//   Devices, Inc. All rights reserved.
+// - the previous depth reconstruction (in "shading_change_cs") and the depth clip: AMD FidelityFX FSR 2. Copyright (c)
+//   2022-2023 Advanced Micro Devices, Inc. All rights reserved.
 // - "shading_change_cs", "SortCross", "SmallestCrossDifference" and the shading change's use: AMD FidelityFX FSR 3.1.
 //   Copyright (c) 2023-2024 Advanced Micro Devices, Inc. All rights reserved.
 //
@@ -44,7 +44,7 @@
 // Quality levels: 0 Low: 3x3 box, closest depth of the cross, bilinear history. 1 Medium: + 5-tap bicubic history,
 // closest depth of the full 3x3, flickering analysis, reactive mask, depth clip against the previous frame's depth.
 // 2 High: + 2x2 history. 3 Ultra: + depth clip against the reconstructed previous depth
-// ("reconstruct_previous_depth_cs" dispatched first).
+// (reconstructed by "shading_change_cs", dispatched first).
 #ifndef TAA_QUALITY
 #define TAA_QUALITY 2
 #endif
@@ -347,7 +347,7 @@ Texture2D<float3> SourceColor : register(t0);
 Texture2D<float> DeviceDepth : register(t1);
 Texture2D<float2> MotionVectors : register(t2);
 Texture2D<float4> History : register(t3);
-// Linear depth bits (asuint), written by "reconstruct_previous_depth_cs" and read by the Ultra quality resolve.
+// Linear depth bits (asuint), written by "shading_change_cs" at Ultra quality and read by the Ultra quality resolve.
 Texture2D<uint> ReconstructedPreviousDepth : register(t4);
 // Alternating like the history, R32_UINT from Medium quality (R8_UINT at Low): the thin feature lock frames left or a moving
 // pixel's speed in the low byte (see "TAA_LOCK_SPEED_STEPS"), the flickering analysis' darkest luminance average in the
@@ -367,7 +367,6 @@ Texture2D<float2> ShadingChangePyramid : register(t9);
 
 RWTexture2D<float4> OutputHistory : register(u0);
 RWTexture2D<float4> OutputColor : register(u1);
-RWTexture2D<uint> OutputReconstructedPreviousDepth : register(u2);
 RWTexture2D<uint> OutputLock : register(u3);
 RWTexture2D<float3> OutputFlicker : register(u4);
 // "shading_change_cs" only (its own dispatch, so the slots overlap the resolve's)
@@ -375,6 +374,7 @@ RWTexture2D<float> OutputLuminance : register(u0);
 RWTexture2D<float2> OutputShadingChange0 : register(u1);
 RWTexture2D<float2> OutputShadingChange1 : register(u2);
 RWTexture2D<float2> OutputShadingChange2 : register(u3);
+RWTexture2D<uint> OutputReconstructedPreviousDepth : register(u4); // Ultra quality
 
 SamplerState LinearClampSampler : register(s0);
 
@@ -618,82 +618,32 @@ float4 LoadHistory2x(bool from_tile, int2 texel, int2 tile_origin, int2 max_texe
 groupshared float3 color_tile[COLOR_TILE * COLOR_TILE];
 #endif
 
-[numthreads(TAA_GROUP_SIZE, TAA_GROUP_SIZE, 1)] void reconstruct_previous_depth_cs(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_GroupID, uint group_index : SV_GroupIndex) {
-   // Ultra quality first pass (AMD FSR 2 "reconstruct previous depth"): every pixel's closest 3x3 depth is scattered
-   // along its motion vector into the previous frame's bilinear footprint (taps weighing more than 1%), keeping the
-   // nearest. "OutputReconstructedPreviousDepth" must be cleared to asuint(FLT_MAX) (0x7F7FFFFF) before the dispatch;
-   // positive floats order like their bits, so InterlockedMin keeps the nearest linear depth.
-   const int2 pixel = dispatch_thread_id.xy;
-   const int2 max_pixel = int2(RenderResolution) - 1;
-   const bool inside = all(pixel <= max_pixel);
-
-   // The group's taps usually land in one small area (neighbors share motion): reduce them in groupshared memory
-   // first, anchored around where the group's center pixel lands, and write one global atomic per touched texel.
-   const int2 group_center = min(int2(group_id.xy) * TAA_GROUP_SIZE + TAA_GROUP_SIZE / 2, max_pixel);
-   const float2 center_previous = group_center + 0.5 + MotionVectors.Load(int3(group_center, 0)) * MotionVectorScale;
-   const int2 tile_origin = int2(floor(center_previous)) - RECONSTRUCT_TILE / 2;
-   [unroll] for (uint i = group_index; i < RECONSTRUCT_TILE * RECONSTRUCT_TILE; i += TAA_GROUP_SIZE * TAA_GROUP_SIZE)
-   {
-      reconstruct_tile[i] = asuint(FLT_MAX);
-   }
-   GroupMemoryBarrierWithGroupSync();
-
-   if (inside)
-   {
-      float closest_depth;
-      int2 closest_pixel;
-      float farthest_depth;
-      FindClosestDepth(pixel, max_pixel, (Flags & TAA_FLAG_INVERTED_DEPTH) != 0, false, closest_depth, closest_pixel, farthest_depth);
-
-      const uint linear_depth_bits = asuint(LinearizeDepth(closest_depth));
-      const float2 previous_position = pixel + 0.5 + MotionVectors.Load(int3(closest_pixel, 0)) * MotionVectorScale;
-      int2 footprint_base;
-      float2 footprint_fraction;
-      BilinearFootprint(previous_position, footprint_base, footprint_fraction);
-      [unroll] for (uint tap = 0; tap < 4; tap++)
-      {
-         const int2 offset = int2(tap & 1, tap >> 1);
-         const float2 axis_weights = (offset ? footprint_fraction : (1.0 - footprint_fraction));
-         const int2 tap_pixel = footprint_base + offset;
-         if (axis_weights.x * axis_weights.y > 0.01 && all(tap_pixel >= 0) && all(tap_pixel <= max_pixel))
-         {
-            const int2 tile_pixel = tap_pixel - tile_origin;
-            if (all(tile_pixel >= 0) && all(tile_pixel < RECONSTRUCT_TILE))
-            {
-               InterlockedMin(reconstruct_tile[tile_pixel.y * RECONSTRUCT_TILE + tile_pixel.x], linear_depth_bits);
-            }
-            else
-            {
-               InterlockedMin(OutputReconstructedPreviousDepth[tap_pixel], linear_depth_bits);
-            }
-         }
-      }
-   }
-   GroupMemoryBarrierWithGroupSync();
-
-   [unroll] for (uint j = group_index; j < RECONSTRUCT_TILE * RECONSTRUCT_TILE; j += TAA_GROUP_SIZE * TAA_GROUP_SIZE)
-   {
-      const uint value = reconstruct_tile[j];
-      if (value != asuint(FLT_MAX))
-      {
-         InterlockedMin(OutputReconstructedPreviousDepth[tile_origin + int2(j % RECONSTRUCT_TILE, j / RECONSTRUCT_TILE)], value);
-      }
-   }
-   // clang-format off
-}
-
 // clang-format parses a second "[numthreads] void f() {}" in a file as a lambda and indents it, hence the off region
-// around this entry and the next one's signature.
+// around this entry's end and the next one's signature.
 #if TAA_SHADING_CHANGE
 groupshared float2 shading_change_tile[TAA_GROUP_SIZE * TAA_GROUP_SIZE];
 
-[numthreads(TAA_GROUP_SIZE, TAA_GROUP_SIZE, 1)]
-void shading_change_cs(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_thread_id : SV_GroupThreadID, uint3 group_id : SV_GroupID, uint group_index : SV_GroupIndex)
-{
+[numthreads(TAA_GROUP_SIZE, TAA_GROUP_SIZE, 1)] void shading_change_cs(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_thread_id : SV_GroupThreadID, uint3 group_id : SV_GroupID, uint group_index : SV_GroupIndex) {
    // AMD FSR 3.1's shading change and its pyramid (see "TAA_SHADING_CHANGE"), per render pixel. Every thread reaches the
    // barriers: threads past the edge repeat the edge pixel, as FSR's clamped loads do.
    const int2 max_pixel = int2(RenderResolution) - 1;
    const int2 pixel = min(int2(dispatch_thread_id.xy), max_pixel);
+#if TAA_QUALITY >= 3
+   // Ultra quality also reconstructs the previous depth (AMD FSR 2 "reconstruct previous depth"), sharing the closest 3x3
+   // depth and its motion vector: every pixel's closest 3x3 depth is scattered along its motion vector into the previous
+   // frame's bilinear footprint (taps weighing more than 1%), keeping the nearest.
+   // "OutputReconstructedPreviousDepth" must be cleared to asuint(FLT_MAX) (0x7F7FFFFF) before the dispatch; positive
+   // floats order like their bits, so InterlockedMin keeps the nearest linear depth.
+   // The group's taps usually land in one small area (neighbors share motion): reduce them in groupshared memory
+   // first, anchored around where the group's center pixel lands, and write one global atomic per touched texel.
+   const int2 group_center = min(int2(group_id.xy) * TAA_GROUP_SIZE + TAA_GROUP_SIZE / 2, max_pixel);
+   const float2 center_previous = group_center + 0.5 + MotionVectors.Load(int3(group_center, 0)) * MotionVectorScale;
+   const int2 reconstruct_origin = int2(floor(center_previous)) - RECONSTRUCT_TILE / 2;
+   [unroll] for (uint i = group_index; i < RECONSTRUCT_TILE * RECONSTRUCT_TILE; i += TAA_GROUP_SIZE * TAA_GROUP_SIZE)
+   {
+      reconstruct_tile[i] = asuint(FLT_MAX);
+   }
+#endif
    const int2 cross_offsets[5] = {int2(0, 0), int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1)};
    float current[5];
    [unroll] for (uint tap = 0; tap < 5; tap++)
@@ -706,6 +656,35 @@ void shading_change_cs(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 gro
    int2 closest_pixel;
    float farthest_depth;
    FindClosestDepth(pixel, max_pixel, (Flags & TAA_FLAG_INVERTED_DEPTH) != 0, false, closest_depth, closest_pixel, farthest_depth);
+#if TAA_QUALITY >= 3
+   GroupMemoryBarrierWithGroupSync(); // The reconstruction tile's clear
+   // Threads past the edge repeat the edge pixel: scatter it once
+   if (all(int2(dispatch_thread_id.xy) <= max_pixel))
+   {
+      const uint linear_depth_bits = asuint(LinearizeDepth(closest_depth));
+      int2 footprint_base;
+      float2 footprint_fraction;
+      BilinearFootprint(pixel + 0.5 + MotionVectors.Load(int3(closest_pixel, 0)) * MotionVectorScale, footprint_base, footprint_fraction);
+      [unroll] for (uint tap = 0; tap < 4; tap++)
+      {
+         const int2 offset = int2(tap & 1, tap >> 1);
+         const float2 axis_weights = (offset ? footprint_fraction : (1.0 - footprint_fraction));
+         const int2 tap_pixel = footprint_base + offset;
+         if (axis_weights.x * axis_weights.y > 0.01 && all(tap_pixel >= 0) && all(tap_pixel <= max_pixel))
+         {
+            const int2 tile_pixel = tap_pixel - reconstruct_origin;
+            if (all(tile_pixel >= 0) && all(tile_pixel < RECONSTRUCT_TILE))
+            {
+               InterlockedMin(reconstruct_tile[tile_pixel.y * RECONSTRUCT_TILE + tile_pixel.x], linear_depth_bits);
+            }
+            else
+            {
+               InterlockedMin(OutputReconstructedPreviousDepth[tap_pixel], linear_depth_bits);
+            }
+         }
+      }
+   }
+#endif
    // The previous frame's sample nearest to where this frame's sample was then (both frames are jittered)
    const float2 previous_position = pixel + 0.5 + Jitter + MotionVectors.Load(int3(closest_pixel, 0)) * MotionVectorScale - PreviousJitter;
    float2 change = 0.0; // The difference and its sign
@@ -731,6 +710,16 @@ void shading_change_cs(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 gro
    // their top left pixel
    shading_change_tile[group_index] = change;
    GroupMemoryBarrierWithGroupSync();
+#if TAA_QUALITY >= 3
+   [unroll] for (uint j = group_index; j < RECONSTRUCT_TILE * RECONSTRUCT_TILE; j += TAA_GROUP_SIZE * TAA_GROUP_SIZE)
+   {
+      const uint value = reconstruct_tile[j];
+      if (value != asuint(FLT_MAX))
+      {
+         InterlockedMin(OutputReconstructedPreviousDepth[reconstruct_origin + int2(j % RECONSTRUCT_TILE, j / RECONSTRUCT_TILE)], value);
+      }
+   }
+#endif
    const uint2 local = group_thread_id.xy;
    [unroll] for (uint level = 0; level < 3; level++)
    {
@@ -757,6 +746,7 @@ void shading_change_cs(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 gro
       }
       GroupMemoryBarrierWithGroupSync();
    }
+   // clang-format off
 }
 #endif
 
