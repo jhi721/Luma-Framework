@@ -40,20 +40,222 @@ namespace FidelityFX
 #include "api/include/dx12/ffx_api_dx12.h"
 #include "upscalers/include/ffx_upscale.h"
 
+#include "../includes/minhook.h"
+
+#include <filesystem>
+#include <intrin.h>
+#include <mutex>
 #include <vector>
 #include <d3d12.h>
+#include <dxgi1_4.h>
 
+#if DX12
+namespace FidelityFX::inline D3D12
+#else
 namespace FidelityFX
+#endif
 {
+   // The FFX upscaler dll only offers FSR 4 on AMD GPUs. If it sees an AMD RDNA 3 GPU without the AMD driver dll, it offers FSR 4's INT8 model,
+   // which runs on any D3D12 GPU (heavier than DLSS and XeSS). It only checks the GPU on the versions query and on context creation, so these
+   // hooks only run around those, for the upscaler dll's calls. Same as OptiScaler's "Fsr4GpuSupport" and upstream Luma's "FidelityFXHooks".
+   namespace
+   {
+      constexpr UINT vendor_id_amd = 0x1002;
+      // The AMD driver private adapter data, the upscaler reads the ASIC family and revision from it (see "amdgpu_asic_addr.h" in Mesa)
+      constexpr UINT amd_private_data_size = 608;
+      constexpr size_t amd_asic_family_index = 12;
+      constexpr size_t amd_asic_revision_index = 13;
+      constexpr UINT amd_asic_family_rdna3 = 145; // gfx11
+      constexpr UINT amd_asic_revision_rdna3 = 1;
+      // The upscaler gets the driver's FSR from it, which might not support the spoofed GPU
+      constexpr const wchar_t* amd_driver_module_name = L"amdxc64.dll";
+      constexpr size_t adapter_get_desc1_index = 10; // IUnknown (3) + IDXGIObject (4) + IDXGIAdapter (3)
+
+      // Same layout as "D3DKMT_QUERYADAPTERINFO" (from the WDK headers)
+      struct KmtQueryAdapterInfo
+      {
+         UINT adapter;
+         UINT type;
+         void* private_driver_data;
+         UINT private_driver_data_size;
+      };
+      constexpr UINT kmt_query_umdriver_private = 0; // KMTQAITYPE_UMDRIVERPRIVATE
+
+      using AdapterGetDesc1 = HRESULT(STDMETHODCALLTYPE*)(IDXGIAdapter1* adapter, DXGI_ADAPTER_DESC1* desc);
+      using KmtQueryAdapterInfoFunction = LONG(WINAPI*)(const KmtQueryAdapterInfo* info);
+      using GetModuleHandleAFunction = HMODULE(WINAPI*)(LPCSTR module_name);
+      using GetModuleHandleWFunction = HMODULE(WINAPI*)(LPCWSTR module_name);
+
+      // Guards the hooks' creation and the spoofed module range
+      std::mutex amd_spoofing_mutex;
+      std::array<void*, 4> amd_spoofing_targets = {}; // Null until the (disabled) hooks are created
+      AdapterGetDesc1 original_adapter_get_desc1 = nullptr;
+      KmtQueryAdapterInfoFunction original_kmt_query_adapter_info = nullptr;
+      GetModuleHandleAFunction original_get_module_handle_a = nullptr;
+      GetModuleHandleWFunction original_get_module_handle_w = nullptr;
+      // The upscaler dll's image while spoofing, empty otherwise. Only written while the hooks are disabled.
+      const uint8_t* spoofed_module_begin = nullptr;
+      const uint8_t* spoofed_module_end = nullptr;
+
+      bool IsSpoofedCaller(const void* return_address)
+      {
+         const auto* address = static_cast<const uint8_t*>(return_address);
+         return address >= spoofed_module_begin && address < spoofed_module_end;
+      }
+
+      HRESULT STDMETHODCALLTYPE HookedAdapterGetDesc1(IDXGIAdapter1* adapter, DXGI_ADAPTER_DESC1* desc)
+      {
+         const HRESULT hr = original_adapter_get_desc1(adapter, desc);
+         if (SUCCEEDED(hr) && desc && IsSpoofedCaller(_ReturnAddress()))
+         {
+            desc->VendorId = vendor_id_amd;
+         }
+         return hr;
+      }
+
+      LONG WINAPI HookedKmtQueryAdapterInfo(const KmtQueryAdapterInfo* info)
+      {
+         const LONG status = original_kmt_query_adapter_info(info);
+         if (info && info->type == kmt_query_umdriver_private && info->private_driver_data && info->private_driver_data_size == amd_private_data_size && IsSpoofedCaller(_ReturnAddress()))
+         {
+            auto* amd_gpu_info = static_cast<UINT*>(info->private_driver_data);
+            amd_gpu_info[amd_asic_family_index] = amd_asic_family_rdna3;
+            amd_gpu_info[amd_asic_revision_index] = amd_asic_revision_rdna3;
+            return 1; // Positive NT status (success), like OptiScaler
+         }
+         return status;
+      }
+
+      bool IsAMDDriverModule(const wchar_t* module_name)
+      {
+         const wchar_t* file_name = std::wcsrchr(module_name, L'\\');
+         return _wcsicmp(file_name ? file_name + 1 : module_name, amd_driver_module_name) == 0;
+      }
+
+      HMODULE WINAPI HookedGetModuleHandleA(LPCSTR module_name)
+      {
+         wchar_t module_name_w[MAX_PATH] = {};
+         if (module_name && IsSpoofedCaller(_ReturnAddress()) && MultiByteToWideChar(CP_ACP, 0, module_name, -1, module_name_w, MAX_PATH) && IsAMDDriverModule(module_name_w))
+         {
+            SetLastError(ERROR_MOD_NOT_FOUND);
+            return nullptr;
+         }
+         return original_get_module_handle_a(module_name);
+      }
+
+      HMODULE WINAPI HookedGetModuleHandleW(LPCWSTR module_name)
+      {
+         if (module_name && IsSpoofedCaller(_ReturnAddress()) && IsAMDDriverModule(module_name))
+         {
+            SetLastError(ERROR_MOD_NOT_FOUND);
+            return nullptr;
+         }
+         return original_get_module_handle_w(module_name);
+      }
+
+      // Creates the disabled hooks once ("adapter" is the real one). They are removed with MinHook when the addon unloads.
+      bool CreateAMDSpoofingHooks(IDXGIAdapter1* adapter)
+      {
+         const std::lock_guard lock(amd_spoofing_mutex);
+         if (amd_spoofing_targets[0])
+         {
+            return true;
+         }
+         if (!InitializeMinHook())
+         {
+            return false;
+         }
+         HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+         const std::array<void*, 4> targets = {
+            (*reinterpret_cast<void***>(adapter))[adapter_get_desc1_index],
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"gdi32.dll"), "D3DKMTQueryAdapterInfo")), // gdi32 is always loaded with DXGI
+            reinterpret_cast<void*>(GetProcAddress(kernel32, "GetModuleHandleA")),
+            reinterpret_cast<void*>(GetProcAddress(kernel32, "GetModuleHandleW")),
+         };
+         const std::array<void*, 4> detours = {
+            reinterpret_cast<void*>(&HookedAdapterGetDesc1),
+            reinterpret_cast<void*>(&HookedKmtQueryAdapterInfo),
+            reinterpret_cast<void*>(&HookedGetModuleHandleA),
+            reinterpret_cast<void*>(&HookedGetModuleHandleW),
+         };
+         const std::array<void**, 4> originals = {
+            reinterpret_cast<void**>(&original_adapter_get_desc1),
+            reinterpret_cast<void**>(&original_kmt_query_adapter_info),
+            reinterpret_cast<void**>(&original_get_module_handle_a),
+            reinterpret_cast<void**>(&original_get_module_handle_w),
+         };
+         for (size_t i = 0; i < targets.size(); i++)
+         {
+            if (!targets[i] || MH_CreateHook(targets[i], detours[i], originals[i]) != MH_OK)
+            {
+               for (size_t j = 0; j < i; j++)
+               {
+                  MH_RemoveHook(targets[j]);
+               }
+               return false;
+            }
+         }
+         amd_spoofing_targets = targets;
+         return true;
+      }
+
+      // While alive, the calls made by "upscaler_module" see an AMD RDNA 3 GPU (nothing happens if it's null)
+      struct ScopedAMDSpoofing
+      {
+         std::unique_lock<std::mutex> lock;
+
+         explicit ScopedAMDSpoofing(HMODULE upscaler_module)
+         {
+            if (!upscaler_module)
+            {
+               return;
+            }
+            lock = std::unique_lock(amd_spoofing_mutex);
+            const auto* image = reinterpret_cast<const uint8_t*>(upscaler_module);
+            const auto* nt_headers = reinterpret_cast<const IMAGE_NT_HEADERS*>(image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew);
+            spoofed_module_begin = image;
+            spoofed_module_end = image + nt_headers->OptionalHeader.SizeOfImage;
+            // Queued, so the other threads are only suspended once
+            for (void* target : amd_spoofing_targets)
+            {
+               MH_QueueEnableHook(target);
+            }
+            if (MH_ApplyQueued() != MH_OK)
+            {
+               reshade::log::message(reshade::log::level::error, "FSR: failed to enable the hooks to spoof an AMD GPU");
+            }
+         }
+
+         ~ScopedAMDSpoofing()
+         {
+            if (!lock)
+            {
+               return;
+            }
+            for (void* target : amd_spoofing_targets)
+            {
+               MH_QueueDisableHook(target);
+            }
+            MH_ApplyQueued();
+            spoofed_module_begin = nullptr;
+            spoofed_module_end = nullptr;
+         }
+      };
+   } // namespace
+
    struct FSRInstanceData : public SR::InstanceData
    {
       // "amd_fidelityfx_loader_dx12.dll", which loads the upscaler dll ("version_name" points into it)
       HMODULE module = nullptr;
+      // The upscaler dll (an extra reference), when it needs to see an AMD GPU (see "ScopedAMDSpoofing")
+      HMODULE spoofed_upscaler_module = nullptr;
       PfnFfxCreateContext create_context = nullptr;
       PfnFfxDestroyContext destroy_context = nullptr;
       PfnFfxQuery query = nullptr;
       PfnFfxDispatch dispatch = nullptr;
       Microsoft::WRL::ComPtr<ID3D12Device> device;
+      // 1x1, 1: the exposure when the game has none and auto exposure is off, FSR 4 fails the dispatch without one
+      Microsoft::WRL::ComPtr<ID3D12Resource> unit_exposure;
 
       // The upscaler versions the runtime supports on this device (FSR 4 isn't listed on GPUs that can't run it)
       std::vector<uint64_t> version_ids;
@@ -100,6 +302,39 @@ namespace FidelityFX
          return false;
       }
 
+      // D3D12 callers don't pass the adapter, it's found from the device
+      Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter_1;
+      if (adapter)
+      {
+         adapter->QueryInterface(IID_PPV_ARGS(&adapter_1));
+      }
+      else if (Microsoft::WRL::ComPtr<IDXGIFactory4> factory; SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+      {
+         factory->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&adapter_1));
+      }
+      DXGI_ADAPTER_DESC1 adapter_desc = {};
+      if (adapter_1 && SUCCEEDED(adapter_1->GetDesc1(&adapter_desc)) && adapter_desc.VendorId != vendor_id_amd)
+      {
+         // The loader loads the upscaler from its own folder, by name: loading it first gives the same module
+         wchar_t loader_path[MAX_PATH] = {};
+         GetModuleFileNameW(module, loader_path, MAX_PATH);
+         const std::filesystem::path upscaler_path = std::filesystem::path(loader_path).replace_filename(L"amd_fidelityfx_upscaler_dx12.dll");
+         HMODULE upscaler_module = LoadLibraryExW(upscaler_path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+         if (upscaler_module && CreateAMDSpoofingHooks(adapter_1.Get()))
+         {
+            custom_data->spoofed_upscaler_module = upscaler_module;
+         }
+         else
+         {
+            if (upscaler_module)
+            {
+               FreeLibrary(upscaler_module);
+            }
+            reshade::log::message(reshade::log::level::warning, "FSR: couldn't spoof an AMD GPU, FSR 4 won't be offered");
+         }
+      }
+      const ScopedAMDSpoofing spoofing(custom_data->spoofed_upscaler_module);
+
       // Count, then fill
       uint64_t version_count = 0;
       ffxQueryDescGetVersions versions_query = {};
@@ -121,12 +356,22 @@ namespace FidelityFX
          return false;
       }
 
-      std::string versions_text = "FSR: upscaler versions (\"core.fsr_version_index\": name):";
+      std::string versions_text = custom_data->spoofed_upscaler_module ? std::format("FSR: spoofing an AMD GPU (the real vendor id is {:#06x}), upscaler versions (\"core.fsr_version_index\": name):", adapter_desc.VendorId) : "FSR: upscaler versions (\"core.fsr_version_index\": name):";
       for (size_t i = 0; i < version_names.size(); i++)
       {
          versions_text += std::format(" {}: {};", i, version_names[i] ? version_names[i] : "?");
       }
       reshade::log::message(reshade::log::level::info, versions_text.c_str());
+
+      // In a CPU writable heap, so it's filled without a command list (reading one texel from system memory is free)
+      const D3D12_HEAP_PROPERTIES exposure_heap = {.Type = D3D12_HEAP_TYPE_CUSTOM, .CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, .MemoryPoolPreference = D3D12_MEMORY_POOL_L0};
+      const D3D12_RESOURCE_DESC exposure_desc = {.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D, .Width = 1, .Height = 1, .DepthOrArraySize = 1, .MipLevels = 1, .Format = DXGI_FORMAT_R32_FLOAT, .SampleDesc = {.Count = 1}};
+      const float unit_exposure = 1.f;
+      if (FAILED(device->CreateCommittedResource(&exposure_heap, D3D12_HEAP_FLAG_NONE, &exposure_desc, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&custom_data->unit_exposure))) || FAILED(custom_data->unit_exposure->WriteToSubresource(0, nullptr, &unit_exposure, sizeof(unit_exposure), sizeof(unit_exposure))))
+      {
+         reshade::log::message(reshade::log::level::warning, "FSR: couldn't create the exposure texture, FSR 4 needs one or auto exposure");
+         custom_data->unit_exposure = nullptr;
+      }
 
       custom_data->is_supported = true;
       return true;
@@ -145,9 +390,14 @@ namespace FidelityFX
       custom_data->retired_contexts.ReleaseAll([&](ffxContext* retired)
          { custom_data->destroy_context(retired, nullptr); });
       HMODULE module = custom_data->module;
+      HMODULE spoofed_upscaler_module = custom_data->spoofed_upscaler_module;
       delete custom_data;
       custom_data = nullptr;
       FreeLibrary(module);
+      if (spoofed_upscaler_module)
+      {
+         FreeLibrary(spoofed_upscaler_module);
+      }
    }
 
    // The context (FSR's own textures). The next "UpdateSettings()" creates it again.
@@ -232,16 +482,18 @@ namespace FidelityFX
       context_desc.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING | FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION;
       context_desc.fpMessage = [](uint32_t type, const wchar_t* message)
       {
-         // Without an exposure texture and auto exposure FSR uses an exposure of 1, as DLSS and XeSS do with the same inputs: not a misconfiguration
-         if (std::wcsstr(message, L"exposure resource is null") != nullptr)
-            return;
          LogMessage(type == FFX_API_MESSAGE_TYPE_ERROR, message);
       };
 #endif
 
       custom_data->RetireContext();
 
-      if (custom_data->create_context(&custom_data->context, &context_desc.header, nullptr) != FFX_API_RETURN_OK)
+      ffxReturnCode_t create_result;
+      {
+         const ScopedAMDSpoofing spoofing(custom_data->spoofed_upscaler_module);
+         create_result = custom_data->create_context(&custom_data->context, &context_desc.header, nullptr);
+      }
+      if (create_result != FFX_API_RETURN_OK)
       {
          // No retry policy here: without a context "Draw()" fails, and the games then suppress SR until an upscaler is picked again
          custom_data->context = nullptr;
@@ -292,7 +544,8 @@ namespace FidelityFX
       dispatch_upscale.color = ffxApiGetResourceDX12(draw_data.source_color, input_state);
       dispatch_upscale.depth = ffxApiGetResourceDX12(draw_data.depth_buffer, input_state);
       dispatch_upscale.motionVectors = ffxApiGetResourceDX12(draw_data.motion_vectors, input_state);
-      dispatch_upscale.exposure = ffxApiGetResourceDX12(draw_data.exposure, input_state);
+      ID3D12Resource* const exposure = ((draw_data.exposure || custom_data->settings_data.auto_exposure) ? draw_data.exposure : custom_data->unit_exposure.Get());
+      dispatch_upscale.exposure = ffxApiGetResourceDX12(exposure, input_state);
       dispatch_upscale.reactive = ffxApiGetResourceDX12(draw_data.bias_mask, input_state);
       dispatch_upscale.transparencyAndComposition = ffxApiGetResourceDX12(draw_data.transparency_alpha, input_state);
       dispatch_upscale.output = ffxApiGetResourceDX12(draw_data.output_color, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
