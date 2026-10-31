@@ -467,6 +467,23 @@ float4 SampleHistory(float2 position, float2 inv_resolution)
 #endif
 }
 
+// The game's color, its luminance and the resolved history as finite RGBA16F values, per component: NaN and infinities
+// become 0 (as UE's MakeFinite and HDRP's NaN killer; an infinity clamped to FLT16_MAX would leave a firefly that decays
+// over ~100 frames), finite values beyond the half range are clamped to it. Negative values are kept.
+// The history would keep a NaN or an infinity forever (a lerp with a history weight of 0 still returns NaN, and an
+// infinity times the bicubic's negative lobes becomes NaN), and its filtered reads spread it a pixel further every frame.
+// "abs(x) <= FLT_MAX" is an ordered comparison: false for NaN, so fxc can't fold it as it does a bare "x == x". It avoids
+// clamp(), as D3D min/max return the non-NaN operand (NaN would become -FLT16_MAX). For computed values and texture loads:
+// a raw constant buffer read would need IsNaN_Strict (see Shaders/AGENTS.md).
+float ToHalfRange(float value)
+{
+   return ((abs(value) <= FLT16_MAX) ? value : ((abs(value) <= FLT_MAX) ? (sign(value) * FLT16_MAX) : 0.0));
+}
+float3 ToHalfRange(float3 color)
+{
+   return ((abs(color) <= FLT16_MAX) ? color : ((abs(color) <= FLT_MAX) ? (sign(color) * FLT16_MAX) : 0.0));
+}
+
 // Moves "history" along the segment towards "target" until it is inside the box (Playdead "clip_aabb").
 float3 ClipToBox(float3 history, float3 target, float3 box_min, float3 box_max)
 {
@@ -485,12 +502,17 @@ void FindClosestDepth(int2 pixel, int2 max_pixel, bool inverted_depth, bool cros
    closest_pixel = pixel;
    farthest_depth = (inverted_depth ? 1.0 : 0.0);
    // Four 2x2 gathers (the 4x4 texels around the 3x3) instead of 9 loads: one texture instruction per 4 texels. Quad q's top
-   // left texel is at offset -1 + 2 * (q & 1, q >> 1); clamp addressing returns the same edge texels as the clamped loads.
+   // left texel is at offset -1 + 2 * (q & 1, q >> 1); clamp addressing returns the same edge texels as the clamped loads
+   // at the texture edge (the render edge on the top and left, even with a larger depth texture under render scale).
+   // On a render sub-rect's right and bottom edge the gather reads texel max_pixel + 1, outside the render area.
    // The cross doesn't reach the bottom right quad.
+   float depth_width, depth_height;
+   DeviceDepth.GetDimensions(depth_width, depth_height);
+   const float2 inv_depth_size = 1.0 / float2(depth_width, depth_height);
    float4 quads[4];
    [unroll] for (int quad = 0; quad < 4; quad++)
    {
-      quads[quad] = ((cross_only && quad == 3) ? 0.0 : DeviceDepth.GatherRed(LinearClampSampler, (pixel + int2(quad & 1, quad >> 1) * 2) * InvRenderResolution));
+      quads[quad] = ((cross_only && quad == 3) ? 0.0 : DeviceDepth.GatherRed(LinearClampSampler, (pixel + int2(quad & 1, quad >> 1) * 2) * inv_depth_size));
    }
    [unroll] for (int y = -1; y <= 1; y++)
    {
@@ -671,7 +693,7 @@ void shading_change_cs(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 gro
    float current[5];
    [unroll] for (uint tap = 0; tap < 5; tap++)
    {
-      current[tap] = max(dot(SourceColor.Load(int3(clamp(pixel + cross_offsets[tap], 0, max_pixel), 0)), Rec709_Luminance), TAA_SHADING_CHANGE_EPSILON);
+      current[tap] = max(ToHalfRange(dot(SourceColor.Load(int3(clamp(pixel + cross_offsets[tap], 0, max_pixel), 0)), Rec709_Luminance)), TAA_SHADING_CHANGE_EPSILON);
    }
    OutputLuminance[pixel] = current[0];
 
@@ -778,7 +800,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
       const uint color_index = group_index + color_load * TAA_GROUP_SIZE * TAA_GROUP_SIZE;
       if (color_index < COLOR_TILE * COLOR_TILE)
       {
-         color_tile[color_index] = SourceColor.Load(int3(clamp(group_origin - 1 + int2(color_index % COLOR_TILE, color_index / COLOR_TILE), 0, max_pixel), 0));
+         color_tile[color_index] = ToHalfRange(SourceColor.Load(int3(clamp(group_origin - 1 + int2(color_index % COLOR_TILE, color_index / COLOR_TILE), 0, max_pixel), 0)));
       }
    }
    const int color_tile_center = (pixel.y - group_origin.y + 1) * COLOR_TILE + (pixel.x - group_origin.x + 1);
@@ -958,7 +980,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
 #if TAA_HISTORY_2X
          const float3 color = color_tile[color_tile_center + y * COLOR_TILE + x];
 #else
-         const float3 color = SourceColor.Load(int3(clamp(pixel + int2(x, y), 0, max_pixel), 0));
+         const float3 color = ToHalfRange(SourceColor.Load(int3(clamp(pixel + int2(x, y), 0, max_pixel), 0)));
 #endif
          const float luminance = dot(color, Rec709_Luminance);
          min_luminance = min(min_luminance, luminance);
@@ -1168,7 +1190,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
    const float history_weight_output = history_samples * history_validity;
    // Rejected history (depth clip, offscreen) is replaced even in pixels that got no sample this frame
    const float blend = ((history_samples > 0.0) ? (history_samples / (history_samples + sample_weight)) : 0.0) * history_validity;
-   const float3 resolved = lerp(current_output, history, blend);
+   const float3 resolved = ToHalfRange(lerp(current_output, history, blend));
    const float accumulated = history_weight_output + sample_weight;
    OutputHistory[output_pixel] = float4(resolved, accumulated / (accumulated + 1.0));
    OutputColor[output_pixel] = float4(resolved, 1.0);
@@ -1227,7 +1249,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
       }
       // Rejected history (depth clip, offscreen) is replaced even in texels that got no sample this frame
       const float blend = ((history_samples > 0.0) ? (history_samples / (history_samples + sample_weight)) : 0.0) * history_validity;
-      const float3 resolved_2x = lerp(current_2x, history_2x, blend);
+      const float3 resolved_2x = ToHalfRange(lerp(current_2x, history_2x, blend));
       const float accumulated = history_weight_2x + sample_weight;
       OutputHistory[pixel * 2 + sub_offset] = float4(resolved_2x, accumulated / (accumulated + 1.0));
       output_sum += resolved_2x;
@@ -1245,9 +1267,9 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
    const float reinhard_peak = 1.0 / TAA_TONEMAP_SCALE;
    const float3 blended = lerp(Reinhard::ReinhardSimple(current, reinhard_peak), Reinhard::ReinhardSimple(history, reinhard_peak),
                                history_weight);
-   const float3 resolved = Reinhard::InverseReinhardSimple(blended, reinhard_peak);
+   const float3 resolved = ToHalfRange(Reinhard::InverseReinhardSimple(blended, reinhard_peak));
 #else
-   const float3 resolved = lerp(current, history, history_weight);
+   const float3 resolved = ToHalfRange(lerp(current, history, history_weight));
 #endif
 
    OutputHistory[pixel] = float4(resolved, accumulated_weight);
