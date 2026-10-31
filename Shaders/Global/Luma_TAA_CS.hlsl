@@ -217,6 +217,12 @@
 #ifndef TAA_HISTORY_2X_REACTIVE_FALLBACK
 #define TAA_HISTORY_2X_REACTIVE_FALLBACK 0.25
 #endif
+// Under the reactive mask the masked pixel's Gaussian (see "TAA_HISTORY_2X") counts as a full sample in all 4 texels,
+// weighted by the pixel's own mask: the fallback alone left the 3 texels without a sample at ~85% history under a
+// faint mask (0.4), so blinking additive lights (Bayonetta's laser gates) blinked far less than in AMD FSR 3. 0 disables.
+#ifndef TAA_HISTORY_2X_REACTIVE_SAMPLE
+#define TAA_HISTORY_2X_REACTIVE_SAMPLE 1
+#endif
 // Deferred accumulation (AMD FSR 3.1's "fMinDisocclusionAccumulation" idea): a texel without a sample this frame whose
 // history this frame holds less than "TAA_HISTORY_2X_DEFERRED_SAMPLES" samples (fresh after a rejection, such as content
 // entering at the screen edge) also takes the Gaussian, with a weight of this value times the Gaussian's peak tap, fading
@@ -302,6 +308,12 @@
 // return 0 but aren't free (~0.15-0.2 ms at 4K on an RTX 4080 SUPER, against ~0.02 ms for a bound mask).
 #ifndef TAA_REACTIVE
 #define TAA_REACTIVE (TAA_QUALITY >= 1)
+#endif
+// The clip box shrinks towards the pixel's own color by its mask times this. The min/max box of a thin lit feature
+// (a laser beam) reaches its dark neighbors, so it kept the dark history of a light that just turned on; AMD FSR 3.1's
+// box (Gaussian weighted mean and deviation, scaled 3 -> 1 by the mask) stays around the center. 0 disables.
+#ifndef TAA_REACTIVE_BOX_SHRINK
+#define TAA_REACTIVE_BOX_SHRINK 1.0
 #endif
 #ifndef TAA_REACTIVE_MAX
 #define TAA_REACTIVE_MAX 0.9
@@ -1065,6 +1077,11 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
    float3 box_min = 0.5 * (min_3x3 + min_cross);
    float3 box_max = 0.5 * (max_3x3 + max_cross);
    const float3 box_average = 0.5 * (sum_3x3 / 9.0 + sum_cross / 5.0);
+   if (TAA_REACTIVE_BOX_SHRINK > 0.0)
+   {
+      box_min = lerp(box_min, current, saturate(reactive_center * TAA_REACTIVE_BOX_SHRINK));
+      box_max = lerp(box_max, current, saturate(reactive_center * TAA_REACTIVE_BOX_SHRINK));
+   }
    const float current_luminance = dot(current, Rec709_Luminance);
    const float mean_luminance = dot(sum_3x3, Rec709_Luminance) / 9.0; // For the flickering analysis' lighting test
 
@@ -1261,6 +1278,10 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_id : SV_Gr
       const float3 current_2x = lerp(texel_estimate, pixel_gauss, reactive_center);
       const float reactive_fallback_weight = reactive * TAA_HISTORY_2X_REACTIVE_FALLBACK * gauss_max;
       float sample_weight = ((current_weight > 0.0) ? min(current_weight, 1.0) : reactive_fallback_weight);
+      if (TAA_HISTORY_2X_REACTIVE_SAMPLE)
+      {
+         sample_weight = max(sample_weight, reactive_center);
+      }
       const float history_samples = min(history_sample_2x.a / max(1.0 - history_sample_2x.a, 1e-4), cap_samples);
       const float history_validity = ((offscreen_2x || (Flags & TAA_FLAG_RESET)) ? 0.0 : depth_clip);
       const float history_weight_2x = history_samples * history_validity;
