@@ -195,6 +195,8 @@ namespace LumaTAA
             {
                const UINT no_lock[4] = {};
                command_list->ClearUnorderedAccessViewUint(taa_data->lock_uavs[i].get(), no_lock);
+               const FLOAT no_history[4] = {};
+               command_list->ClearUnorderedAccessViewFloat(taa_data->history_uavs[i].get(), no_history);
             }
          }
          if (created && level >= medium_quality)
