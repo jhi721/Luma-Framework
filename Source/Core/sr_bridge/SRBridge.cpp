@@ -3,6 +3,7 @@
 #if ENABLE_SR_BRIDGE
 
 #include "SRBridgeProtocol.h"
+#include "SRBridgeD3D11.h"
 #include "../utils/system.h"
 
 #include <include/reshade.hpp>
@@ -15,12 +16,6 @@
 #include <filesystem>
 #include <format>
 #include <string>
-
-// Profiling of a frame's steps: defined by Mass Effect's Development builds (force included "BridgeProfile.h") and by
-// "_tools/sr_bridge_perf" (before including this file)
-#ifndef SR_BRIDGE_PROFILE
-#define SR_BRIDGE_PROFILE(command_list, step)
-#endif
 
 namespace SRBridge
 {
@@ -43,25 +38,16 @@ namespace SRBridge
       }
    } // namespace
 
-   struct BridgeInstanceData : public SR::InstanceData
+   struct BridgeInstanceData : public SR::InstanceData, public Link
    {
       SR::Type type = SR::Type::None;
-      ComPtr<ID3D11Device5> device;
       LUID luid = {};
 
       // The running helper
       HANDLE job = nullptr; // Ends the helper with the game ("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE")
       HANDLE process = nullptr;
       HANDLE pipe = nullptr; // Its stdin
-      ComPtr<ID3D11DeviceContext4> context;
-      ComPtr<ID3D11Fence> fences[2]; // "in": a frame's inputs copied, "out": its output written (first "kReady")
-      // The game's resources it was started for (compared only). Referenced, so a recreated one (e.g. at a new size) can't reuse the address
-      ComPtr<ID3D11Resource> sources[kCount];
-      ComPtr<ID3D11Texture2D> shared[kCount]; // What it opened: the game's own when NT-handle shared already, else copies
-      bool copied[kCount] = {};
-      uint64_t frame = 0;            // 0 until the helper is ready, then the last frame sent (from "kReady")
       bool settings_pending = false; // Changed since the helper started: sent before the next frame
-
       bool failed = false;
 
       ~BridgeInstanceData()
@@ -90,15 +76,7 @@ namespace SRBridge
       if (job)
          CloseHandle(job); // Ends it if it's still running
       job = process = pipe = nullptr;
-      for (auto& fence : fences)
-         fence.Reset();
-      for (int i = 0; i < kCount; i++)
-      {
-         sources[i].Reset();
-         shared[i].Reset();
-         copied[i] = false;
-      }
-      frame = 0;
+      Reset();
       settings_pending = false;
       if (running == this)
          running = nullptr;
@@ -124,11 +102,6 @@ namespace SRBridge
       if (running && running != this)
          running->Stop();
       Stop();
-      if (FAILED(command_list->QueryInterface(IID_PPV_ARGS(&context))))
-         return Fail("no D3D11 fences on this device context");
-      if (!resources[kColor] || !resources[kMotion] || !resources[kDepth] || !resources[kOutput])
-         return Fail("missing color, motion vectors, depth or output");
-
       HANDLE handles[kCount + 2] = {}; // The textures', then the fences'
       const auto fail = [&](const std::string& reason)
       {
@@ -137,38 +110,8 @@ namespace SRBridge
                CloseHandle(handle);
          return Fail(reason);
       };
-      for (int i = 0; i < kCount; i++)
-      {
-         sources[i] = resources[i];
-         if (!resources[i])
-            continue;
-         ComPtr<ID3D11Texture2D> texture;
-         if (FAILED(resources[i]->QueryInterface(IID_PPV_ARGS(&texture))))
-            return fail(std::format("resource {} isn't a 2D texture", i));
-         D3D11_TEXTURE2D_DESC desc;
-         texture->GetDesc(&desc);
-         copied[i] = (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) == 0;
-         if (copied[i])
-         {
-            desc.Usage = D3D11_USAGE_DEFAULT;
-            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | (i == kOutput ? D3D11_BIND_UNORDERED_ACCESS : 0);
-            desc.CPUAccessFlags = 0;
-            desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
-            if (FAILED(device->CreateTexture2D(&desc, nullptr, &texture)))
-               return fail(std::format("resource {} (format {}) can't be shared", i, int(desc.Format)));
-         }
-         shared[i] = texture;
-         ComPtr<IDXGIResource1> dxgi_resource;
-         if (FAILED(texture.As(&dxgi_resource)) ||
-             FAILED(dxgi_resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handles[i])))
-            return fail(std::format("resource {} has no shared handle", i));
-      }
-      for (int i = 0; i < 2; i++)
-      {
-         if (FAILED(device->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fences[i]))) ||
-             FAILED(fences[i]->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &handles[kCount + i])))
-            return fail("no shared fences");
-      }
+      if (const std::string error = Open(command_list, resources, handles); !error.empty())
+         return fail(error);
 
       job = CreateJobObjectW(nullptr, nullptr);
       JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
@@ -211,7 +154,7 @@ namespace SRBridge
          return fail(std::format("the helper couldn't start (error {}): {}", error, helper_path.string()));
 
       std::string message =
-         std::format("bridge {} {} {} {} {}", kVersion, type == SR::Type::DLSS ? int(kDlss) : int(kFsr), luid.LowPart, luid.HighPart, FormatSettings(settings_data));
+         std::format("bridge {} {} {} {} {}", kVersion, type == SR::Type::DLSS ? int(kDlss) : (type == SR::Type::XeSS ? int(kXess) : int(kFsr)), luid.LowPart, luid.HighPart, FormatSettings(settings_data));
       for (HANDLE handle : handles)
       {
          HANDLE remote = nullptr;
@@ -225,7 +168,7 @@ namespace SRBridge
       if (!Send(message))
          return false;
       running = this;
-      Log(reshade::log::level::info, std::format("started the helper for {} ({}x{} -> {}x{})", type == SR::Type::DLSS ? "DLSS" : "FSR 3", settings_data.render_width,
+      Log(reshade::log::level::info, std::format("started the helper for {} ({}x{} -> {}x{})", SR::GetTypeName(type), settings_data.render_width,
                                         settings_data.render_height, settings_data.output_width, settings_data.output_height));
       return true;
    }
@@ -259,8 +202,20 @@ namespace SRBridge
       custom_data->luid = adapter_desc.AdapterLuid;
       const std::filesystem::path directory = System::GetModulePath().parent_path();
       std::error_code error;
-      custom_data->is_supported = std::filesystem::exists(directory / kHelperName, error) &&
-                                  (type != SR::Type::DLSS || (adapter_desc.VendorId == 0x10DE && std::filesystem::exists(directory / L"nvngx_dlss.dll", error)));
+      bool files_present = false;
+      switch (type)
+      {
+      case SR::Type::DLSS:
+         files_present = adapter_desc.VendorId == 0x10DE && std::filesystem::exists(directory / L"nvngx_dlss.dll", error);
+         break;
+      case SR::Type::FSR:
+         files_present = std::filesystem::exists(directory / L"amd_fidelityfx_loader_dx12.dll", error) && std::filesystem::exists(directory / L"amd_fidelityfx_upscaler_dx12.dll", error);
+         break;
+      case SR::Type::XeSS:
+         files_present = std::filesystem::exists(directory / L"libxess.dll", error);
+         break;
+      }
+      custom_data->is_supported = files_present && std::filesystem::exists(directory / kHelperName, error);
       return custom_data->is_supported;
    }
 
@@ -307,30 +262,10 @@ namespace SRBridge
          // A dead process's fences read UINT64_MAX, so no GPU wait is left hanging
          if (WaitForSingleObject(custom_data.process, 0) == WAIT_OBJECT_0 || custom_data.fences[1]->GetCompletedValue() == UINT64_MAX)
             return custom_data.Fail(std::format("the helper exited (see {} next to the game's exe)", std::filesystem::path(kLogName).string()));
-         // An input the bridge copies each frame can come from another texture of the same description (a game that alternates two
-         // targets for one pass): only the source changes, the helper keeps its shared copy
-         for (int i = 0; i < kCount; i++)
-         {
-            if (i == kOutput || !custom_data.copied[i] || !resources[i] || resources[i] == custom_data.sources[i].Get())
-               continue;
-            ComPtr<ID3D11Texture2D> texture;
-            if (FAILED(resources[i]->QueryInterface(IID_PPV_ARGS(&texture))))
-               continue;
-            D3D11_TEXTURE2D_DESC desc;
-            texture->GetDesc(&desc);
-            D3D11_TEXTURE2D_DESC shared_desc;
-            custom_data.shared[i]->GetDesc(&shared_desc);
-            if (desc.Format == shared_desc.Format && desc.Width == shared_desc.Width && desc.Height == shared_desc.Height && desc.ArraySize == shared_desc.ArraySize &&
-                desc.MipLevels == shared_desc.MipLevels && desc.SampleDesc.Count == shared_desc.SampleDesc.Count)
-               custom_data.sources[i] = resources[i];
-         }
-         if (const auto changed = std::mismatch(std::begin(resources), std::end(resources), std::begin(custom_data.sources), [](ID3D11Resource* resource, const ComPtr<ID3D11Resource>& source)
-                { return resource == source.Get(); });
-            changed.first != std::end(resources))
+         if (const int changed = custom_data.FindNewInput(resources); changed >= 0)
          {
             // Recreated: the helper restarts on them (named, so a game that alternates an input is seen as a restart loop's cause)
-            constexpr const char* names[kCount] = {"color", "motion vectors", "depth", "bias mask", "transparency", "exposure", "output"};
-            Log(reshade::log::level::info, std::format("restarting the helper: a new {} texture", names[changed.first - std::begin(resources)]));
+            Log(reshade::log::level::info, std::format("restarting the helper: a new {} texture", Link::names[changed]));
             custom_data.Stop();
          }
       }
@@ -339,23 +274,14 @@ namespace SRBridge
 
       if (custom_data.frame == 0)
       {
-         if (custom_data.fences[1]->GetCompletedValue() < kReady)
+         if (!custom_data.IsReadySignaled())
          {
-            // Still creating the upscaler: the color as it is (at the top left, if it's smaller)
-            ComPtr<ID3D11Texture2D> source, output;
-            D3D11_TEXTURE2D_DESC source_desc, output_desc;
-            if (SUCCEEDED(draw_data.source_color->QueryInterface(IID_PPV_ARGS(&source))) && SUCCEEDED(draw_data.output_color->QueryInterface(IID_PPV_ARGS(&output))))
-            {
-               source->GetDesc(&source_desc);
-               output->GetDesc(&output_desc);
-               const D3D11_BOX box = {0, 0, 0, (std::min)(source_desc.Width, output_desc.Width), (std::min)(source_desc.Height, output_desc.Height), 1};
-               if (source_desc.Format == output_desc.Format)
-                  command_list->CopySubresourceRegion(output.Get(), 0, 0, 0, 0, source.Get(), 0, &box);
-            }
+            // Still creating the upscaler
+            custom_data.CopyColorToOutput(command_list, draw_data);
             return true;
          }
          custom_data.frame = kReady;
-         Log(reshade::log::level::info, custom_data.type == SR::Type::DLSS ? "running DLSS" : "running FSR 3");
+         Log(reshade::log::level::info, std::format("running {}", SR::GetTypeName(custom_data.type)));
       }
       if (custom_data.settings_pending)
       {
@@ -366,45 +292,26 @@ namespace SRBridge
          Log(reshade::log::level::info, "new settings for the helper: " + FormatSettings(custom_data.settings_data));
       }
 
-      SR_BRIDGE_PROFILE(command_list, 0);
       const UINT render_width = (draw_data.render_width ? draw_data.render_width : custom_data.settings_data.render_width);
       const UINT render_height = (draw_data.render_height ? draw_data.render_height : custom_data.settings_data.render_height);
-      for (int i = 0; i < kCount; i++)
-      {
-         if (i == kOutput || !custom_data.copied[i])
-            continue;
-         if (i == kExposure)
-         {
-            command_list->CopyResource(custom_data.shared[i].Get(), resources[i]);
-            continue;
-         }
-         // The upscaler reads the render resolution inputs only within the render size (a render scale draws into the top left of
-         // larger targets)
-         D3D11_TEXTURE2D_DESC desc;
-         custom_data.shared[i]->GetDesc(&desc);
-         const D3D11_BOX render_area = {0, 0, 0, (std::min)(render_width, desc.Width), (std::min)(render_height, desc.Height), 1};
-         command_list->CopySubresourceRegion(custom_data.shared[i].Get(), 0, 0, 0, 0, resources[i], 0, &render_area);
-      }
-      SR_BRIDGE_PROFILE(command_list, 1);
-      const uint64_t frame = ++custom_data.frame;
-      custom_data.context->Signal(custom_data.fences[0].Get(), frame);
-      command_list->Flush();
-      SR_BRIDGE_PROFILE(command_list, 2);
+      const uint64_t frame = custom_data.Submit(command_list, resources, render_width, render_height);
       if (!custom_data.Send(std::format("frame {} {} {} {} {} {} {} {} {} {} {}\n", frame, draw_data.jitter_x, draw_data.jitter_y, draw_data.reset ? 1 : 0, render_width,
              render_height, draw_data.pre_exposure, draw_data.user_sharpness, draw_data.near_plane, draw_data.far_plane, draw_data.vert_fov)))
          return false;
       SR_BRIDGE_PROFILE(command_list, 3);
-      custom_data.context->Wait(custom_data.fences[1].Get(), frame);
-      SR_BRIDGE_PROFILE(command_list, 4);
-      if (custom_data.copied[kOutput])
-         command_list->CopyResource(draw_data.output_color, custom_data.shared[kOutput].Get());
-      SR_BRIDGE_PROFILE(command_list, 5);
+      custom_data.WaitOutput(command_list, draw_data.output_color, frame);
       return true;
    }
 
    bool Bridge::IsReady(const SR::InstanceData* data) const
    {
       return data && static_cast<const BridgeInstanceData*>(data)->frame != 0;
+   }
+
+   float Bridge::GetMipLODBias(const SR::InstanceData* data) const
+   {
+      const SR::SettingsData& settings = data->settings_data;
+      return type == SR::Type::XeSS ? SR::GetXeSSMipLODBias(settings.render_height, settings.output_height) : SR::GetMipLODBias(settings.render_height, settings.output_height);
    }
 
    // Each upscaler's own formula (as Core's DLSS and FSR)

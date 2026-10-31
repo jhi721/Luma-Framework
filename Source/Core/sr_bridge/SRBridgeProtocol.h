@@ -3,7 +3,8 @@
 #include <cstdint>
 
 // The protocol between a 32-bit game's SR bridge ("SRBridge.h") and the x64 "Luma-Upscaler.exe" next to the game's exe
-// (Source/Tools/SR Bridge Helper), which runs DLSS or FSR 3 (both x64 only) on NT-handle shared textures between two shared fences.
+// (Source/Tools/SR Bridge Helper), which runs DLSS, FSR (the FidelityFX API: FSR 4, else 3.1) or XeSS on its own D3D12 device (all x64 only)
+// on NT-handle shared textures between two shared fences.
 // Text lines over the helper's stdin, its stdout and stderr go to "Luma-Upscaler.log" next to the exe.
 //
 // Settings: "<render width> <render height> <output width> <output height> <hdr> <inverted depth> <jittered motion vectors>
@@ -18,7 +19,7 @@
 // EOF ends it.
 namespace SRBridgeProtocol
 {
-   constexpr int kVersion = 3;
+   constexpr int kVersion = 6;
 
    constexpr const wchar_t* kHelperName = L"Luma-Upscaler.exe";
    constexpr const wchar_t* kLogName = L"Luma-Upscaler.log";
@@ -27,6 +28,7 @@ namespace SRBridgeProtocol
    {
       kDlss,
       kFsr,
+      kXess,
    };
 
    // The shared textures, in the order their handles travel. A missing optional one (0) isn't passed to the upscaler.
@@ -43,4 +45,14 @@ namespace SRBridgeProtocol
    };
 
    constexpr uint64_t kReady = 1;
+
+   // The "frame" line's values: what the upscaler needs of a frame besides the shared textures (also the in-process host's "RunFrame()")
+   struct Frame
+   {
+      uint64_t n = 0;
+      float jitter_x = 0.f, jitter_y = 0.f;
+      int reset = 0;
+      uint32_t render_width = 0, render_height = 0;
+      float pre_exposure = 0.f, sharpness = -1.f, near_plane = 0.f, far_plane = 0.f, vert_fov = 0.f;
+   };
 } // namespace SRBridgeProtocol

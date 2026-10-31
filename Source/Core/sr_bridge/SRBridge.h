@@ -1,8 +1,9 @@
 #pragma once
 
 #include "../includes/super_resolution.h"
+#include "SRBridgeProtocol.h"
 
-// DLSS and FSR 3 for 32-bit games: both are x64 only, so they run in "Luma-Upscaler.exe" next to the game's exe
+// DLSS, FSR and XeSS for 32-bit games: all are x64 only, so they run in "Luma-Upscaler.exe" next to the game's exe
 // (Source/Tools/SR Bridge Helper) on shared copies of the inputs. Games opt in with "UseLumaSRBridge" (their package then
 // ships the helper and DLSS's dll), and use it like the in-process implementations.
 #if defined(_WIN64) || !defined(ENABLE_SR_BRIDGE)
@@ -48,6 +49,7 @@ namespace SRBridge
       virtual bool Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_list, const DrawData& draw_data) override;
 
       virtual int GetJitterPhases(const SR::InstanceData* data) const override;
+      virtual float GetMipLODBias(const SR::InstanceData* data) const override;
 
       // Once the helper created the upscaler
       virtual bool IsReady(const SR::InstanceData* data) const override;

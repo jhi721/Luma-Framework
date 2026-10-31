@@ -68,6 +68,8 @@
     <UseLumaNGX>true</UseLumaNGX>
     <UseLumaFSR>true</UseLumaFSR>
     <UseLumaFastNoise>true</UseLumaFastNoise>
+    <!-- D3D12 SR in process (FSR 4, XeSS), picked with the "Super Resolution API" setting -->
+    <UseLumaD3D12SR>true</UseLumaD3D12SR>
   </PropertyGroup>
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>

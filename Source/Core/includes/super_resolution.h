@@ -17,16 +17,29 @@ struct IDXGIAdapter;
 
 namespace SR
 {
-	// The objects of the API the mod is built for (DLSS, FSR and XeSS have a D3D12 path)
+	// The objects of an API. DLSS, FSR and XeSS have a D3D12 path, which a D3D11 build can host too (its D3D12 implementations live in
+	// "unity_build_d3d12.cpp", see "sr_bridge/D3D12SR.h").
+	struct D3D11Api
+	{
+		using Device = ID3D11Device;
+		using CommandList = ID3D11DeviceContext;
+		using Resource = ID3D11Resource;
+	};
+	struct D3D12Api
+	{
+		using Device = ID3D12Device;
+		using CommandList = ID3D12GraphicsCommandList;
+		using Resource = ID3D12Resource;
+	};
+	// The API the mod is built for
 #if DX12
-	using Device = ID3D12Device;
-	using CommandList = ID3D12GraphicsCommandList;
-	using Resource = ID3D12Resource;
+	using CurrentApi = D3D12Api;
 #else
-	using Device = ID3D11Device;
-	using CommandList = ID3D11DeviceContext;
-	using Resource = ID3D11Resource;
+	using CurrentApi = D3D11Api;
 #endif
+	using Device = CurrentApi::Device;
+	using CommandList = CurrentApi::CommandList;
+	using Resource = CurrentApi::Resource;
 
 	// Note that these don't necessarily match 1:1 with classes, some might be different configurations of the same implementation.
 	enum class UserType
@@ -125,6 +138,11 @@ namespace SR
 	static float GetMipLODBias(unsigned int render_height, unsigned int output_height)
 	{
 		return GetMipLODBias(float(render_height), float(output_height));
+	}
+	// The XeSS guide's log2(render / output), without DLSS and FSR's extra -1: 0 at native resolution
+	static float GetXeSSMipLODBias(unsigned int render_height, unsigned int output_height)
+	{
+		return std::log2(float(render_height) / float((std::max)(render_height, output_height)));
 	}
 
 	// The camera an upscaler needs (FSR), from a view projection with an affine view: element (row, column) at m[row * 4 + column] for
@@ -284,12 +302,17 @@ namespace SR
 
 	// A super resolution implementation,
 	// this is a generic term to include Temporal Anti Aliasing (with jittered rendering and motion vectors) and upscaling.
-	class SuperResolutionImpl
+	template <typename Api>
+	class SuperResolutionImplT
 	{
 	public:
+		using Device = typename Api::Device;
+		using CommandList = typename Api::CommandList;
+		using Resource = typename Api::Resource;
+
 		// The implementations are owned and deleted through this base.
 		// A new virtual must also be forwarded by the DEVELOPMENT MCP wrapper ("Mcp::SrTap"), or it silently gets the defaults below there.
-		virtual ~SuperResolutionImpl() = default;
+		virtual ~SuperResolutionImplT() = default;
 		virtual bool HasInit(const InstanceData* data) const { return data != nullptr; }
 		// Needs init to be called first
 		virtual bool IsSupported(const InstanceData* data) const { return data && data->is_supported; }
@@ -367,4 +390,12 @@ namespace SR
 		// Whether the implementation leaves the state dirty compared to when it begun
 		virtual bool NeedsStateRestoration() const { return false; }
 	};
+
+	// The implementations' interface for the API the mod is built for. Its different instantiations have distinct types (and vtables) even
+	// within one dll, while the D3D12 implementations are in an inline namespace (e.g. "NGX::D3D12::DLSS") when built as a D3D12 mod.
+	using SuperResolutionImpl = SuperResolutionImplT<CurrentApi>;
+	namespace D3D12
+	{
+		using SuperResolutionImpl = SuperResolutionImplT<D3D12Api>;
+	}
 }

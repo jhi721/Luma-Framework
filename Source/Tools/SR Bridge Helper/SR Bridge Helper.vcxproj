@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <!-- x64 only: the 32-bit games' SR bridge (Source/Core/sr_bridge) starts it. The solution builds it in its Win32 configurations,
-       into the Win32 output folder next to those addons. -->
+       into the Win32 output folder next to those addons. It runs Core's D3D12 DLSS, FSR and XeSS (Luma.Features.props, imported through
+       Luma.DXP.props, adds their defines, libs and runtime dlls next to the exe). -->
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Development-Debug|x64">
       <Configuration>Development-Debug</Configuration>
@@ -42,6 +43,8 @@
   <PropertyGroup>
     <UseLumaNGX>true</UseLumaNGX>
     <UseLumaFSR>true</UseLumaFSR>
+    <UseLumaXeSS>true</UseLumaXeSS>
+    <LumaGraphicsAPI>D3D12</LumaGraphicsAPI>
     <UseLumaNVAPI>false</UseLumaNVAPI>
     <TargetName>Luma-Upscaler</TargetName>
     <OutDir>$(SolutionDir)\Binaries\Win32-$(Configuration)\</OutDir>
@@ -54,7 +57,12 @@
       <SDLCheck>true</SDLCheck>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
-      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- RESHADE_API_LIBRARY_EXPORT + BUILTIN_ADDON (its header-only "reshade::log"): Core's ReShade log goes to main.cpp's "ReShadeLogMessage" (there is no ReShade module to find).
+           PREFER_OVERLAY_MESSAGE_ASSERTS: Core's asserts don't open a message box, which would stall the game on its fence (no window shows it) -->
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;_WINDOWS;_CRT_SECURE_NO_WARNINGS;RESHADE_API_LIBRARY_EXPORT;BUILTIN_ADDON;PREFER_OVERLAY_MESSAGE_ASSERTS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\..\External\reshade;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <UseStandardPreprocessor>true</UseStandardPreprocessor>
+      <AdditionalOptions>%(AdditionalOptions) /utf-8</AdditionalOptions>
       <RuntimeLibrary Condition="'$(Configuration)'=='Development-Debug'">MultiThreadedDebugDLL</RuntimeLibrary>
       <RuntimeLibrary Condition="'$(Configuration)'!='Development-Debug'">MultiThreadedDLL</RuntimeLibrary>
       <Optimization Condition="'$(Configuration)'=='Development-Debug'">Disabled</Optimization>
@@ -65,7 +73,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <!-- The standard mitigations, and only the PDB's name in the exe (not the build machine's path) -->
       <RandomizedBaseAddress>true</RandomizedBaseAddress>
       <DataExecutionPrevention>true</DataExecutionPrevention>
@@ -76,11 +84,36 @@
       <AdditionalManifestFiles>Luma-Upscaler.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
     </Manifest>
   </ItemDefinitionGroup>
+  <!-- The same configuration defines as the game addons, for Core's debug.h -->
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Development-Debug'">
+    <ClCompile>
+      <PreprocessorDefinitions>DEVELOPMENT=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Development-Release'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;DEVELOPMENT=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Test-Release'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;TEST=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Publishing-Release'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="..\..\Core\dlss\DLSS.cpp" />
+    <ClCompile Include="..\..\Core\fsr\FSR.cpp" />
+    <ClCompile Include="..\..\Core\xess\XeSS.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\Core\sr_bridge\SRBridgeProtocol.h" />
+    <ClInclude Include="..\..\Core\sr_bridge\D3D12SRRunner.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="SR Bridge Helper.rc" />

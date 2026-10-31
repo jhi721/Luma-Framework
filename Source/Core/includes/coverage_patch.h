@@ -10,8 +10,8 @@
 #include "dxbc.h"
 
 // MSAA alpha to coverage for alpha tested materials, by patching their pixel shaders' clip. First written for Mirror's Edge, also
-// used by Bayonetta: both run through dgVoodoo, whose translation of a D3D9 clip(alpha - k) (or texkill) is
-// "add rD, rS.c, l(-k, -k, -k, -k)" -> lt -> discard_nz.
+// used by Bayonetta and MGR:R: all run through dgVoodoo, whose translation of a D3D9 clip(alpha - k) (or texkill) is
+// "add rD, rS.c, l(-k, -k, -k, -k)" (MGR:R: "mad rD, a, b, l(-k, ...)") -> lt -> discard_nz.
 namespace CoveragePatch
 {
    // The clip value's sharpened alpha c = saturate(d / fwidth(d) + 0.5) (Golus; the plain alpha would thin cut-outs out), right after
@@ -90,9 +90,9 @@ namespace CoveragePatch
             return false;
          }
       };
-      // The clip's add, outside flow control (the derivatives need all the quad's lanes): a temp destination, a temp source without a
-      // modifier and the threshold as a replicated immediate, whose value reaches a discard's condition (data flow through temp
-      // components). Each such add is tried in order: other subtractions of a constant (a distortion map's UV offset, Bayonetta's
+      // The clip's add (or mad, see below), outside flow control (the derivatives need all the quad's lanes): a temp destination, for an
+      // add a temp source without a modifier, and the threshold as a replicated immediate, whose value reaches a discard's condition
+      // (data flow through temp components). Each such instruction is tried in order: other subtractions of a constant (a distortion map's UV offset, Bayonetta's
       // translucent Purgatorio humans 0xB7CD0392) come before the alpha test's and never reach the discard.
       // "symmetric": nothing else reads what the clip computed (no output written from it before the discard, no read of it after),
       // so the patch can replace it with the coverage's own test (see below).
@@ -263,14 +263,40 @@ namespace CoveragePatch
             continue;
          }
          const uint32_t* const t = &tokens[instruction.begin];
-         if (outer_depth != 0 || instruction.opcode != D3D10_SB_OPCODE_ADD || instruction.length != 10 || DECODE_IS_D3D10_SB_OPCODE_EXTENDED(t[0]))
+         if (outer_depth != 0 || DECODE_IS_D3D10_SB_OPCODE_EXTENDED(t[0]))
             continue;
-         // dgVoodoo's immediates carry an xyzw swizzle (0x00004E46), fxc's don't (0x00004002): the type and width only
-         if (DECODE_D3D10_SB_OPERAND_TYPE(t[1]) != D3D10_SB_OPERAND_TYPE_TEMP || DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(t[1]) != D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE || DECODE_D3D10_SB_OPERAND_TYPE(t[3]) != D3D10_SB_OPERAND_TYPE_TEMP || DECODE_IS_D3D10_SB_OPERAND_EXTENDED(t[3]) ||
-             DECODE_D3D10_SB_OPERAND_TYPE(t[5]) != D3D10_SB_OPERAND_TYPE_IMMEDIATE32 || DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(t[5]) != D3D10_SB_OPERAND_4_COMPONENT)
+         // The threshold's immediate: dgVoodoo's carry an xyzw swizzle (0x00004E46), fxc's don't (0x00004002), the type and width only
+         const uint32_t* immediate = nullptr;
+         if (instruction.opcode == D3D10_SB_OPCODE_ADD && instruction.length == 10)
+         {
+            if (DECODE_D3D10_SB_OPERAND_TYPE(t[3]) != D3D10_SB_OPERAND_TYPE_TEMP || DECODE_IS_D3D10_SB_OPERAND_EXTENDED(t[3]))
+               continue;
+            immediate = &t[5];
+         }
+         // "mad rD, a, b, l(-k)": the clip of an alpha scaled first (MGR:R's texkill of alpha * c - k). Its sources can be any operand
+         // form, so the immediate is the last operand found by walking them.
+         else if (instruction.opcode == D3D10_SB_OPCODE_MAD)
+         {
+            size_t last_operand = 0;
+            int operands = 0;
+            if (!DXBC::WalkOperands(tokens, instruction, [&](size_t token_position, size_t)
+                   {
+                      last_operand = token_position;
+                      operands++;
+                      return true; }) ||
+                operands != 4 || last_operand + 5 != instruction.begin + instruction.length)
+               continue;
+            immediate = &tokens[last_operand];
+         }
+         else
+         {
             continue;
-         const float threshold = -std::bit_cast<float>(t[6]);
-         if (!(threshold > min_threshold && threshold < 1.f) || t[7] != t[6] || t[8] != t[6] || t[9] != t[6])
+         }
+         if (DECODE_D3D10_SB_OPERAND_TYPE(t[1]) != D3D10_SB_OPERAND_TYPE_TEMP || DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(t[1]) != D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE || DECODE_IS_D3D10_SB_OPERAND_EXTENDED(t[1]) ||
+             DECODE_D3D10_SB_OPERAND_TYPE(immediate[0]) != D3D10_SB_OPERAND_TYPE_IMMEDIATE32 || DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(immediate[0]) != D3D10_SB_OPERAND_4_COMPONENT)
+            continue;
+         const float threshold = -std::bit_cast<float>(immediate[1]);
+         if (!(threshold > min_threshold && threshold < 1.f) || immediate[2] != immediate[1] || immediate[3] != immediate[1] || immediate[4] != immediate[1])
             continue;
          const uint32_t mask = DECODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(t[1]);
          symmetric = true;

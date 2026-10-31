@@ -95,12 +95,13 @@ $useLumaNGX = Test-PropEnabled $vcxproj "UseLumaNGX"
 $useLumaFSR = Test-PropEnabled $vcxproj "UseLumaFSR"
 $useLumaXeSS = Test-PropEnabled $vcxproj "UseLumaXeSS"
 $useLumaSRBridge = Test-PropEnabled $vcxproj "UseLumaSRBridge"
+$useLumaD3D12SR = Test-PropEnabled $vcxproj "UseLumaD3D12SR"
 $useDgVoodoo = Test-PropEnabled $vcxproj "UseDgVoodoo"
 $useDgVoodooLinux = Test-PropEnabled $vcxproj "UseDgVoodooLinux"
 $useD3D9VAFix = Test-PropEnabled $vcxproj "UseD3D9VAFix"
 $useD3D9CSMT = Test-PropEnabled $vcxproj "UseD3D9CSMT"
 $isD3D12 = (Get-Content $vcxproj -Raw) -match "<LumaGraphicsAPI>\s*D3D12\s*</LumaGraphicsAPI>"
-Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX UseLumaFSR=$useLumaFSR UseLumaXeSS=$useLumaXeSS UseLumaSRBridge=$useLumaSRBridge UseDgVoodoo=$useDgVoodoo UseDgVoodooLinux=$useDgVoodooLinux UseD3D9VAFix=$useD3D9VAFix UseD3D9CSMT=$useD3D9CSMT D3D12=$isD3D12"
+Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX UseLumaFSR=$useLumaFSR UseLumaXeSS=$useLumaXeSS UseLumaSRBridge=$useLumaSRBridge UseLumaD3D12SR=$useLumaD3D12SR UseDgVoodoo=$useDgVoodoo UseDgVoodooLinux=$useDgVoodooLinux UseD3D9VAFix=$useD3D9VAFix UseD3D9CSMT=$useD3D9CSMT D3D12=$isD3D12"
 if (($useDgVoodooLinux -or $useD3D9VAFix) -and -not $useDgVoodoo) {
     Write-Error "UseDgVoodooLinux and UseD3D9VAFix need UseDgVoodoo"
     exit 1
@@ -183,18 +184,18 @@ try {
         }
         Copy-Item $helperSrc -Destination $tempDir -Force
     }
-    if ($useLumaNGX -or $useLumaSRBridge) {
+    if ($useLumaNGX -or $useLumaSRBridge -or $useLumaD3D12SR) {
         $ngxSrc = Join-Path $repoRoot "Source\External\NGX\bin\dev\nvngx_dlss.dll"
         if ($Config -notlike "Development*") { $ngxSrc = Join-Path $repoRoot "Source\External\NGX\bin\rel\nvngx_dlss.dll" }
         if (Test-Path $ngxSrc) { Copy-Item $ngxSrc -Destination $tempDir -Force }
     }
 
-    # D3D12 FSR loads AMD's signed FidelityFX API dlls from the game folder (D3D11 FSR is linked statically).
+    # D3D12 FSR and the SR bridge's helper load AMD's signed FidelityFX API dlls from the game folder (D3D11 FSR is linked statically).
     # Without the (untracked) SDK the addon was built without FSR ("__has_include" in Source/Core/fsr/FSR.h).
     $ffxHeader = Join-Path $repoRoot "Source\External\FidelityFX-API\api\include\ffx_api.h"
     if ($useLumaFSR -and $isD3D12 -and -not (Test-Path $ffxHeader)) {
         Write-Warning "FidelityFX API SDK not found ($ffxHeader): the addon was built without D3D12 FSR, its dlls aren't shipped"
-    } elseif ($useLumaFSR -and $isD3D12) {
+    } elseif (($useLumaFSR -and $isD3D12) -or $useLumaSRBridge -or $useLumaD3D12SR) {
         foreach ($ffxDll in @("amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll")) {
             $ffxSrc = Join-Path $repoRoot "Source\External\FidelityFX-API\signedbin\$ffxDll"
             if (-not (Test-Path $ffxSrc)) {
@@ -205,12 +206,12 @@ try {
         }
     }
 
-    # D3D12 XeSS loads Intel's signed libxess.dll from the game folder. Without the (untracked) SDK the addon was built without
+    # D3D12 XeSS and the SR bridge's helper load Intel's signed libxess.dll from the game folder. Without the (untracked) SDK the addon was built without
     # XeSS ("__has_include" in Source/Core/xess/XeSS.h).
     $xessHeader = Join-Path $repoRoot "Source\External\XeSS\inc\xess\xess_d3d12.h"
     if ($useLumaXeSS -and $isD3D12 -and -not (Test-Path $xessHeader)) {
         Write-Warning "XeSS SDK not found ($xessHeader): the addon was built without XeSS, libxess.dll isn't shipped"
-    } elseif ($useLumaXeSS -and $isD3D12) {
+    } elseif (($useLumaXeSS -and $isD3D12) -or $useLumaSRBridge -or $useLumaD3D12SR) {
         $xessSrc = Join-Path $repoRoot "Source\External\XeSS\bin\libxess.dll"
         if (-not (Test-Path $xessSrc)) {
             Write-Error "libxess.dll not found: $xessSrc"

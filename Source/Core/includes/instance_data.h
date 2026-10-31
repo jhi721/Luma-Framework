@@ -819,6 +819,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    D3D12State::PipelineLayouts pipeline_layouts;
    D3D12State::DescriptorHeaps descriptor_heaps;
    D3D12State::BufferAddresses buffer_addresses;
+   D3D12State::LiveResources live_resources;
    // The frame capture, joined from the command lists in submission order (the queue's immediate command list is ReShade's own)
    CommandListData trace_command_list_data;
    D3D12Readback::State readback; // The dev MCP's GPU copies

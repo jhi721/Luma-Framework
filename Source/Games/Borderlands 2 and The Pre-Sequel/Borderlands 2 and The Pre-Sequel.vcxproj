@@ -171,8 +171,8 @@
       </LinkLibraryDependencies>
     </ProjectReference>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_BORDERLANDS2_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS2_BIN_PATH%" || exit /B 0 )
-IF DEFINED LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_BORDERLANDS2_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)amd_fidelityfx_*_dx12.dll" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)libxess.dll" "%LUMA_BORDERLANDS2_BIN_PATH%" || exit /B 0 )
+IF DEFINED LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)amd_fidelityfx_*_dx12.dll" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)libxess.dll" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Publishing-Release|Win32'">
@@ -221,8 +221,8 @@ IF DEFINED LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH ( xcopy /Y "$(TargetDir)*$(Soluti
       </LinkLibraryDependencies>
     </ProjectReference>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_BORDERLANDS2_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS2_BIN_PATH%" || exit /B 0 )
-IF DEFINED LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_BORDERLANDS2_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)amd_fidelityfx_*_dx12.dll" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)libxess.dll" "%LUMA_BORDERLANDS2_BIN_PATH%" || exit /B 0 )
+IF DEFINED LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)amd_fidelityfx_*_dx12.dll" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)libxess.dll" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Test-Release|Win32'">
@@ -271,8 +271,8 @@ IF DEFINED LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH ( xcopy /Y "$(TargetDir)*$(Soluti
       </LinkLibraryDependencies>
     </ProjectReference>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_BORDERLANDS2_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS2_BIN_PATH%" || exit /B 0 )
-IF DEFINED LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_BORDERLANDS2_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)amd_fidelityfx_*_dx12.dll" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)libxess.dll" "%LUMA_BORDERLANDS2_BIN_PATH%" || exit /B 0 )
+IF DEFINED LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)amd_fidelityfx_*_dx12.dll" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)libxess.dll" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Development-Release|Win32'">
@@ -321,8 +321,8 @@ IF DEFINED LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH ( xcopy /Y "$(TargetDir)*$(Soluti
       </LinkLibraryDependencies>
     </ProjectReference>
     <PostBuildEvent>
-      <Command>IF DEFINED LUMA_BORDERLANDS2_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS2_BIN_PATH%" || exit /B 0 )
-IF DEFINED LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" || exit /B 0 )</Command>
+      <Command>IF DEFINED LUMA_BORDERLANDS2_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)amd_fidelityfx_*_dx12.dll" "%LUMA_BORDERLANDS2_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)libxess.dll" "%LUMA_BORDERLANDS2_BIN_PATH%" || exit /B 0 )
+IF DEFINED LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH ( xcopy /Y "$(TargetDir)*$(SolutionName)-$(ProjectName).addon" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y "$(TargetDir)Luma-Upscaler.exe" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)amd_fidelityfx_*_dx12.dll" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" &amp;&amp; xcopy /Y /D "$(TargetDir)libxess.dll" "%LUMA_BORDERLANDS_PRESEQUEL_BIN_PATH%" || exit /B 0 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>

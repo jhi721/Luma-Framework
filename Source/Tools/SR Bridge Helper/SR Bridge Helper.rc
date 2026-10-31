@@ -21,15 +21,15 @@ BEGIN
       BLOCK "040904B0"
       BEGIN
          VALUE "CompanyName", "Luma Framework"
-         VALUE "FileDescription", "Luma Upscaler: DLSS and FSR 3 for 32-bit games"
+         VALUE "FileDescription", "Luma Upscaler: DLSS, FSR and XeSS for 32-bit games"
          VALUE "FileVersion", LUMA_UPSCALER_VERSION_STRING
          VALUE "InternalName", "Luma-Upscaler"
          VALUE "LegalCopyright", "Copyright (c) 2026 DristoforColumb"
-         VALUE "LegalTrademarks", "NVIDIA DLSS is a trademark of NVIDIA Corporation. AMD FidelityFX is a trademark of Advanced Micro Devices, Inc."
+         VALUE "LegalTrademarks", "NVIDIA DLSS is a trademark of NVIDIA Corporation. AMD FidelityFX is a trademark of Advanced Micro Devices, Inc. Intel XeSS is a trademark of Intel Corporation."
          VALUE "OriginalFilename", "Luma-Upscaler.exe"
          VALUE "ProductName", "Luma"
          VALUE "ProductVersion", LUMA_UPSCALER_VERSION_STRING
-         VALUE "Comments", "Started by the Luma ReShade addon of a 32-bit game to run DLSS or FSR 3, which are 64-bit only. It exits with the game. Source: https://github.com/Filoppi/Luma-Framework (Source/Tools/SR Bridge Helper)"
+         VALUE "Comments", "Started by the Luma ReShade addon of a 32-bit game to run DLSS, FSR or XeSS, which are 64-bit only. It exits with the game. Source: https://github.com/Filoppi/Luma-Framework (Source/Tools/SR Bridge Helper)"
       END
    END
    BLOCK "VarFileInfo"

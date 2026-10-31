@@ -29,7 +29,11 @@
 // Should be <= the max (last) of NVSDK_NGX_PerfQuality_Value
 #define NUM_PERF_QUALITY_MODES 6
 
+#if DX12
+namespace NGX::inline D3D12
+#else
 namespace NGX
+#endif
 {
 	const char* project_id = "d8238c51-1f2f-438d-a309-38c16e33c716"; // This needs to be a GUID. We generated a unique one. This isn't registered by NV. This was generated for Luma. It's ok to share it for all games.
 	const char* engine_version = "1.0";
@@ -242,6 +246,20 @@ bool NGX::DLSS::Init(SR::InstanceData*& data, SR::Device* device, IDXGIAdapter* 
 			reshade::log::message(reshade::log::level::info, (std::string("NGX: ") + message).c_str());
 		};
 		feature_info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
+#endif
+#if DX12 && !ENABLE_D3D12_SR // Native D3D12 games only: a D3D11 game's in-process D3D12 SR has no frame generation
+		// Streamline's DLSS-G gets this NGX context back on the same device, with the feature paths given here: "nvngx_dlssg.dll" is in the
+		// "Streamline" folder next to the exe (not next to it, where every NGX init of the game would load it, see "fg/FrameGenerationDlss.h")
+		static const std::wstring streamline_directory = []
+		{
+			wchar_t path[MAX_PATH] = {};
+			GetModuleFileNameW(nullptr, path, MAX_PATH);
+			*wcsrchr(path, L'\\') = 0;
+			return std::wstring(path) + L"\\Streamline";
+		}();
+		static const wchar_t* const feature_paths[] = {streamline_directory.c_str()};
+		feature_info.PathListInfo.Path = feature_paths;
+		feature_info.PathListInfo.Length = 1;
 #endif
 		NVSDK_NGX_Result result = NGX_D3D(Init_with_ProjectID)(project_id, NVSDK_NGX_ENGINE_TYPE_CUSTOM, engine_version, data_path, device, &feature_info);
 

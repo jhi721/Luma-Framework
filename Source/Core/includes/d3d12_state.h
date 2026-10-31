@@ -693,6 +693,15 @@ namespace D3D12State
       }
    }
 
+   // The live resources the game created (and their clones). A descriptor heap slot keeps the resource of the view last written to it after the game destroyed it,
+   // and tables span slots their shaders never read: a resource is only queried if it's in here.
+   // ponytail: the resources Luma creates aren't in here, a game descriptor viewing one shows as unbound
+   struct LiveResources
+   {
+      std::shared_mutex mutex;
+      std::unordered_set<uint64_t> resources;
+   };
+
    // The buffer holding "address", none if unknown. Expects "addresses.mutex" to be locked (shared is enough).
    BufferAddress FindBuffer(const BufferAddresses& addresses, uint64_t address)
    {

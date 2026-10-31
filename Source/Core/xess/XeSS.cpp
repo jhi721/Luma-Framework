@@ -17,7 +17,11 @@
 #include <wrl/client.h>
 #include <d3d12.h>
 
+#if DX12
+namespace Intel::inline D3D12
+#else
 namespace Intel
+#endif
 {
    struct XeSSInstanceData : public SR::InstanceData
    {
@@ -205,11 +209,9 @@ namespace Intel
       return SR::GetFsrJitterPhases(data->settings_data.render_width, data->settings_data.output_width);
    }
 
-   // The XeSS guide's log2(render / output), without DLSS and FSR's extra -1: 0 at native resolution
    float Intel::XeSS::GetMipLODBias(const SR::InstanceData* data) const
    {
-      const float render_height = float(data->settings_data.render_height);
-      return std::log2(render_height / (std::max)(render_height, float(data->settings_data.output_height)));
+      return SR::GetXeSSMipLODBias(data->settings_data.render_height, data->settings_data.output_height);
    }
 
    bool Intel::XeSS::Draw(const SR::InstanceData* data, SR::CommandList* command_list, const DrawData& draw_data)

@@ -25,7 +25,7 @@
 
 #pragma comment(lib, "Gdi32.lib") // For "SetDeviceGammaRamp"
 #pragma comment(lib, "dxguid.lib")
-#pragma comment(lib, "Dxva2.lib")   // For "SetMonitorBrightness"
+#pragma comment(lib, "Dxva2.lib")    // For "SetMonitorBrightness"
 #pragma comment(lib, "Advapi32.lib") // For the MCP pipe's security descriptor
 
 #define _USE_MATH_DEFINES
@@ -139,6 +139,10 @@ using NativeCommandList = ID3D11DeviceContext;
 #ifndef ENABLE_SR_BRIDGE
 #define ENABLE_SR_BRIDGE 0
 #endif // ENABLE_SR_BRIDGE
+// 64-bit D3D11 only: DLSS, FSR and XeSS on D3D12 in the game's process, instead of the D3D11 ones (see "D3D12SRLocal.h"). Defined by the project's "UseLumaD3D12SR".
+#ifndef ENABLE_D3D12_SR
+#define ENABLE_D3D12_SR 0
+#endif // ENABLE_D3D12_SR
 // Luma's own native resolution TAA, in process on any GPU and on 32-bit (see "taa/LumaTAA.hpp")
 #ifndef ENABLE_LUMA_TAA
 #define ENABLE_LUMA_TAA 0
@@ -147,7 +151,7 @@ using NativeCommandList = ID3D11DeviceContext;
 #ifdef ENABLE_SR
 #undef ENABLE_SR
 #endif // ENABLE_SR
-#if (defined(ENABLE_NGX) && ENABLE_NGX) || (defined(ENABLE_FIDELITY_SK) && ENABLE_FIDELITY_SK) || ENABLE_XESS || (ENABLE_SR_BRIDGE && !defined(_WIN64)) || ENABLE_LUMA_TAA
+#if (defined(ENABLE_NGX) && ENABLE_NGX) || (defined(ENABLE_FIDELITY_SK) && ENABLE_FIDELITY_SK) || ENABLE_XESS || (ENABLE_SR_BRIDGE && !defined(_WIN64)) || ENABLE_D3D12_SR || ENABLE_LUMA_TAA
 #define ENABLE_SR 1
 #else
 #define ENABLE_SR 0
@@ -190,6 +194,11 @@ using NativeCommandList = ID3D11DeviceContext;
 #ifndef TEST_DUPLICATE_SHADER_HASH
 #define TEST_DUPLICATE_SHADER_HASH 0
 #endif // TEST_DUPLICATE_SHADER_HASH
+// The in-process D3D12 upscaler (ENABLE_D3D12_SR) creates a D3D12 device next to the game's D3D11 one, which ReShade
+// reports too: it's ignored, not asserted on
+#if ENABLE_D3D12_SR && !defined(CHECK_GRAPHICS_API_COMPATIBILITY)
+#define CHECK_GRAPHICS_API_COMPATIBILITY 1
+#endif
 #ifndef CHECK_GRAPHICS_API_COMPATIBILITY
 #define CHECK_GRAPHICS_API_COMPATIBILITY 0
 #endif // CHECK_GRAPHICS_API_COMPATIBILITY
@@ -234,24 +243,31 @@ using NativeCommandList = ID3D11DeviceContext;
 
 // Only enable this if needed, given that it adds a lot of unnecessary checks for most games
 #if CHECK_GRAPHICS_API_COMPATIBILITY
-#define SKIP_UNSUPPORTED_DEVICE_API(api, ...)                              \
-   do {                                                                    \
-      if (!IsSupportedGraphicsAPI(api)) {                                  \
-         return __VA_OPT__(__VA_ARGS__);                                   \
-      }                                                                    \
+#define SKIP_UNSUPPORTED_DEVICE_API(api, ...) \
+   do                                         \
+   {                                          \
+      if (!IsSupportedGraphicsAPI(api))       \
+      {                                       \
+         return __VA_OPT__(__VA_ARGS__);      \
+      }                                       \
    } while (0)
 #else
-#define SKIP_UNSUPPORTED_DEVICE_API(api, ...) do { (void)0; } while (0)
+#define SKIP_UNSUPPORTED_DEVICE_API(api, ...) \
+   do                                         \
+   {                                          \
+      (void)0;                                \
+   } while (0)
 #endif
 
 // Depends on "DEVELOPMENT"
 #define TEST_SR (DEVELOPMENT && 0)
 
-#include "dlss/DLSS.h" // see "ENABLE_NGX"
-#include "fsr/FSR.h" // see "ENABLE_FIDELITY_SK"
-#include "xess/XeSS.h" // see "ENABLE_XESS"
-#include "sr_bridge/SRBridge.h" // see "ENABLE_SR_BRIDGE"
-#include "includes/reflex.h" // see "ENABLE_REFLEX"
+#include "dlss/DLSS.h"              // see "ENABLE_NGX"
+#include "fsr/FSR.h"                // see "ENABLE_FIDELITY_SK"
+#include "xess/XeSS.h"              // see "ENABLE_XESS"
+#include "sr_bridge/SRBridge.h"     // see "ENABLE_SR_BRIDGE"
+#include "sr_bridge/D3D12SRLocal.h" // see "ENABLE_D3D12_SR"
+#include "includes/reflex.h"        // see "ENABLE_REFLEX"
 #if ENABLE_MINHOOK
 #include "includes/minhook.h"
 #endif
@@ -275,7 +291,7 @@ using NativeCommandList = ID3D11DeviceContext;
 #include "includes/swapchain_proxy.hpp" // see "ENABLE_SWAPCHAIN_PROXY"
 #if DEVELOPMENT && DX11
 #include "includes/perf_test.h" // Also "luma_perf" in "includes/mcp_server.inl"
-#endif // DEVELOPMENT && DX11
+#endif                          // DEVELOPMENT && DX11
 
 #include "utils/format.hpp"
 #include "utils/pipeline.hpp"
@@ -283,7 +299,7 @@ using NativeCommandList = ID3D11DeviceContext;
 #include "includes/d3d12_resource_creation.h" // see "DX12" and "ENABLE_MINHOOK"
 // See "DX12", "ENABLE_MINHOOK" and "DEVELOPMENT"
 #include "includes/d3d12_command_signatures.h"
-#include "includes/d3d12_clones.h" // see "DX12" and "ENABLE_MINHOOK"
+#include "includes/d3d12_clones.h"          // see "DX12" and "ENABLE_MINHOOK"
 #include "includes/d3d12_root_signatures.h" // see "DX12" and "ENABLE_MINHOOK"
 #include "utils/display.hpp"
 #if DX11 // Native D3D11 helpers
@@ -508,7 +524,7 @@ namespace
 #if TEST && !DEVELOPMENT
    bool reshade_effects_toggle_to_display_mode_toggle = true;
 #elif DEVELOPMENT
-	bool reshade_effects_toggle_to_display_mode_toggle = false;
+   bool reshade_effects_toggle_to_display_mode_toggle = false;
 #endif
 #if DEVELOPMENT
    bool compile_clear_all_shaders = false; // If true, even shaders that aren't used by the current mod will be compiled, for a test
@@ -518,13 +534,13 @@ namespace
    bool trace_ignore_bindings = true;
    bool trace_ignore_non_bound_shader_referenced_resources = true;
    bool allow_replace_draw_nans = false;
-#endif // DEVELOPMENT
-   constexpr bool precompile_custom_shaders = true; // Async shader compilation on boot
+#endif                                                                    // DEVELOPMENT
+   constexpr bool precompile_custom_shaders = true;                       // Async shader compilation on boot
    constexpr bool block_draw_until_device_custom_shaders_creation = true; // Needs "precompile_custom_shaders". Note that drawing (and "Present()") could be blocked anyway due to other mutexes on boot if custom shaders are still compiling
 #if !TEST && !DEVELOPMENT
    constexpr
-#endif 
-   bool custom_shaders_enabled = true;
+#endif
+      bool custom_shaders_enabled = true;
    // Master switch for patch clones only (files bypass it); also gates the exposed
    // handle, so per-draw toggles no-op too. DEV/TEST UI only.
    bool allow_patches = true;
@@ -539,7 +555,7 @@ namespace
 #endif
 
 #if ENABLE_SR
-   SR::UserType sr_user_type = SR::UserType::Auto; // If set to a non "None" value, some SR tech is enabled by the user (but not necessarily supported+initialized correctly, that's by device)
+   SR::UserType sr_user_type = SR::UserType::Auto;                                  // If set to a non "None" value, some SR tech is enabled by the user (but not necessarily supported+initialized correctly, that's by device)
    std::map<SR::Type, std::unique_ptr<SR::SuperResolutionImpl>> sr_implementations; // All the SR implementations class objects (not necessarily initialized, nor fully loaded)
 
    // DLSS render preset selection (maps to NVSDK_NGX_DLSS_Hint_Render_Preset values)
@@ -557,7 +573,7 @@ namespace
    int frame_sleep_interval = 1;
 #endif // DEVELOPMENT
 #if DEVELOPMENT || TEST
-   int test_index = 0; //TODOFT5: remove most of the calls to this once Prey performance is fixed
+   int test_index = 0; // TODOFT5: remove most of the calls to this once Prey performance is fixed
 #else
    constexpr int test_index = 0;
 #endif // DEVELOPMENT || TEST
@@ -573,18 +589,18 @@ namespace
          SDRInHDR = 2,
       };
       const char* display_mode_preset_strings[3] = {
-          "SDR", // SDR (80 nits) on scRGB HDR for SDR (gamma sRGB, because Windows interprets scRGB as sRGB)
-          "HDR",
-          "SDR on HDR", // (Fake) SDR (baseline to 203 nits) on scRGB HDR for HDR (gamma 2.2) - Dev only, for quick comparisons
+         "SDR", // SDR (80 nits) on scRGB HDR for SDR (gamma sRGB, because Windows interprets scRGB as sRGB)
+         "HDR",
+         "SDR on HDR", // (Fake) SDR (baseline to 203 nits) on scRGB HDR for HDR (gamma 2.2) - Dev only, for quick comparisons
       };
 
       // The texture upgrade types (and settings below) are defined in "ResourceUpgradeManager" (see "resource_upgrades.hpp"), these are aliases to them
       using TextureFormatUpgradesType = ResourceUpgradeManager::TextureFormatUpgradesType;
       using ChainTextureFormatUpgradesType = ResourceUpgradeManager::ChainTextureFormatUpgradesType;
       const char* chain_texture_format_upgrades_type_strings[3] = {
-          "None",
-          "Direct Dependencies",
-          "Direct and Indirect Dependencies",
+         "None",
+         "Direct Dependencies",
+         "Direct and Indirect Dependencies",
       };
       using SwapchainUpgradeType = ResourceUpgradeManager::SwapchainUpgradeType;
 
@@ -593,7 +609,7 @@ namespace
       //
 
       TextureFormatUpgradesType swapchain_format_upgrade_type = TextureFormatUpgradesType::None; // Only swap between allowed enabled/disabled after init
-      SwapchainUpgradeType swapchain_upgrade_type = SwapchainUpgradeType::scRGB; // TODO: finish implementing HDR10 output (as input it'd be harder but it might be possible as a "POST_PROCESS_SPACE_TYPE")
+      SwapchainUpgradeType swapchain_upgrade_type = SwapchainUpgradeType::scRGB;                 // TODO: finish implementing HDR10 output (as input it'd be harder but it might be possible as a "POST_PROCESS_SPACE_TYPE")
       // Some games use a non linear swapchain (e.g. R8G8B8A8_UNORM, expected to be written and read in gamma space), but always write to it through sRGB view, so we should essentially treat it as linear
       bool force_vanilla_swapchain_linear = false;
 
@@ -663,7 +679,7 @@ namespace
       // especially if the UI used R8G8B8A8_UNORM instead of R10G10B10A2_UNORM/R16G16B16A16_FLOAT as the swapchain could have been, or in case it flipped sRGB views on or off compared to the swapchain.
       // It's important to pick a format that has the same "encoding" as the original game, to preserve the look of alpha blends, so keep linear space for linear space and gamma space for gamma space.
       // Note: as of now the UI is expected to be gamma space during composition. // TODO: fix that when re-working the display composition and per game gamma settings! We should have an ecoding for draw and one for blending? Maybe using different views?
-      // 
+      //
       // For high quality SDR use "DXGI_FORMAT_R16G16B16A16_UNORM", 16 bits might reduce banding. This is best for gamma space UI but can also work in linear.
       // For high quality HDR use "DXGI_FORMAT_R16G16B16A16_FLOAT", though this can trigger NaNs or negative luminances (that you might want to preserve). This is best for linear space UI but can also work in gamma. The UI in SDR games might still go into HDR if it's ever additive.
       // For linear space SDR use "DXGI_FORMAT_R8G8B8A8_UNORM_SRGB", especially if there's no need to upgrade the bit depth, gamut and dynamic range of the UI.
@@ -706,7 +722,7 @@ namespace
       // Samplers
       //
 
-      bool enable_samplers_upgrade = false; // Can't be changed after boot
+      bool enable_samplers_upgrade = false;  // Can't be changed after boot
       bool ignore_upgraded_samplers = false; // Global live toggle. Can be enabled in certain parts of the rendering (for games that aren't multi threaded)
       int samplers_upgrade_mode = 4;
       bool force_upgrade_linear_samplers = false; // Best avoided given that it might break things that weren't meant to have AF, unless you selectively turn "ignore_upgraded_samplers" on and off // TODO: delete? dev only?
@@ -714,7 +730,7 @@ namespace
       int samplers_upgrade_mode_2 = 0;
 #endif
       PUBLISHING_CONSTEXPR bool custom_texture_mip_lod_bias_offset = false; // Live edit
-   }
+   } // namespace
 
 #if DX12
    // What Luma's upgrade of a sampler depends on: when it changes, the D3D12 sampler descriptors the game wrote are written again (see "OnPresent()")
@@ -757,7 +773,7 @@ namespace
    // Game specific constants (these are not expected to be changed at runtime)
    uint32_t luma_settings_cbuffer_index = 13;
    uint32_t luma_data_cbuffer_index = -1; // Needed, unless "POST_PROCESS_SPACE_TYPE" is 0 and we don't need the final display composition pass
-	uint32_t luma_ui_cbuffer_index = -1; // Optional, for "UI_DRAW_TYPE" 1
+   uint32_t luma_ui_cbuffer_index = -1;   // Optional, for "UI_DRAW_TYPE" 1
 #if DX12 && ENABLE_MINHOOK
    // Root parameters the game wants in every root signature, after Luma's CBVs (see "D3D12RootSignatures::GameParameter"). Set by the game in "OnInit()", read once at device init
    std::vector<D3D12RootSignatures::GameParameter> d3d12_game_root_parameters;
@@ -775,63 +791,63 @@ namespace
    // Do not edit this after init, it's not thread safe.
    // As of now, these need the "Luma_" prefix in the file.
    std::unordered_map<uint32_t, ShaderDefinition> native_shaders_definitions =
-   {
-      { CompileTimeStringHash("Copy VS"), { "Luma_Copy_VS", reshade::api::pipeline_subobject_type::vertex_shader } },
-      { CompileTimeStringHash("Display Composition"), { "Luma_DisplayComposition", reshade::api::pipeline_subobject_type::pixel_shader } },
+      {
+         {CompileTimeStringHash("Copy VS"), {"Luma_Copy_VS", reshade::api::pipeline_subobject_type::vertex_shader}},
+         {CompileTimeStringHash("Display Composition"), {"Luma_DisplayComposition", reshade::api::pipeline_subobject_type::pixel_shader}},
 #if DX12
-      // The in place one, on back buffers that allow unordered access (see "DrawDisplayCompositionD3D12()"). Not on D3D11: SM 5 has no typed UAV loads of float4
-      { CompileTimeStringHash("Display Composition CS"), { "Luma_DisplayComposition", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_cs" } },
+         // The in place one, on back buffers that allow unordered access (see "DrawDisplayCompositionD3D12()"). Not on D3D11: SM 5 has no typed UAV loads of float4
+         {CompileTimeStringHash("Display Composition CS"), {"Luma_DisplayComposition", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_cs"}},
 #endif
 
-      // Encodes the scRGB proxy back buffer into the real HDR10 PQ (or SDR sRGB) one, see "ENABLE_SWAPCHAIN_PROXY"
-      { CompileTimeStringHash("Swapchain Encode"), { "Luma_SwapchainEncode", reshade::api::pipeline_subobject_type::pixel_shader } },
+         // Encodes the scRGB proxy back buffer into the real HDR10 PQ (or SDR sRGB) one, see "ENABLE_SWAPCHAIN_PROXY"
+         {CompileTimeStringHash("Swapchain Encode"), {"Luma_SwapchainEncode", reshade::api::pipeline_subobject_type::pixel_shader}},
 
 #if ENABLE_RCAS
-      { CompileTimeStringHash("RCAS PS"), { "Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps" } },
+         {CompileTimeStringHash("RCAS PS"), {"Luma_RCAS_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "sharpen_ps"}},
 #endif
 
 #if ENABLE_SMAA // D3D11: CB::LumaGameSettings::OutputRes is required! See BioShock Series implementation. D3D12: see "DrawSMAA()"
-      { CompileTimeStringHash("SMAA Edge Detection VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_edge_detection_vs" } },
-      { CompileTimeStringHash("SMAA Edge Detection PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_edge_detection_ps" } },
-      { CompileTimeStringHash("SMAA Blending Weight Calculation VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_blending_weight_calculation_vs" } },
-      { CompileTimeStringHash("SMAA Blending Weight Calculation PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps" } },
-      { CompileTimeStringHash("SMAA Neighborhood Blending VS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_neighborhood_blending_vs" } },
-      { CompileTimeStringHash("SMAA Neighborhood Blending PS"), { "Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps" } },
+         {CompileTimeStringHash("SMAA Edge Detection VS"), {"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_edge_detection_vs"}},
+         {CompileTimeStringHash("SMAA Edge Detection PS"), {"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_edge_detection_ps"}},
+         {CompileTimeStringHash("SMAA Blending Weight Calculation VS"), {"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_blending_weight_calculation_vs"}},
+         {CompileTimeStringHash("SMAA Blending Weight Calculation PS"), {"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps"}},
+         {CompileTimeStringHash("SMAA Neighborhood Blending VS"), {"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "smaa_neighborhood_blending_vs"}},
+         {CompileTimeStringHash("SMAA Neighborhood Blending PS"), {"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps"}},
 #endif
 
 #if ENABLE_BLOOM
-      { CompileTimeStringHash("Bloom VS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "bloom_main_vs" } },
-      { CompileTimeStringHash("Bloom Prefilter PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_prefilter_ps" } },
-      { CompileTimeStringHash("Bloom Downsample PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_downsample_ps" } },
-      { CompileTimeStringHash("Bloom Upsample PS"), { "Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_upsample_ps" } },
+         {CompileTimeStringHash("Bloom VS"), {"Luma_Bloom_impl", reshade::api::pipeline_subobject_type::vertex_shader, nullptr, "bloom_main_vs"}},
+         {CompileTimeStringHash("Bloom Prefilter PS"), {"Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_prefilter_ps"}},
+         {CompileTimeStringHash("Bloom Downsample PS"), {"Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_downsample_ps"}},
+         {CompileTimeStringHash("Bloom Upsample PS"), {"Luma_Bloom_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "bloom_upsample_ps"}},
 #endif
 #if DX11 || ENABLE_BLOOM // D3D12 only draws it before its bloom
-      { CompileTimeStringHash("Karis Average CS"), { "Luma_KarisAverage", reshade::api::pipeline_subobject_type::compute_shader } },
+         {CompileTimeStringHash("Karis Average CS"), {"Luma_KarisAverage", reshade::api::pipeline_subobject_type::compute_shader}},
 #endif
 
 #if DX11 || ENABLE_D3D12_PASSES // D3D12: "ConvertTextureCopyD3D12()"
-      { CompileTimeStringHash("Copy PS"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
-      // Bilinear scaling copy (same aspect, different size): separate from the point-sampled Copy PS.
-      { CompileTimeStringHash("Scale VS"), { "Luma_Scale_VS", reshade::api::pipeline_subobject_type::vertex_shader } },
-      { CompileTimeStringHash("Scale PS"), { "Luma_Scale_PS", reshade::api::pipeline_subobject_type::pixel_shader } },
+         {CompileTimeStringHash("Copy PS"), {"Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader}},
+         // Bilinear scaling copy (same aspect, different size): separate from the point-sampled Copy PS.
+         {CompileTimeStringHash("Scale VS"), {"Luma_Scale_VS", reshade::api::pipeline_subobject_type::vertex_shader}},
+         {CompileTimeStringHash("Scale PS"), {"Luma_Scale_PS", reshade::api::pipeline_subobject_type::pixel_shader}},
 #endif
 #if DX11 // The D3D12 builds only have the natives of their display composition, swapchain encode, RCAS, SMAA, bloom and texture copy: the passes of the others aren't ported to D3D12 yet
-      
-      { CompileTimeStringHash("Copy RGB Max 0 A Sat"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, { { "RGB_MAX_0", "1" }, { "A_SAT", "1" } } } },
-      { CompileTimeStringHash("Copy RGB Max 0 A Sat MS"), { "Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, { { "MS", "1" }, { "RGB_MAX_0", "1" }, { "A_SAT", "1" } } } },
-      { CompileTimeStringHash("Sanitize A"), { "Luma_SanitizeAlpha", reshade::api::pipeline_subobject_type::compute_shader } },
-      { CompileTimeStringHash("Sanitize RGBA CS"), { "Luma_SanitizeRGBA", reshade::api::pipeline_subobject_type::compute_shader } },
-      { CompileTimeStringHash("Sanitize RGBA PS"), { "Luma_SanitizeRGBA", reshade::api::pipeline_subobject_type::pixel_shader } },
-      { CompileTimeStringHash("Sanitize RGBA Mipped"), { "Luma_SanitizeRGBAMipped", reshade::api::pipeline_subobject_type::pixel_shader } },
-      { CompileTimeStringHash("Gen Sanitized Mip"), { "Luma_GenerateSanitizedMip_CS", reshade::api::pipeline_subobject_type::compute_shader } },
 
-      { CompileTimeStringHash("Draw Purple PS"), { "Luma_DrawColor_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, { { "COLOR", "float4(1.0, 0.0, 1.0, 1.0)" } } } },
-      { CompileTimeStringHash("Draw Purple CS"), { "Luma_DrawColor_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "COLOR", "float4(1.0, 0.0, 1.0, 1.0)" } } } },
-      { CompileTimeStringHash("Draw NaN PS"), { "Luma_DrawColor_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, { { "COLOR", "FLT_NAN" } } } },
-      { CompileTimeStringHash("Draw NaN CS"), { "Luma_DrawColor_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "COLOR", "FLT_NAN" } } } },
+         {CompileTimeStringHash("Copy RGB Max 0 A Sat"), {"Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"RGB_MAX_0", "1"}, {"A_SAT", "1"}}}},
+         {CompileTimeStringHash("Copy RGB Max 0 A Sat MS"), {"Luma_Copy_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"MS", "1"}, {"RGB_MAX_0", "1"}, {"A_SAT", "1"}}}},
+         {CompileTimeStringHash("Sanitize A"), {"Luma_SanitizeAlpha", reshade::api::pipeline_subobject_type::compute_shader}},
+         {CompileTimeStringHash("Sanitize RGBA CS"), {"Luma_SanitizeRGBA", reshade::api::pipeline_subobject_type::compute_shader}},
+         {CompileTimeStringHash("Sanitize RGBA PS"), {"Luma_SanitizeRGBA", reshade::api::pipeline_subobject_type::pixel_shader}},
+         {CompileTimeStringHash("Sanitize RGBA Mipped"), {"Luma_SanitizeRGBAMipped", reshade::api::pipeline_subobject_type::pixel_shader}},
+         {CompileTimeStringHash("Gen Sanitized Mip"), {"Luma_GenerateSanitizedMip_CS", reshade::api::pipeline_subobject_type::compute_shader}},
 
-      // TODO: finish these (e.g. use shader defines to make branches!)
-      { CompileTimeStringHash("Normalize LUT 3D"), { "Luma_NormalizeLUT3D", reshade::api::pipeline_subobject_type::compute_shader } },
+         {CompileTimeStringHash("Draw Purple PS"), {"Luma_DrawColor_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"COLOR", "float4(1.0, 0.0, 1.0, 1.0)"}}}},
+         {CompileTimeStringHash("Draw Purple CS"), {"Luma_DrawColor_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"COLOR", "float4(1.0, 0.0, 1.0, 1.0)"}}}},
+         {CompileTimeStringHash("Draw NaN PS"), {"Luma_DrawColor_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"COLOR", "FLT_NAN"}}}},
+         {CompileTimeStringHash("Draw NaN CS"), {"Luma_DrawColor_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"COLOR", "FLT_NAN"}}}},
+
+         // TODO: finish these (e.g. use shader defines to make branches!)
+         {CompileTimeStringHash("Normalize LUT 3D"), {"Luma_NormalizeLUT3D", reshade::api::pipeline_subobject_type::compute_shader}},
 #if 0
       { CompileTimeStringHash("Normalize LUT 2D"), { "Luma_NormalizeLUT2D", reshade::api::pipeline_subobject_type::compute_shader } },
       { CompileTimeStringHash("Normalize LUT 1D"), { "Luma_NormalizeLUT1D", reshade::api::pipeline_subobject_type::compute_shader } },
@@ -841,16 +857,16 @@ namespace
 #endif
 
 #if ENABLE_LUMA_TAA // See "LumaTAA::resolve_shader_hashes"
-      { CompileTimeStringHash("Luma TAA Low CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "0" } } } },
-      { CompileTimeStringHash("Luma TAA Medium CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "1" } } } },
-      { CompileTimeStringHash("Luma TAA High CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "2" } } } },
-      { CompileTimeStringHash("Luma TAA Ultra CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "3" } } } },
-      { CompileTimeStringHash("Luma TAA Low Upscale CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "0" }, { "TAA_UPSCALE", "1" } } } },
-      { CompileTimeStringHash("Luma TAA Medium Upscale CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "1" }, { "TAA_UPSCALE", "1" } } } },
-      { CompileTimeStringHash("Luma TAA High Upscale CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "2" }, { "TAA_UPSCALE", "1" } } } },
-      { CompileTimeStringHash("Luma TAA Ultra Upscale CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, { { "TAA_QUALITY", "3" }, { "TAA_UPSCALE", "1" } } } },
-      { CompileTimeStringHash("Luma TAA Shading Change Ultra CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "shading_change_cs", { { "TAA_QUALITY", "3" } } } },
-      { CompileTimeStringHash("Luma TAA Shading Change CS"), { "Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "shading_change_cs", { { "TAA_QUALITY", "1" } } } },
+         {CompileTimeStringHash("Luma TAA Low CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "0"}}}},
+         {CompileTimeStringHash("Luma TAA Medium CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "1"}}}},
+         {CompileTimeStringHash("Luma TAA High CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "2"}}}},
+         {CompileTimeStringHash("Luma TAA Ultra CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "3"}}}},
+         {CompileTimeStringHash("Luma TAA Low Upscale CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "0"}, {"TAA_UPSCALE", "1"}}}},
+         {CompileTimeStringHash("Luma TAA Medium Upscale CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "1"}, {"TAA_UPSCALE", "1"}}}},
+         {CompileTimeStringHash("Luma TAA High Upscale CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "2"}, {"TAA_UPSCALE", "1"}}}},
+         {CompileTimeStringHash("Luma TAA Ultra Upscale CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "3"}, {"TAA_UPSCALE", "1"}}}},
+         {CompileTimeStringHash("Luma TAA Shading Change Ultra CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "shading_change_cs", {{"TAA_QUALITY", "3"}}}},
+         {CompileTimeStringHash("Luma TAA Shading Change CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "shading_change_cs", {{"TAA_QUALITY", "1"}}}},
 #endif
 #endif // DX11
    };
@@ -884,7 +900,7 @@ namespace
       // display the patched bytecode.
 #if DEVELOPMENT && LUMA_PATCH_PROVIDERS != 0
       inline void SetLivePatchedShaderInfo(CachedShader* cached_shader, uint32_t shader_hash,
-                                        const uint8_t* code, uint32_t size)
+         const uint8_t* code, uint32_t size)
       {
          if (!cached_shader || !code || size == 0)
             return;
@@ -903,9 +919,9 @@ namespace
          patched_shaders_to_dump.emplace(shader_hash);
       }
 #endif // ALLOW_SHADER_PATCHES_DUMPING && LUMA_PATCH_PROVIDERS != 0
-   }
+   } // namespace
 
-   std::string shaders_compilation_errors; // errors and warning log
+   std::string shaders_compilation_errors;  // errors and warning log
    bool shaders_compilation_failed = false; // Whether "shaders_compilation_errors" has errors, not only warnings
 #if DEVELOPMENT
    std::vector<std::string> custom_shaders_compile_defines; // Name/value pairs of the last "CompileCustomShaders()", for "luma_get_settings" (offline replays)
@@ -918,22 +934,22 @@ namespace
    // For further descriptions, see their shader declarations.
    // TODO: add grey out conditions (another define, by name, whether its value is > 0, or flipped (we can already manually toggle their editability manually)), and "category"
    std::vector<ShaderDefineData> shader_defines_data = {
-       {"DEVELOPMENT", DEVELOPMENT ? '1' : '0', true, DEVELOPMENT ? false : true, "Enables some development/debug features that are otherwise not allowed (use a DEVELOPMENT build if you want to use this)", 1},
-       {"TEST", (TEST || DEVELOPMENT) ? '1' : '0', true, (TEST || DEVELOPMENT) ? false : true, "Enables some test features to aid with development (use a DEVELOPMENT or TEST build if you want to use this)", 1},
-       // Usually if we store in gamma space, we also keep the paper white not multiplied in until we apply it on the final output, while if we store in linear space, we pre-multiply it in (and we might also pre-correct gamma before the final output).
-       // NOTE: "POST_PROCESS_SPACE_TYPE" 2 is actually implemented as well but only used by Prey.
-       {"POST_PROCESS_SPACE_TYPE", '0', true, DEVELOPMENT ? false : true, "Describes in what \"space\" (encoding) the game post processing color buffers are stored\n0 - SDR Gamma space\n1 - Linear space"},
-       {"EARLY_DISPLAY_ENCODING", '0', true, DEVELOPMENT ? false : true, "Whether the main gamma correction and paper white scaling happens early in post processing or in the final display composition pass (only applies if \"POST_PROCESS_SPACE_TYPE\" is set to linear)", 1},
-       // Sadly most games encoded with sRGB (or used linear sRGB buffers, similar thing), so that's the default here
-       {"VANILLA_ENCODING_TYPE", '0', true, DEVELOPMENT ? false : true, "0 - sRGB\n1 - Gamma 2.2"},
-       {"GAMMA_CORRECTION_TYPE", '1', true, false, "(HDR only) Emulates a specific SDR transfer function\nThis is best left to \"1\" (Gamma 2.2) unless you have crushed blacks or overly saturated colors\n0 - sRGB\n1 - Gamma 2.2\n2 - sRGB (color hues) with gamma 2.2 luminance (corrected by channel)\n3 - sRGB (color hues) with gamma 2.2 luminance (corrected by luminance)\n4 - Gamma 2.2 (corrected by luminance) with per channel correction chrominance"},
-       {"GAMUT_MAPPING_TYPE", '0', true, DEVELOPMENT ? false : true, "The type of gamut mapping that is needed by the game.\nIf rendering and post processing don't generate any colors beyond the target gamut, there's no need to do gamut mapping.\n0 - None\n1 - Auto (SDR/HDR)\n2 - SDR (BT.709)\n3 - HDR (BT.2020)"},
-       {"UI_DRAW_TYPE", '0', true, DEVELOPMENT ? false : true, "Describes how the UI draws in\n0 - Raw (original linear to linear or gamma to gamma draws) (no custom UI paper white control)\n1 - Direct Custom (gamma to linear adapted blends)\n2 - Direct (inverse scene brightness draws)\n3 - Separate (renders the UI on a separate texture, allows tonemapping of UI background)", 3},
+      {"DEVELOPMENT", DEVELOPMENT ? '1' : '0', true, DEVELOPMENT ? false : true, "Enables some development/debug features that are otherwise not allowed (use a DEVELOPMENT build if you want to use this)", 1},
+      {"TEST", (TEST || DEVELOPMENT) ? '1' : '0', true, (TEST || DEVELOPMENT) ? false : true, "Enables some test features to aid with development (use a DEVELOPMENT or TEST build if you want to use this)", 1},
+      // Usually if we store in gamma space, we also keep the paper white not multiplied in until we apply it on the final output, while if we store in linear space, we pre-multiply it in (and we might also pre-correct gamma before the final output).
+      // NOTE: "POST_PROCESS_SPACE_TYPE" 2 is actually implemented as well but only used by Prey.
+      {"POST_PROCESS_SPACE_TYPE", '0', true, DEVELOPMENT ? false : true, "Describes in what \"space\" (encoding) the game post processing color buffers are stored\n0 - SDR Gamma space\n1 - Linear space"},
+      {"EARLY_DISPLAY_ENCODING", '0', true, DEVELOPMENT ? false : true, "Whether the main gamma correction and paper white scaling happens early in post processing or in the final display composition pass (only applies if \"POST_PROCESS_SPACE_TYPE\" is set to linear)", 1},
+      // Sadly most games encoded with sRGB (or used linear sRGB buffers, similar thing), so that's the default here
+      {"VANILLA_ENCODING_TYPE", '0', true, DEVELOPMENT ? false : true, "0 - sRGB\n1 - Gamma 2.2"},
+      {"GAMMA_CORRECTION_TYPE", '1', true, false, "(HDR only) Emulates a specific SDR transfer function\nThis is best left to \"1\" (Gamma 2.2) unless you have crushed blacks or overly saturated colors\n0 - sRGB\n1 - Gamma 2.2\n2 - sRGB (color hues) with gamma 2.2 luminance (corrected by channel)\n3 - sRGB (color hues) with gamma 2.2 luminance (corrected by luminance)\n4 - Gamma 2.2 (corrected by luminance) with per channel correction chrominance"},
+      {"GAMUT_MAPPING_TYPE", '0', true, DEVELOPMENT ? false : true, "The type of gamut mapping that is needed by the game.\nIf rendering and post processing don't generate any colors beyond the target gamut, there's no need to do gamut mapping.\n0 - None\n1 - Auto (SDR/HDR)\n2 - SDR (BT.709)\n3 - HDR (BT.2020)"},
+      {"UI_DRAW_TYPE", '0', true, DEVELOPMENT ? false : true, "Describes how the UI draws in\n0 - Raw (original linear to linear or gamma to gamma draws) (no custom UI paper white control)\n1 - Direct Custom (gamma to linear adapted blends)\n2 - Direct (inverse scene brightness draws)\n3 - Separate (renders the UI on a separate texture, allows tonemapping of UI background)", 3},
 #if DEVELOPMENT
-       {"TEST_2X_ZOOM", '0', true, false, "Allows you to zoom in into the film image center to better analyze it", 1},
+      {"TEST_2X_ZOOM", '0', true, false, "Allows you to zoom in into the film image center to better analyze it", 1},
 #endif
-       {"TEST_SDR_HDR_SPLIT_VIEW_MODE", '0', true, false, "Allows you to clamp to SDR on a portion of the screen, to run quick comparisons between SDR and HDR\n(note that the tonemapper might still run in HDR mode and thus clip further than it would have had in SDR)", 4},
-       {"TEST_SDR_HDR_SPLIT_VIEW_MODE_NATIVE_IMPL", '0', true, DEVELOPMENT ? false : true, "Tells whether \"TEST_SDR_HDR_SPLIT_VIEW_MODE\" is natively implemented in the game's tonemapper, outputting some SDR and some HDR, or if it's not and we are simply clipping to SDR at the very end", 1},
+      {"TEST_SDR_HDR_SPLIT_VIEW_MODE", '0', true, false, "Allows you to clamp to SDR on a portion of the screen, to run quick comparisons between SDR and HDR\n(note that the tonemapper might still run in HDR mode and thus clip further than it would have had in SDR)", 4},
+      {"TEST_SDR_HDR_SPLIT_VIEW_MODE_NATIVE_IMPL", '0', true, DEVELOPMENT ? false : true, "Tells whether \"TEST_SDR_HDR_SPLIT_VIEW_MODE\" is natively implemented in the game's tonemapper, outputting some SDR and some HDR, or if it's not and we are simply clipping to SDR at the very end", 1},
    };
 
    // TODO: if at runtime we can't edit "shader_defines_data" (e.g. in non dev modes), then we could directly set these to the index value of their respective "shader_defines_data" and skip the map?
@@ -961,7 +977,7 @@ namespace
    // Global data (not device dependent really):
 
    // Directly from cbuffer
-   CB::LumaGlobalSettingsPadded cb_luma_global_settings = { }; // Not in device data as this stores some users settings too // Set "cb_luma_global_settings_dirty" when changing within a frame (so it's uploaded again)
+   CB::LumaGlobalSettingsPadded cb_luma_global_settings = {}; // Not in device data as this stores some users settings too // Set "cb_luma_global_settings_dirty" when changing within a frame (so it's uploaded again)
    CB::LumaGameSettings default_luma_global_game_settings;
 
    bool hdr_display_mode_pending_auto_peak_white_calibration = false;
@@ -974,7 +990,7 @@ namespace
    std::atomic<bool> thread_auto_compiling_running = false;
    bool last_pressed_unload = false;
    bool needs_unload_shaders = false;
-   bool needs_load_shaders = false; // Load/compile or reload/recompile shaders, no need to default it to true, we have "auto_load" for that
+   bool needs_load_shaders = false;   // Load/compile or reload/recompile shaders, no need to default it to true, we have "auto_load" for that
    bool needs_unload_patches = false; // Patch clones only (preserved, not destroyed; see UnloadPatches)
    bool needs_load_patches = false;
    // Sticky "patches unloaded" state (parallel to "last_pressed_unload" for files):
@@ -1140,9 +1156,9 @@ namespace
 #if DEVELOPMENT
    thread_local reshade::api::format last_attempted_upgraded_resource_view_creation_view_format = reshade::api::format::unknown;
 
-   bool trace_scheduled = false; // For next frame
+   bool trace_scheduled = false;            // For next frame
    std::atomic<bool> trace_running = false; // For this frame. Atomic so hot paths can skip "s_mutex_trace" while no trace runs
-   uint32_t trace_count = 0; // Not exactly necessary but... it might help
+   uint32_t trace_count = 0;                // Not exactly necessary but... it might help
 #if DX12
    // The device whose command lists and presents the frame capture records, of a game with several (video or compute ones): only its entries are kept, so the others' don't pile
    // up. The overlay's device unless another one was picked (in the capture's device list, or by the MCP's "device"), set when a capture starts and cleared with its device.
@@ -1217,7 +1233,7 @@ namespace
       std::string debug_draw_registered_texture; // "DevValueKind::Texture" name shown straight from the state it rests in (DebugDrawMode::Custom), instead of a copy of a draw's view
       uint32_t debug_draw_copied_frame = 0;      // "FrameIndex" of the last copy of a draw's view
 #endif
-   }
+   } // namespace
 
    // Constant Buffers tracking
    namespace
@@ -1227,7 +1243,7 @@ namespace
       int32_t track_buffer_index = 0;
 
       std::atomic<int32_t> track_buffer_pipeline_instance = 0; // Theoretically should be within "CommandListData" but this should work for most cases
-   }
+   } // namespace
 
    // CB Dev settings settings
    namespace
@@ -1238,7 +1254,7 @@ namespace
       std::array<std::string, CB::LumaDevSettings::SettingsNum> cb_luma_dev_settings_names;
       bool cb_luma_dev_settings_set_from_code = false; // Set this to true to disable dev settings reflections from shaders
       bool cb_luma_dev_settings_edit_mode = false;
-   }
+   } // namespace
 #endif // DEVELOPMENT
 
    // Forward declares:
@@ -1262,9 +1278,9 @@ namespace
    // Returns true if any shader or pipeline has been replaced, meaning that the mod will at least do something (this is representative of how most, but not necessarily all, mods work)
    bool IsModActive(const DeviceData& device_data)
    {
-   #if GAME_UNREAL_ENGINE || GAME_GRANBLUE_FANTASY_RELINK
+#if GAME_UNREAL_ENGINE || GAME_GRANBLUE_FANTASY_RELINK
       return true;
-   #endif
+#endif
       // Note: we don't check "custom_shaders_enabled" here because we want to simulate the mod still being treated as active in that case
       return device_data.cloned_pipeline_count != 0;
    }
@@ -1422,7 +1438,7 @@ namespace
          out_is_global = true;
          return true;
       }
-      
+
       const auto game_shader_directory = shader_directory / Globals::GAME_NAME;
       if (entry_directory == game_shader_directory)
       {
@@ -2123,12 +2139,10 @@ namespace
          return;
       }
 
-      for (const auto& entry : std::filesystem::recursive_directory_iterator(shaders_path)
-         | std::views::filter([](const std::filesystem::directory_entry& e) {
-            return e.is_regular_file() &&
-               (e.path().extension() == ".cso" ||
-                  e.path().extension() == ".meta");
-            }))
+      for (const auto& entry : std::filesystem::recursive_directory_iterator(shaders_path) | std::views::filter([](const std::filesystem::directory_entry& e)
+                                                                                                { return e.is_regular_file() &&
+                                                                                                         (e.path().extension() == ".cso" ||
+                                                                                                            e.path().extension() == ".meta"); }))
       {
          bool is_global = false;
          const auto& entry_path = entry.path();
@@ -2148,7 +2162,7 @@ namespace
          }
 
          const auto filename_no_extension_string = entry_path.stem().string();
-         
+
          if (is_cso)
          {
             // If this is named CSO with exclamation mark, it's user pre-built which needs to be skipped
@@ -2158,7 +2172,7 @@ namespace
             }
          }
 
-#if 1 // Optionally leave any "raw" cso that was likely copied from the dumped shaders folder (these were not compiled from a custom hlsl shader by the same hash)
+#if 1                                                                                                                                                                   // Optionally leave any "raw" cso that was likely copied from the dumped shaders folder (these were not compiled from a custom hlsl shader by the same hash)
          if (filename_no_extension_string.length() >= (HASH_CHARACTERS_LENGTH + 2) && filename_no_extension_string[0] == '0' && filename_no_extension_string[1] == 'x') // Matches "strlen("0x12345678")"
          {
             continue;
@@ -2171,7 +2185,7 @@ namespace
 
 #if DX11 // Luma's own D3D12 shaders need their own root signature and PSOs (see "CreateD3D12NativePipeline()")
    // Expects "s_mutex_loading" and "s_mutex_shader_objects"
-   template<typename T = ID3D11DeviceChild>
+   template <typename T = ID3D11DeviceChild>
    void CreateShaderObject(ID3D11Device* native_device, uint32_t native_shader_hash, com_ptr<T>& shader_object, bool force_delete_previous = !(bool)FORCE_KEEP_CUSTOM_SHADERS_LOADED, bool trigger_assert = false)
    {
       if (force_delete_previous)
@@ -2230,27 +2244,31 @@ namespace
             switch (native_shader_definition.second.type)
             {
             case reshade::api::pipeline_subobject_type::vertex_shader:
-               CreateShaderObject(device_data.native_device, native_shader_definition.first, device_data.native_vertex_shaders[native_shader_definition.first]); break;
+               CreateShaderObject(device_data.native_device, native_shader_definition.first, device_data.native_vertex_shaders[native_shader_definition.first]);
+               break;
 #if GEOMETRY_SHADER_SUPPORT
             case reshade::api::pipeline_subobject_type::geometry_shader:
-               CreateShaderObject(device_data.native_device, native_shader_definition.first, device_data.native_geometry_shaders[native_shader_definition.first]); break;
+               CreateShaderObject(device_data.native_device, native_shader_definition.first, device_data.native_geometry_shaders[native_shader_definition.first]);
+               break;
 #endif
             case reshade::api::pipeline_subobject_type::pixel_shader:
-               CreateShaderObject(device_data.native_device, native_shader_definition.first, device_data.native_pixel_shaders[native_shader_definition.first]); break;
+               CreateShaderObject(device_data.native_device, native_shader_definition.first, device_data.native_pixel_shaders[native_shader_definition.first]);
+               break;
             case reshade::api::pipeline_subobject_type::compute_shader:
-               CreateShaderObject(device_data.native_device, native_shader_definition.first, device_data.native_compute_shaders[native_shader_definition.first]); break;
+               CreateShaderObject(device_data.native_device, native_shader_definition.first, device_data.native_compute_shaders[native_shader_definition.first]);
+               break;
             default:
-               ASSERT_ONCE(false); break;
+               ASSERT_ONCE(false);
+               break;
             }
          }
 
 #if DEVELOPMENT
          bool shader_key_found = device_data.native_vertex_shaders.contains(native_shader_definition.first)
 #if GEOMETRY_SHADER_SUPPORT
-            || device_data.native_geometry_shaders.contains(native_shader_definition.first)
+                                 || device_data.native_geometry_shaders.contains(native_shader_definition.first)
 #endif
-            || device_data.native_pixel_shaders.contains(native_shader_definition.first)
-            || device_data.native_compute_shaders.contains(native_shader_definition.first);
+                                 || device_data.native_pixel_shaders.contains(native_shader_definition.first) || device_data.native_compute_shaders.contains(native_shader_definition.first);
          char msg[512];
          std::snprintf(
             msg,
@@ -2265,17 +2283,22 @@ namespace
             switch (native_shader_definition.second.type)
             {
             case reshade::api::pipeline_subobject_type::vertex_shader:
-               shader_key_valid = device_data.native_vertex_shaders[native_shader_definition.first].get(); break;
+               shader_key_valid = device_data.native_vertex_shaders[native_shader_definition.first].get();
+               break;
 #if GEOMETRY_SHADER_SUPPORT
             case reshade::api::pipeline_subobject_type::geometry_shader:
-               shader_key_valid = device_data.native_geometry_shaders[native_shader_definition.first].get(); break;
+               shader_key_valid = device_data.native_geometry_shaders[native_shader_definition.first].get();
+               break;
 #endif
             case reshade::api::pipeline_subobject_type::pixel_shader:
-               shader_key_valid = device_data.native_pixel_shaders[native_shader_definition.first].get(); break;
+               shader_key_valid = device_data.native_pixel_shaders[native_shader_definition.first].get();
+               break;
             case reshade::api::pipeline_subobject_type::compute_shader:
-               shader_key_valid = device_data.native_compute_shaders[native_shader_definition.first].get(); break;
+               shader_key_valid = device_data.native_compute_shaders[native_shader_definition.first].get();
+               break;
             default:
-               ASSERT_ONCE(false); break;
+               ASSERT_ONCE(false);
+               break;
             }
             std::snprintf(
                msg,
@@ -2316,12 +2339,13 @@ namespace
          shader_defines.assign((shader_defines_data.size() + total_extra_defines) * 2, "");
 
          size_t shader_defines_index = shader_defines.size() - (total_extra_defines * 2);
-         
+
          // Clean up the game name from non letter characters (including spaces), and make it all upper case
          std::string game_name = Globals::GAME_NAME;
-			RemoveNonLetterOrNumberCharacters(game_name.data(), '_'); // Ideally we should remove all weird characters and turn spaces into underscores
+         RemoveNonLetterOrNumberCharacters(game_name.data(), '_'); // Ideally we should remove all weird characters and turn spaces into underscores
          std::transform(game_name.begin(), game_name.end(), game_name.begin(),
-            [](unsigned char c) { return std::toupper(c); });
+            [](unsigned char c)
+            { return std::toupper(c); });
          shader_defines[shader_defines_index++] = "GAME_" + game_name;
          shader_defines[shader_defines_index++] = "1";
 
@@ -2370,7 +2394,7 @@ namespace
          shader_defines[shader_defines_index++] = "LUMA_UI_DATA_CB_INDEX";
          shader_defines[shader_defines_index++] = "b" + std::to_string(luma_ui_cbuffer_define_index);
 
-			ASSERT_ONCE(shader_defines_index == shader_defines.size());
+         ASSERT_ONCE(shader_defines_index == shader_defines.size());
 
          for (uint32_t i = 0; i < shader_defines_data.size(); i++)
          {
@@ -2425,7 +2449,7 @@ namespace
 #endif
 
          // Add the global (generic) include and the game specific one
-         auto settings_directories = { directory / "Includes" / "Settings.hlsl", directory / Globals::GAME_NAME / "Includes" / "Settings.hlsl" };
+         auto settings_directories = {directory / "Includes" / "Settings.hlsl", directory / Globals::GAME_NAME / "Includes" / "Settings.hlsl"};
          bool is_global_settings = true;
          for (auto settings_directory : settings_directories)
          {
@@ -2437,7 +2461,7 @@ namespace
                   file.exceptions(std::ifstream::failbit | std::ifstream::badbit);
                   file.open(settings_directory.c_str()); // Open file
                   std::stringstream str_stream;
-                  str_stream << file.rdbuf(); // Read the file (we could use "D3DReadFileToBlob" to append the hsls includes in the file, but then stuff that is defined out wouldn't be part of the text)
+                  str_stream << file.rdbuf();         // Read the file (we could use "D3DReadFileToBlob" to append the hsls includes in the file, but then stuff that is defined out wouldn't be part of the text)
                   std::string str = str_stream.str(); // str holds the content of the file
                   size_t i = -1;
                   int settings_count = 0;
@@ -2500,22 +2524,37 @@ namespace
                         while (ss.peek() == ' ')
                         {
                            ss.ignore();
-                           if (!ss.good()) { reached_end = true; break; }
+                           if (!ss.good())
+                           {
+                              reached_end = true;
+                              break;
+                           }
                         }
                         // The float read would seemengly advance some state in the stream buffer even if it failed finding it, so skip it in case the next value is not a number (ignore ".3f" like definitions...).
                         // Float heading spaces are automatically ignored.
                         while (!reached_end && ss.peek() >= '0' && ss.peek() <= '9' && ss >> str_float)
                         {
-                           if (settings_float_count == 0) cb_luma_dev_settings_default_value[settings_count - 1] = str_float;
-                           else if (settings_float_count == 1) cb_luma_dev_settings_min_value[settings_count - 1] = str_float;
-                           else if (settings_float_count == 2) cb_luma_dev_settings_max_value[settings_count - 1] = str_float;
+                           if (settings_float_count == 0)
+                              cb_luma_dev_settings_default_value[settings_count - 1] = str_float;
+                           else if (settings_float_count == 1)
+                              cb_luma_dev_settings_min_value[settings_count - 1] = str_float;
+                           else if (settings_float_count == 2)
+                              cb_luma_dev_settings_max_value[settings_count - 1] = str_float;
                            settings_float_count++;
-                           if (!ss.good()) { reached_end = true; break; };
+                           if (!ss.good())
+                           {
+                              reached_end = true;
+                              break;
+                           };
                            // Remove known (supported) characters to ignore (spaces are already ignored above anyway)
                            while (ss.peek() == ',' || ss.peek() == ' ')
                            {
                               ss.ignore();
-                              if (!ss.good()) { reached_end = true; break; }
+                              if (!ss.good())
+                              {
+                                 reached_end = true;
+                                 break;
+                              }
                            }
                         }
 
@@ -2528,7 +2567,7 @@ namespace
                            cb_luma_dev_settings_names[settings_count - 1] = cb_luma_dev_settings_names[settings_count - 1].substr(ss_pos, cb_luma_dev_settings_names[settings_count - 1].length() - ss_pos);
                         }
                      }
-   #endif
+#endif
 
                      if (finished) break;
                   }
@@ -2554,12 +2593,10 @@ namespace
       }
 
       std::set<uint32_t> changed_luma_native_shaders_hashes;
-      for (const auto& entry : std::filesystem::recursive_directory_iterator(directory)
-         | std::views::filter([](const std::filesystem::directory_entry& e) {
-            return e.is_regular_file() &&
-               (e.path().extension() == ".cso" ||
-                  e.path().extension() == ".hlsl");
-            }))
+      for (const auto& entry : std::filesystem::recursive_directory_iterator(directory) | std::views::filter([](const std::filesystem::directory_entry& e)
+                                                                                             { return e.is_regular_file() &&
+                                                                                                      (e.path().extension() == ".cso" ||
+                                                                                                         e.path().extension() == ".hlsl"); }))
       {
          bool is_global = false;
          const auto& entry_path = entry.path();
@@ -2608,9 +2645,9 @@ namespace
                is_luma_native = true;
             }
             const auto length = filename_no_extension_string.length();
-            const auto hash_length = strlen(hash_sample); // HASH_CHARACTERS_LENGTH+2
+            const auto hash_length = strlen(hash_sample);                                                            // HASH_CHARACTERS_LENGTH+2
             const auto min_expected_length = is_luma_native ? strlen(native_prefix) : (hash_length + 1 + sm_length); // The shader model is appended after any name, so we add 1 for a dot (e.g. "0x12345678.ps_5_0")
-            
+
             if (length < min_expected_length) continue;
 
             if (is_luma_native)
@@ -2692,7 +2729,7 @@ namespace
             // which implies that we either did not ship the hlsl and shipped the pre-compiled cso(s),
             // or that this is a vanilla cso dumped from the game.
             // If the hlsl also exists, we load the cso though the hlsl code loading below (by redirecting it).
-            // 
+            //
             // Note that if we have two shaders with the same hash but different overall name (e.g. the description part of the shader),
             // whichever is iterated last will load on top of the previous one (whether they are both cso, or cso and hlsl etc).
             // We don't care about "fixing" that because it's not a real world case.
@@ -2848,10 +2885,10 @@ namespace
             char config_name[std::string_view("Shader#").size() + HASH_CHARACTERS_LENGTH + 1] = "";
             sprintf(&config_name[0], "Shader#%s", hash_string.c_str());
 
-            const std::unique_lock lock(s_mutex_loading); // Don't lock until now as we didn't access any shared data
-            auto& custom_shader = custom_shaders_cache[shader_hash]; // Add default initialized shader
+            const std::unique_lock lock(s_mutex_loading);                                                                                        // Don't lock until now as we didn't access any shared data
+            auto& custom_shader = custom_shaders_cache[shader_hash];                                                                             // Add default initialized shader
             const bool has_custom_shader = (custom_shaders_cache.find(shader_hash) != custom_shaders_cache.end()) && (custom_shader != nullptr); // Weird code...
-            std::wstring trimmed_file_path_cso; // Only valid for hlsl files. Identical for "is_luma_native" files.
+            std::wstring trimmed_file_path_cso;                                                                                                  // Only valid for hlsl files. Identical for "is_luma_native" files.
 
             if (is_hlsl)
             {
@@ -2963,7 +3000,7 @@ namespace
                // Note that this will not try to build the shader again if the last compilation failed and its files haven't changed
                bool error = false;
                std::string preprocessed_code;
-					std::string* preprocessed_code_ref = &preprocessed_code;
+               std::string* preprocessed_code_ref = &preprocessed_code;
 #if DEVELOPMENT
                preprocessed_code_ref = &custom_shader->preprocessed_code;
 #endif
@@ -3334,7 +3371,7 @@ namespace
       {
          const std::shared_lock lock_device(device_data.mutex);
          device_data.patch_context.ForEachPatchedShader([&](const uint32_t shader_hash, const Patch::PatchedShaderData&)
-         {
+            {
             auto pipelines_pair = device_data.pipeline_caches_by_shader_hash.find(shader_hash);
             if (pipelines_pair == device_data.pipeline_caches_by_shader_hash.end())
             {
@@ -3364,8 +3401,7 @@ namespace
                   pipelines_to_destroy[pipeline_clone_handle] = cached_pipeline->device;
                   cached_pipeline->pipeline_clone = {0};
                }
-            }
-         });
+            } });
       }
 #endif
 
@@ -3397,121 +3433,120 @@ namespace
       std::vector<D3D12CloneSource> d3d12_clone_sources;
 #endif
 
-       // "s_mutex_loading" is expected to still be locked
-       for (CachedPipeline* cached_pipeline : pipelines_to_clone)
-       {
-          // Skip pipelines with a live clone: the collection can see a pipeline
-          // twice (file + patch paths, or re-queued across batches). Re-cloning
-          // overwrote pipeline_clone, leaked the old clone, and raced its
-          // ClearCustomShader destroy.
-          if (cached_pipeline->cloned)
-          {
-             continue;
-          }
-          const uint32_t subobject_count = cached_pipeline->subobject_count;
-          reshade::api::pipeline_subobject* subobjects = cached_pipeline->subobjects_cache;
+      // "s_mutex_loading" is expected to still be locked
+      for (CachedPipeline* cached_pipeline : pipelines_to_clone)
+      {
+         // Skip pipelines with a live clone: the collection can see a pipeline
+         // twice (file + patch paths, or re-queued across batches). Re-cloning
+         // overwrote pipeline_clone, leaked the old clone, and raced its
+         // ClearCustomShader destroy.
+         if (cached_pipeline->cloned)
+         {
+            continue;
+         }
+         const uint32_t subobject_count = cached_pipeline->subobject_count;
+         reshade::api::pipeline_subobject* subobjects = cached_pipeline->subobjects_cache;
 
-          // Reset the clone provenance: it describes the clone we are about to create.
-          cached_pipeline->clone_origin = Shader::CloneOrigin::None;
+         // Reset the clone provenance: it describes the clone we are about to create.
+         cached_pipeline->clone_origin = Shader::CloneOrigin::None;
 
 #if _DEBUG && LOG_VERBOSE
-          {
-             std::stringstream s;
-             s << "LoadCustomShaders(Cloning pipeline ";
-             s << reinterpret_cast<void*>(cached_pipeline->pipeline.handle);
-             s << " with " << subobject_count << " object(s)";
-             s << ")";
-             reshade::log::message(reshade::log::level::debug, s.str().c_str());
-          }
+         {
+            std::stringstream s;
+            s << "LoadCustomShaders(Cloning pipeline ";
+            s << reinterpret_cast<void*>(cached_pipeline->pipeline.handle);
+            s << " with " << subobject_count << " object(s)";
+            s << ")";
+            reshade::log::message(reshade::log::level::debug, s.str().c_str());
+         }
 #endif
 
 #if DX12
-          std::vector<D3D12StageReplacement> replacements = FindD3D12StageReplacements(*cached_pipeline);
-          if (replacements.empty())
-          {
-             continue;
-          }
-          cached_pipeline->clone_origin = Shader::CloneOrigin::File;
-          D3D12CloneSource& clone_source = d3d12_clone_sources.emplace_back(D3D12CloneSource{.cached_pipeline = cached_pipeline, .code_hash = HashD3D12Replacements(replacements)});
-          clone_source.codes.reserve(replacements.size());
-          for (D3D12StageReplacement& replacement : replacements)
-          {
-             replacement.code = clone_source.codes.emplace_back(replacement.code.begin(), replacement.code.end());
-          }
-          clone_source.replacements = std::move(replacements);
+         std::vector<D3D12StageReplacement> replacements = FindD3D12StageReplacements(*cached_pipeline);
+         if (replacements.empty())
+         {
+            continue;
+         }
+         cached_pipeline->clone_origin = Shader::CloneOrigin::File;
+         D3D12CloneSource& clone_source = d3d12_clone_sources.emplace_back(D3D12CloneSource{.cached_pipeline = cached_pipeline, .code_hash = HashD3D12Replacements(replacements)});
+         clone_source.codes.reserve(replacements.size());
+         for (D3D12StageReplacement& replacement : replacements)
+         {
+            replacement.code = clone_source.codes.emplace_back(replacement.code.begin(), replacement.code.end());
+         }
+         clone_source.replacements = std::move(replacements);
 #else
-          auto [pipeline_clone, injected] = Patch::ClonePipelineWithPatches(
-             cached_pipeline->device, cached_pipeline->layout,
-             subobjects, subobject_count,
-             [&device_data, cached_pipeline](
-                 const reshade::api::shader_desc* clone_desc,
-                 const reshade::api::shader_desc* orig_desc) -> std::optional<std::pair<const uint8_t*, uint32_t>>
-             {
-                const uint32_t shader_hash = Shader::BinToHash(static_cast<const uint8_t*>(orig_desc->code), orig_desc->code_size);
+         auto [pipeline_clone, injected] = Patch::ClonePipelineWithPatches(
+            cached_pipeline->device, cached_pipeline->layout,
+            subobjects, subobject_count,
+            [&device_data, cached_pipeline](
+               const reshade::api::shader_desc* clone_desc,
+               const reshade::api::shader_desc* orig_desc) -> std::optional<std::pair<const uint8_t*, uint32_t>>
+            {
+               const uint32_t shader_hash = Shader::BinToHash(static_cast<const uint8_t*>(orig_desc->code), orig_desc->code_size);
 
-                // Check for custom shader first
-                if (auto custom_shader_pair = custom_shaders_cache.find(shader_hash); custom_shader_pair != custom_shaders_cache.end())
-                {
-                   const CachedCustomShader* custom_shader = custom_shader_pair->second;
-                   if (custom_shader != nullptr && !custom_shader->is_luma_native && !custom_shader->code.empty())
-                   {
-                      cached_pipeline->clone_origin = Shader::CloneOrigin::File;
+               // Check for custom shader first
+               if (auto custom_shader_pair = custom_shaders_cache.find(shader_hash); custom_shader_pair != custom_shaders_cache.end())
+               {
+                  const CachedCustomShader* custom_shader = custom_shader_pair->second;
+                  if (custom_shader != nullptr && !custom_shader->is_luma_native && !custom_shader->code.empty())
+                  {
+                     cached_pipeline->clone_origin = Shader::CloneOrigin::File;
 #if LUMA_PATCH_PROVIDERS != 0
-                      // A cached file wins over the patched version on this
-                      // clone. Report once per shader so developers know the
-                      // patch is being shadowed (it otherwise looks broken).
-                      if (device_data.patch_context.HasPatch(shader_hash))
-                      {
-                         static std::mutex s_logged_patch_override_mutex;
-                         static std::unordered_set<uint32_t> s_logged_patch_override_hashes;
-                         const std::lock_guard lock_logged_override(s_logged_patch_override_mutex);
-                         if (s_logged_patch_override_hashes.emplace(shader_hash).second)
-                         {
-                            reshade::log::message(reshade::log::level::debug, std::format("[Patch] custom shader file overrides stored patch for shader {:08X}", shader_hash).c_str());
-                         }
-                      }
+                     // A cached file wins over the patched version on this
+                     // clone. Report once per shader so developers know the
+                     // patch is being shadowed (it otherwise looks broken).
+                     if (device_data.patch_context.HasPatch(shader_hash))
+                     {
+                        static std::mutex s_logged_patch_override_mutex;
+                        static std::unordered_set<uint32_t> s_logged_patch_override_hashes;
+                        const std::lock_guard lock_logged_override(s_logged_patch_override_mutex);
+                        if (s_logged_patch_override_hashes.emplace(shader_hash).second)
+                        {
+                           reshade::log::message(reshade::log::level::debug, std::format("[Patch] custom shader file overrides stored patch for shader {:08X}", shader_hash).c_str());
+                        }
+                     }
 #endif
-                      return std::make_pair(custom_shader->code.data(), static_cast<uint32_t>(custom_shader->code.size()));
-                   }
-                }
+                     return std::make_pair(custom_shader->code.data(), static_cast<uint32_t>(custom_shader->code.size()));
+                  }
+               }
 
-                // Check for DXP/bytecode patched shader
+            // Check for DXP/bytecode patched shader
 #if LUMA_PATCH_PROVIDERS != 0
-                if (auto patched = device_data.patch_context.GetShaderData(shader_hash); patched)
-                {
-                   cached_pipeline->clone_origin = Shader::CloneOrigin::Patch;
-                   return std::make_pair(patched->code.data(), static_cast<uint32_t>(patched->code.size()));
-                }
+               if (auto patched = device_data.patch_context.GetShaderData(shader_hash); patched)
+               {
+                  cached_pipeline->clone_origin = Shader::CloneOrigin::Patch;
+                  return std::make_pair(patched->code.data(), static_cast<uint32_t>(patched->code.size()));
+               }
 #endif
 
-                return std::nullopt;
-             });
+               return std::nullopt;
+            });
 
-          if (!injected)
-          {
-             continue;
-          }
+         if (!injected)
+         {
+            continue;
+         }
 
 #if _DEBUG && LOG_VERBOSE
-          {
-             std::stringstream s;
-             s << "Creating pipeline clone (";
-             s << "pipeline: " << reinterpret_cast<void*>(cached_pipeline->pipeline.handle);
-             s << ", layout: " << reinterpret_cast<void*>(cached_pipeline->layout.handle);
-             s << ", size: " << subobject_count;
-             s << ", " << (pipeline_clone.handle != 0 ? "OK" : "FAILED!");
-             s << ")";
-             reshade::log::message(reshade::log::level::debug, s.str().c_str());
-          }
+         {
+            std::stringstream s;
+            s << "Creating pipeline clone (";
+            s << "pipeline: " << reinterpret_cast<void*>(cached_pipeline->pipeline.handle);
+            s << ", layout: " << reinterpret_cast<void*>(cached_pipeline->layout.handle);
+            s << ", size: " << subobject_count;
+            s << ", " << (pipeline_clone.handle != 0 ? "OK" : "FAILED!");
+            s << ")";
+            reshade::log::message(reshade::log::level::debug, s.str().c_str());
+         }
 #endif
 
-          if (pipeline_clone.handle != 0)
-          {
-             cloned_pipelines_data.push_back(std::make_tuple(cached_pipeline, pipeline_clone, uint64_t{0}));
-          }
+         if (pipeline_clone.handle != 0)
+         {
+            cloned_pipelines_data.push_back(std::make_tuple(cached_pipeline, pipeline_clone, uint64_t{0}));
+         }
 #endif // DX12
-
-       }
+      }
 
       lock_loading.unlock(); // Before "s_mutex_generic" is locked again, as "UnloadCustomShaders()" locks it first
 
@@ -3598,7 +3633,7 @@ namespace
    void OnDisplayModeChanged()
    {
       // s_mutex_reshade should already be locked here, it's not necessary anyway
-      GetShaderDefineData(GAMMA_CORRECTION_TYPE_HASH).editable = cb_luma_global_settings.DisplayMode != DisplayModeType::SDR; //TODOFT4: necessary to disable this in SDR?
+      GetShaderDefineData(GAMMA_CORRECTION_TYPE_HASH).editable = cb_luma_global_settings.DisplayMode != DisplayModeType::SDR; // TODOFT4: necessary to disable this in SDR?
 
       game->OnDisplayModeChanged();
    }
@@ -3712,10 +3747,17 @@ namespace
          reshade::api::pipeline_subobject_type type;
          switch (reinterpret_cast<const DXBCByteCodeChunk*>(program.bytecode - offsetof(DXBCByteCodeChunk, byte_code))->program_type)
          {
-         case DXBCProgramType::VertexShader: type = reshade::api::pipeline_subobject_type::vertex_shader; break;
-         case DXBCProgramType::PixelShader: type = reshade::api::pipeline_subobject_type::pixel_shader; break;
-         case DXBCProgramType::ComputeShader: type = reshade::api::pipeline_subobject_type::compute_shader; break;
-         default: continue;
+         case DXBCProgramType::VertexShader:
+            type = reshade::api::pipeline_subobject_type::vertex_shader;
+            break;
+         case DXBCProgramType::PixelShader:
+            type = reshade::api::pipeline_subobject_type::pixel_shader;
+            break;
+         case DXBCProgramType::ComputeShader:
+            type = reshade::api::pipeline_subobject_type::compute_shader;
+            break;
+         default:
+            continue;
          }
          entries.push_back({.type = type, .code = custom_shader->code});
       }
@@ -3820,7 +3862,7 @@ namespace
 
       D3D11_SAMPLER_DESC sampler_desc = {};
       sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR; // Bilinear filtering
-      sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP; // Clamp by default (though returning black would also be good?)
+      sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;   // Clamp by default (though returning black would also be good?)
       sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
       sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
       sampler_desc.MipLODBias = 0.f;
@@ -3933,7 +3975,7 @@ namespace
       {
          const std::unique_lock lock_reshade(s_mutex_reshade);
          sr_user_type = SR::UserType::None; // Reset the global user setting if it's not supported, we want to grey it out in the UI (there's no need to serialize the new value for it though!)
-		}
+      }
       device_data.sr_type_selected = device_data.sr_type;
 #endif // ENABLE_SR
 
@@ -4170,12 +4212,15 @@ namespace
          }
       }
       device_data.sr_implementations_instances.clear();
+#if ENABLE_D3D12_SR
+      SR::D3D12::ReleaseProcessState(); // After the upscalers
+#endif
 #endif // ENABLE_SR
 
       // Execute all Luma callbacks.
       for (const auto& callback : LumaCallbacks::on_destroy_device)
       {
-          callback.second();
+         callback.second();
       }
 
 #if DX12
@@ -4345,7 +4390,7 @@ namespace
             {
                // Lost foreground activation
                return 1; // block it
-				}
+            }
          }
       }
       return CallNextHookEx(NULL, nCode, wParam, lParam);
@@ -4389,7 +4434,7 @@ namespace
       // Generally we want to add these flags in all cases, they seem to work in all games
       {
 #if !DISABLE_SWAPCHAIN_FLIP_MODEL
-         desc.back_buffer_count = max(desc.back_buffer_count, 2); // Needed by flip models, which is mandatory for HDR. Note that DX10/11 will still only create one buffer, even if their desc says they have two.
+         desc.back_buffer_count = max(desc.back_buffer_count, 2);                                                                                                                                                                                                                                                   // Needed by flip models, which is mandatory for HDR. Note that DX10/11 will still only create one buffer, even if their desc says they have two.
          if ((swapchain_format_upgrade_type == TextureFormatUpgradesType::AllowedEnabled && swapchain_upgrade_type > SwapchainUpgradeType::None) || (desc.back_buffer.texture.format != reshade::api::format::r8g8b8a8_unorm_srgb && desc.back_buffer.texture.format != reshade::api::format::b8g8r8a8_unorm_srgb)) // sRGB formats don't support flip modes
          {
             desc.present_mode = DXGI_SWAP_EFFECT_FLIP_DISCARD;
@@ -4406,7 +4451,7 @@ namespace
 
          if (desc.present_mode == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL || desc.present_mode == DXGI_SWAP_EFFECT_FLIP_DISCARD) // DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING requires flip model
          {
-             desc.present_flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING; // Games will still need to call "Present()" with "DXGI_PRESENT_ALLOW_TEARING" for this to do anything (ReShade will automatically do it if this flag is set)
+            desc.present_flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING; // Games will still need to call "Present()" with "DXGI_PRESENT_ALLOW_TEARING" for this to do anything (ReShade will automatically do it if this flag is set)
          }
 
          if (prevent_fullscreen_state) // Not sure this helps but it doesn't seem to hurt
@@ -4628,7 +4673,7 @@ namespace
       }
 
 #if DX11
-		device_data.ui_texture = nullptr;
+      device_data.ui_texture = nullptr;
       device_data.ui_texture_rtv = nullptr;
       device_data.ui_texture_srv = nullptr;
       // At the moment this is just created when the swapchain changes anything about it,
@@ -4664,8 +4709,8 @@ namespace
          const bool window_changed = game_window != swapchain_desc.OutputWindow;
          if (window_changed)
          {
-            game_window = swapchain_desc.OutputWindow; // This shouldn't really need any thread safety protection
-#if DEVELOPMENT && !defined(DISABLE_FOCUS_LOSS_SUPPRESSION) //TODOFT: test/fix/finish
+            game_window = swapchain_desc.OutputWindow;      // This shouldn't really need any thread safety protection
+#if DEVELOPMENT && !defined(DISABLE_FOCUS_LOSS_SUPPRESSION) // TODOFT: test/fix/finish
             if (game_window)
             {
 #if 1
@@ -4745,9 +4790,9 @@ namespace
 #if !GAME_FF7_REMAKE
             if (swapchain_upgrade_type == SwapchainUpgradeType::scRGB)
                color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
-            else         
+            else
                color_space = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-#else // FF7 Remake 
+#else // FF7 Remake
             if (swapchain_upgrade_type == SwapchainUpgradeType::scRGB)
             {
                color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
@@ -4763,7 +4808,7 @@ namespace
                   color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
                }
             }
-#endif  
+#endif
             set_color_space = true;
          }
          // Note: if we are not upgrading the swapchain, we don't know the original color space,
@@ -4819,7 +4864,7 @@ namespace
       // Execute all Luma callbacks.
       for (const auto& callback : LumaCallbacks::on_init_swapchain)
       {
-          callback.second();
+         callback.second();
       }
 
       game->OnInitSwapchain(swapchain);
@@ -4919,7 +4964,8 @@ namespace
             }
          }
          reshade::log::message(reshade::log::level::info, std::format("Destroying the D3D12 swapchain: {} root signatures alive, {} descriptor heaps tracked ({} views and samplers, {} constant buffers), {} pipelines cached",
-            device_data.pipeline_layouts.parameters_by_layout.size(), device_data.descriptor_heaps.descriptors_by_heap.size(), views, constant_buffers, device_data.pipeline_cache_by_pipeline_handle.size()).c_str());
+                                                             device_data.pipeline_layouts.parameters_by_layout.size(), device_data.descriptor_heaps.descriptors_by_heap.size(), views, constant_buffers, device_data.pipeline_cache_by_pipeline_handle.size())
+                                                             .c_str());
       }
 #endif
       swapchain->destroy_private_data<SwapchainData>();
@@ -4941,7 +4987,7 @@ namespace
          // Remove window borders (force borderless)
          LONG_PTR style = GetWindowLongPtr(game_window, GWL_STYLE);
          style &= ~(WS_OVERLAPPEDWINDOW | WS_BORDER | WS_THICKFRAME | WS_DLGFRAME); // remove title bar + borders
-         style |= WS_POPUP | WS_VISIBLE; // popup style, no borders
+         style |= WS_POPUP | WS_VISIBLE;                                            // popup style, no borders
          SetWindowLongPtr(game_window, GWL_STYLE, style);
 
          // Also remove extended window styles that may add shadows/borders (extra safety, probably useless)
@@ -4955,7 +5001,7 @@ namespace
          int win_width = rc_window.right - rc_window.left;
          int win_height = rc_window.bottom - rc_window.top;
 
-         const bool force_resize_to_screen = false; // Some games properly response to forced window resize events, other will reject it or stretch the image, expose this if ever necessary
+         const bool force_resize_to_screen = false;                                                                      // Some games properly response to forced window resize events, other will reject it or stretch the image, expose this if ever necessary
          const bool resize_to_screen = force_resize_to_screen || win_width > screen_width || win_height > screen_height; // Prevent games from going bigger than the window, this handles a bug in Thumper where it resized too big, hopefully it won't break other games
          if (resize_to_screen)
          {
@@ -4967,7 +5013,7 @@ namespace
          int x = rc_monitor.left + (screen_width - win_width) / 2;
          int y = rc_monitor.top + (screen_height - win_height) / 2;
 
-         HWND top_state = 0; // None
+         HWND top_state = 0;          // None
          const bool make_top = false; // Make the window at the top now
          // TODO: this makes the game always on top, and "minimize" when alt tabbing out of it, do we really want it? Probably not? It doesn't seem to work in Burnout Paradise anyway
          const bool make_top_most = false; // Force always on top, so it renders on top of the start bar etc
@@ -4982,10 +5028,9 @@ namespace
             top_state,
             x, y,
             resize_to_screen ? screen_width : 0, resize_to_screen ? screen_height : 0,                                         // Preserve the size by default
-            (resize_to_screen ? 0x0 : SWP_NOSIZE) | (z_order_changed ? 0x0 : SWP_NOZORDER) | SWP_NOACTIVATE
-            | SWP_FRAMECHANGED  // Apply style changes
-            | SWP_SHOWWINDOW // Show it just in case it was hidden (mmm, not sure why...)
-            | SWP_ASYNCWINDOWPOS // This prevents this set from waiting on the window thread to have executed our request. As long as we are not changing the size, the game swapchain will stay the same and thus we should be able to do it freely, without hanging this thread
+            (resize_to_screen ? 0x0 : SWP_NOSIZE) | (z_order_changed ? 0x0 : SWP_NOZORDER) | SWP_NOACTIVATE | SWP_FRAMECHANGED // Apply style changes
+               | SWP_SHOWWINDOW                                                                                                // Show it just in case it was hidden (mmm, not sure why...)
+               | SWP_ASYNCWINDOWPOS                                                                                            // This prevents this set from waiting on the window thread to have executed our request. As long as we are not changing the size, the game swapchain will stay the same and thus we should be able to do it freely, without hanging this thread
          );
       }
    }
@@ -5151,7 +5196,7 @@ namespace
                   // SHEX is SM5
                   // SHDR is SM4
                   // DXIL is SM6 (DX12)
-                  // 
+                  //
                   // http://timjones.io/blog/archive/2015/09/02/parsing-direct3d-shader-bytecode#shdr-chunk
                   // Usually this is the last chunk.
                   if (memcmp(&chunk->type_name, "SHEX", 4) == 0 || memcmp(&chunk->type_name, "SHDR", 4) == 0)
@@ -5182,10 +5227,26 @@ namespace
                      DXBCProgramType reshade_program_type = DXBCProgramType(-1);
                      switch (subobject.type)
                      {
-                     case reshade::api::pipeline_subobject_type::geometry_shader: { reshade_program_type = DXBCProgramType::GeometryShader; break; }
-                     case reshade::api::pipeline_subobject_type::vertex_shader: { reshade_program_type = DXBCProgramType::VertexShader; break; }
-                     case reshade::api::pipeline_subobject_type::compute_shader: { reshade_program_type = DXBCProgramType::ComputeShader; break; }
-                     case reshade::api::pipeline_subobject_type::pixel_shader: { reshade_program_type = DXBCProgramType::PixelShader; break; }
+                     case reshade::api::pipeline_subobject_type::geometry_shader:
+                     {
+                        reshade_program_type = DXBCProgramType::GeometryShader;
+                        break;
+                     }
+                     case reshade::api::pipeline_subobject_type::vertex_shader:
+                     {
+                        reshade_program_type = DXBCProgramType::VertexShader;
+                        break;
+                     }
+                     case reshade::api::pipeline_subobject_type::compute_shader:
+                     {
+                        reshade_program_type = DXBCProgramType::ComputeShader;
+                        break;
+                     }
+                     case reshade::api::pipeline_subobject_type::pixel_shader:
+                     {
+                        reshade_program_type = DXBCProgramType::PixelShader;
+                        break;
+                     }
                      }
                      ASSERT_ONCE(reshade_program_type == chunk_byte_code->program_type); // We should probably stop in this case
 
@@ -5266,7 +5327,7 @@ namespace
                   ASSERT_ONCE_MSG((subobject_count == 1 || subobject_count == 2) && subobject.count == 1 && !last_live_patched_original_shader_code, "This behaviour is hardcoded to work with DX9-11, with one object (shader) per pipeline"); // input layouts have two subobjects (input layout and vertex shader)
 
                   bool can_apply = true;
-#if DEVELOPMENT // Slow, but good for prevention
+#if DEVELOPMENT                                                      // Slow, but good for prevention
                   constexpr bool verify_live_patched_shaders = true; // TODO: set false
                   if (verify_live_patched_shaders)
                   {
@@ -5476,12 +5537,13 @@ namespace
       reshade::api::pipeline_subobject* subobjects_cache = Shader::ClonePipelineSubobjects(subobject_count, subobjects);
 
       auto* cached_pipeline = new CachedPipeline{
-          pipeline,
-          device,
-          layout,
-          subobjects_cache
+         pipeline,
+         device,
+         layout,
+         subobjects_cache
 #if DX12
-          , subobject_count
+         ,
+         subobject_count
 #endif
       };
 
@@ -5576,7 +5638,7 @@ namespace
                      {
 #if DEVELOPMENT
                         shader_cache_count--;
-#endif // DEVELOPMENT
+#endif                                          // DEVELOPMENT
                         delete previous_shader; // This should already de-allocate the internally allocated data
                      }
                      else
@@ -5588,7 +5650,7 @@ namespace
 
                   if (!cached_shader)
                   {
-                     cached_shader = new CachedShader{ malloc(original_shader_desc->code_size), original_shader_desc->code_size, subobject.type };
+                     cached_shader = new CachedShader{malloc(original_shader_desc->code_size), original_shader_desc->code_size, subobject.type};
                      std::memcpy(cached_shader->data, original_shader_desc->code, cached_shader->size);
 
 #if DEVELOPMENT
@@ -5602,7 +5664,7 @@ namespace
                      const std::string hash_str = Shader::Hash_NumToStr(shader_hash, true);
 
 #if 0 // Not needed anymore
-                     // We still don't know the shader model here, so search by hash and *
+      // We still don't know the shader model here, so search by hash and *
                      auto FindMetaFile = [&hash_str]() -> std::optional<std::filesystem::path>
                         {
                            if (!std::filesystem::exists(shaders_dump_path) || !std::filesystem::is_directory(shaders_dump_path))
@@ -5659,14 +5721,14 @@ namespace
                               }
 
                               auto ReadBoolArray = [&](bool* arr, size_t count)
+                              {
+                                 for (size_t i = 0; i < count; ++i)
                                  {
-                                    for (size_t i = 0; i < count; ++i)
-                                    {
-                                       uint8_t val = 0;
-                                       ifs.read(reinterpret_cast<char*>(&val), sizeof(val));
-                                       arr[i] = (val != 0);
-                                    }
-                                 };
+                                    uint8_t val = 0;
+                                    ifs.read(reinterpret_cast<char*>(&val), sizeof(val));
+                                    arr[i] = (val != 0);
+                                 }
+                              };
                               ReadBoolArray(cached_shader->cbs, std::size(cached_shader->cbs));
                               ReadBoolArray(cached_shader->samplers, std::size(cached_shader->samplers));
                               ReadBoolArray(cached_shader->srvs, std::size(cached_shader->srvs));
@@ -5727,12 +5789,30 @@ namespace
                            // The asserts might trigger if devs tried to bind the wrong shader type in a slot? Probably impossible.
                            switch (cached_shader->type)
                            {
-                           case reshade::api::pipeline_subobject_type::vertex_shader:   type_prefix = "vs"; assert(type == D3D11_SHVER_VERTEX_SHADER); break;
-                           case reshade::api::pipeline_subobject_type::hull_shader:     type_prefix = "hs"; assert(type == D3D11_SHVER_HULL_SHADER); break;
-                           case reshade::api::pipeline_subobject_type::domain_shader:   type_prefix = "ds"; assert(type == D3D11_SHVER_DOMAIN_SHADER); break;
-                           case reshade::api::pipeline_subobject_type::geometry_shader: type_prefix = "gs"; assert(type == D3D11_SHVER_GEOMETRY_SHADER); break;
-                           case reshade::api::pipeline_subobject_type::pixel_shader:    type_prefix = "ps"; assert(type == D3D11_SHVER_PIXEL_SHADER); break;
-                           case reshade::api::pipeline_subobject_type::compute_shader:  type_prefix = "cs"; assert(type == D3D11_SHVER_COMPUTE_SHADER); break;
+                           case reshade::api::pipeline_subobject_type::vertex_shader:
+                              type_prefix = "vs";
+                              assert(type == D3D11_SHVER_VERTEX_SHADER);
+                              break;
+                           case reshade::api::pipeline_subobject_type::hull_shader:
+                              type_prefix = "hs";
+                              assert(type == D3D11_SHVER_HULL_SHADER);
+                              break;
+                           case reshade::api::pipeline_subobject_type::domain_shader:
+                              type_prefix = "ds";
+                              assert(type == D3D11_SHVER_DOMAIN_SHADER);
+                              break;
+                           case reshade::api::pipeline_subobject_type::geometry_shader:
+                              type_prefix = "gs";
+                              assert(type == D3D11_SHVER_GEOMETRY_SHADER);
+                              break;
+                           case reshade::api::pipeline_subobject_type::pixel_shader:
+                              type_prefix = "ps";
+                              assert(type == D3D11_SHVER_PIXEL_SHADER);
+                              break;
+                           case reshade::api::pipeline_subobject_type::compute_shader:
+                              type_prefix = "cs";
+                              assert(type == D3D11_SHVER_COMPUTE_SHADER);
+                              break;
                            }
 
                            // Version: high byte = minor, low byte = major
@@ -5751,7 +5831,7 @@ namespace
                            bool found_any_other_bindings = false;
 
 #if 0 // This doesn't seem to be reliable, the version below works better
-                           // CBs
+      // CBs
                            for (UINT i = 0; i < shader_desc.ConstantBuffers; ++i)
                            {
                               ID3D11ShaderReflectionConstantBuffer* cbuffer = shader_reflector->GetConstantBufferByIndex(i);
@@ -5804,7 +5884,7 @@ namespace
                                     else if (bind_desc.Type == D3D_SIT_CBUFFER)
                                     {
                                        ASSERT_ONCE(bind_desc.BindPoint + j < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT);
-                                       //ASSERT_ONCE(cached_shader->cbs[bind_desc.BindPoint + j]);
+                                       // ASSERT_ONCE(cached_shader->cbs[bind_desc.BindPoint + j]);
                                        cached_shader->cbs[bind_desc.BindPoint + j] = true;
                                     }
                                     // These are always valid, even when the other ones aren't, so don't set "found_any_other_bindings" to true
@@ -5835,7 +5915,7 @@ namespace
                   // TODO: allow delaying the disassembly until "Capture" is first clicked?
 #if DEVELOPMENT
                   if (!found_reflections || cached_shader->type_and_version.empty())
-#else // !DEVELOPMENT
+#else  // !DEVELOPMENT
                   if (cached_shader->type_and_version.empty())
 #endif // DEVELOPMENT
                   {
@@ -5858,10 +5938,7 @@ namespace
 
                      if (valid_disasm && cached_shader->type_and_version.empty())
                      {
-                        if (cached_shader->type == reshade::api::pipeline_subobject_type::geometry_shader
-                           || cached_shader->type == reshade::api::pipeline_subobject_type::vertex_shader
-                           || cached_shader->type == reshade::api::pipeline_subobject_type::pixel_shader
-                           || cached_shader->type == reshade::api::pipeline_subobject_type::compute_shader)
+                        if (cached_shader->type == reshade::api::pipeline_subobject_type::geometry_shader || cached_shader->type == reshade::api::pipeline_subobject_type::vertex_shader || cached_shader->type == reshade::api::pipeline_subobject_type::pixel_shader || cached_shader->type == reshade::api::pipeline_subobject_type::compute_shader)
                         {
                            static const std::string template_shader_model_version_name = "x_x";
 
@@ -5890,14 +5967,15 @@ namespace
                         const std::regex pattern_cbs(R"(dcl_constantbuffer.*[cC][bB]([0-9]{1,2}))");
                         const std::regex pattern_samplers(R"(dcl_sampler.*[sS]([0-9]{1,2}))");
                         const std::regex pattern_srv(R"(.*dcl_resource_texture.*[tT]([0-9]{1,3})$)"); // In DX9 these are "dcl_2d s0" etc, sampler+srv together
-                        const std::regex pattern_uav(R"(.*dcl_uav_.*[uU]([0-9]{1,2})$)"); // Could be "rov" too! // TODO: verify that all the UAV binding types have incremental numbers, or whether they grow in parallel
-                        const std::regex pattern_rtv(R"(dcl_output.*[oO]([0-9]{1,1}))"); // Match up to 9 even if theoretically "D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT" is up to 7
+                        const std::regex pattern_uav(R"(.*dcl_uav_.*[uU]([0-9]{1,2})$)");             // Could be "rov" too! // TODO: verify that all the UAV binding types have incremental numbers, or whether they grow in parallel
+                        const std::regex pattern_rtv(R"(dcl_output.*[oO]([0-9]{1,1}))");              // Match up to 9 even if theoretically "D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT" is up to 7
                         const std::regex pattern_depth(R"(dcl_output_depth)");
                         const std::regex pattern_sm(R"(\b(ps|vs|gs|hs|ds|cs)_(\d+)_(\d+)\s*$)", std::regex_constants::icase); // e.g. ps_5_0
 
                         bool stop_at_next_0 = true;
                         bool matching_line = false;
-                        while (std::getline(iss, line)) {
+                        while (std::getline(iss, line))
+                        {
                            bool prev_matching_line = matching_line;
                            std::smatch match;
 
@@ -5906,7 +5984,8 @@ namespace
                            // When decompiling, this shows in the list on top of the new shader, and our code scanning got confused as it stopped before the actual shader asm code,
                            // because the DX9 version already had lines starting with 0...
                            // Here we force skip all shader models declared with a different version than ours.
-                           if (!matching_line && std::regex_search(line, match, pattern_sm) && match.size() >= 4) {
+                           if (!matching_line && std::regex_search(line, match, pattern_sm) && match.size() >= 4)
+                           {
                               std::string type = match[1].str(); // ps/vs/...
                               int major_version = std::stoi(match[2].str());
                               int minor_version = std::stoi(match[3].str());
@@ -5935,40 +6014,48 @@ namespace
 
                            bool cbs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
                            // Use search for CBs and RTVs etc because they have additional text after we found the number we are looking for
-                           if (std::regex_search(line, match, pattern_cbs) && match.size() >= 2) {
+                           if (std::regex_search(line, match, pattern_cbs) && match.size() >= 2)
+                           {
                               int num = std::stoi(match[1].str());
-                              if (num >= 0 && num < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+                              if (num >= 0 && num < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+                              {
                                  cached_shader->cbs[num] = true;
                                  matching_line = true;
                               }
                            }
-                           if (std::regex_search(line, match, pattern_samplers) && match.size() >= 2) {
+                           if (std::regex_search(line, match, pattern_samplers) && match.size() >= 2)
+                           {
                               int num = std::stoi(match[1].str());
-                              if (num >= 0 && num < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) {
+                              if (num >= 0 && num < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT)
+                              {
                                  cached_shader->samplers[num] = true;
                                  matching_line = true;
                               }
                            }
                            // Use match for SRVs and UAVs as they end with their letter and a number
-                           if (std::regex_match(line, match, pattern_srv) && match.size() >= 2) {
+                           if (std::regex_match(line, match, pattern_srv) && match.size() >= 2)
+                           {
                               int num = std::stoi(match[1].str());
-                              if (num >= 0 && num < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+                              if (num >= 0 && num < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
+                              {
                                  cached_shader->srvs[num] = true;
                                  matching_line = true;
                               }
                            }
-                           if ((cached_shader->type == reshade::api::pipeline_subobject_type::pixel_shader || cached_shader->type == reshade::api::pipeline_subobject_type::compute_shader)
-                              && std::regex_match(line, match, pattern_uav) && match.size() >= 2) {
+                           if ((cached_shader->type == reshade::api::pipeline_subobject_type::pixel_shader || cached_shader->type == reshade::api::pipeline_subobject_type::compute_shader) && std::regex_match(line, match, pattern_uav) && match.size() >= 2)
+                           {
                               int num = std::stoi(match[1].str());
-                              if (num >= 0 && num < D3D11_1_UAV_SLOT_COUNT) {
+                              if (num >= 0 && num < D3D11_1_UAV_SLOT_COUNT)
+                              {
                                  cached_shader->uavs[num] = true;
                                  matching_line = true;
                               }
                            }
-                           if (cached_shader->type == reshade::api::pipeline_subobject_type::pixel_shader
-                              && std::regex_search(line, match, pattern_rtv) && match.size() >= 2) {
+                           if (cached_shader->type == reshade::api::pipeline_subobject_type::pixel_shader && std::regex_search(line, match, pattern_rtv) && match.size() >= 2)
+                           {
                               int num = std::stoi(match[1].str());
-                              if (num >= 0 && num < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT) {
+                              if (num >= 0 && num < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT)
+                              {
                                  cached_shader->rtvs[num] = true;
                                  matching_line = true;
                               }
@@ -5993,11 +6080,16 @@ namespace
                   // Default all of them to true if we can't tell which ones are used
                   if (!found_reflections)
                   {
-                     for (bool& b : cached_shader->cbs) b = true;
-                     for (bool& b : cached_shader->samplers) b = true;
-                     for (bool& b : cached_shader->srvs) b = true;
-                     for (bool& b : cached_shader->rtvs) b = true;
-                     for (bool& b : cached_shader->uavs) b = true;
+                     for (bool& b : cached_shader->cbs)
+                        b = true;
+                     for (bool& b : cached_shader->samplers)
+                        b = true;
+                     for (bool& b : cached_shader->srvs)
+                        b = true;
+                     for (bool& b : cached_shader->rtvs)
+                        b = true;
+                     for (bool& b : cached_shader->uavs)
+                        b = true;
                   }
 #endif // DEVELOPMENT
                }
@@ -6198,7 +6290,7 @@ namespace
             }
             else
             {
-               device_data.pipeline_caches_by_shader_hash[shader_hash] = { cached_pipeline };
+               device_data.pipeline_caches_by_shader_hash[shader_hash] = {cached_pipeline};
             }
          }
 
@@ -6220,8 +6312,8 @@ namespace
          auto [pipeline_clone, injected] = Patch::ClonePipelineWithPatches(
             device, layout, subobjects_cache, subobject_count,
             [&device_data](
-                const reshade::api::shader_desc*,
-                const reshade::api::shader_desc* orig_desc) -> std::optional<std::pair<const uint8_t*, uint32_t>>
+               const reshade::api::shader_desc*,
+               const reshade::api::shader_desc* orig_desc) -> std::optional<std::pair<const uint8_t*, uint32_t>>
             {
                uint32_t hash = Shader::BinToHash(static_cast<const uint8_t*>(orig_desc->code), orig_desc->code_size);
                if (auto shader_data = device_data.patch_context.GetShaderData(hash); shader_data)
@@ -6251,13 +6343,12 @@ namespace
                for (uint32_t i = 0; i < subobject_count; ++i)
                {
                   const auto& subobject = subobjects[i];
-                  if (subobject.type != reshade::api::pipeline_subobject_type::pixel_shader
-                      && subobject.type != reshade::api::pipeline_subobject_type::vertex_shader
-                      && subobject.type != reshade::api::pipeline_subobject_type::compute_shader
+                  if (subobject.type != reshade::api::pipeline_subobject_type::pixel_shader && subobject.type != reshade::api::pipeline_subobject_type::vertex_shader && subobject.type != reshade::api::pipeline_subobject_type::compute_shader
 #if GEOMETRY_SHADER_SUPPORT
                       && subobject.type != reshade::api::pipeline_subobject_type::geometry_shader
 #endif
-                      ) continue;
+                  )
+                     continue;
 
                   auto* desc = static_cast<reshade::api::shader_desc*>(subobjects_cache[i].data);
                   uint32_t hash = Shader::BinToHash(static_cast<const uint8_t*>(desc->code), desc->code_size);
@@ -6292,7 +6383,7 @@ namespace
 #else
          // No async worker in this build: load/clone inline at creation (the
          // original behavior for custom shader files).
-         LoadCustomShaders(device_data, { pipeline.handle }, !precompile_custom_shaders);
+         LoadCustomShaders(device_data, {pipeline.handle}, !precompile_custom_shaders);
 #endif
       }
 #endif // DX11
@@ -6331,7 +6422,7 @@ namespace
             const std::unique_lock lock_loading(s_mutex_loading);
             device_data.pipelines_to_reload.erase(pipeline.handle);
          }
-         
+
          PipelineObjectsToRelease to_release; // Declared before the locks, so the root signatures are released after them
 
 #if DX11 // D3D12 pins the pipelines "LoadCustomShaders()" clones instead (see "CachedPipeline::clone_pins")
@@ -7622,6 +7713,25 @@ namespace
 
 #if DEVELOPMENT
       TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
+      // TEMP diagnostic: the hashes the bind took against the pipeline cache's
+      {
+         DeviceData& diag_device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+         const std::shared_lock diag_lock(s_mutex_generic);
+         const auto diag_it = diag_device_data.pipeline_cache_by_pipeline_handle.find(cmd_list_data.d3d12_state.pipeline.handle);
+         const Shader::CachedPipeline* const diag_cached = (diag_it != diag_device_data.pipeline_cache_by_pipeline_handle.end() ? diag_it->second : nullptr);
+         if (diag_cached != cmd_list_data.bound_cached_pipeline)
+         {
+            static std::atomic<int> diag_logged = 0;
+            if (diag_logged.fetch_add(1) < 20)
+            {
+               const uint32_t map_hash = (diag_cached && !diag_cached->shader_hashes.empty()) ? diag_cached->shader_hashes[0] : 0;
+               const uint32_t bound_hash = (cmd_list_data.bound_cached_pipeline && !cmd_list_data.bound_cached_pipeline->shader_hashes.empty()) ? cmd_list_data.bound_cached_pipeline->shader_hashes[0] : 0;
+               reshade::log::message(reshade::log::level::warning, std::format("[DIAG] pipeline {:x}: map {} (hash {:08X}), bound {} (hash {:08X}), bound hashes VS {:08X} PS {:08X}, bundle {}", cmd_list_data.d3d12_state.pipeline.handle, (void*)diag_cached, map_hash, (void*)cmd_list_data.bound_cached_pipeline, bound_hash,
+                                                                      uint32_t(original_shader_hashes.vertex_shaders[0]), uint32_t(original_shader_hashes.pixel_shaders[0]), cmd_list_data.is_bundle)
+                                                                      .c_str());
+            }
+         }
+      }
 #endif
 
       DrawOrDispatchOverrideType override_type = DrawOrDispatchOverrideType::None;
@@ -7816,7 +7926,7 @@ namespace
 
       constexpr reshade::api::pipeline_stage supported_stages = reshade::api::pipeline_stage::compute_shader | reshade::api::pipeline_stage::vertex_shader | reshade::api::pipeline_stage::pixel_shader
 #if GEOMETRY_SHADER_SUPPORT
-         | reshade::api::pipeline_stage::geometry_shader
+                                                                | reshade::api::pipeline_stage::geometry_shader
 #endif
          ;
 
@@ -7846,8 +7956,8 @@ namespace
       if (stages == reshade::api::pipeline_stage::all && pipeline.handle == 0)
       {
 #if DEVELOPMENT
-         //CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
-         //ASSERT_ONCE(cmd_list_data.is_primary || cmd_list_data.trace_draw_calls_data.empty()); // This should already be the case (no, sometimes it triggers with acceptable cases, no need to check for this until proven otherwise)
+         // CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+         // ASSERT_ONCE(cmd_list_data.is_primary || cmd_list_data.trace_draw_calls_data.empty()); // This should already be the case (no, sometimes it triggers with acceptable cases, no need to check for this until proven otherwise)
          cmd_list_data.any_draw_done = false;
          cmd_list_data.any_dispatch_done = false;
 #endif
@@ -7868,8 +7978,7 @@ namespace
          // Expose the clone handle for this stage (0 = no clone), gated
          // by the master switches (per-hash defaults don't gate: per-draw overrides
          // must work). File clones need the mod master, patch clones both.
-         if (cached_pipeline && cached_pipeline->cloned && custom_shaders_enabled
-             && (cached_pipeline->clone_origin != Shader::CloneOrigin::Patch || allow_patches))
+         if (cached_pipeline && cached_pipeline->cloned && custom_shaders_enabled && (cached_pipeline->clone_origin != Shader::CloneOrigin::Patch || allow_patches))
          {
             for (uint32_t hash : cached_pipeline->shader_hashes)
             {
@@ -7896,8 +8005,7 @@ namespace
          // Expose the clone handle for this stage (0 = no clone), gated
          // by the master switches (per-hash defaults don't gate: per-draw overrides
          // must work). File clones need the mod master, patch clones both.
-         if (cached_pipeline && cached_pipeline->cloned && custom_shaders_enabled
-             && (cached_pipeline->clone_origin != Shader::CloneOrigin::Patch || allow_patches))
+         if (cached_pipeline && cached_pipeline->cloned && custom_shaders_enabled && (cached_pipeline->clone_origin != Shader::CloneOrigin::Patch || allow_patches))
          {
             for (uint32_t hash : cached_pipeline->shader_hashes)
             {
@@ -7927,8 +8035,7 @@ namespace
          // Expose the clone handle for this stage (0 = no clone), gated
          // by the master switches (per-hash defaults don't gate: per-draw overrides
          // must work). File clones need the mod master, patch clones both.
-         if (cached_pipeline && cached_pipeline->cloned && custom_shaders_enabled
-             && (cached_pipeline->clone_origin != Shader::CloneOrigin::Patch || allow_patches))
+         if (cached_pipeline && cached_pipeline->cloned && custom_shaders_enabled && (cached_pipeline->clone_origin != Shader::CloneOrigin::Patch || allow_patches))
          {
             for (uint32_t hash : cached_pipeline->shader_hashes)
             {
@@ -8020,8 +8127,7 @@ namespace
       if (cached_pipeline)
       {
 #if DEVELOPMENT
-         if (cached_pipeline->replace_draw_type == ShaderReplaceDrawType::Purple
-            || cached_pipeline->replace_draw_type == ShaderReplaceDrawType::NaN)
+         if (cached_pipeline->replace_draw_type == ShaderReplaceDrawType::Purple || cached_pipeline->replace_draw_type == ShaderReplaceDrawType::NaN)
          {
             // TODO: automatically generate a pixel shader that has a matching input and output signature as the one the pass would have had instead,
             // given that sometimes drawing purple fails with warnings. Or replace the vertex shader too with "Copy VS"? Though the shape will then not match, likely.
@@ -8043,7 +8149,7 @@ namespace
          else if (cached_pipeline->replace_draw_type == ShaderReplaceDrawType::Skip)
          {
             // This will make the shader output black, or skip drawing, so we can easily detect it. This might not be very safe but seems to work in DX11.
-            cmd_list->bind_pipeline(stages, reshade::api::pipeline{ 0 });
+            cmd_list->bind_pipeline(stages, reshade::api::pipeline{0});
          }
          else
 #endif
@@ -8059,9 +8165,9 @@ namespace
                   (uint32_t)cached_pipeline_shader_hash,
                   (stages & reshade::api::pipeline_stage::compute_shader) != 0
                      ? reshade::api::pipeline_subobject_type::compute_shader
-                     : (stages & reshade::api::pipeline_stage::vertex_shader) != 0
-                        ? reshade::api::pipeline_subobject_type::vertex_shader
-                        : reshade::api::pipeline_subobject_type::pixel_shader);
+                  : (stages & reshade::api::pipeline_stage::vertex_shader) != 0
+                     ? reshade::api::pipeline_subobject_type::vertex_shader
+                     : reshade::api::pipeline_subobject_type::pixel_shader);
             }
 #endif
 
@@ -8078,9 +8184,7 @@ namespace
                // UseShaderVariant overrides). Readback path (game/mod bound the
                // clone itself) keeps the bound object as-is.
                const bool game_bound_clone = cached_pipeline->cloned && cached_pipeline->pipeline_clone.handle == pipeline.handle;
-               const bool swap_to_clone = !game_bound_clone && cached_pipeline->cloned && custom_shaders_enabled
-                  && (cached_pipeline->clone_origin != Shader::CloneOrigin::Patch || allow_patches)
-                  && (cached_pipeline->clone_origin != Shader::CloneOrigin::Patch || game_patch_default);
+               const bool swap_to_clone = !game_bound_clone && cached_pipeline->cloned && custom_shaders_enabled && (cached_pipeline->clone_origin != Shader::CloneOrigin::Patch || allow_patches) && (cached_pipeline->clone_origin != Shader::CloneOrigin::Patch || game_patch_default);
                if (swap_to_clone)
                {
                   pipeline_to_bind = cached_pipeline->pipeline_clone;
@@ -8122,7 +8226,7 @@ namespace
          TraceDrawCallData trace_draw_call_data;
          trace_draw_call_data.type = TraceDrawCallData::TraceDrawCallType::BindPipeline;
          trace_draw_call_data.command_list = (ID3D11DeviceContext*)(cmd_list->get_native());
-         //trace_draw_call_data.custom_name = std::string("Bind Shader ") + Shader::Hash_NumToStr(cached_pipeline->shader_hashes[0], true); //TODOFT: fix ...
+         // trace_draw_call_data.custom_name = std::string("Bind Shader ") + Shader::Hash_NumToStr(cached_pipeline->shader_hashes[0], true); //TODOFT: fix ...
          cmd_list_data.trace_draw_calls_data.push_back(trace_draw_call_data);
       }
 #endif
@@ -8268,42 +8372,42 @@ namespace
       constexpr bool force_update = false;
 
       auto SetConstantBuffer = [&](uint32_t slot, ID3D11Buffer* const buffer)
-         {
+      {
 #if DEVELOPMENT && !ENABLE_AUTO_CBUFFER_RESTORATION
-            if (do_safety_checks)
+         if (do_safety_checks)
+         {
+            bool failed = false;
+            if ((stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
             {
-               bool failed = false;
-               if ((stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex)
-               {
-                  com_ptr<ID3D11Buffer> cb;
-                  native_device_context->VSGetConstantBuffers(slot, 1, &cb);
-                  failed |= cb.get() != nullptr && cb.get() != buffer;
-               }
-               if ((stages & reshade::api::shader_stage::geometry) == reshade::api::shader_stage::geometry)
-               {
-                  com_ptr<ID3D11Buffer> cb;
-                  native_device_context->GSGetConstantBuffers(slot, 1, &cb);
-                  failed |= cb.get() != nullptr && cb.get() != buffer;
-               }
-               if ((stages & reshade::api::shader_stage::pixel) == reshade::api::shader_stage::pixel)
-               {
-                  com_ptr<ID3D11Buffer> cb;
-                  native_device_context->PSGetConstantBuffers(slot, 1, &cb);
-                  failed |= cb.get() != nullptr && cb.get() != buffer;
-               }
-               if ((stages & reshade::api::shader_stage::compute) == reshade::api::shader_stage::compute)
-               {
-                  com_ptr<ID3D11Buffer> cb;
-                  native_device_context->CSGetConstantBuffers(slot, 1, &cb);
-                  failed |= cb.get() != nullptr && cb.get() != buffer;
-               }
-               // The game might have used the same cbuffer slot we are using for this very pass, or just left a cbuffer bound even if unused by the current pass (in that case it's likely ok)
-               ASSERT_ONCE_MSG(!failed, "This game might have used the same cbuffer indexes we use for Luma, there's a chance the game will break unless we reset them after we are done with the custom passes that use them");
+               com_ptr<ID3D11Buffer> cb;
+               native_device_context->VSGetConstantBuffers(slot, 1, &cb);
+               failed |= cb.get() != nullptr && cb.get() != buffer;
             }
+            if ((stages & reshade::api::shader_stage::geometry) == reshade::api::shader_stage::geometry)
+            {
+               com_ptr<ID3D11Buffer> cb;
+               native_device_context->GSGetConstantBuffers(slot, 1, &cb);
+               failed |= cb.get() != nullptr && cb.get() != buffer;
+            }
+            if ((stages & reshade::api::shader_stage::pixel) == reshade::api::shader_stage::pixel)
+            {
+               com_ptr<ID3D11Buffer> cb;
+               native_device_context->PSGetConstantBuffers(slot, 1, &cb);
+               failed |= cb.get() != nullptr && cb.get() != buffer;
+            }
+            if ((stages & reshade::api::shader_stage::compute) == reshade::api::shader_stage::compute)
+            {
+               com_ptr<ID3D11Buffer> cb;
+               native_device_context->CSGetConstantBuffers(slot, 1, &cb);
+               failed |= cb.get() != nullptr && cb.get() != buffer;
+            }
+            // The game might have used the same cbuffer slot we are using for this very pass, or just left a cbuffer bound even if unused by the current pass (in that case it's likely ok)
+            ASSERT_ONCE_MSG(!failed, "This game might have used the same cbuffer indexes we use for Luma, there's a chance the game will break unless we reset them after we are done with the custom passes that use them");
+         }
 #endif
 
-            CommandListData::SetConstantBuffers(native_device_context, stages, slot, buffer);
-         };
+         CommandListData::SetConstantBuffers(native_device_context, stages, slot, buffer);
+      };
 
       // Most games (e.g. Prey, Dishonored 2) doesn't ever use these buffer slots, so it's fine to re-apply them once per frame if they didn't change.
       // For other games, it'd be good to re-apply the previously set cbuffer after temporarily changing it, as they might only set them once per frame.
@@ -8425,7 +8529,7 @@ namespace
       }
       case LumaConstantBufferType::LumaUIData:
       {
-         ASSERT_ONCE_MSG(false, "Luma UI Data is not implemented (yet?)"); //TODOFT5: do it?
+         ASSERT_ONCE_MSG(false, "Luma UI Data is not implemented (yet?)"); // TODOFT5: do it?
          break;
       }
       }
@@ -8559,7 +8663,7 @@ namespace
       }
 
 #if DEVELOPMENT
-      //ASSERT_ONCE(cmd_list_data.is_primary || cmd_list_data.trace_draw_calls_data.empty()); // This should already be the case (no, sometimes it triggers with acceptable cases, no need to check for this until proven otherwise)
+      // ASSERT_ONCE(cmd_list_data.is_primary || cmd_list_data.trace_draw_calls_data.empty()); // This should already be the case (no, sometimes it triggers with acceptable cases, no need to check for this until proven otherwise)
       cmd_list_data.any_draw_done = false;
       cmd_list_data.any_dispatch_done = false;
 
@@ -8629,7 +8733,7 @@ namespace
       // if true, this is generating a temporary command list ("cmd_list") to then be "joined" to the main command list.
       // If false, this is joining that previously created temporary command list ("secondary_cmd_list") on the immediate context.
       // "FinishCommandList" should have ideally been called "create command list", but probably internally it already existed so they called it "finish".
-      // 
+      //
       // The data in here is theoretically already synchronized by the design of DirectX, given that "D3D11DeviceContext::FinishCommandList" would be called by an async thread,
       // while "D3D11DeviceContext::ExecuteCommandList" on the main/render thread, as such, the application needs to guarantee they are ready (even if possibly DX internally only protects its stuff?).
       bool is_finish_command_list = false;
@@ -8645,7 +8749,8 @@ namespace
       // Make sure the data we wrote is fully synchronized before we read it
       if (!is_finish_command_list)
       {
-         while (!secondary_cmd_list_data.write_finished.load(std::memory_order_acquire));
+         while (!secondary_cmd_list_data.write_finished.load(std::memory_order_acquire))
+            ;
       }
 
       cmd_list_data.async_set_cb_luma_global_settings = secondary_cmd_list_data.async_set_cb_luma_global_settings;
@@ -10092,9 +10197,7 @@ namespace
       constexpr bool source_in_layout = false;
       constexpr bool dest_in_layout = false;
 #endif
-      if (source_view_format == DXGI_FORMAT_UNKNOWN || dest_view_format == DXGI_FORMAT_UNKNOWN || (!scaled && (source_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT) == (dest_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT))
-         || !is_whole_2d(source_desc) || !is_whole_2d(dest_desc) || (!scaled && !same_size)
-         || (!source_in_layout && (source_desc.usage & reshade::api::resource_usage::shader_resource) == 0))
+      if (source_view_format == DXGI_FORMAT_UNKNOWN || dest_view_format == DXGI_FORMAT_UNKNOWN || (!scaled && (source_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT) == (dest_view_format == DXGI_FORMAT_R16G16B16A16_FLOAT)) || !is_whole_2d(source_desc) || !is_whole_2d(dest_desc) || (!scaled && !same_size) || (!source_in_layout && (source_desc.usage & reshade::api::resource_usage::shader_resource) == 0))
       {
          return false;
       }
@@ -10943,8 +11046,7 @@ namespace
       const reshade::api::rect* source_rect,
       const reshade::api::rect* dest_rect,
       uint32_t dirty_rect_count,
-      const reshade::api::rect* dirty_rects
-   )
+      const reshade::api::rect* dirty_rects)
    {
       SKIP_UNSUPPORTED_DEVICE_API(swapchain->get_device()->get_api());
 
@@ -11023,7 +11125,7 @@ namespace
          creates.last_present = now;
       }
 #endif // DX11
-#endif  // DEVELOPMENT
+#endif // DEVELOPMENT
 
       // If there are no shaders being currently replaced in the game,
       // we can assume that we either missed replacing some shaders, or that we have unloaded all of our shaders.
@@ -11116,7 +11218,7 @@ namespace
             draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
 
 #if DEVELOPMENT
-            UINT debug_draw_srv_slot = 2; // 0 is for background, 1 is for UI, 2+ for debug draw types
+            UINT debug_draw_srv_slot = 2;                   // 0 is for background, 1 is for UI, 2+ for debug draw types
             constexpr UINT debug_draw_srv_slot_numbers = 7; // The max amount of debug draw types, determined by the display composition shader too
 
             if (device_data.debug_draw_texture.get())
@@ -11281,8 +11383,8 @@ namespace
 
                if (wants_mips)
                {
-                  proxy_target_desc.MipLevels = 0; // All mips
-                  proxy_target_desc.BindFlags |= D3D11_BIND_RENDER_TARGET; // Needed by "GenerateMips()"
+                  proxy_target_desc.MipLevels = 0;                                  // All mips
+                  proxy_target_desc.BindFlags |= D3D11_BIND_RENDER_TARGET;          // Needed by "GenerateMips()"
                   proxy_target_desc.MiscFlags |= D3D11_RESOURCE_MISC_GENERATE_MIPS; // For AutoHDR "bloom" feature
                }
 
@@ -11400,7 +11502,7 @@ namespace
             if (ui_needs_composition)
             {
                // UI render target should be all zero at the beginning of each frame (the next one)
-               const FLOAT ColorRGBA[4] = { 0.f, 0.f, 0.f, 0.f };
+               const FLOAT ColorRGBA[4] = {0.f, 0.f, 0.f, 0.f};
                native_device_context->ClearRenderTargetView(device_data.ui_texture_rtv.get(), ColorRGBA);
 
                // Reset this, it shouldn't persist between frames
@@ -11616,7 +11718,7 @@ namespace
       device_data.cb_luma_global_settings_dirty = true;
    }
 
-   //TODOFT3: merge all the shader permutations that use the same code in Prey (and then move shader binaries to bin folder? Add shader files to VS project?)
+   // TODOFT3: merge all the shader permutations that use the same code in Prey (and then move shader binaries to bin folder? Add shader files to VS project?)
 
    // The sampler Luma's upgrade makes of a game's one ("samplers_upgrade_mode", "texture_mip_lod_bias_offset"): "desc" is a "D3D11_SAMPLER_DESC" or a "D3D12_SAMPLER_DESC",
    // whose members and filter, comparison, anisotropy and bias values are the same. False if it isn't one to upgrade (it can still come out unchanged).
@@ -11659,8 +11761,8 @@ namespace
          }
          else if (samplers_upgrade_mode == 3) // Only change the offset when the original value is zero
          {
-             desc.MipLODBias = (desc.MipLODBias == 0.0f) ? device_data.texture_mip_lod_bias_offset : desc.MipLODBias;
-             desc.MipLODBias = std::clamp(desc.MipLODBias, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
+            desc.MipLODBias = (desc.MipLODBias == 0.0f) ? device_data.texture_mip_lod_bias_offset : desc.MipLODBias;
+            desc.MipLODBias = std::clamp(desc.MipLODBias, MIP_LOD_BIAS_MIN, MIP_LOD_BIAS_MAX);
          }
 
          float bias_difference = desc.MipLODBias - original_desc.MipLODBias;
@@ -11717,14 +11819,10 @@ namespace
          }
       }
       else if ((desc.Filter == FILTER_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 1) // This is the most common (main/only) format being used other than AF
-         || (desc.Filter == FILTER_COMPARISON_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 2)
-         || (desc.Filter == FILTER_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 3)
-         || (desc.Filter == FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 4)
-         || (desc.Filter == FILTER_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 5)
-         || (desc.Filter == FILTER_COMPARISON_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 6))
+               || (desc.Filter == FILTER_COMPARISON_MIN_MAG_MIP_LINEAR && samplers_upgrade_mode_2 >= 2) || (desc.Filter == FILTER_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 3) || (desc.Filter == FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT && samplers_upgrade_mode_2 >= 4) || (desc.Filter == FILTER_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 5) || (desc.Filter == FILTER_COMPARISON_MIN_MAG_MIP_POINT && samplers_upgrade_mode_2 >= 6))
       {
-         //TODOFT: research. Force this on to see how it behaves. Doesn't work, it doesn't really help any further with (e.g.) blurry decal textures
-         // Note: this doesn't seem to do anything really, it doesn't help with the occasional blurry texture (probably because all samplers that needed anisotropic already had it set)
+         // TODOFT: research. Force this on to see how it behaves. Doesn't work, it doesn't really help any further with (e.g.) blurry decal textures
+         //  Note: this doesn't seem to do anything really, it doesn't help with the occasional blurry texture (probably because all samplers that needed anisotropic already had it set)
          if (samplers_upgrade_mode >= 7)
          {
             // A comparison sampler (SampleCmp, shadows) stays one
@@ -11824,8 +11922,10 @@ namespace
 #if DEVELOPMENT && !defined(NDEBUG) && 0 // Make sure that the device we are using to create samples is the "native" one (the final one), not the proxy created by ReShade // TODO: delete if ReShade doesn't take my PR for this
       ID3D11Device* parent_device = nullptr;
       // Special ID used by ReShade (and possibly other applications) that returns the parent object of a proxy
-      constexpr GUID ID_IDeviceChildParent = { 0x7f2c9a11, 0x3b4e, 0x4d6a, { 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
-      struct __declspec(uuid("7F2C9A11-3B4E-4D6A-812F-5E9CD37A1B42")) IDeviceChildParent : IUnknown { };
+      constexpr GUID ID_IDeviceChildParent = {0x7f2c9a11, 0x3b4e, 0x4d6a, {0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42}};
+      struct __declspec(uuid("7F2C9A11-3B4E-4D6A-812F-5E9CD37A1B42")) IDeviceChildParent : IUnknown
+      {
+      };
       device->QueryInterface(__uuidof(IDeviceChildParent), (void**)&parent_device);
       if (parent_device)
       {
@@ -12090,7 +12190,7 @@ namespace
             }
          }
       }
-#endif //DEVELOPMENT
+#endif // DEVELOPMENT
 
       const bool mod_active = IsModActive(device_data);
 
@@ -12101,7 +12201,7 @@ namespace
          // or an exclude list, of all the scene post processing shaders, and then manually setting "has_drawn_main_post_processing" somewhere in your game's code (and exclude any non UI shader that possibly runs after it).
          // If the main post processing shaders didn't run, it means the scene isn't rendering, or showing anyway, so we don't need to separate the UI,
          // as it'd likely already draw correctly on the swapchain or whatever is its render target.
-         // 
+         //
          // We expect the UI to draw on the immediate context, as it does in most games, if not, handle the render targets yourself for the custom case.
          if (cmd_list_data.is_known_ui_shader_bound || (!ui_separation_use_ui_hashes_only && device_data.has_drawn_main_post_processing && cmd_list_data.is_primary))
          {
@@ -12237,8 +12337,8 @@ namespace
 
                // List of dummy RTV and UAV indexes to upgrade. We set all of them, as this is for the forced upgrades branch.
                // See "D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT" and "D3D11_PS_CS_UAV_REGISTER_COUNT" (theoretically we should use "D3D11_1_UAV_SLOT_COUNT" but in reality that's never going to matter).
-               static const AutoTextureFormatUpgradeShaderHash dummy_texture_format_upgrade_shader_hashes_data = { {0,1,2,3,4,5,6,7}, {0,1,2,3,4,5,6,7}, false };
-               const AutoTextureFormatUpgradeShaderHash dummy_empty_texture_format_upgrade_shader_hashes_data = { {}, {}, false };
+               static const AutoTextureFormatUpgradeShaderHash dummy_texture_format_upgrade_shader_hashes_data = {{0, 1, 2, 3, 4, 5, 6, 7}, {0, 1, 2, 3, 4, 5, 6, 7}, false};
+               const AutoTextureFormatUpgradeShaderHash dummy_empty_texture_format_upgrade_shader_hashes_data = {{}, {}, false};
 
                uint64_t source_resource = 0;
                if (force_indirect_texture_format_upgrades && !hash_based_indirect_texture_format_upgrades && (is_dispatch ? cmd_list_data.any_upgraded_cs_srvs : cmd_list_data.any_upgraded_ps_srvs))
@@ -12256,7 +12356,7 @@ namespace
                            native_device_context->CSGetShaderResources(i, 1, &srv);
                         else
                            native_device_context->PSGetShaderResources(i, 1, &srv);
-                        source_resource = srv.get() ? device->get_resource_from_view({ (uint64_t)srv.get() }).handle : 0;
+                        source_resource = srv.get() ? device->get_resource_from_view({(uint64_t)srv.get()}).handle : 0;
                         break;
                      }
                   }
@@ -12268,14 +12368,14 @@ namespace
                if (!is_dispatch)
                {
                   native_device_context->OMGetRenderTargetsAndUnorderedAccessViews(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv, 0, device_data.uav_max_count, &uavs[0]);
-                  
+
                   if (force_indirect_texture_format_upgrades && !hash_based_indirect_texture_format_upgrades && source_resource == 0 && cmd_list_data.any_upgraded_ps_uavs)
                   {
                      for (size_t i = 0; i < cmd_list_data.ps_uavs_state.size(); ++i)
                      {
                         if (cmd_list_data.ps_uavs_state[i] == CommandListData::ViewState::SetAndUpgraded)
                         {
-                           source_resource = uavs[i].get() ? device->get_resource_from_view({ (uint64_t)uavs[i].get() }).handle : 0;
+                           source_resource = uavs[i].get() ? device->get_resource_from_view({(uint64_t)uavs[i].get()}).handle : 0;
                            break;
                         }
                      }
@@ -12284,14 +12384,14 @@ namespace
                else
                {
                   native_device_context->CSGetUnorderedAccessViews(0, device_data.uav_max_count, &uavs[0]);
-                  
+
                   if (force_indirect_texture_format_upgrades && !hash_based_indirect_texture_format_upgrades && source_resource == 0 && cmd_list_data.any_upgraded_cs_uavs)
                   {
                      for (size_t i = 0; i < cmd_list_data.cs_uavs_state.size(); ++i)
                      {
                         if (cmd_list_data.cs_uavs_state[i] == CommandListData::ViewState::SetAndUpgraded)
                         {
-                           source_resource = uavs[i].get() ? device->get_resource_from_view({ (uint64_t)uavs[i].get() }).handle : 0;
+                           source_resource = uavs[i].get() ? device->get_resource_from_view({(uint64_t)uavs[i].get()}).handle : 0;
                            break;
                         }
                      }
@@ -12370,12 +12470,14 @@ namespace
                                     {
                                        if (auto m = reinterpret_cast<ID3D11Resource*>(it->second.mirror_handle); m)
                                        {
-                                          com_ptr<ID3D11Texture2D> mt; if (SUCCEEDED(m->QueryInterface(&mt))) mt->GetDesc(&mirror_desc);
+                                          com_ptr<ID3D11Texture2D> mt;
+                                          if (SUCCEEDED(m->QueryInterface(&mt))) mt->GetDesc(&mirror_desc);
                                        }
                                     }
                                     if (auto o = reinterpret_cast<ID3D11Resource*>(seed_res_before); o)
                                     {
-                                       com_ptr<ID3D11Texture2D> ot; if (SUCCEEDED(o->QueryInterface(&ot))) ot->GetDesc(&orig_desc);
+                                       com_ptr<ID3D11Texture2D> ot;
+                                       if (SUCCEEDED(o->QueryInterface(&ot))) ot->GetDesc(&orig_desc);
                                     }
                                     char buf[256];
                                     std::snprintf(buf, sizeof(buf), "[LumaScale] SEED RTV redirected hash=%08X orig=%ux%u mirror=%ux%u has_drawn_sr=%d allow_scale=%d",
@@ -12523,7 +12625,9 @@ namespace
                               const uint64_t rtv_resource = GetCachedResourceFromView(device_data, reinterpret_cast<uint64_t>(rtvs[i].get()), false, true);
                               // TODO: make a "upgraded view to IndirectUpgradedResource*" map to speed this up
                               // We need to do two lookups to pass from an upgraded view to the original resource (back to the upgraded resource struct)
-                              if (auto mirror_it = std::ranges::find_if(device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources, [rtv_resource](const auto& pair) { return pair.second.mirror_handle == rtv_resource; }); mirror_it != device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.end())
+                              if (auto mirror_it = std::ranges::find_if(device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources, [rtv_resource](const auto& pair)
+                                     { return pair.second.mirror_handle == rtv_resource; });
+                                 mirror_it != device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.end())
                               {
                                  any_scaled |= mirror_it->second.is_scaled; // Only scaled mirrors (created at output resolution), not plain format-upgrade mirrors
                                  all_scaled &= mirror_it->second.is_scaled;
@@ -12542,7 +12646,9 @@ namespace
                         if (dsv.get())
                         {
                            const uint64_t dsv_resource = GetCachedResourceFromView(device_data, reinterpret_cast<uint64_t>(dsv.get()), false, true);
-                           if (auto mirror_it = std::ranges::find_if(device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources, [dsv_resource](const auto& pair) { return pair.second.mirror_handle == dsv_resource; }); mirror_it != device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.end())
+                           if (auto mirror_it = std::ranges::find_if(device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources, [dsv_resource](const auto& pair)
+                                  { return pair.second.mirror_handle == dsv_resource; });
+                              mirror_it != device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.end())
                            {
                               any_scaled |= mirror_it->second.is_scaled;
                               all_scaled &= mirror_it->second.is_scaled;
@@ -12567,7 +12673,8 @@ namespace
                            const float2 scale = float2((float)scaled_size.x / (float)original_size.x, (float)scaled_size.y / (float)original_size.y);
 
                            // Viewports and scissors are expected to be pixel aligned already, if they weren't, scaling and rounding them would shift the rendering by a sub pixel amount
-                           auto IsRounded = [](float value) { return value == std::floor(value); };
+                           auto IsRounded = [](float value)
+                           { return value == std::floor(value); };
 
                            // Only scale them once after the game last set them. We assume that if we scale a draw, then all other following draws should also be scaled, until the game sets a new viewport.
                            if (!cmd_list_data.viewports_scaled)
@@ -12587,14 +12694,14 @@ namespace
                                  // Scale the edges (not the sizes) and round them to whole pixels, so we never end up with values like 1239.999 instead of 1240.
                                  // Re-deriving the sizes from the rounded edges also keeps adjacent viewports perfectly tiled (no gaps nor overlaps).
                                  // Top Left would usually be 0. If it's not, then we also want to align it with the new size.
-                                 const float left   = std::round(viewports[i].TopLeftX * scale.x);
-                                 const float top    = std::round(viewports[i].TopLeftY * scale.y);
-                                 const float right  = std::round((viewports[i].TopLeftX + viewports[i].Width) * scale.x);
+                                 const float left = std::round(viewports[i].TopLeftX * scale.x);
+                                 const float top = std::round(viewports[i].TopLeftY * scale.y);
+                                 const float right = std::round((viewports[i].TopLeftX + viewports[i].Width) * scale.x);
                                  const float bottom = std::round((viewports[i].TopLeftY + viewports[i].Height) * scale.y);
                                  viewports[i].TopLeftX = left;
                                  viewports[i].TopLeftY = top;
-                                 viewports[i].Width    = right - left;
-                                 viewports[i].Height   = bottom - top;
+                                 viewports[i].Width = right - left;
+                                 viewports[i].Height = bottom - top;
                                  changed_viewports = true;
                               }
                               if (changed_viewports)
@@ -12615,9 +12722,9 @@ namespace
                                  if (scissors[i].right == scissors[i].left || scissors[i].bottom == scissors[i].top) continue; // Zero sized. Skip.
 
                                  // Scissors are already stored as (whole pixel) edges, so rounding each of them independently is enough to keep them tiled
-                                 scissors[i].left   = std::lround(scissors[i].left   * scale.x);
-                                 scissors[i].top    = std::lround(scissors[i].top    * scale.y);
-                                 scissors[i].right  = std::lround(scissors[i].right  * scale.x);
+                                 scissors[i].left = std::lround(scissors[i].left * scale.x);
+                                 scissors[i].top = std::lround(scissors[i].top * scale.y);
+                                 scissors[i].right = std::lround(scissors[i].right * scale.x);
                                  scissors[i].bottom = std::lround(scissors[i].bottom * scale.y);
                                  changed_scissors = true;
                               }
@@ -12680,7 +12787,7 @@ namespace
          }
 #endif
 
-         //TODOFT: optimize these shader searches by simply marking "CachedPipeline" with a tag on what they are (and whether they have a particular role) (also we can restrict the search to pixel shaders or compute shaders?) upfront. And move these into their own functions. Update: we optimized this enough.
+         // TODOFT: optimize these shader searches by simply marking "CachedPipeline" with a tag on what they are (and whether they have a particular role) (also we can restrict the search to pixel shaders or compute shaders?) upfront. And move these into their own functions. Update: we optimized this enough.
 
          if (test_index == 9) return false;
          // Use the specific callback if there's one, and fall back on the generic one otherwise.
@@ -12756,10 +12863,10 @@ namespace
          updated_cbuffers = true;
       }
 
-#if !DEVELOPMENT || !GAME_PREY //TODOFT2: re-enable once we are sure we replaced all the post tonemap shaders and we are done debugging the blend states. Compute Shaders are also never used in UI and by all stuff below...!!!
+#if !DEVELOPMENT || !GAME_PREY // TODOFT2: re-enable once we are sure we replaced all the post tonemap shaders and we are done debugging the blend states. Compute Shaders are also never used in UI and by all stuff below...!!!
       if (!is_custom_pass) return false;
-#else // ("GAME_PREY") We can't do any further checks in this case because some UI draws at the beginning of the frame (in world computers, in Prey), and sometimes the scene doesn't draw, but we still need to update the cbuffers (though maybe we could clear it up on present, to avoid problems)
-      //if (device_data.has_drawn_main_post_processing_previous && !device_data.has_drawn_main_post_processing) return false;
+#else  // ("GAME_PREY") We can't do any further checks in this case because some UI draws at the beginning of the frame (in world computers, in Prey), and sometimes the scene doesn't draw, but we still need to update the cbuffers (though maybe we could clear it up on present, to avoid problems)
+       // if (device_data.has_drawn_main_post_processing_previous && !device_data.has_drawn_main_post_processing) return false;
 #endif // !DEVELOPMENT
 
       // Skip the rest in cases where the UI isn't passing through our custom linear blends that emulate SDR gamma->gamma blends.
@@ -12815,14 +12922,12 @@ namespace
          // 2 Pre-multiplied alpha blend (alpha is also pre-multiplied, not just rgb): "result = source.RGB + (dest.RGB * (1 - source.A))"
          // 3 Additive alpha blend (source is "Straight alpha" while destination is retained at 100%): "result = (source.RGB * source.A) + dest.RGB"
          // 4 Additive blend (source and destination are simply summed up, ignoring the alpha): result = source.RGB + dest.RGB
-         // 
+         //
          // We don't care for the alpha blend operation (source alpha * dest alpha) as alpha is never read back from destination
-         if (blend_desc.RenderTarget[0].BlendEnable
-            && blend_desc.RenderTarget[0].BlendOp == D3D11_BLEND_OP::D3D11_BLEND_OP_ADD)
+         if (blend_desc.RenderTarget[0].BlendEnable && blend_desc.RenderTarget[0].BlendOp == D3D11_BLEND_OP::D3D11_BLEND_OP_ADD)
          {
             // Do both the "straight alpha" and "pre-multiplied alpha" cases
-            if ((blend_desc.RenderTarget[0].SrcBlend == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA || blend_desc.RenderTarget[0].SrcBlend == D3D11_BLEND::D3D11_BLEND_ONE)
-               && (blend_desc.RenderTarget[0].DestBlend == D3D11_BLEND::D3D11_BLEND_INV_SRC_ALPHA || blend_desc.RenderTarget[0].DestBlend == D3D11_BLEND::D3D11_BLEND_ONE))
+            if ((blend_desc.RenderTarget[0].SrcBlend == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA || blend_desc.RenderTarget[0].SrcBlend == D3D11_BLEND::D3D11_BLEND_ONE) && (blend_desc.RenderTarget[0].DestBlend == D3D11_BLEND::D3D11_BLEND_INV_SRC_ALPHA || blend_desc.RenderTarget[0].DestBlend == D3D11_BLEND::D3D11_BLEND_ONE))
             {
                if (blend_desc.RenderTarget[0].SrcBlend == D3D11_BLEND::D3D11_BLEND_ONE && blend_desc.RenderTarget[0].DestBlend == D3D11_BLEND::D3D11_BLEND_ONE)
                {
@@ -12844,20 +12949,15 @@ namespace
 #endif // GAME_PREY
                }
 #if GAME_PREY
-               //if (ui_data.blend_mode == 1 || ui_data.blend_mode == 3) // Old check
+               // if (ui_data.blend_mode == 1 || ui_data.blend_mode == 3) // Old check
                {
                   // In "blend_mode == 1", Prey seems to erroneously use "D3D11_BLEND::D3D11_BLEND_SRC_ALPHA" as source blend alpha, thus it multiplies alpha by itself when using pre-multiplied alpha passes,
                   // which doesn't seem to make much sense, at least not for the first write on a separate new texture (it means that the next blend with the final target background could end up going beyond 1 because the background darkening intensity is lower than it should be).
                   ASSERT_ONCE(!had_drawn_main_post_processing || (ui_data.targeting_swapchain ?
-                     // Make sure we never read back from the swap chain texture (which means we can ignore all the alpha blend ops on previous to it)
-                     (blend_desc.RenderTarget[0].SrcBlend != D3D11_BLEND::D3D11_BLEND_DEST_ALPHA
-                        && blend_desc.RenderTarget[0].DestBlend != D3D11_BLEND::D3D11_BLEND_DEST_ALPHA
-                        && blend_desc.RenderTarget[0].SrcBlend != D3D11_BLEND::D3D11_BLEND_DEST_COLOR
-                        && blend_desc.RenderTarget[0].DestBlend != D3D11_BLEND::D3D11_BLEND_DEST_COLOR)
-                     // Make sure that writes to separate textures always use known alpha blends modes, because we'll be reading back that alpha for later (possibly)
-                     : (blend_desc.RenderTarget[0].BlendOpAlpha == D3D11_BLEND_OP::D3D11_BLEND_OP_ADD
-                        && (blend_desc.RenderTarget[0].SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA
-                           || blend_desc.RenderTarget[0].SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_ONE))));
+                                                                                              // Make sure we never read back from the swap chain texture (which means we can ignore all the alpha blend ops on previous to it)
+                                                                       (blend_desc.RenderTarget[0].SrcBlend != D3D11_BLEND::D3D11_BLEND_DEST_ALPHA && blend_desc.RenderTarget[0].DestBlend != D3D11_BLEND::D3D11_BLEND_DEST_ALPHA && blend_desc.RenderTarget[0].SrcBlend != D3D11_BLEND::D3D11_BLEND_DEST_COLOR && blend_desc.RenderTarget[0].DestBlend != D3D11_BLEND::D3D11_BLEND_DEST_COLOR)
+                                                                                              // Make sure that writes to separate textures always use known alpha blends modes, because we'll be reading back that alpha for later (possibly)
+                                                                                              : (blend_desc.RenderTarget[0].BlendOpAlpha == D3D11_BLEND_OP::D3D11_BLEND_OP_ADD && (blend_desc.RenderTarget[0].SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_SRC_ALPHA || blend_desc.RenderTarget[0].SrcBlendAlpha == D3D11_BLEND::D3D11_BLEND_ONE))));
                }
 #endif // GAME_PREY
             }
@@ -12925,7 +13025,7 @@ namespace
 
       if (redirect_data.source_type != CachedPipeline::RedirectData::RedirectSourceType::None && redirect_data.target_type != CachedPipeline::RedirectData::RedirectTargetType::None)
       {
-			com_ptr<ID3D11Resource> source_resource;
+         com_ptr<ID3D11Resource> source_resource;
          com_ptr<ID3D11Resource> target_resource;
 
          switch (redirect_data.source_type)
@@ -13008,7 +13108,7 @@ namespace
 
       return false;
    }
-#endif //DEVELOPMENT
+#endif // DEVELOPMENT
 
    bool OnDraw(
       reshade::api::command_list* cmd_list,
@@ -13420,7 +13520,7 @@ namespace
 
 #if ENABLE_DRAW_DISPATCH_DATA_CACHE || DEVELOPMENT
       last_draw_dispatch_data = {};
-      last_draw_dispatch_data.dispatch_count = uint3( group_count_x, group_count_y, group_count_z );
+      last_draw_dispatch_data.dispatch_count = uint3(group_count_x, group_count_y, group_count_z);
 #endif
       bool updated_cbuffers = false;
       bool cancelled_or_replaced = OnDrawOrDispatch_Custom<true>(cmd_list, updated_cbuffers, original_draw_dispatch_func);
@@ -13608,8 +13708,8 @@ namespace
       bool updated_cbuffers = false;
       // This is the only case where we don't know whether it's a dispatch at compile time
       bool cancelled_or_replaced = is_dispatch
-         ? OnDrawOrDispatch_Custom<true>(cmd_list, updated_cbuffers, original_draw_dispatch_func)
-         : OnDrawOrDispatch_Custom<false>(cmd_list, updated_cbuffers, original_draw_dispatch_func);
+                                      ? OnDrawOrDispatch_Custom<true>(cmd_list, updated_cbuffers, original_draw_dispatch_func)
+                                      : OnDrawOrDispatch_Custom<false>(cmd_list, updated_cbuffers, original_draw_dispatch_func);
 #if DEVELOPMENT
       if (wants_debug_draw)
       {
@@ -13734,7 +13834,7 @@ namespace
       if (desc.filter == reshade::api::filter_mode::anisotropic || desc.filter == reshade::api::filter_mode::compare_anisotropic)
       {
          assert(desc.max_anisotropy >= 2); // Doesn't seem to happen
-         assert(desc.min_lod == 0); // Doesn't seem to happen
+         assert(desc.min_lod == 0);        // Doesn't seem to happen
          assert(desc.mip_lod_bias == 0.f); // This seems to happen when enabling TAA (but not with SMAA 2TX), some new samplers are created with bias -1 and then persist, it's unclear if they are used though.
       }
       else
@@ -13743,13 +13843,8 @@ namespace
       }
       assert(desc.filter != reshade::api::filter_mode::min_mag_anisotropic_mip_point && desc.filter != reshade::api::filter_mode::compare_min_mag_anisotropic_mip_point); // Doesn't seem to happen
 
-      ASSERT_ONCE(desc.filter == reshade::api::filter_mode::anisotropic
-         || desc.filter == reshade::api::filter_mode::compare_anisotropic
-         || desc.filter == reshade::api::filter_mode::min_mag_mip_linear
-         || desc.filter == reshade::api::filter_mode::compare_min_mag_mip_linear
-         || desc.filter == reshade::api::filter_mode::min_mag_linear_mip_point
-         || desc.filter == reshade::api::filter_mode::compare_min_mag_linear_mip_point); // Doesn't seem to happen
-#endif // DEVELOPMENT
+      ASSERT_ONCE(desc.filter == reshade::api::filter_mode::anisotropic || desc.filter == reshade::api::filter_mode::compare_anisotropic || desc.filter == reshade::api::filter_mode::min_mag_mip_linear || desc.filter == reshade::api::filter_mode::compare_min_mag_mip_linear || desc.filter == reshade::api::filter_mode::min_mag_linear_mip_point || desc.filter == reshade::api::filter_mode::compare_min_mag_linear_mip_point); // Doesn't seem to happen
+#endif                                                                                                                                                                                                                                                                                                                                                                                                                                 // DEVELOPMENT
 
       ID3D11SamplerState* native_sampler = reinterpret_cast<ID3D11SamplerState*>(sampler.handle);
 
@@ -13868,9 +13963,7 @@ namespace
       if (is_depth)
       {
          // Preserve the stencil if we can!
-         if (desc.texture.format == reshade::api::format(DXGI_FORMAT_R24G8_TYPELESS)
-            || desc.texture.format == reshade::api::format(DXGI_FORMAT_D24_UNORM_S8_UINT)
-            || desc.texture.format == reshade::api::format(DXGI_FORMAT_R32G8X24_TYPELESS))
+         if (desc.texture.format == reshade::api::format(DXGI_FORMAT_R24G8_TYPELESS) || desc.texture.format == reshade::api::format(DXGI_FORMAT_D24_UNORM_S8_UINT) || desc.texture.format == reshade::api::format(DXGI_FORMAT_R32G8X24_TYPELESS))
          {
             return reshade::api::format::r32_g8_typeless;
          }
@@ -13977,6 +14070,10 @@ namespace
 
       DeviceData& device_data = *device->get_private_data<DeviceData>();
 #if DX12 && DEVELOPMENT
+      {
+         const std::unique_lock lock_live(device_data.live_resources.mutex);
+         device_data.live_resources.resources.emplace(resource.handle);
+      }
       // Root SRVs and UAVs are GPU virtual addresses, the capture resolves them to their buffer. Textures are kept with how the game created them, for the MCP: ReShade fires this inside the
       // game's create call (see "includes/d3d12_resource_creation.h")
       if (desc.type == reshade::api::resource_type::buffer)
@@ -14014,6 +14111,10 @@ namespace
                D3D12ResourceCreation::RememberLayoutTexture(clone_handle);
             }
 #if DEVELOPMENT
+            {
+               const std::unique_lock lock_live(device_data.live_resources.mutex);
+               device_data.live_resources.resources.emplace(clone_handle);
+            }
             const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
             device_data.texture_kinds.by_resource[clone_handle] = D3D12ResourceCreation::Kind::Clone;
 #endif
@@ -14061,7 +14162,7 @@ namespace
          if (upgraded_resource_init_data)
          {
             delete[] static_cast<uint8_t*>(upgraded_resource_init_data); // TODO: this has a memory leak when a thread is closed if it last failed. Make it a smart ptr.
-            upgraded_resource_init_data = nullptr; // optional, avoid dangling pointer
+            upgraded_resource_init_data = nullptr;                       // optional, avoid dangling pointer
          }
 
 #if DX11
@@ -14091,7 +14192,7 @@ namespace
 
                lock.lock();
                ASSERT(!device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.contains(resource.handle)); // The game re-used the ptr (can rarely happen), and we haven't cleared our mirrored verson yet
-               device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.emplace(resource.handle, ResourceUpgradeManager::IndirectUpgradedResource{ mirrored_upgraded_resource.handle, texture_scaled, desc.texture.width, desc.texture.height, upgraded_desc.texture.width, upgraded_desc.texture.height });
+               device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.emplace(resource.handle, ResourceUpgradeManager::IndirectUpgradedResource{mirrored_upgraded_resource.handle, texture_scaled, desc.texture.width, desc.texture.height, upgraded_desc.texture.width, upgraded_desc.texture.height});
                device_data.resource_upgrades.any_mirror.store(true, std::memory_order_release);
             }
             if (new_initial_data_ptr)
@@ -14157,7 +14258,7 @@ namespace
 
       DeviceData& device_data = *device->get_private_data<DeviceData>();
       std::shared_lock lock(device_data.mutex); // Note: we possibly don't even need this (or well, we might want to use a different mutex)
-      
+
       if (std::optional<reshade::api::resource_desc> upgraded_desc = (texture_format_upgrades_on_creation ? GetOptionalResourceUpgradeDesc(desc, device_data, initial_data && initial_data->data) : std::nullopt))
       {
          lock.unlock();
@@ -14290,6 +14391,10 @@ namespace
       DeviceData& device_data = *device->get_private_data<DeviceData>();
 #if DX12 && DEVELOPMENT
       D3D12State::RemoveBuffer(&device_data.buffer_addresses, resource);
+      {
+         const std::unique_lock lock_live(device_data.live_resources.mutex);
+         device_data.live_resources.resources.erase(resource.handle);
+      }
 #if ENABLE_MINHOOK
       {
          const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
@@ -14309,6 +14414,10 @@ namespace
             device_data.resource_upgrades.OnResourceDestroyed(clone_handle);
          }
 #if DEVELOPMENT
+         {
+            const std::unique_lock lock_live(device_data.live_resources.mutex);
+            device_data.live_resources.resources.erase(clone_handle);
+         }
          const std::unique_lock lock_kinds(device_data.texture_kinds.mutex);
          device_data.texture_kinds.by_resource.erase(clone_handle);
 #endif
@@ -14361,7 +14470,7 @@ namespace
       }
 #endif
 
-		reshade::api::resource_view_type lut_dimensions = reshade::api::resource_view_type::unknown;
+      reshade::api::resource_view_type lut_dimensions = reshade::api::resource_view_type::unknown;
       switch (texture_format_upgrades_lut_dimensions)
       {
       case LUTDimensions::_1D:
@@ -14463,7 +14572,7 @@ namespace
                formats_compatible |= bgra8_1 && bgra8_2;
                // No need to force replace the view format if formats are compatible
                if (!formats_compatible)
-                 desc.format = resource_desc.texture.format; // Should be R16G16B16A16_FLOAT or R10G10B10A2_UNORM if "swapchain_format_upgrade_type" is enabled (depending on "swapchain_upgrade_type")
+                  desc.format = resource_desc.texture.format; // Should be R16G16B16A16_FLOAT or R10G10B10A2_UNORM if "swapchain_format_upgrade_type" is enabled (depending on "swapchain_upgrade_type")
                break;
             }
             }
@@ -14636,7 +14745,7 @@ namespace
       {
          // Only the last attempted creation would matter
          device_data.resource_upgrades.original_upgraded_resource_views_formats.emplace(
-            view.handle, // Key
+            view.handle,                                                                                // Key
             std::make_pair(resource.handle, last_attempted_upgraded_resource_view_creation_view_format) // Value
          );
       }
@@ -14696,7 +14805,7 @@ namespace
       switch (update.type)
       {
       default:
-      break;
+         break;
       case reshade::api::descriptor_type::texture_unordered_access_view:
       case reshade::api::descriptor_type::texture_shader_resource_view:
       {
@@ -14722,7 +14831,7 @@ namespace
             std::shared_lock lock_device_read(device_data.mutex);
 
             const reshade::api::resource_view* original_rvs = (reshade::api::resource_view*)update.descriptors;
-            reshade::api::resource_view* replaced_rvs = nullptr; // Assigned below on creation if ever needed
+            reshade::api::resource_view* replaced_rvs = nullptr;                                         // Assigned below on creation if ever needed
             reshade::api::resource_usage resource_usage = reshade::api::resource_usage::shader_resource; // Implied by default
             if (update.type == reshade::api::descriptor_type::texture_unordered_access_view)
             {
@@ -14978,7 +15087,7 @@ namespace
                   }
                }
                ASSERT_ONCE(recursive_or_null || samplers_upgrade_mode == 0); // Shouldn't happen anymore, because now we re-add recursively created samples to the "custom_sampler_by_original_sampler" list anyway! (if we know the sampler set is "recursive", then we are good and don't need to replace this sampler again)
-#if 0 // TODO: delete or restore in case the "recursive_or_null" assert above ever triggered (seems like it won't, and the problem has been fixed)
+#if 0                                                                        // TODO: delete or restore in case the "recursive_or_null" assert above ever triggered (seems like it won't, and the problem has been fixed)
                if (sampler.handle != 0)
                {
                   ID3D11SamplerState* native_sampler = reinterpret_cast<ID3D11SamplerState*>(sampler.handle);
@@ -15139,7 +15248,7 @@ namespace
       if (convert_directly || has_mirror)
       {
          ASSERT_ONCE(access == reshade::api::map_access::write_only || access == reshade::api::map_access::write_discard); // For now we only support write, games generally don't read back textures from the CPU if not for screenshots or for save game snapshots. Note: this happens in Shenmue 2 photo mode. It should be ok as long as we have indirect texture upgrades (the photo will be black or garbage data), otherwise we'd need to covert the data inline here!
-         ASSERT_ONCE(data && data->data); // If this is nullptr, it might be a "ID3D11DeviceContext3::WriteToSubresource", which we don't support!
+         ASSERT_ONCE(data && data->data);                                                                                  // If this is nullptr, it might be a "ID3D11DeviceContext3::WriteToSubresource", which we don't support!
 
          upgraded_mapped_resources[resource.handle] = data;
 
@@ -15279,7 +15388,7 @@ namespace
          {
             const auto original_resource_to_mirrored_upgraded_resource_ptr = original_resource_to_mirrored_upgraded_resource->second.mirror_handle;
             lock_device_read.unlock(); // Avoid deadlocks with device
-            upgraded_desc = device->get_resource_desc({ original_resource_to_mirrored_upgraded_resource_ptr });
+            upgraded_desc = device->get_resource_desc({original_resource_to_mirrored_upgraded_resource_ptr});
             original_desc = device->get_resource_desc(resource);
             resource.handle = original_resource_to_mirrored_upgraded_resource_ptr;
             convert_data = true;
@@ -15323,7 +15432,7 @@ namespace
          }
       }
 #endif
-      
+
       DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
       std::shared_lock lock(device_data.mutex);
       auto original_resource_view_to_mirrored_upgraded_resource_view = device_data.resource_upgrades.original_resource_views_to_mirrored_upgraded_resource_views.find(dsv.handle);
@@ -15331,7 +15440,7 @@ namespace
       {
          const auto original_resource_view_to_mirrored_upgraded_resource_view_ptr = original_resource_view_to_mirrored_upgraded_resource_view->second;
          lock.unlock(); // Avoids deadlock with the device
-         cmd_list->clear_depth_stencil_view({ original_resource_view_to_mirrored_upgraded_resource_view_ptr }, depth, stencil, rect_count, rects);
+         cmd_list->clear_depth_stencil_view({original_resource_view_to_mirrored_upgraded_resource_view_ptr}, depth, stencil, rect_count, rects);
          return true;
       }
 
@@ -15372,7 +15481,7 @@ namespace
       {
          const auto original_resource_view_to_mirrored_upgraded_resource_view_ptr = original_resource_view_to_mirrored_upgraded_resource_view->second;
          lock.unlock(); // Avoids deadlock with the device
-         cmd_list->clear_render_target_view({ original_resource_view_to_mirrored_upgraded_resource_view_ptr }, color, rect_count, rects);
+         cmd_list->clear_render_target_view({original_resource_view_to_mirrored_upgraded_resource_view_ptr}, color, rect_count, rects);
          return true;
       }
 
@@ -15425,7 +15534,7 @@ namespace
          upgraded_values[1] = values[1];
          upgraded_values[2] = values[2];
          upgraded_values[3] = values[3];
-         cmd_list->clear_unordered_access_view_float({ original_resource_view_to_mirrored_upgraded_resource_view_ptr }, upgraded_values, rect_count, rects);
+         cmd_list->clear_unordered_access_view_float({original_resource_view_to_mirrored_upgraded_resource_view_ptr}, upgraded_values, rect_count, rects);
          return true;
       }
 
@@ -15466,7 +15575,7 @@ namespace
       {
          const auto original_resource_view_to_mirrored_upgraded_resource_view_ptr = original_resource_view_to_mirrored_upgraded_resource_view->second;
          lock.unlock(); // Avoids deadlock with the device
-         cmd_list->clear_unordered_access_view_float({ original_resource_view_to_mirrored_upgraded_resource_view_ptr }, values, rect_count, rects);
+         cmd_list->clear_unordered_access_view_float({original_resource_view_to_mirrored_upgraded_resource_view_ptr}, values, rect_count, rects);
          return true;
       }
 
@@ -15562,54 +15671,54 @@ namespace
                return false;
 
             auto isUnorm8 = [](DXGI_FORMAT format)
+            {
+               switch (format)
                {
-                  switch (format)
-                  {
-                  case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-                  case DXGI_FORMAT_R8G8B8A8_UNORM:
-                  case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-                  case DXGI_FORMAT_B8G8R8A8_UNORM:
-                  case DXGI_FORMAT_B8G8R8X8_UNORM:
-                  case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-                  case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-                  case DXGI_FORMAT_B8G8R8X8_TYPELESS:
-                  case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
-                  // Hacky case (just as a shortcut)
-                  case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-                  case DXGI_FORMAT_R10G10B10A2_UNORM:
+               case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+               case DXGI_FORMAT_R8G8B8A8_UNORM:
+               case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+               case DXGI_FORMAT_B8G8R8A8_UNORM:
+               case DXGI_FORMAT_B8G8R8X8_UNORM:
+               case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+               case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+               case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+               case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+               // Hacky case (just as a shortcut)
+               case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+               case DXGI_FORMAT_R10G10B10A2_UNORM:
                   return true;
-                  }
-                  return false;
-               };
+               }
+               return false;
+            };
             auto isUnorm16 = [](DXGI_FORMAT format)
+            {
+               switch (format)
                {
-                  switch (format)
-                  {
-                  case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-                  case DXGI_FORMAT_R16G16B16A16_UNORM:
+               case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+               case DXGI_FORMAT_R16G16B16A16_UNORM:
                   return true;
-                  }
-                  return false;
-               };
+               }
+               return false;
+            };
             auto isFloat16 = [](DXGI_FORMAT format)
+            {
+               switch (format)
                {
-                  switch (format)
-                  {
-                  case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-                  case DXGI_FORMAT_R16G16B16A16_FLOAT:
+               case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+               case DXGI_FORMAT_R16G16B16A16_FLOAT:
                   return true;
-                  }
-                  return false;
-               };
+               }
+               return false;
+            };
             auto isFloat11 = [](DXGI_FORMAT format)
+            {
+               switch (format)
                {
-                  switch (format)
-                  {
-                  case DXGI_FORMAT_R11G11B10_FLOAT:
+               case DXGI_FORMAT_R11G11B10_FLOAT:
                   return true;
-                  }
-                  return false;
-               };
+               }
+               return false;
+            };
 
             // If we detected incompatible formats that were likely caused by Luma upgrading texture formats (of render targets only...),
             // do the copy in shader. It should currently cover all texture formats upgradable with "texture_upgrade_formats".
@@ -15617,10 +15726,7 @@ namespace
             // Note that formats of the same typeless group are copied by byte, so DXGI_FORMAT_R16G16B16A16_UNORM <-> DXGI_FORMAT_R16G16B16A16_FLOAT also needs the shader
             // (a typeless resource keeps the byte copy, its views decide how it's read).
             // TODO: add gamma to linear support (e.g. non sRGB views into sRGB views)? Also just use AreFormatsCopyCompatible(format1, format2)
-            if (((isUnorm8(target_desc.Format) || isFloat11(target_desc.Format)) && isFloat16(source_desc.Format))
-               || ((isUnorm8(source_desc.Format) || isFloat11(source_desc.Format)) && isFloat16(target_desc.Format))
-               || (!IsTypelessFormat(source_desc.Format) && !IsTypelessFormat(target_desc.Format)
-                  && ((isUnorm16(target_desc.Format) && isFloat16(source_desc.Format)) || (isUnorm16(source_desc.Format) && isFloat16(target_desc.Format)))))
+            if (((isUnorm8(target_desc.Format) || isFloat11(target_desc.Format)) && isFloat16(source_desc.Format)) || ((isUnorm8(source_desc.Format) || isFloat11(source_desc.Format)) && isFloat16(target_desc.Format)) || (!IsTypelessFormat(source_desc.Format) && !IsTypelessFormat(target_desc.Format) && ((isUnorm16(target_desc.Format) && isFloat16(source_desc.Format)) || (isUnorm16(source_desc.Format) && isFloat16(target_desc.Format)))))
             {
                ASSERT_ONCE_MSG(forced || upgraded_resources, "The game seemingly tried to copy incompatible resource formats for resources that were not upgraded by us");
 
@@ -15849,7 +15955,7 @@ namespace
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
 
-      OnCopyResource_Debug(cmd_list, source, dest, { .kind = TraceDrawCallData::CopyKind::BufferRegion, .dest_offset = uint3{ uint32_t(dest_offset), 0, 0 }, .has_box = true, .box = D3D11_BOX{ uint32_t(source_offset), 0, 0, uint32_t(source_offset + size), 1, 1 } });
+      OnCopyResource_Debug(cmd_list, source, dest, {.kind = TraceDrawCallData::CopyKind::BufferRegion, .dest_offset = uint3{uint32_t(dest_offset), 0, 0}, .has_box = true, .box = D3D11_BOX{uint32_t(source_offset), 0, 0, uint32_t(source_offset + size), 1, 1}});
       return false;
    }
 #endif // DEVELOPMENT
@@ -15907,7 +16013,7 @@ namespace
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
 
-      OnCopyResource_Debug(cmd_list, source, dest, { .kind = TraceDrawCallData::CopyKind::Region, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = dest_box ? uint3{ dest_box->left, dest_box->top, dest_box->front } : uint3{}, .has_box = source_box != nullptr, .box = source_box ? D3D11_BOX{ source_box->left, source_box->top, source_box->front, source_box->right, source_box->bottom, source_box->back } : D3D11_BOX{} });
+      OnCopyResource_Debug(cmd_list, source, dest, {.kind = TraceDrawCallData::CopyKind::Region, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = dest_box ? uint3{dest_box->left, dest_box->top, dest_box->front} : uint3{}, .has_box = source_box != nullptr, .box = source_box ? D3D11_BOX{source_box->left, source_box->top, source_box->front, source_box->right, source_box->bottom, source_box->back} : D3D11_BOX{}});
 
       {
          bool any_replaced = false;
@@ -15966,7 +16072,7 @@ namespace
             std::shared_lock lock_device_read(device_data.mutex);
             if (enable_upgraded_texture_resource_copy_redirection && (device_data.resource_upgrades.upgraded_resources.contains(source.handle) || device_data.resource_upgrades.upgraded_resources.contains(dest.handle) || (swapchain_upgrade_type > SwapchainUpgradeType::None && (device_data.back_buffers.contains(source.handle) || device_data.back_buffers.contains(dest.handle)))))
             {
-               lock_device_read.unlock(); // Avoid deadlocks with device
+               lock_device_read.unlock();                                        // Avoid deadlocks with device
                ASSERT_ONCE(AreResourcesEqual(source_resource, target_resource)); // Note: this might catch some false positives too
             }
          }
@@ -15979,11 +16085,15 @@ namespace
    {
       SKIP_UNSUPPORTED_DEVICE_API(cmd_list->get_device()->get_api(), false);
 
-      OnCopyResource_Debug(cmd_list, source, dest, { .kind = TraceDrawCallData::CopyKind::Resolve, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = uint3{ dest_x, dest_y, dest_z }, .has_box = source_box != nullptr, .box = source_box ? D3D11_BOX{ source_box->left, source_box->top, source_box->front, source_box->right, source_box->bottom, source_box->back } : D3D11_BOX{}, .resolve_format = DXGI_FORMAT(format) });
+      OnCopyResource_Debug(cmd_list, source, dest, {.kind = TraceDrawCallData::CopyKind::Resolve, .source_subresource = source_subresource, .dest_subresource = dest_subresource, .dest_offset = uint3{dest_x, dest_y, dest_z}, .has_box = source_box != nullptr, .box = source_box ? D3D11_BOX{source_box->left, source_box->top, source_box->front, source_box->right, source_box->bottom, source_box->back} : D3D11_BOX{}, .resolve_format = DXGI_FORMAT(format)});
 
       // Indirect upgrades
       {
          bool any_replaced = false;
+#if DEVELOPMENT || TEST
+         const uint64_t original_source = source.handle;
+         const uint64_t original_dest = dest.handle;
+#endif
 
          {
             DeviceData& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
@@ -15995,23 +16105,35 @@ namespace
 
          if (any_replaced)
          {
-            uint4 size1;
-            DXGI_FORMAT format1;
+            uint4 size1, size2;
+            DXGI_FORMAT format1, format2;
             GetResourceInfo(reinterpret_cast<ID3D11Resource*>(source.handle), size1, format1);
-#if DEVELOPMENT || TEST
-            uint4 size2;
-            DXGI_FORMAT format2;
             GetResourceInfo(reinterpret_cast<ID3D11Resource*>(dest.handle), size2, format2);
+            const bool full_resolve = source_subresource == 0 && dest_subresource == 0 && !source_box && dest_x == 0 && dest_y == 0 && dest_z == 0;
+            // Only one side upgraded, e.g. an MSAA target that isn't, resolved into a texture shared with one that is (dgVoodoo keeps one
+            // resolve texture per size and format): resolve in the source's own format, then convert by shader
+            if (!AreFormatsCopyCompatible(format1, format2) && full_resolve)
+            {
+               const DXGI_FORMAT source_resolve_format = AreFormatsCopyCompatible(DXGI_FORMAT(format), format1) ? DXGI_FORMAT(format) : format1;
+               const bool succeeded = OnCopyResource_Internal(cmd_list, source, dest, source_resolve_format, true);
+               ASSERT_ONCE(succeeded);
+               return true;
+            }
+#if DEVELOPMENT || TEST
+            // The assert's message box names neither side: which one kept its original (non upgraded) resource
+            if (static std::atomic<bool> logged = false; !AreFormatsCopyCompatible(format1, format2) && !logged.exchange(true))
+            {
+               reshade::log::message(reshade::log::level::warning, std::format("[Luma] Resolve format mismatch: source {} -> {} (format {}, {}x{}x{}), dest {} -> {} (format {}, {}x{}x{})", original_source, source.handle, uint32_t(format1), size1.x, size1.y, size1.w, original_dest, dest.handle, uint32_t(format2), size2.x, size2.y, size2.w).c_str());
+            }
             ASSERT_ONCE(AreFormatsCopyCompatible(format1, format2));
-            
+
             const reshade::api::resource_desc resource_desc = cmd_list->get_device()->get_resource_desc(source);
             const bool is_depth = (resource_desc.usage & reshade::api::resource_usage::depth_stencil) != 0;
             ASSERT_ONCE(!is_depth); // Depth textures are not supported here? Especially if they were upgraded or have stencil
 #endif
 
             format = (reshade::api::format)format1; // Our upgrades "GetBestResourceUpgradeFormat()" are always non typeless so this is fine (this is the "view" format the MS resolve uses for the target and source textures)
-            if (source_subresource == 0 && dest_subresource == 0 && !source_box && dest_x == 0 && dest_y == 0 && dest_z == 0 &&
-                game->OverrideResolveTextureRegion((ID3D11Device*)(cmd_list->get_device()->get_native()), (ID3D11DeviceContext*)(cmd_list->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, source.handle, format1))
+            if (full_resolve && game->OverrideResolveTextureRegion((ID3D11Device*)(cmd_list->get_device()->get_native()), (ID3D11DeviceContext*)(cmd_list->get_native()), *cmd_list->get_device()->get_private_data<DeviceData>(), dest.handle, source.handle, format1))
                return true;
             cmd_list->resolve_texture_region(source, source_subresource, source_box, dest, dest_subresource, dest_x, dest_y, dest_z, format);
             return true;
@@ -16063,7 +16185,7 @@ namespace
             std::shared_lock lock_device_read(device_data.mutex);
             if (enable_upgraded_texture_resource_copy_redirection && (device_data.resource_upgrades.upgraded_resources.contains(source.handle) || device_data.resource_upgrades.upgraded_resources.contains(dest.handle) || (swapchain_upgrade_type > SwapchainUpgradeType::None && (device_data.back_buffers.contains(source.handle) || device_data.back_buffers.contains(dest.handle)))))
             {
-               lock_device_read.unlock(); // Avoid deadlocks with device
+               lock_device_read.unlock();                                        // Avoid deadlocks with device
                ASSERT_ONCE(AreResourcesEqual(source_resource, target_resource)); // Note: this might catch some false positives too
             }
          }
@@ -16338,13 +16460,13 @@ namespace
             ofs.write(reinterpret_cast<const char*>(&Shader::meta_version), sizeof(Shader::meta_version));
 
             auto WriteBoolArray = [&](const bool* arr, size_t count)
+            {
+               for (size_t i = 0; i < count; ++i)
                {
-                  for (size_t i = 0; i < count; ++i)
-                  {
-                     uint8_t val = arr[i] ? 1 : 0;
-                     ofs.write(reinterpret_cast<const char*>(&val), sizeof(val));
-                  }
-               };
+                  uint8_t val = arr[i] ? 1 : 0;
+                  ofs.write(reinterpret_cast<const char*>(&val), sizeof(val));
+               }
+            };
 
             uint32_t type_and_version_size = static_cast<uint32_t>(cached_shader->type_and_version.size());
             ofs.write(reinterpret_cast<const char*>(&type_and_version_size), sizeof(type_and_version_size));
@@ -16448,9 +16570,9 @@ namespace
          // Dumping them here would write the unpatched binary.
          if (!patched_shaders_to_dump.contains(shader_to_dump) && (force_redump_shaders || !dumped_shaders.contains(shader_to_dump)
 #if DEVELOPMENT
-            || !dumped_shaders_meta_paths.contains(shader_to_dump)
+                                                                     || !dumped_shaders_meta_paths.contains(shader_to_dump)
 #endif
-            ))
+                                                                        ))
          {
             DumpShader(shader_to_dump);
          }
@@ -16557,8 +16679,8 @@ namespace
             auto [built, injected] = Patch::BuildPatchedCloneSubobjects(
                subobject_count, subobjects_copy,
                [&device_data, &clone_origin](
-                   const reshade::api::shader_desc*,
-                   const reshade::api::shader_desc* orig_desc) -> std::optional<std::pair<const uint8_t*, uint32_t>>
+                  const reshade::api::shader_desc*,
+                  const reshade::api::shader_desc* orig_desc) -> std::optional<std::pair<const uint8_t*, uint32_t>>
                {
                   const uint32_t shader_hash = Shader::BinToHash(static_cast<const uint8_t*>(orig_desc->code), orig_desc->code_size);
 
@@ -16573,8 +16695,8 @@ namespace
                      }
                   }
 
-                  // Recipe / bytecode patches (only exist when patch providers
-                  // are enabled; other games have no patch_context).
+               // Recipe / bytecode patches (only exist when patch providers
+               // are enabled; other games have no patch_context).
 #if LUMA_PATCH_PROVIDERS != 0
                   if (auto patched = device_data.patch_context.GetShaderData(shader_hash); patched)
                   {
@@ -16704,8 +16826,7 @@ namespace
       auto IsValidTarget = [&device_data](const DeviceData::AsyncCloneEntry& entry) -> Shader::CachedPipeline*
       {
          const auto pipeline_it = device_data.pipeline_cache_by_pipeline_handle.find(entry.pipeline_handle);
-         if (pipeline_it == device_data.pipeline_cache_by_pipeline_handle.end() || pipeline_it->second == nullptr || pipeline_it->second->cloned
-             || pipeline_it->second->shader_hashes[0] != entry.shader_hash
+         if (pipeline_it == device_data.pipeline_cache_by_pipeline_handle.end() || pipeline_it->second == nullptr || pipeline_it->second->cloned || pipeline_it->second->shader_hashes[0] != entry.shader_hash
              // A preserved patch clone still owns its object; the fresh clone would overwrite and leak it.
              || pipeline_it->second->pipeline_clone.handle != 0)
          {
@@ -16762,9 +16883,7 @@ namespace
             // The pipeline may have been destroyed/recycled since the verify
             // above — re-check before registering.
             const auto pipeline_it = device_data.pipeline_cache_by_pipeline_handle.find(entry.pipeline_handle);
-            if (pipeline_it == device_data.pipeline_cache_by_pipeline_handle.end() || pipeline_it->second != v.second
-                || pipeline_it->second->cloned || pipeline_it->second->shader_hashes[0] != entry.shader_hash
-                || pipeline_it->second->pipeline_clone.handle != 0)
+            if (pipeline_it == device_data.pipeline_cache_by_pipeline_handle.end() || pipeline_it->second != v.second || pipeline_it->second->cloned || pipeline_it->second->shader_hashes[0] != entry.shader_hash || pipeline_it->second->pipeline_clone.handle != 0)
             {
                orphans.emplace_back(entry.device, clone);
                continue;
@@ -16837,9 +16956,8 @@ namespace
       {
          {
             std::unique_lock lock_jobs(device_data->async_jobs_mutex);
-            device_data->async_jobs_cv.wait(lock_jobs, [&] {
-               return device_data->async_shutdown || device_data->async_queue_version != last_processed_version;
-            });
+            device_data->async_jobs_cv.wait(lock_jobs, [&]
+               { return device_data->async_shutdown || device_data->async_queue_version != last_processed_version; });
             if (device_data->async_shutdown)
             {
                break; // Device is going away — never touch it again
@@ -16875,11 +16993,11 @@ namespace
 #pragma optimize("t", on) // Temporarily override optimization, this function is too slow in debug otherwise (comment this out if ever needed)
 
    // TODO: apply this everywhere!
-   template <typename T, bool Serialize = true >
+   template <typename T, bool Serialize = true>
    bool DrawResetButton(
-      T& value,                      // The current value to modify
-      const T& default_value,        // The default value to compare against
-      const char* name,              // Unique ID string for ImGui, and ReShade serialization
+      T& value,               // The current value to modify
+      const T& default_value, // The default value to compare against
+      const char* name,       // Unique ID string for ImGui, and ReShade serialization
       reshade::api::effect_runtime* runtime = nullptr)
    {
       bool edited = false;
@@ -17141,8 +17259,8 @@ namespace
       {
          needs_unload_shaders = true;
          last_pressed_unload = true;
-#if 0  // Not necessary anymore with "last_pressed_unload"
-         // For consistency, disable auto load, it makes no sense for them to be on if we have unloaded shaders
+#if 0 // Not necessary anymore with "last_pressed_unload"
+      // For consistency, disable auto load, it makes no sense for them to be on if we have unloaded shaders
          if (auto_load)
          {
             auto_load = false;
@@ -17405,7 +17523,7 @@ namespace
                      }
                      cached_pipeline->replace_draw_type = ShaderReplaceDrawType::None;
                      cached_pipeline->custom_depth_stencil = ShaderCustomDepthStencilType::None;
-                     cached_pipeline->redirect_data = { };
+                     cached_pipeline->redirect_data = {};
                   }
                }
 
@@ -17439,7 +17557,7 @@ namespace
                      CommandListData& cmd_list_data = GetTraceCommandListData(runtime);
                      const std::shared_lock lock_trace_2(cmd_list_data.mutex_trace);
 
-#if 1 // Much more optimized, drawing all items is extremely slow otherwise
+#if 1                                                                         // Much more optimized, drawing all items is extremely slow otherwise
                      std::vector<uint32_t> trace_draw_calls_index_redirector; // From full list index to filtered list index
                      trace_draw_calls_index_redirector.reserve(trace_count);
                      std::vector<uint32_t> trace_draw_calls_index_inverse_redirector; // From filtered index to full list index
@@ -17448,22 +17566,26 @@ namespace
                      // Pre count the elements (some are skipped) otherwise the clipper won't work properly
                      // TODO: do this once on capture
                      size_t actual_trace_count = 0;
-                     for (auto index = 0; index < trace_count; index++) {
+                     for (auto index = 0; index < trace_count; index++)
+                     {
                         trace_draw_calls_index_redirector.emplace_back(uint32_t(trace_draw_calls_index_inverse_redirector.size())); // The closest one
                         auto& draw_call_data = cmd_list_data.trace_draw_calls_data.at(index);
-                        if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Shader) {
+                        if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Shader)
+                        {
                            auto pipeline_handle = draw_call_data.pipeline_handle;
                            const auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(pipeline_handle);
                            const bool is_valid = pipeline_pair != device_data.pipeline_cache_by_pipeline_handle.end() && pipeline_pair->second != nullptr;
-                           if (is_valid) {
+                           if (is_valid)
+                           {
                               if (trace_ignore_vertex_shaders && pipeline_pair->second->HasVertexShader() && !pipeline_pair->second->HasPixelShader()) continue; // D3D11 has one entry per stage, D3D12 one per draw
                            }
                         }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CPUWrite) {
+                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CPUWrite)
+                        {
                            if (trace_ignore_buffer_writes && draw_call_data.rt_type_name[0] == "Buffer") continue;
                         }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BindPipeline
-                           || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BindResource) {
+                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BindPipeline || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BindResource)
+                        {
                            if (trace_ignore_bindings) continue;
                         }
                         actual_trace_count++;
@@ -17488,526 +17610,526 @@ namespace
 
                      ImGuiListClipper clipper;
                      clipper.Begin(actual_trace_count);
-                     while (clipper.Step()) {
-                        for (int filtered_index = clipper.DisplayStart; filtered_index < clipper.DisplayEnd; filtered_index++) {
+                     while (clipper.Step())
+                     {
+                        for (int filtered_index = clipper.DisplayStart; filtered_index < clipper.DisplayEnd; filtered_index++)
+                        {
                            uint32_t index = trace_draw_calls_index_inverse_redirector[filtered_index]; // Raw index
 #else
-                     for (uint32_t index = 0; index < trace_count; index++) {
+                     for (uint32_t index = 0; index < trace_count; index++)
+                     {
 #endif
-                        auto& draw_call_data = cmd_list_data.trace_draw_calls_data.at(index);
+                           auto& draw_call_data = cmd_list_data.trace_draw_calls_data.at(index);
 #if DX11 // D3D12 device level entries (present, display composition, swapchain encode) have no command list, nothing below reads it there
-                        ASSERT_ONCE_MSG(draw_call_data.command_list, "The code below will probably crash if the command list isn't valid, remember to always assign it when adding a new element to the list");
-                        if (draw_call_data.command_list)
-                        {
-                           com_ptr<ID3D11DeviceContext> native_device_context;
-                           HRESULT hr = draw_call_data.command_list->QueryInterface(&native_device_context);
-                           ASSERT_ONCE(SUCCEEDED(hr) && native_device_context); // Just to make sure it accidentally wasn't saved as a "ID3D11CommandList", given ReShade's design that mixes them up
-                        }
+                           ASSERT_ONCE_MSG(draw_call_data.command_list, "The code below will probably crash if the command list isn't valid, remember to always assign it when adding a new element to the list");
+                           if (draw_call_data.command_list)
+                           {
+                              com_ptr<ID3D11DeviceContext> native_device_context;
+                              HRESULT hr = draw_call_data.command_list->QueryInterface(&native_device_context);
+                              ASSERT_ONCE(SUCCEEDED(hr) && native_device_context); // Just to make sure it accidentally wasn't saved as a "ID3D11CommandList", given ReShade's design that mixes them up
+                           }
 #endif
 
-                        auto pipeline_handle = draw_call_data.pipeline_handle;
-                        auto thread_id = draw_call_data.thread_id._Get_underlying_id(); // Possibly compiler dependent but whatever, cast to int alternatively
-                        const bool is_selected = selected_index == index;
-                        // Note that the pipelines can be run more than once so this will return the first one matching (there's only one actually, we don't have separate settings for their running instance, as that's runtime stuff)
-                        const auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(pipeline_handle);
-                        const bool is_valid = pipeline_pair != device_data.pipeline_cache_by_pipeline_handle.end() && pipeline_pair->second != nullptr;
-                        std::stringstream name;
-                        auto text_color = IM_COL32(255, 255, 255, 255); // White
+                           auto pipeline_handle = draw_call_data.pipeline_handle;
+                           auto thread_id = draw_call_data.thread_id._Get_underlying_id(); // Possibly compiler dependent but whatever, cast to int alternatively
+                           const bool is_selected = selected_index == index;
+                           // Note that the pipelines can be run more than once so this will return the first one matching (there's only one actually, we don't have separate settings for their running instance, as that's runtime stuff)
+                           const auto pipeline_pair = device_data.pipeline_cache_by_pipeline_handle.find(pipeline_handle);
+                           const bool is_valid = pipeline_pair != device_data.pipeline_cache_by_pipeline_handle.end() && pipeline_pair->second != nullptr;
+                           std::stringstream name;
+                           auto text_color = IM_COL32(255, 255, 255, 255); // White
 
-                        std::string command_list_info = "";
-                        if (trace_show_command_list_info)
-                        {
-#if DX11
-                           if (draw_call_data.command_list && draw_call_data.command_list->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) // Deferred
-                              command_list_info = " - ~> " + std::to_string(reinterpret_cast<uint64_t>(draw_call_data.command_list.get())) + " - " + std::to_string(thread_id);
-                           else // Immediate
-                              command_list_info = " - " + std::to_string(thread_id); // No need to fill up the immediate command list ptr every time
-#else // Games record on their own command lists only
-                           command_list_info = " - ~> " + std::to_string(reinterpret_cast<uint64_t>(draw_call_data.command_list)) + " - " + std::to_string(thread_id);
-#endif
-                        }
-
-                        bool found_highlighted_resource_write = false;
-                        bool found_highlighted_resource_read = false;
-                        if (!highlighted_resource.empty())
-                        {
-                           for (UINT i = 0; i < TraceDrawCallData::srvs_size; i++)
-                           {
-                              if (found_highlighted_resource_read) break;
-                              found_highlighted_resource_read |= draw_call_data.sr_hash[i] == highlighted_resource;
-                           }
-                           for (UINT i = 0; i < TraceDrawCallData::uavs_size; i++)
-                           {
-                              if (found_highlighted_resource_write) break;
-                              found_highlighted_resource_write |= draw_call_data.ua_hash[i] == highlighted_resource; // We consider UAV as write even if it's not necessarily one
-                           }
-                           for (UINT i = 0; i < TraceDrawCallData::rtvs_size; i++)
-                           {
-                              if (found_highlighted_resource_write) break;
-                              found_highlighted_resource_write |= draw_call_data.rt_hash[i] == highlighted_resource;
-                           }
-                           for (UINT i = 0; i < TraceDrawCallData::cbs_size; i++)
-                           {
-                              if (found_highlighted_resource_read) break;
-                              found_highlighted_resource_read |= draw_call_data.cb_hash[i] == highlighted_resource;
-                           }
-                           // Don't set "found_highlighted_resource_read" for the test and write case, it'd just be more confusing
-                           if (draw_call_data.depth_state == TraceDrawCallData::DepthStateType::TestAndWrite
-                              || draw_call_data.depth_state == TraceDrawCallData::DepthStateType::WriteOnly
-                              || draw_call_data.stencil_state == TraceDrawCallData::DepthStateType::TestAndWrite
-                              || draw_call_data.stencil_state == TraceDrawCallData::DepthStateType::WriteOnly)
-                              found_highlighted_resource_write |= draw_call_data.ds_hash == highlighted_resource;
-                           else
-                              found_highlighted_resource_read |= draw_call_data.ds_hash == highlighted_resource;
-                        }
-
-                        // TODO: merge pixel and vertex shader traces if they are both present? Yes, and then add two tabs one for VS data and shader code and one for PS (same)
-                        if (is_valid && draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Shader)
-                        {
-                           const auto pipeline = pipeline_pair->second;
-
-                           // Highlight other draw calls with the same shader
-                           bool same_as_selected = false;
-                           if (/*!is_selected &&*/ selected_index >= 0 && cmd_list_data.trace_draw_calls_data.size() >= selected_index + 1 && cmd_list_data.trace_draw_calls_data.at(selected_index).type == TraceDrawCallData::TraceDrawCallType::Shader)
-                           {
-                              auto pipeline_handle_2 = cmd_list_data.trace_draw_calls_data.at(selected_index).pipeline_handle;
-                              const auto pipeline_pair_2 = device_data.pipeline_cache_by_pipeline_handle.find(pipeline_handle_2);
-                              const bool is_valid_2 = pipeline_pair_2 != device_data.pipeline_cache_by_pipeline_handle.end() && pipeline_pair_2->second != nullptr;
-                              if (is_valid_2)
-                              {
-                                 const auto pipeline_2 = pipeline_pair_2->second;
-                                 if (pipeline_2->shader_hashes == pipeline->shader_hashes)
-                                 {
-#if 1 // Add a space before it
-                                    name << "   ";
-#endif
-                                    same_as_selected = true;
-                                 }
-                              }
-                           }
-
-                           name << std::setfill('0');
-                           bool written_any_text = false;
-
+                           std::string command_list_info = "";
                            if (trace_show_command_list_info)
                            {
-                              // Index - Thread ID (command list) - Shader Hash(es) - Shader Name
-                              name << std::setw(3) << index << std::setw(0); // Fill up 3 slots for the index so the text is aligned
-
-                              name << command_list_info;
-
-                              written_any_text = true;
-                           }
-
-                           const char* sm = pipeline->StageName();
-
-                           // Pick the default color by shader type
-                           if (pipeline->HasVertexShader() && !pipeline->HasPixelShader())
-                           {
-                              if (trace_ignore_vertex_shaders)
-                              {
-                                 continue;
-                              }
-                              text_color = IM_COL32(192, 192, 0, 255); // Yellow
-                           }
-                           else if (pipeline->HasComputeShader() || pipeline->HasGeometryShader())
-                           {
-                              text_color = IM_COL32(192, 0, 192, 255); // Purple
-                           }
-                           else if (!pipeline->HasPixelShader()) // Invalid
-                           {
-                              text_color = IM_COL32(255, 0, 0, 255); // Red
-                           }
-
-                           // There should always be at least one
-                           for (size_t i = 0; i < pipeline->shader_hashes.size(); i++)
-                           {
-                              if (written_any_text)
-                                 name << " - ";
-#if DX12 // PSOs have one shader per stage
-                              sm = CachedPipeline::StageName(pipeline->shader_types[i]);
+#if DX11
+                              if (draw_call_data.command_list && draw_call_data.command_list->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) // Deferred
+                                 command_list_info = " - ~> " + std::to_string(reinterpret_cast<uint64_t>(draw_call_data.command_list.get())) + " - " + std::to_string(thread_id);
+                              else                                                      // Immediate
+                                 command_list_info = " - " + std::to_string(thread_id); // No need to fill up the immediate command list ptr every time
+#else                                                                                   // Games record on their own command lists only
+                           command_list_info = " - ~> " + std::to_string(reinterpret_cast<uint64_t>(draw_call_data.command_list)) + " - " + std::to_string(thread_id);
 #endif
-                              name << sm << " " << PRINT_CRC32(pipeline->shader_hashes[i]);
-                              written_any_text = true;
                            }
 
-                           // DX11 specific code
-                           const std::shared_lock lock_loading(s_mutex_loading);
-                           const auto custom_shader = !pipeline->shader_hashes.empty() ? custom_shaders_cache[pipeline->shader_hashes[0]] : nullptr;
-
-                           // Clone provenance comes from CloneOrigin (recorded at
-                           // clone creation), not cache lookups or
-                           // patch_application_mode (also stamped on file clones).
-                           const bool is_custom_shader_clone = pipeline->cloned && pipeline->clone_origin == Shader::CloneOrigin::File;
-                           const bool is_patch_clone = pipeline->cloned && pipeline->clone_origin == Shader::CloneOrigin::Patch;
-                           const bool is_replaced_shader_clone = is_custom_shader_clone || is_patch_clone;
-
-                           // Markers: "*" = custom-shader file clone, "#" =
-                           // in-place sync, "#S" = sync clone, "#A" = async
-                           // clone.
-                           constexpr const char* replacement_markers[] = {"", "*", "#", "#S", "#A"};
-                           name << replacement_markers[size_t(pipeline->GetReplacement())];
-
-                           // Find if the shader has been modified
-
-                           if (is_replaced_shader_clone)
+                           bool found_highlighted_resource_write = false;
+                           bool found_highlighted_resource_read = false;
+                           if (!highlighted_resource.empty())
                            {
-                              if (pipeline->HasVertexShader())
+                              for (UINT i = 0; i < TraceDrawCallData::srvs_size; i++)
                               {
-                                 text_color = IM_COL32(128, 255, 0, 255); // Yellow + Green
+                                 if (found_highlighted_resource_read) break;
+                                 found_highlighted_resource_read |= draw_call_data.sr_hash[i] == highlighted_resource;
                               }
-                              else if (pipeline->HasComputeShader())
+                              for (UINT i = 0; i < TraceDrawCallData::uavs_size; i++)
                               {
-                                 text_color = IM_COL32(128, 255, 128, 255); // Purple + Green
+                                 if (found_highlighted_resource_write) break;
+                                 found_highlighted_resource_write |= draw_call_data.ua_hash[i] == highlighted_resource; // We consider UAV as write even if it's not necessarily one
+                              }
+                              for (UINT i = 0; i < TraceDrawCallData::rtvs_size; i++)
+                              {
+                                 if (found_highlighted_resource_write) break;
+                                 found_highlighted_resource_write |= draw_call_data.rt_hash[i] == highlighted_resource;
+                              }
+                              for (UINT i = 0; i < TraceDrawCallData::cbs_size; i++)
+                              {
+                                 if (found_highlighted_resource_read) break;
+                                 found_highlighted_resource_read |= draw_call_data.cb_hash[i] == highlighted_resource;
+                              }
+                              // Don't set "found_highlighted_resource_read" for the test and write case, it'd just be more confusing
+                              if (draw_call_data.depth_state == TraceDrawCallData::DepthStateType::TestAndWrite || draw_call_data.depth_state == TraceDrawCallData::DepthStateType::WriteOnly || draw_call_data.stencil_state == TraceDrawCallData::DepthStateType::TestAndWrite || draw_call_data.stencil_state == TraceDrawCallData::DepthStateType::WriteOnly)
+                                 found_highlighted_resource_write |= draw_call_data.ds_hash == highlighted_resource;
+                              else
+                                 found_highlighted_resource_read |= draw_call_data.ds_hash == highlighted_resource;
+                           }
+
+                           // TODO: merge pixel and vertex shader traces if they are both present? Yes, and then add two tabs one for VS data and shader code and one for PS (same)
+                           if (is_valid && draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Shader)
+                           {
+                              const auto pipeline = pipeline_pair->second;
+
+                              // Highlight other draw calls with the same shader
+                              bool same_as_selected = false;
+                              if (/*!is_selected &&*/ selected_index >= 0 && cmd_list_data.trace_draw_calls_data.size() >= selected_index + 1 && cmd_list_data.trace_draw_calls_data.at(selected_index).type == TraceDrawCallData::TraceDrawCallType::Shader)
+                              {
+                                 auto pipeline_handle_2 = cmd_list_data.trace_draw_calls_data.at(selected_index).pipeline_handle;
+                                 const auto pipeline_pair_2 = device_data.pipeline_cache_by_pipeline_handle.find(pipeline_handle_2);
+                                 const bool is_valid_2 = pipeline_pair_2 != device_data.pipeline_cache_by_pipeline_handle.end() && pipeline_pair_2->second != nullptr;
+                                 if (is_valid_2)
+                                 {
+                                    const auto pipeline_2 = pipeline_pair_2->second;
+                                    if (pipeline_2->shader_hashes == pipeline->shader_hashes)
+                                    {
+#if 1 // Add a space before it
+                                       name << "   ";
+#endif
+                                       same_as_selected = true;
+                                    }
+                                 }
+                              }
+
+                              name << std::setfill('0');
+                              bool written_any_text = false;
+
+                              if (trace_show_command_list_info)
+                              {
+                                 // Index - Thread ID (command list) - Shader Hash(es) - Shader Name
+                                 name << std::setw(3) << index << std::setw(0); // Fill up 3 slots for the index so the text is aligned
+
+                                 name << command_list_info;
+
+                                 written_any_text = true;
+                              }
+
+                              const char* sm = pipeline->StageName();
+
+                              // Pick the default color by shader type
+                              if (pipeline->HasVertexShader() && !pipeline->HasPixelShader())
+                              {
+                                 if (trace_ignore_vertex_shaders)
+                                 {
+                                    continue;
+                                 }
+                                 text_color = IM_COL32(192, 192, 0, 255); // Yellow
+                              }
+                              else if (pipeline->HasComputeShader() || pipeline->HasGeometryShader())
+                              {
+                                 text_color = IM_COL32(192, 0, 192, 255); // Purple
+                              }
+                              else if (!pipeline->HasPixelShader()) // Invalid
+                              {
+                                 text_color = IM_COL32(255, 0, 0, 255); // Red
+                              }
+
+                              // There should always be at least one
+                              for (size_t i = 0; i < pipeline->shader_hashes.size(); i++)
+                              {
+                                 if (written_any_text)
+                                    name << " - ";
+#if DX12 // PSOs have one shader per stage
+                                 sm = CachedPipeline::StageName(pipeline->shader_types[i]);
+#endif
+                                 name << sm << " " << PRINT_CRC32(pipeline->shader_hashes[i]);
+                                 written_any_text = true;
+                              }
+
+                              // DX11 specific code
+                              const std::shared_lock lock_loading(s_mutex_loading);
+                              const auto custom_shader = !pipeline->shader_hashes.empty() ? custom_shaders_cache[pipeline->shader_hashes[0]] : nullptr;
+
+                              // Clone provenance comes from CloneOrigin (recorded at
+                              // clone creation), not cache lookups or
+                              // patch_application_mode (also stamped on file clones).
+                              const bool is_custom_shader_clone = pipeline->cloned && pipeline->clone_origin == Shader::CloneOrigin::File;
+                              const bool is_patch_clone = pipeline->cloned && pipeline->clone_origin == Shader::CloneOrigin::Patch;
+                              const bool is_replaced_shader_clone = is_custom_shader_clone || is_patch_clone;
+
+                              // Markers: "*" = custom-shader file clone, "#" =
+                              // in-place sync, "#S" = sync clone, "#A" = async
+                              // clone.
+                              constexpr const char* replacement_markers[] = {"", "*", "#", "#S", "#A"};
+                              name << replacement_markers[size_t(pipeline->GetReplacement())];
+
+                              // Find if the shader has been modified
+
+                              if (is_replaced_shader_clone)
+                              {
+                                 if (pipeline->HasVertexShader())
+                                 {
+                                    text_color = IM_COL32(128, 255, 0, 255); // Yellow + Green
+                                 }
+                                 else if (pipeline->HasComputeShader())
+                                 {
+                                    text_color = IM_COL32(128, 255, 128, 255); // Purple + Green
+                                 }
+                                 else
+                                 {
+                                    text_color = IM_COL32(0, 255, 0, 255); // Green
+                                 }
+                              }
+                              // Texture upgrades symbols
+                              constexpr bool targets_swapchain = false; // TODO: implement
+                              if (draw_call_data.any_input_resources_format_upgraded || draw_call_data.any_output_resources_format_upgraded || draw_call_data.any_input_resources_scaled || draw_call_data.any_output_resources_scaled || targets_swapchain)
+                              {
+                                 name << " ";
+                              }
+                              if (draw_call_data.any_input_resources_format_upgraded)
+                              {
+                                 name << "^";
+                              }
+                              if (draw_call_data.any_input_resources_scaled)
+                              {
+                                 name << "\\";
+                              }
+                              if (draw_call_data.any_output_resources_scaled)
+                              {
+                                 name << "/";
+                              }
+                              if (draw_call_data.any_output_resources_format_upgraded)
+                              {
+                                 name << "v";
+                              }
+                              if (targets_swapchain)
+                              {
+                                 name << "°";
+                              }
+
+                              if (strlen(pipeline->custom_name.c_str()) > 0) // We can not check the string size as it's been allocated to more characters even if they are empty
+                              {
+                                 name << " - " << pipeline->custom_name.c_str(); // Add c string otherwise it will append a billion null terminators
+                              }
+                              else if (is_custom_shader_clone)
+                              {
+                                 // For now just force picking the first shader linked to the pipeline, there should always only be one (?)
+                                 if (custom_shader != nullptr && custom_shader->is_hlsl && !custom_shader->file_path.empty())
+                                 {
+                                    auto filename_string = custom_shader->file_path.filename().string();
+                                    if (const auto hash_begin_index = filename_string.find("0x"); hash_begin_index != std::string::npos) // TODO: this doesn't work with hashless shader files
+                                    {
+                                       filename_string.erase(hash_begin_index); // Start deleting from where the shader hash(es) begin (e.g. "0x12345678.xs_n_n.hlsl")
+                                    }
+                                    if (filename_string.ends_with("_") || filename_string.ends_with("."))
+                                    {
+                                       filename_string.erase(filename_string.length() - 1);
+                                    }
+                                    if (!filename_string.empty())
+                                    {
+                                       name << " - " << filename_string;
+                                    }
+                                 }
                               }
                               else
                               {
-                                 text_color = IM_COL32(0, 255, 0, 255); // Green
-                              }
-                           }
-                           // Texture upgrades symbols
-                           constexpr bool targets_swapchain = false; // TODO: implement
-                           if (draw_call_data.any_input_resources_format_upgraded || draw_call_data.any_output_resources_format_upgraded || draw_call_data.any_input_resources_scaled || draw_call_data.any_output_resources_scaled || targets_swapchain)
-                           {
-                              name << " ";
-                           }
-                           if (draw_call_data.any_input_resources_format_upgraded)
-                           {
-                              name << "^";
-                           }
-                           if (draw_call_data.any_input_resources_scaled)
-                           {
-                              name << "\\";
-                           }
-                           if (draw_call_data.any_output_resources_scaled)
-                           {
-                              name << "/";
-                           }
-                           if (draw_call_data.any_output_resources_format_upgraded)
-                           {
-                              name << "v";
-                           }
-                           if (targets_swapchain)
-                           {
-                              name << "°";
-                           }
-
-                           if (strlen(pipeline->custom_name.c_str()) > 0) // We can not check the string size as it's been allocated to more characters even if they are empty
-                           {
-                              name << " - " << pipeline->custom_name.c_str(); // Add c string otherwise it will append a billion null terminators
-                           }
-                           else if (is_custom_shader_clone)
-                           {
-                              // For now just force picking the first shader linked to the pipeline, there should always only be one (?)
-                              if (custom_shader != nullptr && custom_shader->is_hlsl && !custom_shader->file_path.empty())
-                              {
-                                 auto filename_string = custom_shader->file_path.filename().string();
-                                 if (const auto hash_begin_index = filename_string.find("0x"); hash_begin_index != std::string::npos) // TODO: this doesn't work with hashless shader files
-                                 {
-                                    filename_string.erase(hash_begin_index); // Start deleting from where the shader hash(es) begin (e.g. "0x12345678.xs_n_n.hlsl")
-                                 }
-                                 if (filename_string.ends_with("_") || filename_string.ends_with("."))
-                                 {
-                                    filename_string.erase(filename_string.length() - 1);
-                                 }
-                                 if (!filename_string.empty())
-                                 {
-                                    name << " - " << filename_string;
-                                 }
-                              }
-                           }
-                           else
-                           {
 #if DX11
-                              std::optional<std::string> optional_name = GetD3DNameW(reinterpret_cast<ID3D11DeviceChild*>(pipeline->pipeline.handle));
+                                 std::optional<std::string> optional_name = GetD3DNameW(reinterpret_cast<ID3D11DeviceChild*>(pipeline->pipeline.handle));
 #else
                               std::optional<std::string> optional_name = GetD3DNameW(reinterpret_cast<ID3D12Object*>(pipeline->pipeline.handle));
 #endif
-                              if (optional_name.has_value())
-                              {
-                                 name << " - " << optional_name.value().c_str();
+                                 if (optional_name.has_value())
+                                 {
+                                    name << " - " << optional_name.value().c_str();
+                                 }
                               }
-                           }
 
-                           // Print out dangerous blend modes. We only check the first RT for now.
-                           // Note: theoretically we should only check this on upgraded textures (and all upgraded textures, not just RGBA) (here and in other places where we do this)! We can't check the format here reliably as it's the non upgraded one in case of indirect upgrades.
+                              // Print out dangerous blend modes. We only check the first RT for now.
+                              // Note: theoretically we should only check this on upgraded textures (and all upgraded textures, not just RGBA) (here and in other places where we do this)! We can't check the format here reliably as it's the non upgraded one in case of indirect upgrades.
 #if DX11
-                           if (pipeline->HasPixelShader() && IsRGBAFormat(draw_call_data.rtv_format[0], true) /*&& IsSignedFloatFormat(draw_call_data.rtv_format[0])*/ && IsBlendInverted(draw_call_data.blend_desc, 1, false))
-                           {
-                              text_color = IM_COL32(255, 165, 0, 255); // Orange for Warning
-                           }
+                              if (pipeline->HasPixelShader() && IsRGBAFormat(draw_call_data.rtv_format[0], true) /*&& IsSignedFloatFormat(draw_call_data.rtv_format[0])*/ && IsBlendInverted(draw_call_data.blend_desc, 1, false))
+                              {
+                                 text_color = IM_COL32(255, 165, 0, 255); // Orange for Warning
+                              }
 #endif
 
-                           // Highlight loading error
-                           if (custom_shader != nullptr && !custom_shader->compilation_errors.empty())
-                           {
-                              text_color = custom_shader->compilation_error ? IM_COL32(255, 0, 0, 255) : IM_COL32(255, 165, 0, 255); // Red for Error, Orange for Warning
-                           }
+                              // Highlight loading error
+                              if (custom_shader != nullptr && !custom_shader->compilation_errors.empty())
+                              {
+                                 text_color = custom_shader->compilation_error ? IM_COL32(255, 0, 0, 255) : IM_COL32(255, 165, 0, 255); // Red for Error, Orange for Warning
+                              }
 
-                           if (same_as_selected)
-                           {
+                              if (same_as_selected)
+                              {
 #if 0 // We already do this better above
                               name << " - (Selected) ";
 #endif
-                              if (!is_selected)
-                              {
-                                 text_color = IM_COL32(192, 192, 192, 255); // Grey
+                                 if (!is_selected)
+                                 {
+                                    text_color = IM_COL32(192, 192, 192, 255); // Grey
+                                 }
                               }
                            }
-                        }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CopyResource)
-                        {
-                           if (trace_show_command_list_info)
+                           else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CopyResource)
                            {
-                              name << std::setfill('0') << std::setw(3) << index << std::setw(0);
-                           name << command_list_info;
-                              name << " - ";
+                              if (trace_show_command_list_info)
+                              {
+                                 name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                                 name << command_list_info;
+                                 name << " - ";
+                              }
+                              name << "Copy Resource";
+                              text_color = IM_COL32(255, 105, 0, 255); // Orange
                            }
-                           name << "Copy Resource";
-                           text_color = IM_COL32(255, 105, 0, 255); // Orange
-                        }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BindPipeline)
-                        {
-                           if (trace_ignore_bindings) continue;
-                           
-                           if (trace_show_command_list_info)
+                           else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BindPipeline)
                            {
-                              name << std::setfill('0') << std::setw(3) << index << std::setw(0);
-                           name << command_list_info;
-                              name << " - ";
-                           }
-                           name << "Bind Pipeline";
-                           text_color = IM_COL32(30, 200, 10, 255); // Some green
-                        }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BindResource)
-                        {
-                           if (trace_ignore_bindings) continue;
-                           
-                           if (trace_show_command_list_info)
-                           {
-                              name << std::setfill('0') << std::setw(3) << index << std::setw(0);
-                           name << command_list_info;
-                              name << " - ";
-                           }
-                           name << "Bind Resource";
-                           text_color = IM_COL32(30, 200, 10, 255); // Some green
-                        }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CPURead)
-                        {
-                           if (trace_show_command_list_info)
-                           {
-                              name << std::setfill('0') << std::setw(3) << index << std::setw(0);
-                           name << command_list_info;
-                              name << " - ";
-                           }
-                           name << "Resource CPU Read";
-                           text_color = IM_COL32(255, 40, 0, 255); // Bright Red
-                        }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CPUWrite)
-                        {
-                           if (trace_show_command_list_info)
-                           {
-                              name << std::setfill('0') << std::setw(3) << index << std::setw(0);
-                           name << command_list_info;
-                              name << " - ";
-                           }
+                              if (trace_ignore_bindings) continue;
 
-                           // Hacky resource type name check
-                           if (trace_ignore_buffer_writes && draw_call_data.rt_type_name[0] == "Buffer")
-                           {
-                              continue;
+                              if (trace_show_command_list_info)
+                              {
+                                 name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                                 name << command_list_info;
+                                 name << " - ";
+                              }
+                              name << "Bind Pipeline";
+                              text_color = IM_COL32(30, 200, 10, 255); // Some green
                            }
+                           else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BindResource)
+                           {
+                              if (trace_ignore_bindings) continue;
 
-                           name << "Resource CPU Write";
+                              if (trace_show_command_list_info)
+                              {
+                                 name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                                 name << command_list_info;
+                                 name << " - ";
+                              }
+                              name << "Bind Resource";
+                              text_color = IM_COL32(30, 200, 10, 255); // Some green
+                           }
+                           else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CPURead)
+                           {
+                              if (trace_show_command_list_info)
+                              {
+                                 name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                                 name << command_list_info;
+                                 name << " - ";
+                              }
+                              name << "Resource CPU Read";
+                              text_color = IM_COL32(255, 40, 0, 255); // Bright Red
+                           }
+                           else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CPUWrite)
+                           {
+                              if (trace_show_command_list_info)
+                              {
+                                 name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                                 name << command_list_info;
+                                 name << " - ";
+                              }
 
-                           text_color = IM_COL32(255, 105, 0, 255); // Orange
-                        }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::ClearResource)
-                        {
-                           if (trace_show_command_list_info)
-                           {
-                              name << std::setfill('0') << std::setw(3) << index << std::setw(0);
-                           name << command_list_info;
-                              name << " - ";
+                              // Hacky resource type name check
+                              if (trace_ignore_buffer_writes && draw_call_data.rt_type_name[0] == "Buffer")
+                              {
+                                 continue;
+                              }
+
+                              name << "Resource CPU Write";
+
+                              text_color = IM_COL32(255, 105, 0, 255); // Orange
                            }
-                           name << "Clear Resource";
-                           text_color = IM_COL32(255, 105, 0, 255); // Orange
-                        }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CreateCommandList)
-                        {
-                           if (trace_show_command_list_info)
+                           else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::ClearResource)
                            {
-                              name << std::setfill('0') << std::setw(3) << index << std::setw(0);
-                           name << command_list_info;
-                              name << " - ";
+                              if (trace_show_command_list_info)
+                              {
+                                 name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                                 name << command_list_info;
+                                 name << " - ";
+                              }
+                              name << "Clear Resource";
+                              text_color = IM_COL32(255, 105, 0, 255); // Orange
                            }
-                           name << "Create Command List";
-                           text_color = IM_COL32(50, 80, 190, 255); // Some Blue
-                        }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::AppendCommandList)
-                        {
-                           if (trace_show_command_list_info)
+                           else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CreateCommandList)
                            {
-                              name << std::setfill('0') << std::setw(3) << index << std::setw(0);
-                           name << command_list_info;
-                              name << " - ";
+                              if (trace_show_command_list_info)
+                              {
+                                 name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                                 name << command_list_info;
+                                 name << " - ";
+                              }
+                              name << "Create Command List";
+                              text_color = IM_COL32(50, 80, 190, 255); // Some Blue
                            }
-                           name << "Append Command List";
-                           text_color = IM_COL32(50, 80, 190, 255); // Some Blue
-                        }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::ResetCommmandList)
-                        {
-                           if (trace_show_command_list_info)
+                           else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::AppendCommandList)
                            {
-                              name << std::setfill('0') << std::setw(3) << index << std::setw(0);
-                           name << command_list_info;
-                              name << " - ";
+                              if (trace_show_command_list_info)
+                              {
+                                 name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                                 name << command_list_info;
+                                 name << " - ";
+                              }
+                              name << "Append Command List";
+                              text_color = IM_COL32(50, 80, 190, 255); // Some Blue
                            }
-                           name << "Reset Command List";
-                           text_color = IM_COL32(50, 80, 190, 255); // Some Blue
-                        }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::FlushCommandList)
-                        {
-                           if (trace_show_command_list_info)
+                           else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::ResetCommmandList)
                            {
-                              name << std::setfill('0') << std::setw(3) << index << std::setw(0);
-                           name << command_list_info;
-                              name << " - ";
+                              if (trace_show_command_list_info)
+                              {
+                                 name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                                 name << command_list_info;
+                                 name << " - ";
+                              }
+                              name << "Reset Command List";
+                              text_color = IM_COL32(50, 80, 190, 255); // Some Blue
                            }
-                           name << "Flush Command List";
-                           text_color = IM_COL32(50, 80, 190, 255); // Some Blue
-                        }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Present)
-                        {
-                           if (trace_show_command_list_info)
+                           else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::FlushCommandList)
                            {
-                              name << std::setfill('0') << std::setw(3) << index << std::setw(0);
-                           name << command_list_info;
-                              name << " - ";
+                              if (trace_show_command_list_info)
+                              {
+                                 name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                                 name << command_list_info;
+                                 name << " - ";
+                              }
+                              name << "Flush Command List";
+                              text_color = IM_COL32(50, 80, 190, 255); // Some Blue
                            }
-                           name << "Present";
-                           text_color = IM_COL32(50, 80, 190, 255); // Some Blue
+                           else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Present)
+                           {
+                              if (trace_show_command_list_info)
+                              {
+                                 name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                                 name << command_list_info;
+                                 name << " - ";
+                              }
+                              name << "Present";
+                              text_color = IM_COL32(50, 80, 190, 255); // Some Blue
 
 #if DX11 // D3D12 Present entries hold the back buffer they showed as their source
-                           // Highlight the resource on the swapchain too, given that "Present" traces aren't tracked the same way
-                           if (!highlighted_resource.empty() && !device_data.swapchains.empty())
-                           {
-                              // Not fully safe, but it should do for almost all cases
-                              reshade::api::swapchain* swapchain = *device_data.swapchains.begin();
-                              IDXGISwapChain* native_swapchain = (IDXGISwapChain*)(swapchain->get_native());
-                              const com_ptr<ID3D11Texture2D> back_buffer = GetGameBackBuffer(native_swapchain);
-
-                              std::string backbuffer_hash = std::to_string(std::hash<void*>{}(back_buffer.get()));
-                              if (highlighted_resource == backbuffer_hash)
+         // Highlight the resource on the swapchain too, given that "Present" traces aren't tracked the same way
+                              if (!highlighted_resource.empty() && !device_data.swapchains.empty())
                               {
-                                 found_highlighted_resource_read = true;
-                              }
-                           }
-#endif // DX11
-                        }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BeginRenderPass || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::EndRenderPass)
-                        {
-                           if (trace_show_command_list_info)
-                           {
-                              name << std::setfill('0') << std::setw(3) << index << std::setw(0);
-                              name << command_list_info;
-                              name << " - ";
-                           }
-                           name << (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BeginRenderPass ? "Begin Render Pass" : "End Render Pass");
-                           text_color = IM_COL32(50, 80, 190, 255); // Some Blue
-                        }
-                        else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Custom)
-                        {
-                           if (trace_show_command_list_info)
-                           {
-                              name << std::setfill('0') << std::setw(3) << index << std::setw(0);
-                           name << command_list_info;
-                              name << " - ";
-                           }
-                           name << draw_call_data.custom_name;
-                           text_color = IM_COL32(70, 130, 180, 255); // Steel Blue
-                        }
-                        else
-                        {
-                           text_color = IM_COL32(255, 0, 0, 255); // Red
-                           name << "ERROR: Capture data not found"; // The draw call either had an empty (e.g. pixel) shader set, or the game has since unloaded them
-                        }
+                                 // Not fully safe, but it should do for almost all cases
+                                 reshade::api::swapchain* swapchain = *device_data.swapchains.begin();
+                                 IDXGISwapChain* native_swapchain = (IDXGISwapChain*)(swapchain->get_native());
+                                 const com_ptr<ID3D11Texture2D> back_buffer = GetGameBackBuffer(native_swapchain);
 
-                        if (found_highlighted_resource_write || found_highlighted_resource_read)
-                        {
-                           if (found_highlighted_resource_write && found_highlighted_resource_read)
+                                 std::string backbuffer_hash = std::to_string(std::hash<void*>{}(back_buffer.get()));
+                                 if (highlighted_resource == backbuffer_hash)
+                                 {
+                                    found_highlighted_resource_read = true;
+                                 }
+                              }
+#endif // DX11
+                           }
+                           else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BeginRenderPass || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::EndRenderPass)
                            {
-                              // Highlight there's an error in this case as in any DX version, reading and writing from the same resource isn't supported
-                              text_color = IM_COL32(255, 0, 0, 255); // Red
-                              name << " - (Highlighted Resource Read And Write)";
+                              if (trace_show_command_list_info)
+                              {
+                                 name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                                 name << command_list_info;
+                                 name << " - ";
+                              }
+                              name << (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BeginRenderPass ? "Begin Render Pass" : "End Render Pass");
+                              text_color = IM_COL32(50, 80, 190, 255); // Some Blue
+                           }
+                           else if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Custom)
+                           {
+                              if (trace_show_command_list_info)
+                              {
+                                 name << std::setfill('0') << std::setw(3) << index << std::setw(0);
+                                 name << command_list_info;
+                                 name << " - ";
+                              }
+                              name << draw_call_data.custom_name;
+                              text_color = IM_COL32(70, 130, 180, 255); // Steel Blue
                            }
                            else
                            {
-                              text_color = IM_COL32(255, 192, 203, 255); // Pink
-                              name << (found_highlighted_resource_write ? " - (Highlighted R Write)" : " - (Highlighted R Read)");
+                              text_color = IM_COL32(255, 0, 0, 255);   // Red
+                              name << "ERROR: Capture data not found"; // The draw call either had an empty (e.g. pixel) shader set, or the game has since unloaded them
                            }
-                        }
 
-                        ImGui::PushID(index);
-                        ImGui::PushStyleColor(ImGuiCol_Text, text_color);
-                        if (ImGui::Selectable(name.str().c_str(), is_selected, ImGuiSelectableFlags_AllowOverlap))
-                        {
-                           selected_index = index;
-                           changed_selected = true;
-                        }
-                        ImGui::PopStyleColor();
-#if DX11 // Debug draw
-                        if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Shader)
-                        {
-                           ImGui::SameLine();
-                           ImGui::SetNextItemAllowOverlap(); // Allow the button to be clickable if rects overlap
-                           if (ImGui::SmallButton(ICON_FK_SEARCH))
+                           if (found_highlighted_resource_write || found_highlighted_resource_read)
                            {
-                              // TODO: move all into a function
-
-                              int32_t target_instance = 0;
-                              for (int32_t i = 0; i < index; i++)
+                              if (found_highlighted_resource_write && found_highlighted_resource_read)
                               {
-                                 if (pipeline_handle == cmd_list_data.trace_draw_calls_data.at(i).pipeline_handle && draw_call_data.thread_id == cmd_list_data.trace_draw_calls_data.at(i).thread_id)
-                                    target_instance++;
+                                 // Highlight there's an error in this case as in any DX version, reading and writing from the same resource isn't supported
+                                 text_color = IM_COL32(255, 0, 0, 255); // Red
+                                 name << " - (Highlighted Resource Read And Write)";
                               }
-
-                              debug_draw_pipeline = pipeline_pair->first; // Note: this is probably completely useless at the moment as we don't store the index of the pipeline instance the user had selected (e.g. "debug_draw_pipeline_target_instance")
-                              debug_draw_shader_hash = pipeline_pair->second->shader_hashes[0];
-                              std::string new_debug_draw_shader_hash_string = Shader::Hash_NumToStr(debug_draw_shader_hash);
-                              if (new_debug_draw_shader_hash_string.size() <= HASH_CHARACTERS_LENGTH)
-                                 strcpy(&debug_draw_shader_hash_string[0], new_debug_draw_shader_hash_string.c_str());
                               else
-                                 debug_draw_shader_hash_string[0] = 0;
-                              device_data.debug_draw_frozen_draw_state_stack.reset();
-                              device_data.debug_draw_texture = nullptr;
-                              device_data.debug_draw_texture_format = DXGI_FORMAT_UNKNOWN;
-                              device_data.debug_draw_texture_size = {};
-                              debug_draw_pipeline_instance = 0;
-                              debug_draw_pipeline_target_instance = target_instance;
-                              debug_draw_pipeline_target_thread = debug_draw_pipeline_instance_filter_by_thread ? draw_call_data.thread_id : std::thread::id();
-                              const auto prev_debug_draw_mode = debug_draw_mode;
-                              if (prev_debug_draw_mode == DebugDrawMode::Depth || prev_debug_draw_mode == DebugDrawMode::Stencil)
                               {
-                                 debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::RedOnly;
+                                 text_color = IM_COL32(255, 192, 203, 255); // Pink
+                                 name << (found_highlighted_resource_write ? " - (Highlighted R Write)" : " - (Highlighted R Read)");
                               }
-                              if (prev_debug_draw_mode == DebugDrawMode::Custom)
-                              {
-                                 debug_draw_view_index = 0;
-                                 debug_draw_mip = 0;
-                                 // Don't change it automatically in this pass, it will default to render target (usually) if we come from debugging somewhere else, and keep the last debugging mode otherwise
-                                 debug_draw_mode = pipeline_pair->second->HasPixelShader() ? DebugDrawMode::RenderTarget : (pipeline_pair->second->HasComputeShader() ? DebugDrawMode::UnorderedAccessView : DebugDrawMode::ShaderResource);
-                              }
-                              // Fall back on depth if there main RT isn't valid
-                              if (debug_draw_mode == DebugDrawMode::RenderTarget && draw_call_data.rt_format[0] == DXGI_FORMAT_UNKNOWN && draw_call_data.depth_state != TraceDrawCallData::DepthStateType::Disabled)
-                              {
-                                 debug_draw_mode = DebugDrawMode::Depth;
-                                 debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::RedOnly;
-                                 debug_draw_mip = 0;
-                              }
-                              debug_draw_freeze_inputs = false; // Optional, but also unfreeze inputs automatically every time we swap the target pass here
                            }
-                        }
+
+                           ImGui::PushID(index);
+                           ImGui::PushStyleColor(ImGuiCol_Text, text_color);
+                           if (ImGui::Selectable(name.str().c_str(), is_selected, ImGuiSelectableFlags_AllowOverlap))
+                           {
+                              selected_index = index;
+                              changed_selected = true;
+                           }
+                           ImGui::PopStyleColor();
+#if DX11 // Debug draw
+                           if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Shader)
+                           {
+                              ImGui::SameLine();
+                              ImGui::SetNextItemAllowOverlap(); // Allow the button to be clickable if rects overlap
+                              if (ImGui::SmallButton(ICON_FK_SEARCH))
+                              {
+                                 // TODO: move all into a function
+
+                                 int32_t target_instance = 0;
+                                 for (int32_t i = 0; i < index; i++)
+                                 {
+                                    if (pipeline_handle == cmd_list_data.trace_draw_calls_data.at(i).pipeline_handle && draw_call_data.thread_id == cmd_list_data.trace_draw_calls_data.at(i).thread_id)
+                                       target_instance++;
+                                 }
+
+                                 debug_draw_pipeline = pipeline_pair->first; // Note: this is probably completely useless at the moment as we don't store the index of the pipeline instance the user had selected (e.g. "debug_draw_pipeline_target_instance")
+                                 debug_draw_shader_hash = pipeline_pair->second->shader_hashes[0];
+                                 std::string new_debug_draw_shader_hash_string = Shader::Hash_NumToStr(debug_draw_shader_hash);
+                                 if (new_debug_draw_shader_hash_string.size() <= HASH_CHARACTERS_LENGTH)
+                                    strcpy(&debug_draw_shader_hash_string[0], new_debug_draw_shader_hash_string.c_str());
+                                 else
+                                    debug_draw_shader_hash_string[0] = 0;
+                                 device_data.debug_draw_frozen_draw_state_stack.reset();
+                                 device_data.debug_draw_texture = nullptr;
+                                 device_data.debug_draw_texture_format = DXGI_FORMAT_UNKNOWN;
+                                 device_data.debug_draw_texture_size = {};
+                                 debug_draw_pipeline_instance = 0;
+                                 debug_draw_pipeline_target_instance = target_instance;
+                                 debug_draw_pipeline_target_thread = debug_draw_pipeline_instance_filter_by_thread ? draw_call_data.thread_id : std::thread::id();
+                                 const auto prev_debug_draw_mode = debug_draw_mode;
+                                 if (prev_debug_draw_mode == DebugDrawMode::Depth || prev_debug_draw_mode == DebugDrawMode::Stencil)
+                                 {
+                                    debug_draw_options &= ~(uint32_t)DebugDrawTextureOptionsMask::RedOnly;
+                                 }
+                                 if (prev_debug_draw_mode == DebugDrawMode::Custom)
+                                 {
+                                    debug_draw_view_index = 0;
+                                    debug_draw_mip = 0;
+                                    // Don't change it automatically in this pass, it will default to render target (usually) if we come from debugging somewhere else, and keep the last debugging mode otherwise
+                                    debug_draw_mode = pipeline_pair->second->HasPixelShader() ? DebugDrawMode::RenderTarget : (pipeline_pair->second->HasComputeShader() ? DebugDrawMode::UnorderedAccessView : DebugDrawMode::ShaderResource);
+                                 }
+                                 // Fall back on depth if there main RT isn't valid
+                                 if (debug_draw_mode == DebugDrawMode::RenderTarget && draw_call_data.rt_format[0] == DXGI_FORMAT_UNKNOWN && draw_call_data.depth_state != TraceDrawCallData::DepthStateType::Disabled)
+                                 {
+                                    debug_draw_mode = DebugDrawMode::Depth;
+                                    debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::RedOnly;
+                                    debug_draw_mip = 0;
+                                 }
+                                 debug_draw_freeze_inputs = false; // Optional, but also unfreeze inputs automatically every time we swap the target pass here
+                              }
+                           }
 #else
                         if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Shader)
                         {
@@ -18019,17 +18141,17 @@ namespace
                            }
                         }
 #endif // DX11
-                        ImGui::PopID();
+                           ImGui::PopID();
 
-                        if (is_selected)
-                        {
-                           ImGui::SetItemDefaultFocus();
-                           if (list_size_changed)
+                           if (is_selected)
                            {
-                              ImGui::SetScrollHereY(0.5f); // 0.0 = top, 0.5 = middle, 1.0 = bottom
+                              ImGui::SetItemDefaultFocus();
+                              if (list_size_changed)
+                              {
+                                 ImGui::SetScrollHereY(0.5f); // 0.0 = top, 0.5 = middle, 1.0 = bottom
+                              }
                            }
                         }
-                     }
 #if 1
                      }
                      clipper.End();
@@ -18129,7 +18251,7 @@ namespace
                                  if (pipeline_pair->second->cloned && ImGui::Button("Unload"))
                                  {
                                     s_mutex_generic.unlock(); // Hack to avoid deadlocks with the device destroying pipelines // TODO: use "out_pipelines_to_destroy" instead (in all similar cases too)
-                                    UnloadCustomShaders(device_data, { pipeline_handle }, false);
+                                    UnloadCustomShaders(device_data, {pipeline_handle}, false);
                                     s_mutex_generic.lock();
                                  }
 
@@ -18165,7 +18287,7 @@ namespace
                                  {
                                     // You may need to specify the full path to "code.exe" if it's not in PATH.
                                     HINSTANCE ret_val = ShellExecuteA(nullptr, "open", "code", ("\"" + custom_shader->file_path.string() + "\"").c_str(), nullptr, SW_SHOWNORMAL); // TODO: instruct users on how to use this (add "code" path to VS Code). // TODO: this fails with Mafia II DE...
-                                    ASSERT_ONCE(ret_val > (HINSTANCE)32); // Unknown reason
+                                    ASSERT_ONCE(ret_val > (HINSTANCE)32);                                                                                                          // Unknown reason
                                  }
 
                                  // TODO: add opening the dumped shader file (e.g. "dumped_shaders")
@@ -18174,7 +18296,7 @@ namespace
                                     System::OpenExplorerToFile(custom_shader->file_path);
                                  }
 
-#if DX11 // Debug draw and constant buffer tracking are D3D11 only
+#if DX11                                                                 // Debug draw and constant buffer tracking are D3D11 only
                                  bool debug_draw_shader_enabled = false; // Whether this shader/pipeline instance is the one we are draw debugging
 
                                  if (pipeline_pair->second->HasVertexShader() || pipeline_pair->second->HasPixelShader() || pipeline_pair->second->HasComputeShader())
@@ -18200,15 +18322,18 @@ namespace
                                     {
                                        for (UINT i = 0; i < std::size(trace_draw_call_data.srv_format); i++)
                                        {
-                                          if (trace_draw_call_data.IsSRVValid(i)) has_any_resources = true; break;
+                                          if (trace_draw_call_data.IsSRVValid(i)) has_any_resources = true;
+                                          break;
                                        }
                                        for (UINT i = 0; i < std::size(trace_draw_call_data.uav_format); i++)
                                        {
-                                          if (trace_draw_call_data.IsUAVValid(i)) has_any_resources = true; break;
+                                          if (trace_draw_call_data.IsUAVValid(i)) has_any_resources = true;
+                                          break;
                                        }
                                        for (UINT i = 0; i < std::size(trace_draw_call_data.rtv_format); i++)
                                        {
-                                          if (trace_draw_call_data.IsRTVValid(i)) has_any_resources = true; break;
+                                          if (trace_draw_call_data.IsRTVValid(i)) has_any_resources = true;
+                                          break;
                                        }
                                        if (trace_draw_call_data.IsDSVValid()) has_any_resources = true;
                                     }
@@ -18218,8 +18343,8 @@ namespace
                                     // TODO: add a slider to scroll through all the draw calls quickly and show the RTVs etc, like Nsight. Or at least add Next, Prev buttons.
                                     if (has_any_resources && (debug_draw_shader_enabled ? ImGui::Button("Disable Debug Draw Shader Instance") : ImGui::Button("Debug Draw Shader Instance")))
                                     {
-                                       ASSERT_ONCE(GetShaderDefineCompiledNumericalValue(DEVELOPMENT_HASH) >= 1); // Development flag is needed in shaders for this to output correctly
-                                       ASSERT_ONCE(luma_data_cbuffer_index != -1); // Needed to pass data to the display composition shader
+                                       ASSERT_ONCE(GetShaderDefineCompiledNumericalValue(DEVELOPMENT_HASH) >= 1);                   // Development flag is needed in shaders for this to output correctly
+                                       ASSERT_ONCE(luma_data_cbuffer_index != -1);                                                  // Needed to pass data to the display composition shader
                                        ASSERT_ONCE(device_data.native_pixel_shaders[CompileTimeStringHash("Display Composition")]); // This shader is necessary to draw this debug stuff
 
                                        if (debug_draw_shader_enabled)
@@ -18292,7 +18417,7 @@ namespace
                                              debug_draw_mip = 0;
                                           }
                                        }
-                                       //debug_draw_replaced_pass = false;
+                                       // debug_draw_replaced_pass = false;
 #endif
 
                                        debug_draw_shader_enabled = !debug_draw_shader_enabled;
@@ -18312,7 +18437,7 @@ namespace
                                        {
                                           device_data.debug_draw_frozen_draw_state_stack.reset();
                                        }
-                                       
+
                                        ImGui::SameLine();
                                        ImGui::BeginDisabled(debug_draw_mode != DebugDrawMode::RenderTarget);
                                        ImGui::Checkbox("Disable Blends", &debug_draw_disable_blends);
@@ -18375,7 +18500,8 @@ namespace
                                           {
                                              // TODO: match with the shader assembly cbs etc (if the data is available)
                                              // TODO: add a matrix 4x4 view?
-                                             if (ImGui::BeginTable("TrackBufferTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+                                             if (ImGui::BeginTable("TrackBufferTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
+                                             {
                                                 ImGui::TableSetupColumn("Index", ImGuiTableColumnFlags_WidthFixed, 60.0f);
                                                 ImGui::TableSetupColumn("Float Value", ImGuiTableColumnFlags_WidthStretch);
                                                 ImGui::TableSetupColumn("Int Value", ImGuiTableColumnFlags_WidthStretch);
@@ -18386,10 +18512,10 @@ namespace
                                                    float this_data = device_data.track_buffer_data.data[i];
                                                    ImGui::TableNextRow();
                                                    ImGui::TableSetColumnIndex(0);
-                                                   static const char* components[] = { "x", "y", "z", "w" };
+                                                   static const char* components[] = {"x", "y", "z", "w"};
                                                    size_t relative_i = i - tb_display_begin; // 0-based offset within the visible slice
-                                                   size_t group = relative_i / 4; // Split index by float4
-                                                   size_t comp_index = relative_i % 4; // Print out the x/y/w/z identifier
+                                                   size_t group = relative_i / 4;            // Split index by float4
+                                                   size_t comp_index = relative_i % 4;       // Print out the x/y/w/z identifier
                                                    ImGui::Text("%zu:%s", group, components[comp_index]);
                                                    // First print as float
                                                    ImGui::TableSetColumnIndex(1);
@@ -18418,7 +18544,8 @@ namespace
                                           if (ImGui::Button("Copy Constant Buffer Data to Clipboard (float)"))
                                           {
                                              std::ostringstream oss;
-                                             for (size_t i = tb_display_begin; i < tb_display_end_clamped; ++i) {
+                                             for (size_t i = tb_display_begin; i < tb_display_end_clamped; ++i)
+                                             {
                                                 oss << device_data.track_buffer_data.data[i];
                                                 if (i + 1 < tb_display_end_clamped)
                                                    oss << '\n';
@@ -18523,23 +18650,35 @@ namespace
                                        ImGui::Text("Indexed: %s", draw_call_data.draw_dispatch_data.indexed ? "True" : "False"); // TODO: do we need this? Is "index_count" enough? The functions would be different.
 
                                        auto GetPrimitiveTopologyName = [](D3D_PRIMITIVE_TOPOLOGY topology) -> const char*
+                                       {
+                                          switch (topology)
                                           {
-                                             switch (topology)
-                                             {
-                                             case D3D_PRIMITIVE_TOPOLOGY_UNDEFINED:         return "UNDEFINED";
-                                             case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:         return "POINTLIST";
-                                             case D3D_PRIMITIVE_TOPOLOGY_LINELIST:          return "LINELIST";
-                                             case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:         return "LINESTRIP";
-                                             case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST:      return "TRIANGLELIST";
-                                             case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:     return "TRIANGLESTRIP";
-                                             case D3D_PRIMITIVE_TOPOLOGY_TRIANGLEFAN:       return "TRIANGLEFAN";
-                                             case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ:      return "LINELIST ADJ";
-                                             case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ:     return "LINESTRIP ADJ";
-                                             case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ:  return "TRIANGLELIST ADJ";
-                                             case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ: return "TRIANGLESTRIP ADJ";
-                                             default:                                       return "UNKNOWN";
-                                             }
-                                          };
+                                          case D3D_PRIMITIVE_TOPOLOGY_UNDEFINED:
+                                             return "UNDEFINED";
+                                          case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
+                                             return "POINTLIST";
+                                          case D3D_PRIMITIVE_TOPOLOGY_LINELIST:
+                                             return "LINELIST";
+                                          case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
+                                             return "LINESTRIP";
+                                          case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST:
+                                             return "TRIANGLELIST";
+                                          case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
+                                             return "TRIANGLESTRIP";
+                                          case D3D_PRIMITIVE_TOPOLOGY_TRIANGLEFAN:
+                                             return "TRIANGLEFAN";
+                                          case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ:
+                                             return "LINELIST ADJ";
+                                          case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ:
+                                             return "LINESTRIP ADJ";
+                                          case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ:
+                                             return "TRIANGLELIST ADJ";
+                                          case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ:
+                                             return "TRIANGLESTRIP ADJ";
+                                          default:
+                                             return "UNKNOWN";
+                                          }
+                                       };
                                        ImGui::NewLine();
                                        ImGui::Text("Primitive Topology: %s", GetPrimitiveTopologyName(draw_call_data.primitive_topology));
 
@@ -18590,7 +18729,10 @@ namespace
 
                                           ImGui::PushID(i);
 
-                                          if (!is_first_draw) { ImGui::Text(""); };
+                                          if (!is_first_draw)
+                                          {
+                                             ImGui::Text("");
+                                          };
                                           is_first_draw = false;
                                           ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(245, 230, 140, 255)); // Faint Yellow
 #if DX12
@@ -18667,7 +18809,7 @@ namespace
                                                    }
 
                                                    upgraded = true;
-                                                
+
                                                    break;
                                                 }
                                              }
@@ -18739,7 +18881,10 @@ namespace
 
                                           ImGui::PushID(i + TraceDrawCallData::srvs_size); // Offset by the max amount of previous iterations from above
 
-                                          if (!is_first_draw) { ImGui::Text(""); };
+                                          if (!is_first_draw)
+                                          {
+                                             ImGui::Text("");
+                                          };
                                           is_first_draw = false;
                                           ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 170, 230, 255)); // Faint Purple
 #if DX12
@@ -18794,7 +18939,7 @@ namespace
                                                    if (const auto it = device_data.resource_upgrades.original_upgraded_resource_views_formats.find(draw_call_data.uavs[i]); it != device_data.resource_upgrades.original_upgraded_resource_views_formats.end())
                                                    {
                                                       const auto& [native_resource, original_view_format] = it->second;
-                                                      ASSERT_ONCE(native_resource == upgraded_resource_pair.first); // Uh!?
+                                                      ASSERT_ONCE(native_resource == upgraded_resource_pair.first);    // Uh!?
                                                       DXGI_FORMAT upgraded_view_format = draw_call_data.uav_format[i]; // This only works with direct upgrades, otherwise it'd be the original view format
                                                       DXGI_FORMAT adjusted_original_view_format = (DXGI_FORMAT(original_view_format) == upgraded_view_format) ? DXGI_FORMAT(upgraded_resource_pair.second) : DXGI_FORMAT(original_view_format);
                                                       ImGui::Text("RV Original Format: %s", GetFormatName(adjusted_original_view_format));
@@ -18835,7 +18980,7 @@ namespace
 
                                           if (!upgraded && texture_format_upgrades_type == TextureFormatUpgradesType::AllowedEnabled && ImGui::Button("Indirect Upgrade Resource Format (By Shader)"))
                                           {
-                                             auto_texture_format_upgrade_shader_hashes[pipeline_pair->second->shader_hashes[0]] = AutoTextureFormatUpgradeShaderHash{ std::vector<uint8_t>(), std::vector<uint8_t>{ uint8_t(i) }, false }; // DX11 logic
+                                             auto_texture_format_upgrade_shader_hashes[pipeline_pair->second->shader_hashes[0]] = AutoTextureFormatUpgradeShaderHash{std::vector<uint8_t>(), std::vector<uint8_t>{uint8_t(i)}, false}; // DX11 logic
                                           }
 
 #if DX11
@@ -18909,7 +19054,10 @@ namespace
 
                                           ImGui::PushID(i + TraceDrawCallData::srvs_size + TraceDrawCallData::uavs_size); // Offset by the max amount of previous iterations from above
 
-                                          if (!is_first_draw) { ImGui::Text(""); };
+                                          if (!is_first_draw)
+                                          {
+                                             ImGui::Text("");
+                                          };
                                           is_first_draw = false;
                                           ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(160, 200, 255, 255)); // Faint Blue
                                           ImGui::Text("RTV Index: %u", i);
@@ -18963,7 +19111,7 @@ namespace
                                                    if (const auto it = device_data.resource_upgrades.original_upgraded_resource_views_formats.find(draw_call_data.rtvs[i]); it != device_data.resource_upgrades.original_upgraded_resource_views_formats.end())
                                                    {
                                                       const auto& [native_resource, original_view_format] = it->second;
-                                                      ASSERT_ONCE(native_resource == upgraded_resource_pair.first); // Uh!?
+                                                      ASSERT_ONCE(native_resource == upgraded_resource_pair.first);    // Uh!?
                                                       DXGI_FORMAT upgraded_view_format = draw_call_data.rtv_format[i]; // This only works with direct upgrades, otherwise it'd be the original view format
                                                       DXGI_FORMAT adjusted_original_view_format = (DXGI_FORMAT(original_view_format) == upgraded_view_format) ? DXGI_FORMAT(upgraded_resource_pair.second) : DXGI_FORMAT(original_view_format);
                                                       ImGui::Text("RV Original Format: %s", GetFormatName(adjusted_original_view_format));
@@ -19001,8 +19149,8 @@ namespace
                                           {
                                              bool pop_text_style_color = false;
 #if DX11 // "IsBlendInverted()" is with the native D3D11 helpers
-                                             // Print out invalid blend modes.
-                                             // Note: this is assuming that indirect upgrades always upgrade to a signed float type, which is generally true. Ideally we'd implement something like "GetBestResourceViewUpgradeFormat(draw_call_data.rtv_format[i])" here, but given it's just a warning, it doesn't really matter
+         // Print out invalid blend modes.
+         // Note: this is assuming that indirect upgrades always upgrade to a signed float type, which is generally true. Ideally we'd implement something like "GetBestResourceViewUpgradeFormat(draw_call_data.rtv_format[i])" here, but given it's just a warning, it doesn't really matter
                                              if (IsRGBAFormat(draw_call_data.rtv_format[i], true) && (indirect_upgraded || IsSignedFloatFormat(draw_call_data.rtv_format[i])) && IsBlendInverted(draw_call_data.blend_desc, 1, false, i))
                                              {
                                                 ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 105, 0, 255)); // Orange
@@ -19016,8 +19164,7 @@ namespace
                                              {
                                                 bool has_drawn_blend_rgb_text = false;
 
-                                                if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_BLEND_FACTOR) || render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_BLEND_FACTOR)
-                                                   || render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_INV_BLEND_FACTOR) || render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_INV_BLEND_FACTOR))
+                                                if (render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_BLEND_FACTOR) || render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_BLEND_FACTOR) || render_target_blend_desc.SrcBlend == LUMA_D3D(BLEND_INV_BLEND_FACTOR) || render_target_blend_desc.DestBlend == LUMA_D3D(BLEND_INV_BLEND_FACTOR))
                                                 {
                                                    ImGui::Text("Blend RGB Mode: Blend Factor (Any)");
                                                    has_drawn_blend_rgb_text = true;
@@ -19126,8 +19273,7 @@ namespace
                                                 bool has_drawn_blend_a_text = false;
 
                                                 // It's enabled but it's as if it was disabled
-                                                if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_BLEND_FACTOR) || render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_BLEND_FACTOR)
-                                                   || render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_INV_BLEND_FACTOR) || render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_INV_BLEND_FACTOR))
+                                                if (render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_BLEND_FACTOR) || render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_BLEND_FACTOR) || render_target_blend_desc.SrcBlendAlpha == LUMA_D3D(BLEND_INV_BLEND_FACTOR) || render_target_blend_desc.DestBlendAlpha == LUMA_D3D(BLEND_INV_BLEND_FACTOR))
                                                 {
                                                    ImGui::Text("Blend A Mode: Blend Factor (Any)");
                                                    has_drawn_blend_a_text = true;
@@ -19217,9 +19363,9 @@ namespace
                                              else
                                              {
                                                 ImGui::Text("Write Mask:");
-                                                if (render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_RED))   ImGui::SameLine(), ImGui::Text(" R");
+                                                if (render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_RED)) ImGui::SameLine(), ImGui::Text(" R");
                                                 if (render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_GREEN)) ImGui::SameLine(), ImGui::Text(" G");
-                                                if (render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_BLUE))  ImGui::SameLine(), ImGui::Text(" B");
+                                                if (render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_BLUE)) ImGui::SameLine(), ImGui::Text(" B");
                                                 if (render_target_blend_desc.RenderTargetWriteMask & LUMA_D3D(COLOR_WRITE_ENABLE_ALPHA)) ImGui::SameLine(), ImGui::Text(" A");
                                              }
                                           }
@@ -19235,7 +19381,7 @@ namespace
 
                                           if (!upgraded && texture_format_upgrades_type == TextureFormatUpgradesType::AllowedEnabled && ImGui::Button("Indirect Upgrade Resource Format (By Shader)"))
                                           {
-                                             auto_texture_format_upgrade_shader_hashes[pipeline_pair->second->shader_hashes[0]] = AutoTextureFormatUpgradeShaderHash{ std::vector<uint8_t>{ uint8_t(i) }, std::vector<uint8_t>(), false }; // DX11 logic
+                                             auto_texture_format_upgrade_shader_hashes[pipeline_pair->second->shader_hashes[0]] = AutoTextureFormatUpgradeShaderHash{std::vector<uint8_t>{uint8_t(i)}, std::vector<uint8_t>(), false}; // DX11 logic
                                           }
 
 #if DX11
@@ -19287,12 +19433,18 @@ namespace
                                        // Only print this when enabled given it's rare (it's MSAA transparency dithering basically)
                                        if (blend_desc.AlphaToCoverageEnable)
                                        {
-                                          if (!is_first_draw) { ImGui::Text(""); };
+                                          if (!is_first_draw)
+                                          {
+                                             ImGui::Text("");
+                                          };
                                           // Don't set "is_first_draw" to true to let depth printing have a space too
                                           ImGui::Text("Alpha to Coverage Enable: %s", blend_desc.AlphaToCoverageEnable ? "True" : "False");
                                        }
 
-                                       if (!is_first_draw) { ImGui::Text(""); }; // No views drew before, skip space
+                                       if (!is_first_draw)
+                                       {
+                                          ImGui::Text("");
+                                       }; // No views drew before, skip space
                                        is_first_draw = false;
                                        ImGui::Text("Depth State: %s", TraceDrawCallData::depth_state_names[(size_t)draw_call_data.depth_state]);
                                        ImGui::Text("Stencil State: %s", TraceDrawCallData::depth_state_names[(size_t)draw_call_data.stencil_state]);
@@ -19363,8 +19515,7 @@ namespace
                                        }
 
 #if DX11
-                                       const bool has_valid_depth = draw_call_data.depth_state != TraceDrawCallData::DepthStateType::Disabled
-                                          && draw_call_data.depth_state != TraceDrawCallData::DepthStateType::Invalid;
+                                       const bool has_valid_depth = draw_call_data.depth_state != TraceDrawCallData::DepthStateType::Disabled && draw_call_data.depth_state != TraceDrawCallData::DepthStateType::Invalid;
                                        if (has_valid_depth && debug_draw_shader_enabled && debug_draw_mode != DebugDrawMode::Depth && ImGui::Button("Debug Draw Depth Resource"))
                                        {
                                           debug_draw_mode = DebugDrawMode::Depth;
@@ -19469,20 +19620,12 @@ namespace
                            }
                            lock.unlock(); // Needed to prevent "LoadCustomShaders()" from deadlocking, and anyway, there's no need to lock it beyond the for loop above
 
-                           if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CopyResource
-                              || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CPURead
-                              || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CPUWrite
-                              || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BindResource
-                              || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::ClearResource
-                              || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Custom)
+                           if (draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CopyResource || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CPURead || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CPUWrite || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BindResource || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::ClearResource || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::Custom)
                            {
                               if (ImGui::BeginChild("Settings and Info"))
                               {
-                                 const bool has_source_resource = draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CopyResource
-                                    || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CPURead
-                                    || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BindResource;
-                                 const bool has_target_resource = draw_call_data.type != TraceDrawCallData::TraceDrawCallType::CPURead
-                                    && draw_call_data.type != TraceDrawCallData::TraceDrawCallType::BindResource;
+                                 const bool has_source_resource = draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CopyResource || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::CPURead || draw_call_data.type == TraceDrawCallData::TraceDrawCallType::BindResource;
+                                 const bool has_target_resource = draw_call_data.type != TraceDrawCallData::TraceDrawCallType::CPURead && draw_call_data.type != TraceDrawCallData::TraceDrawCallType::BindResource;
 
                                  if (has_source_resource)
                                  {
@@ -19594,7 +19737,7 @@ namespace
                            // We need to do this here or it'd deadlock due to "s_mutex_generic" trying to be locked in shared mod again
                            if (reload && pipeline_handle != 0)
                            {
-                              LoadCustomShaders(device_data, { pipeline_handle }, recompile);
+                              LoadCustomShaders(device_data, {pipeline_handle}, recompile);
                            }
                         }
                      }
@@ -19608,7 +19751,7 @@ namespace
                   {
                      static bool pending_disassembly_refresh = false;
 
-                     static const char* asm_types[] = { "Default", "Live Patched", "Custom" };
+                     static const char* asm_types[] = {"Default", "Live Patched", "Custom"};
                      static int asm_type = 0;
                      if (ImGui::SliderInt("Type", &asm_type, 0, std::size(asm_types) - 1, asm_types[asm_type]))
                      {
@@ -19705,7 +19848,7 @@ namespace
                            ImVec2(-FLT_MIN, -FLT_MIN),
                            ImGuiInputTextFlags_ReadOnly);
                      }
-                     ImGui::EndChild(); // DisassemblyCode
+                     ImGui::EndChild();   // DisassemblyCode
                      ImGui::EndTabItem(); // Disassembly
                   }
                   opened_disassembly_tab_item = open_disassembly_tab_item;
@@ -19763,7 +19906,8 @@ namespace
                                     // Also skip any empty line beyond 2 ones, as usually it's empty spaces (or tabs) generated by the source concatenation.
                                     bool is_meta_line = line.rfind("#line ", 0) == 0 && !line.contains("\"");
                                     bool is_pragma_line = line.rfind("#pragma ", 0) == 0;
-                                    if (is_meta_line || is_pragma_line || line.empty() || std::all_of(line.begin(), line.end(), [](unsigned char c) { return std::isspace(c); }))
+                                    if (is_meta_line || is_pragma_line || line.empty() || std::all_of(line.begin(), line.end(), [](unsigned char c)
+                                                                                             { return std::isspace(c); }))
                                     {
                                        empty_lines_count++;
                                     }
@@ -19830,7 +19974,7 @@ namespace
                            ImGuiInputTextFlags_ReadOnly);
                         ImGui::PopStyleColor();
                      }
-                     ImGui::EndChild(); // LiveCode
+                     ImGui::EndChild();   // LiveCode
                      ImGui::EndTabItem(); // HLSL
                   }
 
@@ -19882,7 +20026,7 @@ namespace
                      ImGui::PushStyleColor(ImGuiCol_Text, text_color);
                      ImGui::PushID(index);
                      ImGui::PushID(custom_shader.second->preprocessed_hash); // Avoid files by the same simplified name (we also shader files with multiple hashes) from conflicting
-                     
+
                      std::string file_name = custom_shader.second->file_path.stem().string();
                      // Remove all the shader hashes and the shader model ("xs_n_n")
                      if (!custom_shader.second->is_luma_native)
@@ -19967,10 +20111,7 @@ namespace
                   {
                      for (const auto& native_shader_definition : native_shaders_definitions)
                      {
-                        if (native_shader_definition.second.file_name == selected_custom_shader->definition.file_name
-                           && native_shader_definition.second.type == selected_custom_shader->definition.type
-                           && native_shader_definition.second.function_name == selected_custom_shader->definition.function_name
-                           && native_shader_definition.second.defines_data == selected_custom_shader->definition.defines_data)
+                        if (native_shader_definition.second.file_name == selected_custom_shader->definition.file_name && native_shader_definition.second.type == selected_custom_shader->definition.type && native_shader_definition.second.function_name == selected_custom_shader->definition.function_name && native_shader_definition.second.defines_data == selected_custom_shader->definition.defines_data)
                         {
                            ImGui::Text("Luma Native Key: %u", native_shader_definition.first); // TODO: unfortunately at this point the name we address it by in code is lost, so we only have a hash left, which is kinda useless information
                         }
@@ -19984,11 +20125,21 @@ namespace
                      ImGui::SameLine();
                      switch (selected_custom_shader->definition.type)
                      {
-                     case reshade::api::pipeline_subobject_type::vertex_shader:   ImGui::Text("Vertex"); break;
-                     case reshade::api::pipeline_subobject_type::geometry_shader: ImGui::Text("Geometry"); break;
-                     case reshade::api::pipeline_subobject_type::pixel_shader:    ImGui::Text("Pixel"); break;
-                     case reshade::api::pipeline_subobject_type::compute_shader:  ImGui::Text("Compute"); break;
-                     default:                                                     ImGui::Text("Unknown"); break;
+                     case reshade::api::pipeline_subobject_type::vertex_shader:
+                        ImGui::Text("Vertex");
+                        break;
+                     case reshade::api::pipeline_subobject_type::geometry_shader:
+                        ImGui::Text("Geometry");
+                        break;
+                     case reshade::api::pipeline_subobject_type::pixel_shader:
+                        ImGui::Text("Pixel");
+                        break;
+                     case reshade::api::pipeline_subobject_type::compute_shader:
+                        ImGui::Text("Compute");
+                        break;
+                     default:
+                        ImGui::Text("Unknown");
+                        break;
                      }
                   }
 
@@ -20024,7 +20175,7 @@ namespace
                               pipeline->custom_name.empty() ? ImGui::Text("Pipeline: %i", i) : ImGui::Text("Pipeline: %s", pipeline->custom_name.c_str());
                               if (pipeline->HasPixelShader() || pipeline->HasComputeShader())
                               {
-                                 //ImGui::Checkbox("Allow Shader Replace Draw NaNs", &allow_replace_draw_nans); // Disabled as it's draw too many times
+                                 // ImGui::Checkbox("Allow Shader Replace Draw NaNs", &allow_replace_draw_nans); // Disabled as it's draw too many times
                                  ImGui::SliderInt("Shader Replace Draw Type", reinterpret_cast<int*>(&pipeline->replace_draw_type), 0, IM_ARRAYSIZE(CachedPipeline::shader_replace_draw_type_names) - (allow_replace_draw_nans ? 1 : 2), CachedPipeline::shader_replace_draw_type_names[(size_t)pipeline->replace_draw_type], ImGuiSliderFlags_NoInput);
                                  if (pipeline->HasPixelShader())
                                     ImGui::SliderInt("Shader Custom Depth/Stencil Type", reinterpret_cast<int*>(&pipeline->custom_depth_stencil), 0, IM_ARRAYSIZE(CachedPipeline::shader_custom_depth_stencil_type_names) - 1, CachedPipeline::shader_custom_depth_stencil_type_names[(size_t)pipeline->custom_depth_stencil], ImGuiSliderFlags_NoInput);
@@ -20032,7 +20183,7 @@ namespace
                               if (ImGui::Button("Unload"))
                               {
                                  s_mutex_generic.unlock(); // Hack to avoid deadlocks with the device destroying pipelines
-                                 UnloadCustomShaders(device_data, { reinterpret_cast<uint64_t>(pipeline) }, false);
+                                 UnloadCustomShaders(device_data, {reinterpret_cast<uint64_t>(pipeline)}, false);
                                  s_mutex_generic.lock();
                               }
 #if 0 // TODO: this still deadlocks!
@@ -20086,7 +20237,7 @@ namespace
                if (pipeline_to_recompile != 0)
                {
                   bool recompile = true;
-                  LoadCustomShaders(device_data, { pipeline_to_recompile }, recompile);
+                  LoadCustomShaders(device_data, {pipeline_to_recompile}, recompile);
                }
 
                ImGui::EndDisabled();
@@ -20233,7 +20384,7 @@ namespace
                   // Replace the hash with the original one if this is an indirect upgrade
                   {
                      std::shared_lock lock(device_data.mutex); // Note: this is probably not 100% safe, as we don't keep the resources as a com ptr, DX might destroy them as we iterate the array, but this is debug code so, whatever!
-                  
+
                      swapchain = device_data.back_buffers.contains(uint64_t(selected_resource.get()));
 
                      // Redirect the hash to the indirect texture
@@ -20278,7 +20429,7 @@ namespace
                   }
 
                   bool debug_draw_resource_enabled = device_data.debug_draw_texture == selected_resource;
-                  UINT extra_refs = 1; // Our current local ref.
+                  UINT extra_refs = 1;                           // Our current local ref.
                   if (debug_draw_resource_enabled) extra_refs++; // The debug draw ref
                   // Note: there possibly might be more, spread into render targets (actually they don't seem to add references?), SRVs etc, that we set ourselves, but it's hard, but it might actually be correct already.
                   // ReShade doesn't seem to keep textures with hard references, instead they add private data with a destructor to them, to detect when they are being garbage collected, and anyway it doesn't see the resources we created.
@@ -20294,7 +20445,7 @@ namespace
                   selected_resource->QueryInterface(&selected_texture_1d);
 
                   DXGI_FORMAT selected_texture_format = DXGI_FORMAT_UNKNOWN;
-                  uint4 selected_texture_size = { 1, 1, 1, 1 };
+                  uint4 selected_texture_size = {1, 1, 1, 1};
                   if (selected_texture_2d)
                   {
                      D3D11_TEXTURE2D_DESC texture_desc;
@@ -20346,7 +20497,7 @@ namespace
                   // Hide debug draw for the swapchain, given we'd already be looking at it (and it's likely not possible to debug it anyway, unless we had two textures, but DX11 only has 1)
                   if (!swapchain && (debug_draw_resource_enabled ? ImGui::Button("Disable Debug Draw Texture") : ImGui::Button("Debug Draw Texture")))
                   {
-                     ASSERT_ONCE(GetShaderDefineCompiledNumericalValue(DEVELOPMENT_HASH) >= 1); // Development flag is needed in shaders for this to output correctly
+                     ASSERT_ONCE(GetShaderDefineCompiledNumericalValue(DEVELOPMENT_HASH) >= 1);                   // Development flag is needed in shaders for this to output correctly
                      ASSERT_ONCE(device_data.native_pixel_shaders[CompileTimeStringHash("Display Composition")]); // This shader is necessary to draw this debug stuff
 
                      if (!debug_draw_resource_enabled) // Enabled
@@ -20637,17 +20788,23 @@ namespace
             switch (sr_user_type)
             {
             case SR::UserType::None:
-               selected_sr_user_type = "None"; break;
+               selected_sr_user_type = "None";
+               break;
             case SR::UserType::Auto:
-               selected_sr_user_type = "Auto"; break;
+               selected_sr_user_type = "Auto";
+               break;
             case SR::UserType::DLSS:
-               selected_sr_user_type = "DLSS"; break;
+               selected_sr_user_type = "DLSS";
+               break;
             case SR::UserType::FSR:
-               selected_sr_user_type = "FSR"; break;
+               selected_sr_user_type = "FSR";
+               break;
             case SR::UserType::LumaTAA:
-               selected_sr_user_type = "Luma TAA"; break;
+               selected_sr_user_type = "Luma TAA";
+               break;
             case SR::UserType::XeSS:
-               selected_sr_user_type = "XeSS"; break;
+               selected_sr_user_type = "XeSS";
+               break;
             }
 
             SR::Type sr_type = device_data.sr_type;
@@ -20667,29 +20824,29 @@ namespace
             if (ImGui::BeginCombo("Super Resolution", selected_sr_user_type))
             {
                auto AddComboItem = [&](const char* name, SR::UserType local_sr_user_type, SR::Type local_sr_type, bool enabled)
+               {
+                  if (!enabled)
                   {
-                     if (!enabled)
+                     // Grey out text
+                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+                     ImGui::Selectable(name, false, ImGuiSelectableFlags_Disabled);
+                     ImGui::PopStyleColor();
+                  }
+                  else
+                  {
+                     const bool selected = sr_user_type == local_sr_user_type;
+                     if (ImGui::Selectable(name, selected))
                      {
-                        // Grey out text
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
-                        ImGui::Selectable(name, false, ImGuiSelectableFlags_Disabled);
-                        ImGui::PopStyleColor();
-                     }
-                     else
-                     {
-                        const bool selected = sr_user_type == local_sr_user_type;
-                        if (ImGui::Selectable(name, selected))
-                        {
-                           sr_user_type = local_sr_user_type;
-                           int sr_user_type_i = int(sr_user_type);
-                           reshade::set_config_value(runtime, NAME, "SRUserType", sr_user_type_i);
+                        sr_user_type = local_sr_user_type;
+                        int sr_user_type_i = int(sr_user_type);
+                        reshade::set_config_value(runtime, NAME, "SRUserType", sr_user_type_i);
 
-                           sr_type = local_sr_type;
-                        }
-                        if (selected)
-                           ImGui::SetItemDefaultFocus();
+                        sr_type = local_sr_type;
                      }
-                  };
+                     if (selected)
+                        ImGui::SetItemDefaultFocus();
+                  }
+               };
 
                AddComboItem("None", SR::UserType::None, SR::Type::None, true);
                constexpr bool always_show_auto_sr = true; // It's the default value, so just always show it
@@ -20697,7 +20854,7 @@ namespace
                   AddComboItem("Auto", SR::UserType::Auto, sr_auto_type, !device_data.sr_implementations_instances.empty());
                AddComboItem("DLSS", SR::UserType::DLSS, SR::Type::DLSS, device_data.sr_implementations_instances.contains(SR::Type::DLSS));
                AddComboItem("FSR", SR::UserType::FSR, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
-#if ENABLE_XESS // D3D12 only
+#if ENABLE_XESS || ENABLE_SR_BRIDGE || ENABLE_D3D12_SR // D3D12 only, or the SR bridge's helper, or the in-process D3D12 bridge
                AddComboItem("XeSS", SR::UserType::XeSS, SR::Type::XeSS, device_data.sr_implementations_instances.contains(SR::Type::XeSS));
 #endif
 #if ENABLE_LUMA_TAA // Only in games that enable it, rather than as an always disabled item
@@ -20749,21 +20906,29 @@ namespace
                switch (dlss_render_preset)
                {
                case 0: // NVSDK_NGX_DLSS_Hint_Render_Preset_Default
-                  selected_dlss_preset = "Default"; break;
+                  selected_dlss_preset = "Default";
+                  break;
                case 5: // NVSDK_NGX_DLSS_Hint_Render_Preset_E
-                  selected_dlss_preset = "E (CNN)"; break;
+                  selected_dlss_preset = "E (CNN)";
+                  break;
                case 6: // NVSDK_NGX_DLSS_Hint_Render_Preset_F
-                  selected_dlss_preset = "F (CNN)"; break;
+                  selected_dlss_preset = "F (CNN)";
+                  break;
                case 10: // NVSDK_NGX_DLSS_Hint_Render_Preset_J
-                  selected_dlss_preset = "J"; break;
+                  selected_dlss_preset = "J";
+                  break;
                case 11: // NVSDK_NGX_DLSS_Hint_Render_Preset_K
-                  selected_dlss_preset = "K"; break;
+                  selected_dlss_preset = "K";
+                  break;
                case 12: // NVSDK_NGX_DLSS_Hint_Render_Preset_L
-                  selected_dlss_preset = "L"; break;
+                  selected_dlss_preset = "L";
+                  break;
                case 13: // NVSDK_NGX_DLSS_Hint_Render_Preset_M
-                  selected_dlss_preset = "M"; break;
+                  selected_dlss_preset = "M";
+                  break;
                default:
-                  selected_dlss_preset = "Default"; break;
+                  selected_dlss_preset = "Default";
+                  break;
                }
 
                if (sr_type == SR::Type::DLSS && ImGui::BeginCombo("DLSS Preset", selected_dlss_preset))
@@ -20785,13 +20950,13 @@ namespace
                         ImGui::SetItemDefaultFocus();
                   };
 
-                  AddPresetItem("Default", 0, "Uses NVIDIA suggested preset."); // NVSDK_NGX_DLSS_Hint_Render_Preset_Default
+                  AddPresetItem("Default", 0, "Uses NVIDIA suggested preset.");                                                                                              // NVSDK_NGX_DLSS_Hint_Render_Preset_Default
                   AddPresetItem("E (CNN)", 5, "Deprecated CNN model. It is more performant, but blurrier than the newer models. Sharper than F but slightly more aliased."); // NVSDK_NGX_DLSS_Hint_Render_Preset_E
-                  AddPresetItem("F (CNN)", 6, "Deprecated CNN model. It is more performant, but blurrier than the newer models. It might offer less ghosting than J/K."); // NVSDK_NGX_DLSS_Hint_Render_Preset_F
-                  AddPresetItem("J", 10, "Very similar to K. Has issues with reflections and transparent effects / volumetrics."); // NVSDK_NGX_DLSS_Hint_Render_Preset_J
-                  AddPresetItem("K", 11, "Very similar to J. Has issues with reflections and transparent effects / volumetrics."); // NVSDK_NGX_DLSS_Hint_Render_Preset_K
-                  AddPresetItem("L", 12, "Highest quality, but very performance intensive. Suggested when upscaling from very low resolution (Ultra Performance)."); // NVSDK_NGX_DLSS_Hint_Render_Preset_L
-                  AddPresetItem("M", 13, "Best quality to performance ratio."); // NVSDK_NGX_DLSS_Hint_Render_Preset_M
+                  AddPresetItem("F (CNN)", 6, "Deprecated CNN model. It is more performant, but blurrier than the newer models. It might offer less ghosting than J/K.");    // NVSDK_NGX_DLSS_Hint_Render_Preset_F
+                  AddPresetItem("J", 10, "Very similar to K. Has issues with reflections and transparent effects / volumetrics.");                                           // NVSDK_NGX_DLSS_Hint_Render_Preset_J
+                  AddPresetItem("K", 11, "Very similar to J. Has issues with reflections and transparent effects / volumetrics.");                                           // NVSDK_NGX_DLSS_Hint_Render_Preset_K
+                  AddPresetItem("L", 12, "Highest quality, but very performance intensive. Suggested when upscaling from very low resolution (Ultra Performance).");         // NVSDK_NGX_DLSS_Hint_Render_Preset_L
+                  AddPresetItem("M", 13, "Best quality to performance ratio.");                                                                                              // NVSDK_NGX_DLSS_Hint_Render_Preset_M
 
                   ImGui::EndCombo();
                }
@@ -20818,6 +20983,35 @@ namespace
             }
 #endif // ENABLE_SR
 
+#if ENABLE_D3D12_SR
+            {
+               // DLSS and FSR have a D3D11 and a D3D12 implementation (FSR 4 on RDNA4, else 3.1; XeSS has only D3D12)
+               const std::shared_lock lock_sr(device_data.sr_mutex);
+               const SR::InstanceData* const api_instance = device_data.GetSRInstanceData();
+               const bool api_forced = api_instance && !SRBridge::ApiSwitch::CanPick(api_instance);
+               const char* const api_names[] = {"D3D11", "D3D12"};
+               const int api_shown = (api_forced ? int(SRBridge::Api::D3D12) : int(SRBridge::api_setting));
+               ImGui::BeginDisabled(api_forced);
+               if (ImGui::BeginCombo("Super Resolution API", api_names[api_shown]))
+               {
+                  for (int i = 0; i < IM_ARRAYSIZE(api_names); i++)
+                  {
+                     if (ImGui::Selectable(api_names[i], api_shown == i))
+                     {
+                        SRBridge::api_setting = SRBridge::Api(i);
+                        reshade::set_config_value(runtime, NAME, "SuperResolutionAPI", i);
+                     }
+                  }
+                  ImGui::EndCombo();
+               }
+               ImGui::EndDisabled();
+               if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+               {
+                  ImGui::SetTooltip("The graphics API the upscaler runs on.\nD3D11: DLSS, FSR 3.\nD3D12: DLSS, FSR 4 (RDNA4 GPUs, else FSR 3.1), XeSS.\nDLSS and FSR 3 give the same quality on either API.");
+               }
+            }
+#endif // ENABLE_D3D12_SR
+
 #if ENABLE_REFLEX
             {
                const Reflex::State reflex_state = device_data.reflex.state;
@@ -20840,7 +21034,8 @@ namespace
                   reflex_preview = "Off (NVIDIA Smooth Motion)";
                   reflex_tooltip = "Off while NVIDIA Smooth Motion is on for this game: it already turns on the driver's low latency mode itself,\nand NVIDIA Reflex on top of it gains nothing.";
                   break;
-               default: break;
+               default:
+                  break;
                }
                ImGui::BeginDisabled(reflex_state > Reflex::State::Running);
                if (ImGui::BeginCombo("NVIDIA Reflex Low Latency", reflex_preview))
@@ -20880,92 +21075,92 @@ namespace
 #endif // ENABLE_REFLEX
 
             auto DrawScenePaperWhite = [&](bool has_separate_ui_paper_white = true)
+            {
+               static const char* scene_paper_white_name = "Scene Paper White";
+               static const char* paper_white_name = "Paper White";
+
+               assert(!use_os_reference_white_level || !has_separate_ui_paper_white); // "use_os_reference_white_level" mode only uses one slider (scene paper white)!
+               if (ImGui::Checkbox("Link to OS Reference White Level", &use_os_reference_white_level))
                {
-                  static const char* scene_paper_white_name = "Scene Paper White";
-                  static const char* paper_white_name = "Paper White";
-
-                  assert(!use_os_reference_white_level || !has_separate_ui_paper_white); // "use_os_reference_white_level" mode only uses one slider (scene paper white)!
-                  if (ImGui::Checkbox("Link to OS Reference White Level", &use_os_reference_white_level))
+                  if (use_os_reference_white_level)
                   {
-                     if (use_os_reference_white_level)
+                     // Note: this is not fully "safe" to do, so let's rely on users manually setting this instead.
+                     // Clamp to the range accepted by Windows 11 as of 2026, otherwise it fails.
+                     if (!Display::SetSDRWhiteLevel(game_window, std::clamp(cb_luma_global_settings.ScenePaperWhite, 80.f, 480.f)))
                      {
-                        // Note: this is not fully "safe" to do, so let's rely on users manually setting this instead.
-                        // Clamp to the range accepted by Windows 11 as of 2026, otherwise it fails.
-                        if (!Display::SetSDRWhiteLevel(game_window, std::clamp(cb_luma_global_settings.ScenePaperWhite, 80.f, 480.f)))
-                        {
-                           use_os_reference_white_level = false;
-                        }
+                        use_os_reference_white_level = false;
                      }
-
-                     reshade::set_config_value(runtime, NAME, "UseOSReferenceWhiteLevel", use_os_reference_white_level);
-                  }
-                  if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                  {
-                     ImGui::SetTooltip("Links Luma's HDR Paper White value to the Windows SDR content brightness slider (Reference/Diffuse White Level).\nThis makes the game cursor brightness match the one of the game.");
                   }
 
-                  const float max_white_level = use_os_reference_white_level ? 480.f : 500.f; // Windows SDR Reference White Level max is 480 nits! We use 500 otherwise (both are hardcoded elsewhere too!)
+                  reshade::set_config_value(runtime, NAME, "UseOSReferenceWhiteLevel", use_os_reference_white_level);
+               }
+               if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+               {
+                  ImGui::SetTooltip("Links Luma's HDR Paper White value to the Windows SDR content brightness slider (Reference/Diffuse White Level).\nThis makes the game cursor brightness match the one of the game.");
+               }
 
-                  if (ImGui::SliderFloat(has_separate_ui_paper_white ? scene_paper_white_name : paper_white_name, &cb_luma_global_settings.ScenePaperWhite, srgb_white_level, max_white_level, "%.f"))
+               const float max_white_level = use_os_reference_white_level ? 480.f : 500.f; // Windows SDR Reference White Level max is 480 nits! We use 500 otherwise (both are hardcoded elsewhere too!)
+
+               if (ImGui::SliderFloat(has_separate_ui_paper_white ? scene_paper_white_name : paper_white_name, &cb_luma_global_settings.ScenePaperWhite, srgb_white_level, max_white_level, "%.f"))
+               {
+                  cb_luma_global_settings.ScenePaperWhite = max(cb_luma_global_settings.ScenePaperWhite, 0.0);
+                  reshade::set_config_value(runtime, NAME, "ScenePaperWhite", cb_luma_global_settings.ScenePaperWhite);
+
+                  if (use_os_reference_white_level)
                   {
-                     cb_luma_global_settings.ScenePaperWhite = max(cb_luma_global_settings.ScenePaperWhite, 0.0);
+                     Display::SetSDRWhiteLevel(game_window, cb_luma_global_settings.ScenePaperWhite);
+                     // Assumes "has_separate_ui_paper_white" being false, "cb_luma_global_settings.UIPaperWhite" is updated later
+                  }
+               }
+               if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+               {
+                  ImGui::SetTooltip("The \"average\" brightness of the game scene.\nChange this to your liking, just don't get too close to the peak white.\nHigher does not mean better (especially if you struggle to read UI text), the brighter the image is, the lower the dynamic range (contrast) is.\nThe in game settings brightness is best left at default.");
+               }
+               // Warnings
+               if (cb_luma_global_settings.ScenePaperWhite > cb_luma_global_settings.ScenePeakWhite)
+               {
+                  ImGui::SameLine();
+                  if (ImGui::SmallButton(ICON_FK_WARNING))
+                  {
+                     cb_luma_global_settings.ScenePaperWhite = default_paper_white;
                      reshade::set_config_value(runtime, NAME, "ScenePaperWhite", cb_luma_global_settings.ScenePaperWhite);
 
                      if (use_os_reference_white_level)
                      {
                         Display::SetSDRWhiteLevel(game_window, cb_luma_global_settings.ScenePaperWhite);
-                        // Assumes "has_separate_ui_paper_white" being false, "cb_luma_global_settings.UIPaperWhite" is updated later
                      }
                   }
                   if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                   {
-                     ImGui::SetTooltip("The \"average\" brightness of the game scene.\nChange this to your liking, just don't get too close to the peak white.\nHigher does not mean better (especially if you struggle to read UI text), the brighter the image is, the lower the dynamic range (contrast) is.\nThe in game settings brightness is best left at default.");
+                     ImGui::SetTooltip("Your Paper White setting is greater than your Peak White setting, the image will either look bad or broken.");
                   }
-                  // Warnings
-                  if (cb_luma_global_settings.ScenePaperWhite > cb_luma_global_settings.ScenePeakWhite)
+               }
+               // Reset button
+               ImGui::SameLine();
+               if (cb_luma_global_settings.ScenePaperWhite != default_paper_white)
+               {
+                  ImGui::PushID(has_separate_ui_paper_white ? scene_paper_white_name : paper_white_name);
+                  if (ImGui::SmallButton(ICON_FK_UNDO))
                   {
-                     ImGui::SameLine();
-                     if (ImGui::SmallButton(ICON_FK_WARNING))
-                     {
-                        cb_luma_global_settings.ScenePaperWhite = default_paper_white;
-                        reshade::set_config_value(runtime, NAME, "ScenePaperWhite", cb_luma_global_settings.ScenePaperWhite);
+                     cb_luma_global_settings.ScenePaperWhite = default_paper_white;
+                     reshade::set_config_value(runtime, NAME, "ScenePaperWhite", cb_luma_global_settings.ScenePaperWhite);
 
-                        if (use_os_reference_white_level)
-                        {
-                           Display::SetSDRWhiteLevel(game_window, cb_luma_global_settings.ScenePaperWhite);
-                        }
-                     }
-                     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                     if (use_os_reference_white_level)
                      {
-                        ImGui::SetTooltip("Your Paper White setting is greater than your Peak White setting, the image will either look bad or broken.");
+                        Display::SetSDRWhiteLevel(game_window, cb_luma_global_settings.ScenePaperWhite);
                      }
                   }
-                  // Reset button
-                  ImGui::SameLine();
-                  if (cb_luma_global_settings.ScenePaperWhite != default_paper_white)
-                  {
-                     ImGui::PushID(has_separate_ui_paper_white ? scene_paper_white_name : paper_white_name);
-                     if (ImGui::SmallButton(ICON_FK_UNDO))
-                     {
-                        cb_luma_global_settings.ScenePaperWhite = default_paper_white;
-                        reshade::set_config_value(runtime, NAME, "ScenePaperWhite", cb_luma_global_settings.ScenePaperWhite);
-
-                        if (use_os_reference_white_level)
-                        {
-                           Display::SetSDRWhiteLevel(game_window, cb_luma_global_settings.ScenePaperWhite);
-                        }
-                     }
-                     ImGui::PopID();
-                  }
-                  else
-                  {
-                     const auto& style = ImGui::GetStyle();
-                     ImVec2 size = ImGui::CalcTextSize(ICON_FK_UNDO);
-                     size.x += style.FramePadding.x;
-                     size.y += style.FramePadding.y;
-                     ImGui::InvisibleButton("", ImVec2(size.x, size.y));
-                  }
-               };
+                  ImGui::PopID();
+               }
+               else
+               {
+                  const auto& style = ImGui::GetStyle();
+                  ImVec2 size = ImGui::CalcTextSize(ICON_FK_UNDO);
+                  size.x += style.FramePadding.x;
+                  size.y += style.FramePadding.y;
+                  ImGui::InvisibleButton("", ImVec2(size.x, size.y));
+               }
+            };
 
             {
                // Note: this is fast enough that we can check it every frame.
@@ -21263,7 +21458,7 @@ namespace
                      constexpr double neutral_gamma = 1.0;
                      double ramp_temp_value = pow(i / 255.0, 1.0 / neutral_gamma);
                      WORD ramp_value = (WORD)(ramp_temp_value * 65535.0 + 0.5);
-#else // Pure neutral value
+#else                                           // Pure neutral value
                      WORD ramp_value = i * 257; // 0..255 -> 0..65535 (because 65535/255==257)
 #endif
 
@@ -21333,7 +21528,6 @@ namespace
                               }
                            }
                         }
-
                      }
                   }
                }
@@ -21919,7 +22113,7 @@ namespace
                   {
                      texture_format_upgrades_type = texture_format_upgrades_type == TextureFormatUpgradesType::AllowedEnabled ? TextureFormatUpgradesType::AllowedDisabled : TextureFormatUpgradesType::AllowedEnabled;
                   }
-                  //if (texture_format_upgrades_type == TextureFormatUpgradesType::AllowedEnabled) // TODO: hide only the ones that would be restricted by this being disabled, I think most would at least continue to work (at least without clearing what they previously upgraded)
+                  // if (texture_format_upgrades_type == TextureFormatUpgradesType::AllowedEnabled) // TODO: hide only the ones that would be restricted by this being disabled, I think most would at least continue to work (at least without clearing what they previously upgraded)
                   {
                      ImGui::Checkbox("Enable Indirect Texture Format Upgrades", &enable_indirect_texture_format_upgrades);
                      static_assert(sizeof(enable_chain_indirect_texture_format_upgrades) == sizeof(int));
@@ -21958,11 +22152,11 @@ namespace
                         device_data.resource_upgrades.pending_mirror_resource_destructions.clear();
                         for (const auto& original_resource_view_to_mirrored_upgraded_resource_view : original_resource_views_to_mirrored_upgraded_resource_views)
                         {
-                           runtime->get_device()->destroy_resource_view({ original_resource_view_to_mirrored_upgraded_resource_view.second });
+                           runtime->get_device()->destroy_resource_view({original_resource_view_to_mirrored_upgraded_resource_view.second});
                         }
                         for (const auto& original_resource_to_mirrored_upgraded_resource : original_resources_to_mirrored_upgraded_resources)
                         {
-                           runtime->get_device()->destroy_resource({ original_resource_to_mirrored_upgraded_resource.second.mirror_handle });
+                           runtime->get_device()->destroy_resource({original_resource_to_mirrored_upgraded_resource.second.mirror_handle});
                         }
 #else
                         std::unique_lock lock_device_write(device_data.mutex);
@@ -22026,7 +22220,8 @@ namespace
                if (ImGui::Button("Attempt Resize Swapchain (DANGEROUS)"))
                {
                   // Note: unsafe!
-                  auto ThreadFunc = [&]() {
+                  auto ThreadFunc = [&]()
+                  {
                      UINT width = UINT(device_data.output_resolution.x + 0.5);
                      UINT height = UINT(device_data.output_resolution.y + 0.5);
 
@@ -22095,8 +22290,7 @@ namespace
                      }
 
                      native_swapchain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, swap_chain_flags);
-                     };
-
+                  };
 
                   std::thread thread(ThreadFunc);
                   // Detach it so it runs independently from within the "Present" call
@@ -22113,7 +22307,7 @@ namespace
                   SetForegroundWindow(game_window);
                   SetFocus(game_window);
 #else // These won't work
-                  SendMessage(game_window, WM_KILLFOCUS, (WPARAM)NULL, 0); // Tell the window it lost keyboard focus
+                  SendMessage(game_window, WM_KILLFOCUS, (WPARAM)NULL, 0);          // Tell the window it lost keyboard focus
                   SendMessage(game_window, WM_ACTIVATE, WA_INACTIVE, (LPARAM)NULL); // Also notify it is inactive
 #endif
                }
@@ -22191,7 +22385,7 @@ namespace
             }
 #endif // DEVELOPMENT
 
-				ImGui::EndTabItem(); // Settings
+            ImGui::EndTabItem(); // Settings
          }
 
 #if DEVELOPMENT // Use the proper technical name of what this is
@@ -22240,7 +22434,7 @@ namespace
             }
 #if DEVELOPMENT || TEST
             // Show restore button (basically "undo")
-            //if (!auto_recompile_defines) // We could do this, but it's better to just always grey it out in that case
+            // if (!auto_recompile_defines) // We could do this, but it's better to just always grey it out in that case
             {
                bool needs_compilation = defines_need_recompilation;
                for (uint32_t i = 0; i < shader_defines_data.size() && !needs_compilation; i++)
@@ -22308,7 +22502,7 @@ namespace
 #endif
 
 #if 0 // We simply add a "*" next to the reload shaders button now instead
-            // Show when the defines are "dirty" (shaders need recompile)
+      // Show when the defines are "dirty" (shaders need recompile)
             {
                bool needs_compilation = defines_need_recompilation;
                for (uint32_t i = 0; i < shader_defines_data.size() && !needs_compilation; i++)
@@ -22386,14 +22580,14 @@ namespace
                   char user_facing_name_buffer[SHADER_DEFINES_MAX_NAME_LENGTH]{};
                   strncpy(user_facing_name_buffer, user_facing_name.c_str(), sizeof(user_facing_name_buffer) - 1);
 
-                  ImGui::InputText("", user_facing_name_buffer, sizeof(user_facing_name_buffer), ImGuiInputTextFlags_ReadOnly );
+                  ImGui::InputText("", user_facing_name_buffer, sizeof(user_facing_name_buffer), ImGuiInputTextFlags_ReadOnly);
                }
                show_tooltip |= ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
                ImGui::PopID();
 
                // TODO: fix this, it doesn't seem to work
                auto ModulateValueText = [](ImGuiInputTextCallbackData* data) -> int
-                  {
+               {
 #if 0
                      if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit)
                      {
@@ -22411,8 +22605,8 @@ namespace
                         };
                      };
 #endif
-                     return 0;
-                  };
+                  return 0;
+               };
 
                ImGui::SameLine();
                ImGui::PushID(shader_defines_data[i].value_hint.data());
@@ -22455,9 +22649,9 @@ namespace
                      }
                   }
                   else
-                  {  // Compute enough width for one number plus the dropdown arrow and padding
+                  { // Compute enough width for one number plus the dropdown arrow and padding
                      float text_width = ImGui::CalcTextSize("00").x;
-                     float arrow_width = ImGui::GetFrameHeight(); // Roughly the width of the arrow button
+                     float arrow_width = ImGui::GetFrameHeight();          // Roughly the width of the arrow button
                      float padding = ImGui::GetStyle().ItemInnerSpacing.x; // Some padding
 
                      ImGui::SetNextItemWidth(text_width + arrow_width + padding); // Should be enough for a combo with a 0-9 range
@@ -22486,7 +22680,7 @@ namespace
 #endif
                }
 #if 0 // Disabled for now as this is not very user friendly and could accidentally happen if two defines start with the same name.
-               // Reset the define name if it matches another one
+      // Reset the define name if it matches another one
                if (name_edited && ShaderDefineData::ContainsName(shader_defines_data, shader_defines_data[i].editable_data.GetName(), i))
                {
                   shader_defines_data[i].Clear();
@@ -22619,9 +22813,15 @@ namespace
             static std::string development_state = "Finished"; // "ModDevelopmentState::Finished" by default
             switch (Globals::DEVELOPMENT_STATE)
             {
-            case Globals::ModDevelopmentState::NonFunctional: development_state = "Non Functional"; break;
-            case Globals::ModDevelopmentState::WorkInProgress: development_state = "Work in Progress"; break;
-            case Globals::ModDevelopmentState::Playable: development_state = "Playable"; break;
+            case Globals::ModDevelopmentState::NonFunctional:
+               development_state = "Non Functional";
+               break;
+            case Globals::ModDevelopmentState::WorkInProgress:
+               development_state = "Work in Progress";
+               break;
+            case Globals::ModDevelopmentState::Playable:
+               development_state = "Playable";
+               break;
             }
             ImGui::Text("Development State: %s", development_state.c_str());
 #if TEST
@@ -22662,7 +22862,7 @@ void Init(bool async)
    game->OnInit(async);
 
    assert(luma_settings_cbuffer_index < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT);
-   assert(luma_data_cbuffer_index < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT); // Not necessary for custom shaders unless used, but necessary for the final luma display composition shader (unless we forced that one to use cb0 or something for the buffer)
+   assert(luma_data_cbuffer_index < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT);                                                  // Not necessary for custom shaders unless used, but necessary for the final luma display composition shader (unless we forced that one to use cb0 or something for the buffer)
    assert(luma_settings_cbuffer_index == -1 || luma_data_cbuffer_index == -1 || luma_settings_cbuffer_index != luma_data_cbuffer_index); // Can't be equal!
 
    cb_luma_global_settings.SwapchainSize = float2(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)); // An arbitrary guess that is better than 1920x1080 or 1x1
@@ -22676,6 +22876,21 @@ void Init(bool async)
    cb_luma_global_settings.SRType = 0; // We can't set this to >0 until we verified SR engaged correctly and is running
 
    // Note: these shouldn't load any dlls etc, they are just creating an empty class
+#if ENABLE_D3D12_SR
+   // The user picks the D3D11 implementation (DLSS, FSR 3) or the in-process D3D12 one (XeSS has only that), see "SRBridge::ApiSwitch"
+   {
+      std::unique_ptr<SR::SuperResolutionImpl> d3d11_dlss, d3d11_fsr;
+#if ENABLE_NGX
+      d3d11_dlss = std::make_unique<NGX::DLSS>();
+#endif
+#if ENABLE_FIDELITY_SK
+      d3d11_fsr = std::make_unique<FidelityFX::FSR>();
+#endif
+      sr_implementations[SR::Type::DLSS] = std::make_unique<SRBridge::ApiSwitch>(std::move(d3d11_dlss), std::make_unique<SRBridge::LocalBridge>(SR::Type::DLSS));
+      sr_implementations[SR::Type::FSR] = std::make_unique<SRBridge::ApiSwitch>(std::move(d3d11_fsr), std::make_unique<SRBridge::LocalBridge>(SR::Type::FSR));
+      sr_implementations[SR::Type::XeSS] = std::make_unique<SRBridge::ApiSwitch>(nullptr, std::make_unique<SRBridge::LocalBridge>(SR::Type::XeSS));
+   }
+#else
 #if ENABLE_NGX
    sr_implementations[SR::Type::DLSS] = std::make_unique<NGX::DLSS>();
 #endif
@@ -22685,9 +22900,11 @@ void Init(bool async)
 #if ENABLE_XESS
    sr_implementations[SR::Type::XeSS] = std::make_unique<Intel::XeSS>();
 #endif
+#endif
 #if ENABLE_SR_BRIDGE
    sr_implementations[SR::Type::DLSS] = std::make_unique<SRBridge::Bridge>(SR::Type::DLSS);
    sr_implementations[SR::Type::FSR] = std::make_unique<SRBridge::Bridge>(SR::Type::FSR);
+   sr_implementations[SR::Type::XeSS] = std::make_unique<SRBridge::Bridge>(SR::Type::XeSS);
 #endif
 #if ENABLE_LUMA_TAA
    sr_implementations[SR::Type::LumaTAA] = std::make_unique<LumaTAA::TAA>();
@@ -22753,6 +22970,11 @@ void Init(bool async)
       int dlss_render_preset_i = static_cast<int>(dlss_render_preset);
       reshade::get_config_value(runtime, NAME, "DLSSRenderPreset", dlss_render_preset_i);
       dlss_render_preset = static_cast<unsigned int>(dlss_render_preset_i);
+#endif
+#if ENABLE_D3D12_SR
+      int sr_api_i = int(SRBridge::api_setting);
+      reshade::get_config_value(runtime, NAME, "SuperResolutionAPI", sr_api_i);
+      SRBridge::api_setting = SRBridge::Api(std::clamp(sr_api_i, int(SRBridge::Api::D3D11), int(SRBridge::Api::D3D12)));
 #endif
 #if ENABLE_LUMA_TAA
       int taa_quality = LumaTAA::quality.load();
@@ -22826,7 +23048,7 @@ void Init(bool async)
       }
 
       game->LoadConfigs();
-		ASSERT_ONCE(global_devices_data.empty()); // There should be no devices yet, otherwise we need to set "cb_luma_global_settings_dirty" to true! Hence why the "precompile_custom_shaders" code below seems to make no sense?
+      ASSERT_ONCE(global_devices_data.empty()); // There should be no devices yet, otherwise we need to set "cb_luma_global_settings_dirty" to true! Hence why the "precompile_custom_shaders" code below seems to make no sense?
 
       OnDisplayModeChanged();
 
@@ -22962,7 +23184,7 @@ void Init(bool async)
    if (async && precompile_custom_shaders)
    {
       thread_auto_compiling_running = true;
-      static std::binary_semaphore async_shader_compilation_semaphore{ 0 };
+      static std::binary_semaphore async_shader_compilation_semaphore{0};
       thread_auto_compiling = std::thread([]
          {
             // We need to lock this mutex for the whole async shader loading, so that if the game starts loading shaders (from another thread), we can already see if we have a custom version and live load it ("live_load"), otherwise the "custom_shaders_cache" list would be incomplete
@@ -22971,9 +23193,9 @@ void Init(bool async)
             async_shader_compilation_semaphore.release();
             CompileCustomShaders(nullptr, true);
             const std::shared_lock lock_device(s_mutex_device);
-            // Create custom device shaders if the device has already been created before custom shaders were loaded on boot, independently of "block_draw_until_device_custom_shaders_creation".
-            // Note that this might be unsafe if "global_devices_data" was already being destroyed in "OnDestroyDevice()" (I'm not sure you can create device resources anymore at that point).
-            // TODO: can this even ever happen? Having devices already created/added here? I don't think so... however, "async_shader_compilation_semaphore" below will hang in some games
+         // Create custom device shaders if the device has already been created before custom shaders were loaded on boot, independently of "block_draw_until_device_custom_shaders_creation".
+         // Note that this might be unsafe if "global_devices_data" was already being destroyed in "OnDestroyDevice()" (I'm not sure you can create device resources anymore at that point).
+         // TODO: can this even ever happen? Having devices already created/added here? I don't think so... however, "async_shader_compilation_semaphore" below will hang in some games
 #if DX11
             for (auto global_device_data : global_devices_data)
             {
@@ -22984,8 +23206,7 @@ void Init(bool async)
                }
             }
 #endif
-            thread_auto_compiling_running = false;
-         });
+            thread_auto_compiling_running = false; });
       async_shader_compilation_semaphore.acquire();
    }
 
@@ -23108,7 +23329,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
          OverlayLog::AddMessage(Globals::DEVELOPMENT_STATE == Globals::ModDevelopmentState::NonFunctional ? OverlayLog::LogLevel::Error : OverlayLog::LogLevel::Warning,
             "You are playing a mod that is either non functional or non finished. Proceed at your own risk.\nReporting issues is generally not necessary unless you were asked for testing.",
             10.f);
-		}
+      }
 #endif
 
 #if DISABLE_RESHADE
@@ -23542,7 +23763,7 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       reshade::unregister_event<reshade::addon_event::reshade_set_effects_state>(OnReShadeSetEffectsState);
       reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReShadeReloadedEffects);
 #endif // DEVELOPMENT
-      
+
       reshade::unregister_overlay(NAME, OnRegisterMessagesOverlay);
 
       reshade::unregister_overlay(NAME, OnRegisterMainOverlay);
@@ -23580,12 +23801,16 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
       if (thread_auto_dumping.joinable())
       {
          thread_auto_dumping.detach();
-         while (thread_auto_dumping_running) {}
+         while (thread_auto_dumping_running)
+         {
+         }
       }
       if (thread_auto_compiling.joinable())
       {
          thread_auto_compiling.detach();
-         while (thread_auto_compiling_running) {}
+         while (thread_auto_compiling_running)
+         {
+         }
       }
       // We can't lock "s_mutex_device" here, but we also know that if this ptr is valid, then there's no other thread able to run now and change it.
       // ReShade is unloaded when the last device is destroyed so we should have already received an event to clear this thread anyway.

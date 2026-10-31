@@ -21,7 +21,11 @@
 #define ENABLE_FSR_DEBUG_VIEW 0
 #endif
 
+#if DX12
+namespace FidelityFX::inline D3D12
+#else
 namespace FidelityFX
+#endif
 {
 #if DX12
    // Index in the upscaler versions the runtime lists for the device (logged at init), -1 for its default. Applies at the next context creation.

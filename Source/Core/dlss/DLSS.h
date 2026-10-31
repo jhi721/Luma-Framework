@@ -13,7 +13,11 @@
 
 #if ENABLE_NGX
 
+#if DX12
+namespace NGX::inline D3D12
+#else
 namespace NGX
+#endif
 {
 	// DLSS SR
 	class DLSS : public SR::SuperResolutionImpl

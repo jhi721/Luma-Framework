@@ -14,7 +14,11 @@
 
 #if ENABLE_XESS
 
+#if DX12
+namespace Intel::inline D3D12
+#else
 namespace Intel
+#endif
 {
    // XeSS SR, from Intel's signed "libxess.dll" (loaded at runtime)
    class XeSS : public SR::SuperResolutionImpl

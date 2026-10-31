@@ -1559,7 +1559,7 @@ public:
 
       // DLSS/FSR/Luma TAA: their depth and the camera motion from the scene's alpha, the CPU copies of vc4 (dgVoodoo maps it or updates
       // it), and the motion vector target written by every blend state
-      sr_game_tooltip = "DLSS and FSR 3 require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
+      sr_game_tooltip = "DLSS, FSR and XeSS require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
       native_shaders_definitions.emplace(CompileTimeStringHash("ME Motion Vector Fill CS"),
          ShaderDefinition{.file_name = "Luma_ME_MotionVectorFill", .type = reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("ME Copy Back PS"),

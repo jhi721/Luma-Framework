@@ -394,6 +394,7 @@ namespace D3D12Trace
    void ResolveTableDescriptors(std::vector<TraceDrawCallData>* entries, DeviceData* device_data)
    {
       reshade::api::device* device = device_data->reshade_device;
+      const std::shared_lock lock_live(device_data->live_resources.mutex);
       for (TraceDrawCallData& entry : *entries)
       {
          for (const TraceDrawCallData::TableDescriptor& table_descriptor : entry.table_descriptors)
@@ -406,7 +407,9 @@ namespace D3D12Trace
             }
             else if (table_descriptor.type != 'b')
             {
-               FillView(device, &entry, table_descriptor.type, table_descriptor.index, true, descriptor ? descriptor->handle : 0, descriptor ? descriptor->view : D3D12State::ViewInfo{});
+               // A view of a destroyed resource is a stale slot, shown as unbound
+               const bool is_live = descriptor && (device_data->live_resources.resources.contains(descriptor->view.resource) || device_data->back_buffers.contains(descriptor->view.resource));
+               FillView(device, &entry, table_descriptor.type, table_descriptor.index, true, is_live ? descriptor->handle : 0, is_live ? descriptor->view : D3D12State::ViewInfo{});
             }
             else if (descriptor && descriptor->handle != 0)
             {
