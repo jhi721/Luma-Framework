@@ -466,7 +466,8 @@ namespace MotionVectorPatch
    // "blend_alpha_blended_target"): opaque texels (a chain link fence's wires, Mirror's Edge) move with the draw and keep their history,
    // empty ones keep what's behind. The weight is the alpha thresholded around 0.5 (0 up to 0.4, 1 from 0.6): faint texels (a dirty or
    // cracked windshield, Bayonetta) would otherwise pull the motion of the background seen through them toward their own.
-   // No mask ("reactive_slot" ignored): FSR's masks are for content without motion vectors.
+   // A mask too (x and y = a) only with a "reactive_slot": FSR's masks are for content without motion vectors, so it is for the draws
+   // whose motion vectors are only the camera's (Mass Effect Legendary Edition's particles).
    enum class ReactiveMode : uint8_t
    {
       ALPHA,
@@ -482,7 +483,7 @@ namespace MotionVectorPatch
       auto& [chunks, program, input_signature, output_signature, inputs, outputs, target, tokens, instructions, first_body] = shader;
       const bool additive = mode == ReactiveMode::ADDITIVE;
       const bool motion_vectors = mode == ReactiveMode::ALPHA_MOTION_VECTORS;
-      const bool mask = !motion_vectors && reactive_slot != UINT32_MAX;
+      const bool mask = reactive_slot != UINT32_MAX;
       // The game's other targets are written as they were (UE3's translucents also write o1.x, Mass Effect Legendary Edition); the
       // blended color, and its alpha, must then be RT0's
       if ((outputs.size() > 1 && target.reg != 0) || (!mask && !motion_vectors))
@@ -640,7 +641,7 @@ namespace MotionVectorPatch
                                             weight_offset,
                                          });
       }
-      else
+      if (mask && !additive)
       {
          reactive.insert(reactive.end(), {mov | ENCODE_D3D10_SB_INSTRUCTION_SATURATE(true), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, mask_xy), reactive_slot, Source(D3D10_SB_OPERAND_TYPE_TEMP, 3, 3, 3, 3), color});
       }
