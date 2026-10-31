@@ -13,6 +13,8 @@
 #define GEOMETRY_SHADER_SUPPORT 0
 #define ENABLE_SMAA 1 // replaces the game's FXAA pass (FXAA AA mode) with SMAA
 #define ENABLE_RCAS 1 // optional sharpening of the SMAA or DLSS/FSR output (Core's "RCAS PS")
+// A third "Super Resolution" choice next to DLSS and FSR 3, drawn in process on any GPU, upscaling under the render scale
+#define ENABLE_LUMA_TAA 1
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
 #define SMAA_SMOOTH_U_SHAPES 0
 // Every pass Luma reissues itself (the DOF-variant resolve run natively first, the output-sized post passes, the upscaled
@@ -4187,9 +4189,9 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Mass Effect: Andromeda\" is developed by DristoforColumb and is open source and free.\n"
-         "It replaces the game's TAA with DLSS or FSR 3 upscaling and its FXAA with SMAA, plus 16x anisotropic filtering and a fix for the game's TAA jitter.\n"
+         "It replaces the game's TAA with DLSS, FSR 3 or Luma TAA upscaling and its FXAA with SMAA, plus 16x anisotropic filtering and a fix for the game's TAA jitter.\n"
          "With the game's HDR enabled it also replaces the native HDR tonemap with a higher quality one.\n"
-         "Set Anti-Aliasing in the game's video settings to TAA for DLSS and FSR 3, or to FXAA for SMAA.\n"
+         "Set Anti-Aliasing in the game's video settings to TAA for DLSS, FSR 3 and Luma TAA, or to FXAA for SMAA.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
          "If you enjoy it, consider donating.");
