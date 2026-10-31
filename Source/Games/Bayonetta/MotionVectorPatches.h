@@ -1,6 +1,7 @@
 #pragma once
 
 #include "..\..\Core\includes\motion_vector_patch.h"
+#include "..\..\Core\includes\scene_motion_vectors.h"
 
 // The game's slots for Core's DXBC motion vector patch (described in "motion_vector_patch.h"; dgVoodoo's registers in
 // "MotionVectorPatch::DgVoodoo"). The second vertex shader run reads the previous frame's per-draw constants (vc4: view projection or
@@ -31,4 +32,16 @@ namespace MotionVectorPatches
    // No view projection row filter: c8 alone refuses the world view projection shaders (71 of 144 offline); shadow and screen passes
    // are told apart by their bound targets instead
    constexpr MotionVectorPatch::Layout layout = MotionVectorPatch::DgVoodoo::MakeLayout();
+   // Core's "SceneMotionVectors" config. The camera kinds in order (a position uses all 4 rows of a product, but only the first is
+   // required: the kinds were told apart by it), the tie-break rows in order, and the kind that sets the frame's camera.
+   constexpr std::array<SceneMotionVectors::Camera, 2> cameras = {{
+      {.type = SceneMotionVectors::CameraType::VIEW_PROJECTION, .row = view_projection_row, .rows_read = 1},
+      {.type = SceneMotionVectors::CameraType::WORLD_VIEW_PROJECTION, .row = world_view_projection_row, .rows_read = 1},
+   }};
+   constexpr std::array<SceneMotionVectors::TieBreakRow, 3> tie_break_rows = {{
+      {.row = first_bone_row, .relative = true},
+      {.row = world_row},
+      {.row = effect_world_row},
+   }};
+   constexpr SceneMotionVectors::Camera frame_camera = cameras[0];
 } // namespace MotionVectorPatches

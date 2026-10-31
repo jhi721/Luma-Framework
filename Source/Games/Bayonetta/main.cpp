@@ -8,9 +8,9 @@
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads "last_draw_dispatch_data", which Publishing only fills with this
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
-// Luma TAA among the upscalers (in process; DLSS and FSR 3 run in the SR bridge's x64 helper, "UseLumaSRBridge"). Off: the floor
-// flickers under it on a static frame (DLAA and FSR don't).
-#define ENABLE_LUMA_TAA 0
+// Luma TAA among the upscalers (in process; DLSS and FSR 3 run in the SR bridge's x64 helper, "UseLumaSRBridge"). The floor
+// flickered under it on a static frame (DLAA and FSR don't).
+#define ENABLE_LUMA_TAA 1
 // The game has MSAA but no shader AA: SMAA is added on the canvas after the scene copy (see "DrawSMAAOnCanvas")
 #define ENABLE_SMAA 1
 // SMAA's area texture without the U-shape smoothing (see "SMAA_AreaTex_SharpU.h"), as TW1 and ME1
@@ -144,45 +144,9 @@ constexpr bool g_sr_reactive_enable = true;
 constexpr float g_sr_reactive_scale = 2.f;
 constexpr float g_sr_reactive_threshold = 0.5f;
 #endif
-// "DrawWithMotionVectors" refusals, counted per frame in DEVELOPMENT ("mv.rejected.*")
-enum MotionVectorReject
-{
-   REJECT_EXTRA_TARGET,
-   REJECT_NO_SCENE,
-   REJECT_DEPTH_TEST,
-   REJECT_BLEND,
-   REJECT_OTHER_DEPTH_COLOR,
-   REJECT_FORMAT,
-   REJECT_SIZE,
-   REJECT_CREATE,
-   REJECT_SHADERS,
-   REJECT_NO_CAMERA,
-   REJECT_COUNT
-};
-#if DEVELOPMENT
-constexpr const char* MOTION_VECTOR_REJECT_NAMES[REJECT_COUNT] = {"extra_target", "no_scene", "depth_test", "blend", "other_depth_color", "format", "size", "create", "shaders", "no_camera"};
-#endif
-
-// A draw's blend for the reactive masks (see "ClassifyBoundBlend")
-enum class ReactiveBlend : uint8_t
-{
-   NONE,
-   ALPHA,
-   ADDITIVE,
-};
-
-// A pixel shader's patch: the motion vector target, the mask target of an alpha blended or additive draw, or an alpha blended
-// draw's own motion vectors; or the MSAA alpha to coverage
-enum class PixelShaderPatch : uint8_t
-{
-   MOTION_VECTORS,
-   MASK_ALPHA,
-   MASK_ADDITIVE,
-   BLENDED,
-   COVERAGE,
-   COUNT
-};
-constexpr const char* PIXEL_SHADER_PATCH_NAMES[size_t(PixelShaderPatch::COUNT)] = {"MV PS", "MV PS (mask)", "MV PS (mask)", "MV PS (blended)", "Coverage PS"};
+using SceneMotionVectors::PixelShaderPatch;
+// The coverage patch is the game's first pixel shader patch after Core's
+constexpr PixelShaderPatch COVERAGE_PATCH = PixelShaderPatch::GAME_0;
 
 // The Steam executable, whose fixed addresses the game code patches below use (relocations stripped: fixed base)
 static bool IsSteamExecutable()
@@ -533,7 +497,7 @@ struct BayonettaGameDeviceData final : public GameDeviceData
 #endif
 
    // ---- DLAA / FSR 3 Native AA / Luma TAA with motion vectors and jitter from patched shaders (Mirror's Edge's path with The Witcher
-   // 2's CPU cuts, one per-draw buffer: dgVoodoo's vc4) ----
+   // 2's CPU cuts, one per-draw buffer: dgVoodoo's vc4; the state machine is Core's "SceneMotionVectors") ----
    // DLSS and FSR run in the x64 helper of Core's SR bridge (the game is 32-bit, see "SRBridge.h"), Luma TAA in process.
    // An upscaler is picked, hasn't failed (it then gives way to SMAA until picked again) and the game's MSAA is off, latched at present
    // for the whole frame: a selection made after the motion vector state was set would otherwise run the upscaler on mixed state
@@ -543,72 +507,21 @@ struct BayonettaGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11BlendState> sr_rgb_blend_state;
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
 
-   std::atomic<bool> mv_active = false; // Motion vectors and jitter this frame: an upscaler or the DEV toggle (set at present)
-   std::shared_mutex mv_mutex;
-   // A game shader's patched version (null if refused), patched on first use, by its hash; a vertex shader's with the bytes of vc4 it
-   // reads ("DXBC::ConstantBufferBytes": the previous frame's copy uploads only those), the vc4 byte offset of its camera rows (the
-   // view projection or the world view projection, 0 for none: no motion vectors) and of its tie-break transform (0 for none)
-   template <typename T>
-   struct PatchedShader
-   {
-      com_ptr<T> shader;
-      UINT read_size = 0;
-      UINT camera_offset = 0;
-      UINT translation_offset = 0;
-   };
-   std::unordered_map<uint32_t, PatchedShader<ID3D11VertexShader>> mv_vertex_shaders;
-   // By "PixelShaderPatch" (the coverage one null for every shader without a masked material's clip, see
-   // "CoveragePatch::PatchPixelShader")
-   std::unordered_map<uint32_t, PatchedShader<ID3D11PixelShader>> patched_pixel_shaders[size_t(PixelShaderPatch::COUNT)];
-   // The motion vector target (sized like the scene; the alpha blending states blend it like their color, the others write it
-   // unblended, see "OnCreateBlendState")
-   com_ptr<ID3D11Texture2D> mv_texture;
-   com_ptr<ID3D11RenderTargetView> mv_rtv;
-   com_ptr<ID3D11UnorderedAccessView> mv_uav; // Null without typed UAV loads of its format (then no upscaler)
-   // The upscaler's depth, built from the depth prepass by the fill (the game's depth has no shader resource view)
-   com_ptr<ID3D11Texture2D> mv_device_depth;
-   com_ptr<ID3D11UnorderedAccessView> mv_device_depth_uav;
-   // The reactive and transparency & composition masks (FSR, Luma TAA), written by the fill from "mv_reactive_target"
-   com_ptr<ID3D11Texture2D> mv_reactive;
-   com_ptr<ID3D11UnorderedAccessView> mv_reactive_uav;
-   com_ptr<ID3D11Texture2D> mv_transparency;
-   com_ptr<ID3D11UnorderedAccessView> mv_transparency_uav;
-   // The additive draws' mask of the previous frame, which the fill reads and replaces: a laser that went out wrote nothing this
-   // frame but is still in the upscaler's history (R32_FLOAT: typed UAV loads of other formats are optional in D3D11)
-   com_ptr<ID3D11Texture2D> mv_reactive_previous;
-   com_ptr<ID3D11UnorderedAccessView> mv_reactive_previous_uav;
-   // What the alpha blended draws wrote (x reactive, y transparency & composition; max blended, see "OnCreateBlendState"), read by the
-   // fill. Created when a mask user first runs, gone "IDLE_RELEASE_FRAMES" after the fill last wrote them.
-   com_ptr<ID3D11Texture2D> mv_reactive_target;
-   com_ptr<ID3D11RenderTargetView> mv_reactive_target_rtv;
-   com_ptr<ID3D11ShaderResourceView> mv_reactive_target_srv;
-   uint32_t sr_reactive_frame = 0;
-   // A frame opens at its first mesh draw into the scene (the jitter is chosen there), starts at its first motion vector draw (the
-   // target is cleared) and ends at the first post pass ("shader_hashes_ScenePost"), once per present.
-   bool mv_scene_open = false;
-   bool mv_scene_done = false;
-   bool mv_frame_ended = true;
-   bool mv_fill_pending = false;
+   // The motion vector targets, camera, objects and vc4 copies; "mv.active": motion vectors and jitter this frame (an upscaler or the
+   // DEV toggle, set at present)
+   SceneMotionVectors::State mv;
    // The upscaler drew the last frame: only then the scene jitters (frames it skips would reach the screen jittered)
    bool mv_jitter_allowed = false;
    float sr_vert_fov = 1.0471976f; // FSR's vertical FOV (radians): the last camera's, 60 degrees until one is seen
    // The upscalers' near and far (game units): the last camera's with a usable projection, Core's defaults until one is seen
    float sr_near_plane = SR::SuperResolutionImpl::DrawData{}.near_plane;
    float sr_far_plane = SR::SuperResolutionImpl::DrawData{}.far_plane;
-   // The scene's size, the one of its depth: the 16:9 rect of the canvas with PreserveAspect, not the output's. Everything the
-   // upscaler reads is this size.
-   uint2 mv_scene_size = {};
-   com_ptr<ID3D11Resource> mv_depth; // The scene depth (the depth view's resource)
-   // The fp16 scene the motion vector draws write, and the game's view of it (the upscaler's copy back)
-   com_ptr<ID3D11Resource> mv_scene_color;
-   com_ptr<ID3D11RenderTargetView> mv_scene_rtv;
    // The copy of the scene the first post pass reads, null if it reads none. The upscaler's output goes into both
    // ("Bayonetta Copy Back PS"). Found from the game's last CopyResource of the scene: the camera blur (cmx) also reads a copy of the
    // velocity target, whose description matches the scene's.
    com_ptr<ID3D11Resource> mv_scene_copy;
    com_ptr<ID3D11Resource> mv_scene_last_copy;
    com_ptr<ID3D11RenderTargetView> mv_scene_copy_rtv;
-   com_ptr<ID3D11Buffer> mv_fill_buffer;
    // The depth prepass' R32F target (1 - z/w, next to the normals): where the fill reads the depth. "prepass_drawn": it was drawn into
    // this frame; "prepass_rtv" and "prepass_is_depth" classify the last target seen next to a second one.
    com_ptr<ID3D11Resource> prepass_depth;
@@ -616,82 +529,10 @@ struct BayonettaGameDeviceData final : public GameDeviceData
    ID3D11RenderTargetView* prepass_rtv = nullptr;
    bool prepass_is_depth = false;
    bool prepass_drawn = false;
-   // The projection jitter (pixels, +y down), chosen when the scene opens; its NDC offset is at VS "MotionVectorPatches::jitter_slot"
-   // of every mesh draw depth tested against the scene
-   std::array<float, 2> mv_jitter = {};
-   std::array<float, 2> mv_jitter_ndc = {};  // The same offset in NDC (y up), as the jitter buffer holds it
-   com_ptr<ID3D11ShaderResourceView> mv_srv; // SMAA T2x's view of the motion vector target
-   bool mv_filled = false;                   // The fill wrote this frame's motion vectors (reset at present)
-   com_ptr<ID3D11Buffer> mv_jitter_buffer;
-   // Per-draw lookups kept for the next draw (reset when the scene opens): the jitter path's last depth view and whether it's the scene
-   // depth (its depth test: "bound_states.DepthTested"), the motion vector path's last accepted targets and the last blend state's
-   // opacity, the last vertex and pixel shader's patched versions (owned by the maps above, never erased)
-   ID3D11DepthStencilView* jitter_dsv = nullptr;
-   bool jitter_dsv_scene = false;
-   ID3D11DepthStencilView* mv_accepted_dsv = nullptr;
-   ID3D11BlendState* mv_blend_state = nullptr; // See "ClassifyBoundBlend"
-   bool mv_blend_opaque = true;
-   bool mv_alpha_blended = false;
-   ReactiveBlend mv_reactive_blend = ReactiveBlend::NONE;
-   uint32_t mv_last_vertex_shader_hash = 0;
-   const PatchedShader<ID3D11VertexShader>* mv_last_vertex_shader = nullptr;
-   uint32_t mv_last_pixel_shader_hash = 0;
-   ID3D11PixelShader* mv_last_pixel_shader = nullptr;
-   PatchedDraws::BoundShader<ID3D11VertexShader> mv_bound_vertex_shader;
-   PatchedDraws::BoundShader<ID3D11PixelShader> mv_bound_pixel_shader;
-   // The scene's targets refused by "DrawWithMotionVectors" (other depth or color, format, size) and the reason, the targets
-   // "OpenScene" refused (not the scene's); reset when the scene opens (the refused ones at present). The shadow maps and the
-   // prepass' targets are refused once per frame, not per draw.
-   ID3D11RenderTargetView* mv_refused_rtv = nullptr;
-   ID3D11DepthStencilView* mv_refused_dsv = nullptr;
-   MotionVectorReject mv_refused_reason = REJECT_COUNT;
+   bool mv_filled = false; // The fill wrote this frame's motion vectors (reset at present)
+   // The targets "OpenScene" refused (not the scene's); reset at present
    ID3D11RenderTargetView* open_refused_rtv = nullptr;
    ID3D11DepthStencilView* open_refused_dsv = nullptr;
-   // The marker texels got their camera motion before the frame's first alpha blended motion vector draw (see "DrawWithMotionVectors")
-   bool mv_markers_filled = false;
-   // The immediate context's bindings as the game last bound them (see "PatchedDraws::BoundStates"), vc4 at
-   // "MotionVectorPatches::object_slot"; the jitter buffer's at "MotionVectorPatches::jitter_slot" ("BindJitter")
-   PatchedDraws::BoundStates<MotionVectorPatches::object_slot, MotionVectorPatches::jitter_slot> bound_states;
-   // CPU copies of the vc4 buffers the motion vector draws bind (see "PatchedDraws::ObjectConstants"). Not always from one thread:
-   // the D3D9 Reset of a resolution change maps from the game's window thread. Restarted at present when motion vectors restart
-   // (dgVoodoo presents from another thread than the frame's).
-   using ConstantsCopy = PatchedDraws::ObjectConstants::Copy;
-   PatchedDraws::ObjectConstants mv_constants;
-   // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
-   PatchedDraws::PreviousConstants mv_previous_constants;
-   // Motion vector draws by draw key (shaders, buffers, arguments), with their tie-break transform and vc4. A draw takes the previous
-   // frame's vc4 of its key's nearest draw (same object, a frame earlier), its camera included.
-   struct MotionVectorObject
-   {
-      PatchedDraws::ObjectTransform transform;
-      ConstantsCopy constants;
-   };
-   PatchedDraws::FrameObjects<MotionVectorObject, PatchedDraws::KeyHash> mv_objects;
-   // The frame's camera (vc4 of its first scene depth writing view projection draw) and the previous frame's
-   ConstantsCopy mv_camera;
-   ConstantsCopy mv_previous_camera;
-   // Current clip space to the previous frame's (column vectors), identity without a previous camera: the fill's, and the world view
-   // projection of a draw without a previous one
-   Math::Matrix44D mv_reprojection;
-   uint32_t mv_frame_index = 0;              // The Luma frame index of the last motion vector frame
-   std::vector<uint8_t> mv_camera_only_copy; // An unmatched draw's constants with last frame's camera (reused)
-
-#if DEVELOPMENT
-   // Per frame counts for the MCP (the last complete frame's)
-   struct MotionVectorStats
-   {
-      uint32_t motion_vector_draws = 0, jitter_draws = 0, reactive_draws = 0, matched = 0, camera_only = 0, other_camera = 0, uncopied = 0, maps = 0, updates = 0, other_maps = 0, sr_draws = 0;
-      uint32_t tiebreak_collisions = 0; // Objects sharing a key and a transform with other constants ("PatchedDraws::CountTieBreakCollisions")
-      uint32_t untransformed = 0;       // Motion vector draws of vertex shaders without a tie-break transform (camera motion only)
-      uint32_t bound_state_mismatches = 0;
-      uint32_t constants_pool = 0;
-      uint32_t prepass_drawn = 0;
-      uint32_t ended_by = 0; // The ending pass's PS hash
-      uint32_t rejected[REJECT_COUNT] = {};
-   };
-   MotionVectorStats mv_stats, mv_last_stats;
-   MotionVectorReject mv_draw_reject = REJECT_COUNT; // The current draw's refusal ("REJECT_COUNT" for none), for the MCP trace note
-#endif
 
    // "sr_rgb_blend_state" (the upscaler copy back and SMAA T2x's resolve: the canvas alpha stays), made at its first use
    ID3D11BlendState* GetRGBBlendState(ID3D11Device* native_device)
@@ -734,32 +575,6 @@ struct BayonettaGameDeviceData final : public GameDeviceData
          t2x_frame_rtvs[i].reset();
          t2x_frame_srvs[i].reset();
       }
-   }
-
-   // The motion vector target and the device depth the fill writes, recreated at their next use
-   void ReleaseMotionVectorTargets()
-   {
-      mv_texture.reset();
-      mv_rtv.reset();
-      mv_srv.reset();
-      mv_uav.reset();
-      mv_device_depth.reset();
-      mv_device_depth_uav.reset();
-      ReleaseReactiveMasks();
-   }
-
-   // The reactive masks and what the draws wrote for them, recreated at their next use
-   void ReleaseReactiveMasks()
-   {
-      mv_reactive.reset();
-      mv_reactive_uav.reset();
-      mv_transparency.reset();
-      mv_transparency_uav.reset();
-      mv_reactive_previous.reset();
-      mv_reactive_previous_uav.reset();
-      mv_reactive_target.reset();
-      mv_reactive_target_rtv.reset();
-      mv_reactive_target_srv.reset();
    }
 };
 
@@ -829,7 +644,7 @@ class Bayonetta final : public Game
       auto* const t2x_blend_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Bayonetta SMAA T2x Neighborhood Blending PS"));
       auto* const t2x_resolve_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Bayonetta SMAA T2x Resolve PS"));
       const uint32_t frame_index = cb_luma_global_settings.FrameIndex;
-      bool t2x = gd.t2x_active && gd.mv_filled && gd.mv_srv && copy_vs && t2x_weight_ps && t2x_blend_ps && t2x_resolve_ps && GetViewTextureSize(gd.mv_srv.get()) == size;
+      bool t2x = gd.t2x_active && gd.mv_filled && gd.mv.srv && copy_vs && t2x_weight_ps && t2x_blend_ps && t2x_resolve_ps && GetViewTextureSize(gd.mv.srv.get()) == size;
       const int t2x_current = int(frame_index & 1);
       bool t2x_history = gd.t2x_frames[0] && gd.t2x_frame + 1 == frame_index;
       if (t2x && GetViewTextureSize(gd.t2x_frame_srvs[0].get()) != size)
@@ -901,12 +716,12 @@ class Bayonetta final : public Game
          ID3D11Buffer* const metrics_buffer = gd.smaa_metrics_buffer.get();
          native_device_context->VSSetConstantBuffers(1, 1, &metrics_buffer);
          native_device_context->PSSetConstantBuffers(1, 1, &metrics_buffer);
-         const SMAAT2xPasses t2x_passes = {.blending_weight_calculation_ps = t2x_weight_ps, .neighborhood_blending_ps = t2x_blend_ps, .velocity = gd.mv_srv.get()};
+         const SMAAT2xPasses t2x_passes = {.blending_weight_calculation_ps = t2x_weight_ps, .neighborhood_blending_ps = t2x_blend_ps, .velocity = gd.mv.srv.get()};
          DrawSMAA(native_device, native_device_context, device_data, gd.t2x_frame_rtvs[t2x_current].get(), gd.scene_srv.get(), gd.scene_srv.get(), predication ? gd.smaa_predication_srv.get() : nullptr, nullptr, &t2x_passes);
          // The resolve: t0 this frame, t1 the previous one or this one again without a history, t2 the motion vectors, s0 linear and
          // s1 point. RGB only: the canvas alpha stays the scene copy's (T2x's alpha is the velocity length).
          native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
-         ID3D11ShaderResourceView* const resolve_srvs[2] = {gd.t2x_frame_srvs[t2x_history ? (t2x_current ^ 1) : t2x_current].get(), gd.mv_srv.get()};
+         ID3D11ShaderResourceView* const resolve_srvs[2] = {gd.t2x_frame_srvs[t2x_history ? (t2x_current ^ 1) : t2x_current].get(), gd.mv.srv.get()};
          native_device_context->PSSetShaderResources(1, 2, resolve_srvs);
          ID3D11SamplerState* const resolve_samplers[2] = {device_data.sampler_state_linear.get(), device_data.sampler_state_point.get()};
          native_device_context->PSSetSamplers(0, 2, resolve_samplers);
@@ -920,13 +735,9 @@ class Bayonetta final : public Game
 #endif
    }
 
-   // ---- DLAA / FSR 3 Native AA / Luma TAA (vc4 layout in "MotionVectorPatches") ----
-   // The camera rows of a vertex shader (column vector matrices, one row per clip component, c8 for the materials) or the world view
-   // projection of the effects (c24), a matrix's 4 rows
+   // ---- DLAA / FSR 3 Native AA / Luma TAA (vc4 layout in "MotionVectorPatches"; the state machine is Core's "SceneMotionVectors") ----
+   // The view projection's vc4 byte offset: the camera FSR reads
    static constexpr UINT VIEW_PROJECTION_OFFSET = MotionVectorPatches::view_projection_row * 16;
-   static constexpr UINT WORLD_VIEW_PROJECTION_OFFSET = MotionVectorPatches::world_view_projection_row * 16;
-   static constexpr UINT CAMERA_SIZE = 4 * 16;
-   static_assert(sizeof(PatchedDraws::ObjectTransform) == 3 * 16);
 
    // The upscalers that read the reactive mask the alpha blended draws write: FSR and Luma TAA (DLSS's current presets ignore it,
    // DLSS-Best-Practices TRN-2)
@@ -935,242 +746,72 @@ class Bayonetta final : public Game
       return g_sr_reactive_enable && static_cast<const BayonettaGameDeviceData*>(device_data.game)->sr_active && (device_data.sr_type == SR::Type::FSR || device_data.sr_type == SR::Type::LumaTAA);
    }
 
-   // The game's data for the vc4 buffer hooks, while motion vectors are on
-   static BayonettaGameDeviceData* GetMotionVectorGameDeviceData(reshade::api::device* device)
+   // The game's motion vector state for Core's buffer and bind events, null before the device data exists
+   static SceneMotionVectors::State* GetSceneMotionVectors(reshade::api::device* device)
    {
       DeviceData* const device_data = device->get_private_data<DeviceData>();
-      if (!device_data || !device_data->game)
-         return nullptr;
-      auto& gd = GetGameDeviceData(*device_data);
-      return gd.mv_active ? &gd : nullptr;
+      return ((device_data && device_data->game) ? &GetGameDeviceData(*device_data).mv : nullptr);
    }
 
-   // Motion vectors: a registered vc4 buffer mapped for a whole rewrite, remembered until its Unmap
-   static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
+   // What "SceneMotionVectors" asks of the game
+   struct MotionVectorGame
    {
-      BayonettaGameDeviceData* const gd = GetMotionVectorGameDeviceData(device);
-      if (!gd || !data || !*data)
-         return;
-      const PatchedDraws::ObjectConstants::Entry* const registered = gd->mv_constants.OnMap(resource.handle, offset, access, *data);
-#if DEVELOPMENT
-      if (registered && !registered->mapped)
+      static constexpr const char* log_tag = "Bayonetta";
+      static constexpr MotionVectorPatch::Layout layout = MotionVectorPatches::layout;
+      static constexpr auto cameras = MotionVectorPatches::cameras;
+      static constexpr auto tie_break_rows = MotionVectorPatches::tie_break_rows;
+      static constexpr auto frame_camera = MotionVectorPatches::frame_camera;
+      static constexpr const char* patch_names[size_t(PixelShaderPatch::COUNT)] = {"MV PS", "MV PS (mask)", "MV PS (mask)", "MV PS (blended)", "Coverage PS", "", "", ""};
+
+      // The scene color: fp16, single sample, with a shader resource view (the upscaler reads it)
+      static bool AcceptSceneColor(const D3D11_RENDER_TARGET_VIEW_DESC& rtv_desc, const D3D11_TEXTURE2D_DESC& color_desc)
       {
-         gd->mv_stats.other_maps++; // A partial or appending write: the copies would miss it
+         return rtv_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && color_desc.ArraySize == 1 && color_desc.SampleDesc.Count == 1 && (color_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
       }
-#endif
-   }
 
-   // Motion vectors: the CPU copy of a vc4 buffer, before its Unmap (the game has written it). Reads the mapped memory back.
-   static void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
-   {
-      BayonettaGameDeviceData* const gd = GetMotionVectorGameDeviceData(device);
-      if (!gd)
-         return;
-      if (gd->mv_constants.OnUnmap(resource.handle))
+      static bool IsExcludedPixelShader(uint32_t pixel_shader_hash)
       {
-#if DEVELOPMENT
-         gd->mv_stats.maps++;
-#endif
+         return shader_hashes_SceneRefraction.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel);
       }
-   }
 
-   // Motion vectors: the CPU copy of a vc4 buffer from an UpdateSubresource (before it runs). Needs the unsigned "full add-on support"
-   // ReShade (the signed build doesn't raise the event).
-   static bool OnUpdateBufferRegion(reshade::api::device* device, const void* data, reshade::api::resource resource, uint64_t offset, uint64_t size)
-   {
-      BayonettaGameDeviceData* const gd = GetMotionVectorGameDeviceData(device);
-      if (!gd || !data)
-         return false;
-      if (gd->mv_constants.OnUpdate(resource.handle, data, offset, size))
+      static bool ReactiveMaskUsed(const DeviceData& device_data)
       {
-#if DEVELOPMENT
-         gd->mv_stats.updates++;
-#endif
+         return IsReactiveMaskUsed(device_data);
       }
-      return false;
-   }
 
-   // The tracked bindings the "PatchedDraws::BoundStates" events update: the immediate context's
-   static auto* GetBoundStates(reshade::api::command_list* cmd_list)
-   {
-      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
-      const CommandListData* const cmd_list_data = cmd_list->get_private_data<CommandListData>();
-      return ((device_data && device_data->game && cmd_list_data && cmd_list_data->is_primary) ? &GetGameDeviceData(*device_data).bound_states : nullptr);
-   }
-
-   // A game pixel shader's "patch", from the bytecode its shader object was created with; empty with "error" if it can't be patched. Any
-   // thread ("AddShaderWarmupVariants" too).
-   static std::vector<uint8_t> PatchPixelShader(PixelShaderPatch patch, const uint8_t* code, size_t code_size, std::string* error)
-   {
-      switch (patch)
+      static bool CanFill(DeviceData& device_data)
       {
-      case PixelShaderPatch::MOTION_VECTORS:
-         return MotionVectorPatch::PatchPixelShader(code, code_size, MotionVectorPatches::layout, error, /* targets_only */ true);
-      case PixelShaderPatch::MASK_ALPHA:
-      case PixelShaderPatch::MASK_ADDITIVE:
-         return MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, MotionVectorPatches::reactive_slot,
-            (patch == PixelShaderPatch::MASK_ADDITIVE ? MotionVectorPatch::ReactiveMode::ADDITIVE : MotionVectorPatch::ReactiveMode::ALPHA), error);
-      case PixelShaderPatch::BLENDED:
-         return MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, UINT32_MAX, MotionVectorPatch::ReactiveMode::ALPHA_MOTION_VECTORS, error);
-      case PixelShaderPatch::COVERAGE:
-         // The alpha tested materials clip at 0.5; the clips at 0.001 (blended materials' invisible texels) and the depth prepass's
-         // at 0.05 are below the threshold and stay as they are
-         return CoveragePatch::PatchPixelShader(code, code_size, error, 0.1f);
+         auto& gd = GetGameDeviceData(device_data);
+         return gd.prepass_drawn && gd.prepass_depth_srv && HasShaders(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta Motion Vector Fill CS"));
       }
-      return {};
-   }
 
-   // The bound shader's patched version ("patch" for pixel shaders, see above), patched from Core's bytecode copy on first use (null if
-   // it can't be, e.g. a vertex shader that doesn't place vertices with the view projection). The maps' nodes are never erased.
-   template <typename T>
-   static const BayonettaGameDeviceData::PatchedShader<T>& GetPatchedShader(ID3D11Device* native_device, DeviceData& device_data, uint32_t hash, reshade::api::pipeline pipeline,
-      PixelShaderPatch patch = PixelShaderPatch::MOTION_VECTORS)
-   {
-      constexpr bool vertex = std::is_same_v<T, ID3D11VertexShader>;
-      auto& gd = GetGameDeviceData(device_data);
-      auto* const shaders = [&]
+      static void FillMarkersBeforeBlend(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
       {
-         if constexpr (vertex)
-            return &gd.mv_vertex_shaders;
-         else
-            return &gd.patched_pixel_shaders[size_t(patch)];
-      }();
-      {
-         const std::shared_lock lock(gd.mv_mutex);
-         if (const auto it = shaders->find(hash); it != shaders->end())
-            return it->second;
+         FillMotionVectors(native_device, native_device_context, device_data, /* write_reactive */ false);
       }
-#if DEVELOPMENT
-      const auto create_start = std::chrono::steady_clock::now();
-#endif
-      std::vector<uint8_t> patched;
-      std::string error; // Written by a refusal only
-      UINT read_size = 0;
-      UINT camera_offset = 0;
-      UINT translation_offset = 0;
+
+      // A game pixel shader's "patch", from the bytecode its shader object was created with; empty with "error" if it can't be patched. Any
+      // thread ("AddShaderWarmupVariants" too).
+      static std::vector<uint8_t> PatchPixelShader(PixelShaderPatch patch, const uint8_t* code, size_t code_size, std::string* error)
       {
-         const std::shared_lock lock(s_mutex_generic);
-         if (const auto it = device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle); it != device_data.pipeline_cache_by_pipeline_handle.end() && it->second->subobjects_cache)
+         switch (patch)
          {
-            const auto* desc = static_cast<const reshade::api::shader_desc*>(it->second->subobjects_cache[0].data);
-            // On top of the shader as created ("PatchShaderBytecodeSync"'s clamps; the pipeline cache keeps the original bytecode)
-            const auto sync_patched = device_data.patch_context.GetShaderData(hash);
-            const auto* code = (sync_patched ? sync_patched->code.data() : static_cast<const uint8_t*>(desc->code));
-            const size_t code_size = (sync_patched ? sync_patched->code.size() : desc->code_size);
-            if constexpr (vertex)
-            {
-               patched = MotionVectorPatch::PatchVertexShader(code, code_size, MotionVectorPatches::layout, &error);
-               if (!patched.empty())
-               {
-                  constexpr uint32_t slot = MotionVectorPatches::object_slot;
-                  read_size = DXBC::ConstantBufferBytes(code, code_size, slot);
-                  // No vertex shader reads both cameras (see "MotionVectorPatches"). The tie-break transform: the first bone (world
-                  // space, indexed relatively), else the world matrix of the materials or of the effects that have one.
-                  if (DXBC::ReadsConstantRow(code, code_size, slot, MotionVectorPatches::view_projection_row))
-                  {
-                     camera_offset = VIEW_PROJECTION_OFFSET;
-                  }
-                  else if (DXBC::ReadsConstantRow(code, code_size, slot, MotionVectorPatches::world_view_projection_row))
-                  {
-                     camera_offset = WORLD_VIEW_PROJECTION_OFFSET;
-                  }
-                  if (DXBC::ReadsConstantRow(code, code_size, slot, MotionVectorPatches::first_bone_row, /* relative_base */ true))
-                  {
-                     translation_offset = MotionVectorPatches::first_bone_row * 16;
-                  }
-                  else if (DXBC::ReadsConstantRow(code, code_size, slot, MotionVectorPatches::world_row))
-                  {
-                     translation_offset = MotionVectorPatches::world_row * 16;
-                  }
-                  else if (DXBC::ReadsConstantRow(code, code_size, slot, MotionVectorPatches::effect_world_row))
-                  {
-                     translation_offset = MotionVectorPatches::effect_world_row * 16;
-                  }
-               }
-            }
-            else
-            {
-               patched = PatchPixelShader(patch, code, code_size, &error);
-            }
+         case PixelShaderPatch::MOTION_VECTORS:
+            return MotionVectorPatch::PatchPixelShader(code, code_size, MotionVectorPatches::layout, error, /* targets_only */ true);
+         case PixelShaderPatch::MASK_ALPHA:
+         case PixelShaderPatch::MASK_ADDITIVE:
+            return MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, MotionVectorPatches::reactive_slot,
+               (patch == PixelShaderPatch::MASK_ADDITIVE ? MotionVectorPatch::ReactiveMode::ADDITIVE : MotionVectorPatch::ReactiveMode::ALPHA), error);
+         case PixelShaderPatch::BLENDED:
+            return MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, UINT32_MAX, MotionVectorPatch::ReactiveMode::ALPHA_MOTION_VECTORS, error);
+         case COVERAGE_PATCH:
+            // The alpha tested materials clip at 0.5; the clips at 0.001 (blended materials' invisible texels) and the depth prepass's
+            // at 0.05 are below the threshold and stay as they are
+            return CoveragePatch::PatchPixelShader(code, code_size, error, 0.1f);
          }
-         else
-         {
-            error = "no bytecode";
-         }
+         return {};
       }
-      com_ptr<T> shader;
-      if (!patched.empty())
-      {
-         const HRESULT hr = [&]
-         {
-            if constexpr (vertex)
-               return native_device->CreateVertexShader(patched.data(), patched.size(), nullptr, &shader);
-            else
-               return native_device->CreatePixelShader(patched.data(), patched.size(), nullptr, &shader);
-         }();
-         if (FAILED(hr))
-         {
-            error = std::format("create 0x{:08X}", uint32_t(hr));
-         }
-#if DEVELOPMENT
-         else
-         {
-            Perf::g_shader_creates.AddLuma(std::chrono::steady_clock::now() - create_start);
-         }
-#endif
-      }
-      // Every build logs the unexpected failures (bug reports). The expected refusals are a screen space vertex shader and a pixel
-      // shader without a clip offered to the coverage patch. Development also logs every patched shader and the other patches' refusals.
-      const bool expected = error.starts_with("screen space") || error.starts_with("no clip");
-      if ((DEVELOPMENT && (shader || patch != PixelShaderPatch::COVERAGE)) || (!shader && !expected))
-      {
-         // A patched shader's note (the coverage's "inward only") follows "patched"
-         std::string status = error;
-         if (shader)
-         {
-            status = (error.empty() ? std::string("patched") : "patched, " + error);
-         }
-         reshade::log::message(((shader || expected) ? reshade::log::level::info : reshade::log::level::warning),
-            std::format("[Bayonetta] {} 0x{:08X} {}", (vertex ? "MV VS" : PIXEL_SHADER_PATCH_NAMES[size_t(patch)]), hash, status).c_str());
-      }
-      const std::unique_lock lock(gd.mv_mutex);
-      const auto [entry, inserted] = shaders->try_emplace(hash, BayonettaGameDeviceData::PatchedShader<T>{.shader = shader, .read_size = read_size, .camera_offset = camera_offset, .translation_offset = translation_offset});
-      return entry->second;
-   }
-
-   // The bound vertex shader's patched version (null shader if refused), looked up again only when the game's shader changes
-   static const BayonettaGameDeviceData::PatchedShader<ID3D11VertexShader>& GetPatchedVertexShader(ID3D11Device* native_device, const CommandListData& cmd_list_data, DeviceData& device_data, uint32_t hash)
-   {
-      auto& gd = GetGameDeviceData(device_data);
-      if (hash != gd.mv_last_vertex_shader_hash || !gd.mv_last_vertex_shader)
-      {
-         gd.mv_last_vertex_shader = &GetPatchedShader<ID3D11VertexShader>(native_device, device_data, hash, cmd_list_data.pipeline_state_original_vertex_shader);
-         gd.mv_last_vertex_shader_hash = hash;
-      }
-      return *gd.mv_last_vertex_shader;
-   }
-
-   // Classifies the bound blend state (cached in "mv_blend_state"): "mv_blend_opaque" for the motion vectors (additive lights, decals
-   // and translucents keep the motion vectors of what's behind them, and so do colorless draws: the occlusion query bounding boxes), and
-   // "mv_reactive_blend": NONE not alpha blended (opaque, lights ONE/ONE, shadows DEST_COLOR), ALPHA (SRC_ALPHA / INV_SRC_ALPHA:
-   // smoke, glass, water; reactive and transparency & composition), ADDITIVE (SRC_ALPHA / ONE: sparks, glows; reactive)
-   static void ClassifyBoundBlend(ID3D11DeviceContext* native_device_context, BayonettaGameDeviceData* gd)
-   {
-      ID3D11BlendState* const blend_state = gd->bound_states.BlendState(native_device_context);
-      if (blend_state == gd->mv_blend_state)
-         return;
-      D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
-      if (blend_state)
-      {
-         blend_state->GetDesc(&blend_desc);
-      }
-      const D3D11_RENDER_TARGET_BLEND_DESC& rt0 = blend_desc.RenderTarget[0];
-      gd->mv_blend_opaque = rt0.RenderTargetWriteMask != 0 && (!rt0.BlendEnable || (rt0.SrcBlend == D3D11_BLEND_ONE && rt0.DestBlend == D3D11_BLEND_ZERO && rt0.BlendOp == D3D11_BLEND_OP_ADD));
-      gd->mv_reactive_blend = ((!rt0.BlendEnable || rt0.SrcBlend != D3D11_BLEND_SRC_ALPHA) ? ReactiveBlend::NONE : (rt0.DestBlend == D3D11_BLEND_ONE ? ReactiveBlend::ADDITIVE : ReactiveBlend::ALPHA));
-      // Exactly the states whose motion vector target "PatchedDraws::OnCreateBlendState" blends ("blend_alpha_blended_target")
-      gd->mv_alpha_blended = rt0.BlendEnable && rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA && rt0.BlendOp == D3D11_BLEND_OP_ADD;
-      gd->mv_blend_state = blend_state;
-   }
+   };
 
    // Opens the scene at the frame's first mesh draw into its targets: a single sample fp16 color or the depth prepass' R32F (with the
    // normals in the second target), of the bound depth's size, which is the scene's (a full viewport of it). The scene is the output's
@@ -1200,7 +841,7 @@ class Bayonetta final : public Game
       const D3D11_TEXTURE2D_DESC color_desc = GetTexture2DDesc(color.get());
       // Only the depth prepass (R32F 1 - z/w next to the normals) opens the scene: OtMirror draws its reflection earlier into another
       // full size fp16 target, with no prepass (and a view projection whose determinant has the opposite sign of the scene's). The
-      // scene color is the first fp16 target drawn with this depth ("DrawWithMotionVectors").
+      // scene color is the first fp16 target drawn with this depth ("SceneMotionVectors::DrawWithMotionVectors").
       const bool scene_format = rtv_desc.Format == DXGI_FORMAT_R32_FLOAT && has_second_target;
       if (!scene_format || color_desc.SampleDesc.Count != 1 || color_desc.Width != depth_size.x || color_desc.Height != depth_size.y)
       {
@@ -1210,39 +851,11 @@ class Bayonetta final : public Game
       UINT viewport_count = 1;
       D3D11_VIEWPORT viewport = {};
       native_device_context->RSGetViewports(&viewport_count, &viewport);
-      if (viewport_count == 0 || viewport.Width != float(depth_size.x) || viewport.Height != float(depth_size.y) || !GetPatchedVertexShader(native_device, cmd_list_data, device_data, vertex_shader_hash).shader)
+      if (viewport_count == 0 || viewport.Width != float(depth_size.x) || viewport.Height != float(depth_size.y) || !SceneMotionVectors::GetPatchedVertexShader<MotionVectorGame>(&gd.mv, native_device, cmd_list_data, device_data, vertex_shader_hash).shader)
          return;
-      gd.mv_scene_open = true;
-      const bool same_size = gd.mv_scene_size == depth_size;
-      gd.mv_scene_size = depth_size;
-      gd.mv_depth.reset();
-      dsv->GetResource(&gd.mv_depth);
-      gd.mv_scene_color.reset();
-      gd.mv_scene_rtv.reset();
       gd.mv_scene_last_copy.reset();
-      gd.jitter_dsv = nullptr;
-      gd.bound_states.ResetDepthTest();
-      gd.mv_accepted_dsv = nullptr;
-      gd.mv_refused_rtv = nullptr;
-      gd.mv_refused_dsv = nullptr;
-      gd.bound_states.jitter_bound = false;
-      gd.mv_blend_state = nullptr;
-      gd.mv_blend_opaque = true;
-      gd.mv_alpha_blended = false;
-      gd.mv_reactive_blend = ReactiveBlend::NONE;
       gd.prepass_rtv = nullptr;
       gd.prepass_drawn = false;
-      // Last frame's camera and objects are the previous ones, unless frames without a scene (menus, videos) came between
-      const bool previous_valid = gd.mv_camera && same_size && cb_luma_global_settings.FrameIndex - gd.mv_frame_index <= 1;
-      gd.mv_previous_camera = (previous_valid ? gd.mv_camera : nullptr);
-      gd.mv_camera = nullptr;
-      gd.mv_frame_index = cb_luma_global_settings.FrameIndex;
-#if DEVELOPMENT
-      // Objects without a transform match by their draw key alone: any twin has the same vertices
-      gd.mv_stats.tiebreak_collisions = PatchedDraws::CountTieBreakCollisions(gd.mv_objects.Current(), [](const auto& a, const auto& b)
-         { return a.transform == PatchedDraws::ObjectTransform{} || PatchedDraws::SameBytes(a.constants, b.constants); });
-#endif
-      gd.mv_objects.EndFrame(previous_valid);
       // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up). None until the upscaler is ready (the bridge's helper
       // starting shows the scene as it is, antialiased with SMAA).
       const SR::InstanceData* sr_instance_data = (gd.sr_active ? device_data.GetSRInstanceData() : nullptr);
@@ -1250,450 +863,19 @@ class Bayonetta final : public Game
       {
          sr_instance_data = nullptr;
       }
-      gd.mv_jitter = (((sr_instance_data && gd.mv_jitter_allowed) || g_mv_force_jitter) ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{});
+      std::array<float, 2> jitter = (((sr_instance_data && gd.mv_jitter_allowed) || g_mv_force_jitter) ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{});
       // SMAA T2x: the sample offsets (0.25, 0.25) then (-0.25, -0.25) in y down pixels, for "SMAA.hlsl"'s T2x subsample indices 1 and
       // 2. That is its table read with y up, which measured better (docs/SMAA-Lab.md). The projection moves the other way.
       gd.t2x_phase = ((gd.t2x_active && gd.t2x_frames[0] && gd.t2x_frame + 1 == cb_luma_global_settings.FrameIndex) ? int(cb_luma_global_settings.FrameIndex & 1) : -1);
       if (gd.t2x_phase >= 0)
       {
          const float shift = (gd.t2x_phase == 0 ? -0.25f : 0.25f);
-         gd.mv_jitter = {shift, shift};
+         jitter = {shift, shift};
       }
-      gd.mv_jitter_ndc = {gd.mv_jitter[0] * 2.f / float(depth_size.x), gd.mv_jitter[1] * -2.f / float(depth_size.y)};
-      const float ndc_jitter[4] = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1], 0.f, 0.f};
-      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
+      if (!SceneMotionVectors::BeginFrame(&gd.mv, native_device, native_device_context, dsv, depth_size, jitter))
       {
-         // No stale jitter on the scene draws either: no motion vectors this frame
-         gd.mv_jitter = {};
-         gd.mv_jitter_ndc = {};
-         gd.mv_jitter_buffer.reset();
          gd.t2x_phase = -1;
       }
-   }
-
-#if DEVELOPMENT
-#define MV_REJECT(reason) \
-   ([&](auto& gd) { gd.mv_stats.rejected[reason]++; gd.mv_draw_reject = reason; return false; }(GetGameDeviceData(device_data)))
-#else
-#define MV_REJECT(reason) false
-#endif
-
-   // The jitter buffer, bound once per scene (no translated shader reads b9, Luma draws nothing during the scene; a game bind over it
-   // resets "jitter_bound", see "PatchedDraws::OnPushConstantBuffers")
-   static void BindJitter(ID3D11DeviceContext* native_device_context, BayonettaGameDeviceData* gd)
-   {
-      if (std::exchange(gd->bound_states.jitter_bound, true))
-         return;
-      ID3D11Buffer* const jitter = gd->mv_jitter_buffer.get();
-      native_device_context->VSSetConstantBuffers(MotionVectorPatches::jitter_slot, 1, &jitter);
-   }
-
-   // What the next frame keeps of a draw's vc4: only the bytes its vertex shader reads (at least its camera and tie-break transform),
-   // copied from the buffer's latest upload. A draw reading all of it (skinned) shares the entry's one copy. Null if the upload doesn't
-   // hold the camera yet.
-   static BayonettaGameDeviceData::ConstantsCopy SnapshotConstants(BayonettaGameDeviceData* gd, PatchedDraws::ObjectConstants::Entry* entry, const BayonettaGameDeviceData::PatchedShader<ID3D11VertexShader>& vertex_shader)
-   {
-      const size_t camera_end = vertex_shader.camera_offset + CAMERA_SIZE;
-      if (entry->latest.size() < camera_end)
-         return nullptr;
-      const size_t min_size = (std::max)(camera_end, vertex_shader.translation_offset != 0 ? vertex_shader.translation_offset + sizeof(PatchedDraws::ObjectTransform) : 0);
-      return gd->mv_constants.Snapshot(*entry, vertex_shader.read_size, min_size);
-   }
-
-   // A scene draw's vc4 buffer, registered for copies at every Map and Update, and its entry (null without an upload holding the
-   // draw's camera), for a vertex shader with a camera. The frame's camera and the reprojection are taken here, at the first scene
-   // view projection draw.
-   struct SceneDrawConstants
-   {
-      ID3D11Buffer* buffer = nullptr;
-      PatchedDraws::ObjectConstants::Entry* entry = nullptr;
-   };
-   static SceneDrawConstants ReadSceneDrawConstants(ID3D11DeviceContext* native_device_context, BayonettaGameDeviceData* gd, const BayonettaGameDeviceData::PatchedShader<ID3D11VertexShader>& vertex_shader)
-   {
-      SceneDrawConstants result;
-      result.buffer = gd->bound_states.ObjectBuffer(native_device_context);
-      if (!result.buffer)
-         return result;
-      PatchedDraws::ObjectConstants::Entry& entry = gd->mv_constants.Register(result.buffer);
-      // An upload from before the hooks paused is stale (the draw stays uncopied until the next one)
-      if (const auto* const latest = gd->mv_constants.Latest(entry); !latest || latest->size() < vertex_shader.camera_offset + CAMERA_SIZE)
-         return result;
-      result.entry = &entry;
-      // Any scene view projection draw: the prepass and the base passes share the camera, and the prepass' draws reach here only once
-      // they are jittered (after the upscaler's first frame, which needs this camera for its fill)
-      if (!gd->mv_camera && vertex_shader.camera_offset == VIEW_PROJECTION_OFFSET)
-      {
-         gd->mv_camera = SnapshotConstants(gd, &entry, vertex_shader);
-         // Previous clip space from the current: previous * inverse(current), in double (absolute world translation)
-         gd->mv_reprojection.SetIdentity();
-         if (gd->mv_previous_camera)
-         {
-            Math::Matrix44D current, previous;
-            std::copy_n(reinterpret_cast<const float*>(gd->mv_camera->data() + VIEW_PROJECTION_OFFSET), 16, current.GetData());
-            std::copy_n(reinterpret_cast<const float*>(gd->mv_previous_camera->data() + VIEW_PROJECTION_OFFSET), 16, previous.GetData());
-            current.Invert();
-            gd->mv_reprojection = previous * current;
-         }
-      }
-      return result;
-   }
-
-   // Draws an opaque draw into the fp16 scene (the scene target alone, with the scene depth) with the patched shaders, adding the
-   // motion vector target ("target_slot", past the game's) and the previous frame's vc4 ("previous_slots"). False if it can't (the draw
-   // then goes to "DrawWithJitter").
-   static bool DrawWithMotionVectors(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const CommandListData& cmd_list_data, DeviceData& device_data,
-      const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, const std::function<void()>& draw, const com_ptr<ID3D11RenderTargetView> (&rtvs)[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT], ID3D11DepthStencilView* dsv)
-   {
-      auto& gd = GetGameDeviceData(device_data);
-      // The scene target alone, plus the motion vector and mask targets the last patched draws left bound
-      for (UINT slot = 1; slot < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; slot++)
-      {
-         if (rtvs[slot] && (slot != MotionVectorPatches::target_slot || rtvs[slot] != gd.mv_rtv) && (slot != MotionVectorPatches::reactive_slot || rtvs[slot] != gd.mv_reactive_target_rtv))
-            return MV_REJECT(REJECT_EXTRA_TARGET);
-      }
-      if (!rtvs[0] || !dsv || !gd.mv_scene_open)
-         return MV_REJECT(REJECT_NO_SCENE);
-      if (!gd.bound_states.DepthTested(native_device_context))
-         return MV_REJECT(REJECT_DEPTH_TEST);
-      ClassifyBoundBlend(native_device_context, &gd);
-      // Alpha blended draws (SRC_ALPHA / INV_SRC_ALPHA) take their own motion vectors too, blended by their alpha: the particles are
-      // such draws. Additive ones and the other blends keep what's behind them.
-      const bool blended = gd.mv_alpha_blended;
-      if ((!gd.mv_blend_opaque && !blended) || (blended && shader_hashes_SceneRefraction.Contains(uint32_t(original_shader_hashes.pixel_shaders[0]), reshade::api::shader_stage::pixel)))
-         return MV_REJECT(REJECT_BLEND);
-      // Known targets: checked, and the motion vector target built for them (the depth prepass' R32F targets are refused here)
-      if (rtvs[0] != gd.mv_scene_rtv || dsv != gd.mv_accepted_dsv)
-      {
-         if (rtvs[0].get() == gd.mv_refused_rtv && dsv == gd.mv_refused_dsv)
-            return MV_REJECT(gd.mv_refused_reason);
-         const auto refuse = [&](MotionVectorReject reason)
-         {
-            gd.mv_refused_rtv = rtvs[0].get();
-            gd.mv_refused_dsv = dsv;
-            gd.mv_refused_reason = reason;
-            return MV_REJECT(reason);
-         };
-         com_ptr<ID3D11Resource> depth;
-         dsv->GetResource(&depth);
-         com_ptr<ID3D11Resource> color;
-         rtvs[0]->GetResource(&color);
-         if (depth != gd.mv_depth || !color || (gd.mv_scene_color && color != gd.mv_scene_color))
-            return refuse(REJECT_OTHER_DEPTH_COLOR);
-         D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
-         rtvs[0]->GetDesc(&rtv_desc);
-         const D3D11_TEXTURE2D_DESC color_desc = GetTexture2DDesc(color.get());
-         // The upscaler reads the scene: it needs a shader resource view. Filtered by the resource, not the view (dgVoodoo binds
-         // single-slice array views). A multisampled scene is refused here only on MSAA's first frame ("msaa_active" then stops this
-         // path).
-         if (rtv_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || color_desc.ArraySize != 1 || color_desc.SampleDesc.Count != 1 || (color_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0)
-            return refuse(REJECT_FORMAT);
-         const uint2 size = {color_desc.Width, color_desc.Height};
-         if (size != gd.mv_scene_size)
-            return refuse(REJECT_SIZE);
-         const std::unique_lock lock(gd.mv_mutex);
-         D3D11_TEXTURE2D_DESC desc = {};
-         if (gd.mv_texture)
-         {
-            gd.mv_texture->GetDesc(&desc);
-         }
-         // R16G16_FLOAT: FSR keeps 16 bits internally; the error is under 0.1% of the motion (BL GOTY)
-         constexpr DXGI_FORMAT format = DXGI_FORMAT_R16G16_FLOAT;
-         if (desc.Width != size.x || desc.Height != size.y)
-         {
-            gd.ReleaseMotionVectorTargets();
-            // The fill reads the target back through its UAV
-            D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support = {format};
-            const bool typed_uav_load = SUCCEEDED(native_device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &support, sizeof(support))) && (support.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
-            desc = CD3D11_TEXTURE2D_DESC(format, size.x, size.y, 1, 1, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | (typed_uav_load ? D3D11_BIND_UNORDERED_ACCESS : 0u));
-            if (FAILED(SRBridge::CreateSharableTexture(native_device, desc, &gd.mv_texture)) || FAILED(native_device->CreateRenderTargetView(gd.mv_texture.get(), nullptr, &gd.mv_rtv)))
-            {
-               gd.mv_texture.reset();
-               gd.mv_rtv.reset();
-               return MV_REJECT(REJECT_CREATE);
-            }
-            if (typed_uav_load)
-            {
-               native_device->CreateUnorderedAccessView(gd.mv_texture.get(), nullptr, &gd.mv_uav);
-            }
-            native_device->CreateShaderResourceView(gd.mv_texture.get(), nullptr, &gd.mv_srv);
-            const CD3D11_TEXTURE2D_DESC depth_desc(DXGI_FORMAT_R32_FLOAT, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-            if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, depth_desc, &gd.mv_device_depth)))
-            {
-               native_device->CreateUnorderedAccessView(gd.mv_device_depth.get(), nullptr, &gd.mv_device_depth_uav);
-            }
-            gd.mv_frame_ended = true;
-         }
-         gd.mv_scene_color = color;
-         gd.mv_scene_rtv = rtvs[0];
-         gd.mv_accepted_dsv = dsv;
-      }
-
-      const auto& vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]);
-      // The alpha blended draws write no masks: they write their own motion vectors, and FSR's reactive and transparency & composition
-      // masks are for content without them (AMD's FSR manual)
-      ID3D11PixelShader* pixel_shader = nullptr;
-      if (blended)
-      {
-         pixel_shader = GetPatchedShader<ID3D11PixelShader>(native_device, device_data, original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader, PixelShaderPatch::BLENDED).shader.get();
-      }
-      else
-      {
-         if (const uint32_t pixel_shader_hash = original_shader_hashes.pixel_shaders[0]; pixel_shader_hash != gd.mv_last_pixel_shader_hash)
-         {
-            gd.mv_last_pixel_shader = GetPatchedShader<ID3D11PixelShader>(native_device, device_data, pixel_shader_hash, cmd_list_data.pipeline_state_original_pixel_shader).shader.get();
-            gd.mv_last_pixel_shader_hash = pixel_shader_hash;
-         }
-         pixel_shader = gd.mv_last_pixel_shader;
-      }
-      if (!vertex_shader.shader || !pixel_shader || !gd.mv_jitter_buffer)
-         return MV_REJECT(REJECT_SHADERS);
-      // A shader without a camera (view projection or world view projection) has no motion to rebuild
-      if (vertex_shader.camera_offset == 0)
-         return MV_REJECT(REJECT_NO_CAMERA);
-      // The game's vc4 (object, camera and bones in one). The slots added past it stay bound after the draw: no translated shader reads
-      // a constant buffer past b4.
-      const SceneDrawConstants scene_constants = ReadSceneDrawConstants(native_device_context, &gd, vertex_shader);
-      if (std::exchange(gd.mv_frame_ended, false))
-      {
-         gd.mv_markers_filled = false;
-         gd.mv_fill_pending = gd.mv_uav && gd.mv_device_depth_uav && gd.prepass_drawn && gd.prepass_depth_srv && HasShaders(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta Motion Vector Fill CS"));
-         // The fill's marker: the largest float16 (a larger clear value is stored as it in R16G16_FLOAT)
-         const FLOAT clear_value = (gd.mv_fill_pending ? 65504.f : 0.f);
-         const FLOAT clear[4] = {clear_value, clear_value, 0.f, 0.f};
-         native_device_context->ClearRenderTargetView(gd.mv_rtv.get(), clear);
-         // The reactive masks: what the alpha blended draws write, from zero
-         if (IsReactiveMaskUsed(device_data) && !gd.mv_reactive_target)
-         {
-            D3D11_TEXTURE2D_DESC mv_desc;
-            gd.mv_texture->GetDesc(&mv_desc);
-            const CD3D11_TEXTURE2D_DESC reactive_desc(DXGI_FORMAT_R8G8_UNORM, mv_desc.Width, mv_desc.Height, 1, 1, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
-            const std::unique_lock lock(gd.mv_mutex);
-            if (SUCCEEDED(native_device->CreateTexture2D(&reactive_desc, nullptr, &gd.mv_reactive_target)) && SUCCEEDED(native_device->CreateRenderTargetView(gd.mv_reactive_target.get(), nullptr, &gd.mv_reactive_target_rtv)))
-            {
-               native_device->CreateShaderResourceView(gd.mv_reactive_target.get(), nullptr, &gd.mv_reactive_target_srv);
-            }
-            gd.sr_reactive_frame = cb_luma_global_settings.FrameIndex;
-         }
-         if (gd.mv_reactive_target_rtv)
-         {
-            const FLOAT zero[4] = {};
-            native_device_context->ClearRenderTargetView(gd.mv_reactive_target_rtv.get(), zero);
-         }
-      }
-
-      // The buffer's copy as of this draw (null until its first upload)
-      BayonettaGameDeviceData::ConstantsCopy constants;
-      if (scene_constants.entry)
-      {
-         constants = SnapshotConstants(&gd, scene_constants.entry, vertex_shader);
-      }
-      // The previous frame's vc4: the same object's from last frame, else this draw's with last frame's camera (no object motion).
-      // None (no CPU copy yet, another camera): the current one (zero motion).
-      const std::vector<uint8_t>* upload = nullptr;
-      if (constants)
-      {
-         // Draw key: same mesh, same shaders, no instance count. The offsets go with the buffers: queried with them, else tracked
-         // with them.
-         UINT vertex_offset, index_offset;
-         ID3D11Buffer* const vertex_buffer = gd.bound_states.VertexBuffer(native_device_context, &vertex_offset);
-         ID3D11Buffer* const index_buffer = gd.bound_states.IndexBuffer(native_device_context, &index_offset);
-#if DEVELOPMENT
-         if (gd.bound_states.check && gd.bound_states.tracked && (vertex_offset != gd.bound_states.vertex_offset || index_offset != gd.bound_states.index_offset))
-         {
-            gd.mv_stats.bound_state_mismatches++;
-         }
-#endif
-         const DrawDispatchData& draw_data = last_draw_dispatch_data;
-         uint64_t key = 0;
-         for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer), uint64_t(vertex_offset),
-                 reinterpret_cast<uint64_t>(index_buffer), uint64_t(index_offset), uint64_t(draw_data.index_count), uint64_t(draw_data.first_index), uint64_t(uint32_t(draw_data.vertex_offset)),
-                 uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
-         {
-            HashCombine(key, value);
-         }
-         // The tie-break between the objects sharing a key (props, characters): the 3x4 transform at the shader's translation row (the
-         // first bone, the world matrix; see "PatchedDraws::ObjectTransform"), copied as it is. The effects without a world matrix have
-         // none: their draws keep their own constants with last frame's camera (static).
-         PatchedDraws::ObjectTransform transform = {};
-         const bool untransformed = vertex_shader.translation_offset == 0;
-         if (!untransformed)
-         {
-            std::memcpy(transform.data(), constants->data() + vertex_shader.translation_offset, sizeof(transform));
-         }
-#if DEVELOPMENT
-         gd.mv_stats.untransformed += untransformed;
-#endif
-
-         // The same object at the same transform by its draw order or the exact index, else a linear search among the key's candidates
-         const BayonettaGameDeviceData::MotionVectorObject* match = nullptr;
-         if (!untransformed)
-         {
-            match = gd.mv_objects.FindNearest(key, transform, [&](const auto& candidate)
-               { return candidate.constants->size() == constants->size(); });
-         }
-         const bool view_projection_shader = vertex_shader.camera_offset == VIEW_PROJECTION_OFFSET;
-         // Drawn with the frame's camera (a world view projection shader's can't be told)
-         const bool frame_camera = gd.mv_camera && (!view_projection_shader || std::memcmp(constants->data() + VIEW_PROJECTION_OFFSET, gd.mv_camera->data() + VIEW_PROJECTION_OFFSET, CAMERA_SIZE) == 0);
-         if (match)
-         {
-            // Last frame's list outlives the draw (the previous objects only change at the next frame start)
-            upload = &*match->constants;
-#if DEVELOPMENT
-            gd.mv_stats.matched++;
-#endif
-         }
-         else if (gd.mv_previous_camera && frame_camera)
-         {
-            // Not found, drawn with the frame's camera: its own constants with last frame's camera (camera motion only). A view
-            // projection takes the previous one; a world view projection (a static object's) previous * inverse(current) * itself.
-            gd.mv_camera_only_copy.assign(constants->begin(), constants->end());
-            if (view_projection_shader)
-            {
-               std::memcpy(gd.mv_camera_only_copy.data() + VIEW_PROJECTION_OFFSET, gd.mv_previous_camera->data() + VIEW_PROJECTION_OFFSET, CAMERA_SIZE);
-            }
-            else
-            {
-               Math::Matrix44D world_view_projection;
-               std::copy_n(reinterpret_cast<const float*>(constants->data() + WORLD_VIEW_PROJECTION_OFFSET), 16, world_view_projection.GetData());
-               const Math::Matrix44D previous_world_view_projection = gd.mv_reprojection * world_view_projection;
-               float* const destination = reinterpret_cast<float*>(gd.mv_camera_only_copy.data() + WORLD_VIEW_PROJECTION_OFFSET);
-               for (int i = 0; i < 16; i++)
-               {
-                  destination[i] = float(previous_world_view_projection.GetData()[i]);
-               }
-            }
-            upload = &gd.mv_camera_only_copy;
-#if DEVELOPMENT
-            gd.mv_stats.camera_only++;
-#endif
-         }
-#if DEVELOPMENT
-         else
-         {
-            gd.mv_stats.other_camera++;
-         }
-#endif
-         // Kept as drawn for the next frame
-         // Untransformed draws are never looked up
-         gd.mv_objects.Push(key, {.transform = transform, .constants = std::move(constants)}, !untransformed);
-      }
-#if DEVELOPMENT
-      else
-      {
-         gd.mv_stats.uncopied++;
-      }
-#endif
-      // An alpha blended draw blends its motion vector with what's under it: texels no opaque motion vector draw wrote still hold the
-      // fill's marker (65504), which the blend would turn into a huge motion. The fill gives them their camera motion first, from the
-      // depth prepass (the end of the scene fills the rest and the masks).
-      if (blended && gd.mv_fill_pending && !std::exchange(gd.mv_markers_filled, true))
-      {
-         DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
-         DrawStateStack<DrawStateStackType::Compute> compute_state;
-         graphics_state.Cache(native_device_context, device_data.uav_max_count);
-         compute_state.Cache(native_device_context, device_data.uav_max_count);
-         FillMotionVectors(native_device, native_device_context, device_data, /* write_reactive */ false);
-         compute_state.Restore(native_device_context);
-         graphics_state.Restore(native_device_context);
-      }
-      ID3D11Buffer* const previous_current[] = {scene_constants.buffer};
-      gd.mv_previous_constants.Bind(native_device, native_device_context, MotionVectorPatches::previous_slots, {&upload, 1}, previous_current, "Bayonetta", {&vertex_shader.read_size, 1});
-      BindJitter(native_device_context, &gd);
-      // Left bound after the draw (set directly, bypassing Core's state tracking): the game's next draws either bind their own targets
-      // and shaders, or are motion vector draws too. The game's pixel shaders write o0 only, so the motion vector target keeps its
-      // contents; a mask target left by an earlier draw goes (its max blend would take an undefined value).
-      if (rtvs[MotionVectorPatches::target_slot] != gd.mv_rtv || rtvs[MotionVectorPatches::reactive_slot] != nullptr)
-      {
-         ID3D11RenderTargetView* targets[MotionVectorPatches::target_slot + 1] = {rtvs[0].get()};
-         targets[MotionVectorPatches::target_slot] = gd.mv_rtv.get();
-         native_device_context->OMSetRenderTargets(MotionVectorPatches::target_slot + 1, targets, dsv);
-      }
-      PatchedDraws::BindPatchedShader(native_device_context, vertex_shader.shader.get(), &gd.mv_bound_vertex_shader);
-      PatchedDraws::BindPatchedShader(native_device_context, pixel_shader, &gd.mv_bound_pixel_shader);
-
-      draw();
-#if DEVELOPMENT
-      gd.mv_stats.motion_vector_draws++;
-#endif
-      return true;
-   }
-
-   // Jitter for the scene's mesh draws without motion vectors (patched vertex shader, game pixel shader): the depth prepass, lights,
-   // shadow projections, decals, translucents. Every draw depth tested against the scene takes the same jitter, or jittered and
-   // unjittered depths of the same surface fail each other's test. False if it can't (the draw runs untouched).
-   static bool DrawWithJitter(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const CommandListData& cmd_list_data, DeviceData& device_data,
-      const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, const std::function<void()>& draw, const com_ptr<ID3D11RenderTargetView> (&rtvs)[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT], ID3D11DepthStencilView* dsv)
-   {
-      auto& gd = GetGameDeviceData(device_data);
-      if (!gd.mv_scene_open || gd.mv_jitter == std::array<float, 2>{} || !gd.mv_jitter_buffer)
-         return false;
-      // Meshes only (full screen passes have no vertex buffer or no depth test), into the scene depth (not shadows)
-      if (!dsv)
-         return false;
-      if (dsv != gd.jitter_dsv)
-      {
-         com_ptr<ID3D11Resource> depth;
-         dsv->GetResource(&depth);
-         gd.jitter_dsv = dsv;
-         gd.jitter_dsv_scene = depth == gd.mv_depth;
-      }
-      if (!gd.jitter_dsv_scene || !gd.bound_states.DepthTested(native_device_context))
-         return false;
-      const ID3D11Buffer* const vertex_buffer = gd.bound_states.VertexBuffer(native_device_context);
-      if (!vertex_buffer)
-         return false;
-      const auto& vertex_shader = GetPatchedVertexShader(native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]);
-      if (!vertex_shader.shader)
-         return false;
-      if (vertex_shader.camera_offset != 0)
-      {
-         // Takes the frame's camera from the prepass' draws, which come through here
-         ReadSceneDrawConstants(native_device_context, &gd, vertex_shader);
-      }
-
-      // An alpha blended draw into the scene writes its mask, reactive or transparency & composition (its pixel shader patched, the mask
-      // target added past the motion vector one)
-      ID3D11PixelShader* reactive_shader = nullptr;
-      if (IsReactiveMaskUsed(device_data) && gd.mv_reactive_target_rtv && rtvs[0] && rtvs[0] == gd.mv_scene_rtv)
-      {
-         ClassifyBoundBlend(native_device_context, &gd);
-         if (const ReactiveBlend blend = gd.mv_reactive_blend; blend != ReactiveBlend::NONE)
-         {
-            reactive_shader = GetPatchedShader<ID3D11PixelShader>(native_device, device_data, original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader, (blend == ReactiveBlend::ADDITIVE ? PixelShaderPatch::MASK_ADDITIVE : PixelShaderPatch::MASK_ALPHA)).shader.get();
-         }
-      }
-
-      // The patched vertex shader and the jitter stay bound after the draw (see "DrawWithMotionVectors"), with the game's pixel shader
-      // (a motion vector draw's is put back) or its mask version, and the mask target
-      PatchedDraws::BindPatchedShader(native_device_context, vertex_shader.shader.get(), &gd.mv_bound_vertex_shader);
-      BindJitter(native_device_context, &gd);
-      // A mask target left by an earlier draw goes when this one doesn't write it
-      if (ID3D11RenderTargetView* const mask_rtv = (reactive_shader ? gd.mv_reactive_target_rtv.get() : nullptr); rtvs[MotionVectorPatches::reactive_slot].get() != mask_rtv)
-      {
-         ID3D11RenderTargetView* targets[MotionVectorPatches::reactive_slot + 1] = {};
-         for (uint32_t slot = 0; slot < MotionVectorPatches::reactive_slot; slot++)
-         {
-            targets[slot] = rtvs[slot].get();
-         }
-         targets[MotionVectorPatches::reactive_slot] = mask_rtv;
-         native_device_context->OMSetRenderTargets(MotionVectorPatches::reactive_slot + 1, targets, dsv);
-      }
-      if (reactive_shader)
-      {
-         PatchedDraws::BindPatchedShader(native_device_context, reactive_shader, &gd.mv_bound_pixel_shader);
-#if DEVELOPMENT
-         gd.mv_stats.reactive_draws++;
-#endif
-      }
-      else
-      {
-         PatchedDraws::RestoreGameShader(native_device_context, &gd.mv_bound_pixel_shader);
-      }
-      draw();
-#if DEVELOPMENT
-      gd.mv_stats.jitter_draws++;
-#endif
-      return true;
    }
 
    // DLAA, FSR 3 Native AA or Luma TAA on the jittered scene, its depth (from the depth prepass, see the fill) and the motion vectors;
@@ -1704,10 +886,10 @@ class Bayonetta final : public Game
       auto& gd = GetGameDeviceData(device_data);
       auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
       auto* const copy_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Copy PS"));
-      if (!gd.mv_texture || !gd.mv_camera || !gd.mv_device_depth || !gd.mv_scene_color || !gd.mv_scene_rtv || !copy_vs || !copy_ps)
+      if (!gd.mv.texture || !gd.mv.camera || !gd.mv.device_depth || !gd.mv.scene_color || !gd.mv.scene_rtv || !copy_vs || !copy_ps)
          return false;
       com_ptr<ID3D11Texture2D> scene;
-      if (FAILED(gd.mv_scene_color->QueryInterface(&scene)))
+      if (FAILED(gd.mv.scene_color->QueryInterface(&scene)))
          return false;
       D3D11_TEXTURE2D_DESC scene_desc;
       scene->GetDesc(&scene_desc);
@@ -1743,7 +925,7 @@ class Bayonetta final : public Game
          return false;
 
       // FSR needs the camera (column vectors: vc4's view projection rows are the clip components)
-      const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(reinterpret_cast<const float*>(gd.mv_camera->data() + VIEW_PROJECTION_OFFSET), /* row_vectors */ false);
+      const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(reinterpret_cast<const float*>(gd.mv.camera->data() + VIEW_PROJECTION_OFFSET), /* row_vectors */ false);
 
       const SR::SettingsData settings_data = {
          .output_width = scene_desc.Width,
@@ -1780,13 +962,13 @@ class Bayonetta final : public Game
          .reset = device_data.force_reset_sr || output_recreated,
          .output_color = device_data.sr_output_color.get(),
          .source_color = scene.get(),
-         .motion_vectors = gd.mv_texture.get(),
-         .depth_buffer = gd.mv_device_depth.get(),
-         .bias_mask = (reactive_mask ? gd.mv_reactive.get() : nullptr),
-         .transparency_alpha = (reactive_mask ? gd.mv_transparency.get() : nullptr),
+         .motion_vectors = gd.mv.texture.get(),
+         .depth_buffer = gd.mv.device_depth.get(),
+         .bias_mask = (reactive_mask ? gd.mv.reactive.get() : nullptr),
+         .transparency_alpha = (reactive_mask ? gd.mv.transparency.get() : nullptr),
          // As applied (pixels, +y down)
-         .jitter_x = gd.mv_jitter[0],
-         .jitter_y = gd.mv_jitter[1],
+         .jitter_x = gd.mv.jitter[0],
+         .jitter_y = gd.mv.jitter[1],
          .vert_fov = gd.sr_vert_fov,
          .near_plane = gd.sr_near_plane,
          .far_plane = gd.sr_far_plane,
@@ -1817,7 +999,7 @@ class Bayonetta final : public Game
                D3D11_TEXTURE2D_DESC copy_desc;
                copy->GetDesc(&copy_desc);
                D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
-               gd.mv_scene_rtv->GetDesc(&rtv_desc);
+               gd.mv.scene_rtv->GetDesc(&rtv_desc);
                if (copy_desc.BindFlags & D3D11_BIND_RENDER_TARGET)
                {
                   native_device->CreateRenderTargetView(copy.get(), &rtv_desc, &gd.mv_scene_copy_rtv);
@@ -1827,7 +1009,7 @@ class Bayonetta final : public Game
          copy_rtv = gd.mv_scene_copy_rtv.get();
       }
       DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), rgb_blend_state, nullptr, copy_vs, copy_rtv ? copy_back_ps : copy_ps,
-         gd.sr_output_srv.get(), gd.mv_scene_rtv.get(), scene_desc.Width, scene_desc.Height, true, copy_rtv);
+         gd.sr_output_srv.get(), gd.mv.scene_rtv.get(), scene_desc.Width, scene_desc.Height, true, copy_rtv);
       if (gd.mv_scene_copy && !copy_rtv)
       {
          native_device_context->CopyResource(gd.mv_scene_copy.get(), scene.get());
@@ -1843,7 +1025,7 @@ class Bayonetta final : public Game
    {
       auto& gd = GetGameDeviceData(device_data);
       auto* const fill_shader = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta Motion Vector Fill CS"));
-      if (!fill_shader || !gd.mv_camera || !gd.prepass_drawn || !gd.prepass_depth_srv)
+      if (!fill_shader || !gd.mv.camera || !gd.prepass_drawn || !gd.prepass_depth_srv)
          return false;
 #if ENABLE_LUMA_TAA
       // Luma TAA without its 2x history (Medium; the game renders at the output size, so no TAAU) flickered on lasers at the High
@@ -1853,35 +1035,35 @@ class Bayonetta final : public Game
       const float reactive_scale = g_sr_reactive_scale;
 #endif
       CB::MotionVectorFillConstants constants = {
-         .jitter_ndc = {gd.mv_jitter_ndc[0], gd.mv_jitter_ndc[1]},
+         .jitter_ndc = {gd.mv.jitter_ndc[0], gd.mv.jitter_ndc[1]},
          .reactive_scale = reactive_scale,
          .reactive_threshold = g_sr_reactive_threshold,
          .reactive_enabled = (write_reactive ? 1.f : 0.f),
       };
       for (int i = 0; i < 16; i++)
       {
-         constants.reprojection.GetData()[i] = float(gd.mv_reprojection.GetData()[i]);
+         constants.reprojection.GetData()[i] = float(gd.mv.reprojection.GetData()[i]);
       }
-      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv_fill_buffer), &constants, sizeof(constants)))
+      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv.fill_buffer), &constants, sizeof(constants)))
          return false;
       // The scene and the motion vectors may be bound as render targets
       native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
-      ID3D11Buffer* const buffer = gd.mv_fill_buffer.get();
-      ID3D11ShaderResourceView* const srvs[2] = {gd.prepass_depth_srv.get(), write_reactive ? gd.mv_reactive_target_srv.get() : nullptr};
-      ID3D11UnorderedAccessView* const uavs[5] = {gd.mv_uav.get(), gd.mv_device_depth_uav.get(), write_reactive ? gd.mv_reactive_uav.get() : nullptr, write_reactive ? gd.mv_transparency_uav.get() : nullptr,
-         write_reactive ? gd.mv_reactive_previous_uav.get() : nullptr};
+      ID3D11Buffer* const buffer = gd.mv.fill_buffer.get();
+      ID3D11ShaderResourceView* const srvs[2] = {gd.prepass_depth_srv.get(), write_reactive ? gd.mv.reactive_target_srv.get() : nullptr};
+      ID3D11UnorderedAccessView* const uavs[5] = {gd.mv.uav.get(), gd.mv.device_depth_uav.get(), write_reactive ? gd.mv.reactive_uav.get() : nullptr, write_reactive ? gd.mv.transparency_uav.get() : nullptr,
+         write_reactive ? gd.mv.reactive_previous_uav.get() : nullptr};
       native_device_context->CSSetConstantBuffers(0, 1, &buffer);
       native_device_context->CSSetShaderResources(0, UINT(std::size(srvs)), srvs);
       native_device_context->CSSetUnorderedAccessViews(0, UINT(std::size(uavs)), uavs, nullptr);
       native_device_context->CSSetShader(fill_shader, nullptr, 0);
-      native_device_context->Dispatch((gd.mv_scene_size.x + 7) / 8, (gd.mv_scene_size.y + 7) / 8, 1);
+      native_device_context->Dispatch((gd.mv.scene_size.x + 7) / 8, (gd.mv.scene_size.y + 7) / 8, 1);
       ID3D11UnorderedAccessView* const null_uavs[std::size(uavs)] = {};
       ID3D11ShaderResourceView* const null_srvs[std::size(srvs)] = {};
       native_device_context->CSSetUnorderedAccessViews(0, UINT(std::size(null_uavs)), null_uavs, nullptr);
       native_device_context->CSSetShaderResources(0, UINT(std::size(null_srvs)), null_srvs);
       if (write_reactive)
       {
-         gd.sr_reactive_frame = cb_luma_global_settings.FrameIndex;
+         gd.mv.sr_reactive_frame = cb_luma_global_settings.FrameIndex;
       }
       return true;
    }
@@ -1891,57 +1073,57 @@ class Bayonetta final : public Game
    static void EndScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
    {
       auto& gd = GetGameDeviceData(device_data);
-      gd.mv_scene_open = false;
-      gd.mv_scene_done = true;
+      gd.mv.scene_open = false;
+      gd.mv.scene_done = true;
       DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
       DrawStateStack<DrawStateStackType::Compute> compute_state;
       graphics_state.Cache(native_device_context, device_data.uav_max_count);
       compute_state.Cache(native_device_context, device_data.uav_max_count);
       // The reactive and transparency & composition masks, written by the fill from what the alpha blended draws wrote
-      const bool reactive = IsReactiveMaskUsed(device_data) && gd.mv_reactive_target_srv;
+      const bool reactive = IsReactiveMaskUsed(device_data) && gd.mv.reactive_target_srv;
       if (reactive)
       {
          D3D11_TEXTURE2D_DESC desc = {};
-         if (gd.mv_reactive)
+         if (gd.mv.reactive)
          {
-            gd.mv_reactive->GetDesc(&desc);
+            gd.mv.reactive->GetDesc(&desc);
          }
-         if (desc.Width != gd.mv_scene_size.x || desc.Height != gd.mv_scene_size.y)
+         if (desc.Width != gd.mv.scene_size.x || desc.Height != gd.mv.scene_size.y)
          {
-            const std::unique_lock lock(gd.mv_mutex);
-            gd.mv_reactive.reset();
-            gd.mv_reactive_uav.reset();
-            gd.mv_transparency.reset();
-            gd.mv_transparency_uav.reset();
-            gd.mv_reactive_previous.reset();
-            gd.mv_reactive_previous_uav.reset();
-            desc = CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_R8_UNORM, gd.mv_scene_size.x, gd.mv_scene_size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-            if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, desc, &gd.mv_reactive)))
+            const std::unique_lock lock(gd.mv.mutex);
+            gd.mv.reactive.reset();
+            gd.mv.reactive_uav.reset();
+            gd.mv.transparency.reset();
+            gd.mv.transparency_uav.reset();
+            gd.mv.reactive_previous.reset();
+            gd.mv.reactive_previous_uav.reset();
+            desc = CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_R8_UNORM, gd.mv.scene_size.x, gd.mv.scene_size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+            if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, desc, &gd.mv.reactive)))
             {
-               native_device->CreateUnorderedAccessView(gd.mv_reactive.get(), nullptr, &gd.mv_reactive_uav);
+               native_device->CreateUnorderedAccessView(gd.mv.reactive.get(), nullptr, &gd.mv.reactive_uav);
             }
-            if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, desc, &gd.mv_transparency)))
+            if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, desc, &gd.mv.transparency)))
             {
-               native_device->CreateUnorderedAccessView(gd.mv_transparency.get(), nullptr, &gd.mv_transparency_uav);
+               native_device->CreateUnorderedAccessView(gd.mv.transparency.get(), nullptr, &gd.mv.transparency_uav);
             }
-            const CD3D11_TEXTURE2D_DESC previous_desc(DXGI_FORMAT_R32_FLOAT, gd.mv_scene_size.x, gd.mv_scene_size.y, 1, 1, D3D11_BIND_UNORDERED_ACCESS);
-            if (SUCCEEDED(native_device->CreateTexture2D(&previous_desc, nullptr, &gd.mv_reactive_previous)) &&
-                SUCCEEDED(native_device->CreateUnorderedAccessView(gd.mv_reactive_previous.get(), nullptr, &gd.mv_reactive_previous_uav)))
+            const CD3D11_TEXTURE2D_DESC previous_desc(DXGI_FORMAT_R32_FLOAT, gd.mv.scene_size.x, gd.mv.scene_size.y, 1, 1, D3D11_BIND_UNORDERED_ACCESS);
+            if (SUCCEEDED(native_device->CreateTexture2D(&previous_desc, nullptr, &gd.mv.reactive_previous)) &&
+                SUCCEEDED(native_device->CreateUnorderedAccessView(gd.mv.reactive_previous.get(), nullptr, &gd.mv.reactive_previous_uav)))
             {
                constexpr float zero[4] = {};
-               native_device_context->ClearUnorderedAccessViewFloat(gd.mv_reactive_previous_uav.get(), zero);
+               native_device_context->ClearUnorderedAccessViewFloat(gd.mv.reactive_previous_uav.get(), zero);
             }
          }
       }
-      const bool write_reactive = reactive && gd.mv_reactive_uav && gd.mv_transparency_uav && gd.mv_reactive_previous_uav;
-      const bool filled = std::exchange(gd.mv_fill_pending, false) && FillMotionVectors(native_device, native_device_context, device_data, write_reactive);
+      const bool write_reactive = reactive && gd.mv.reactive_uav && gd.mv.transparency_uav && gd.mv.reactive_previous_uav;
+      const bool filled = std::exchange(gd.mv.fill_pending, false) && FillMotionVectors(native_device, native_device_context, device_data, write_reactive);
       gd.mv_filled = filled;
       // The upscaler's depth comes from the fill
       if (gd.sr_active && filled)
       {
          [[maybe_unused]] const bool drawn = DrawUpscaler(native_device, native_device_context, device_data, write_reactive);
 #if DEVELOPMENT
-         gd.mv_stats.sr_draws += drawn;
+         gd.mv.stats.sr_draws += drawn;
 #endif
       }
       compute_state.Restore(native_device_context);
@@ -1949,8 +1131,8 @@ class Bayonetta final : public Game
    }
 
 public:
-   // The motion vector target in every blend state (and dgVoodoo's impossible per-target blends repaired, as TW2), the tracked
-   // bindings (always current, so the first motion vector frame finds them), the MSAA targets' shader resource bind and the vc4 copies
+   // Core's motion vector events (the motion vector target in every blend state, the tracked bindings, the vc4 copies) and the MSAA
+   // targets' shader resource bind
    static void SetEvents(bool enable)
    {
       const auto set = [enable]<reshade::addon_event event>(typename reshade::addon_event_traits<event>::decl callback)
@@ -1964,20 +1146,17 @@ public:
             reshade::unregister_event<event>(callback);
          }
       };
-      set.template operator()<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot, true, true>);
-      set.template operator()<reshade::addon_event::bind_pipeline>(PatchedDraws::OnBindPipeline<GetBoundStates>);
-      set.template operator()<reshade::addon_event::push_descriptors>(PatchedDraws::OnPushConstantBuffers<GetBoundStates>);
-      set.template operator()<reshade::addon_event::bind_vertex_buffers>(PatchedDraws::OnBindVertexBuffers<GetBoundStates>);
-      set.template operator()<reshade::addon_event::bind_index_buffer>(PatchedDraws::OnBindIndexBuffer<GetBoundStates>);
+      if (enable)
+      {
+         SceneMotionVectors::RegisterEvents<GetSceneMotionVectors>();
+      }
+      else
+      {
+         SceneMotionVectors::UnregisterEvents<GetSceneMotionVectors>();
+      }
       set.template operator()<reshade::addon_event::create_resource>(OnCreateResource);
       set.template operator()<reshade::addon_event::copy_resource>(OnCopyResource);
       set.template operator()<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
-      // The vc4 copies' events stay registered too: ReShade changes its callback lists without a lock, and dgVoodoo presents from
-      // another thread than the frame's (registering them at present would race the frame's events). They return at once while
-      // "mv_active" is off.
-      set.template operator()<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
-      set.template operator()<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
-      set.template operator()<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
    }
 
    void OnInit(bool async) override
@@ -2001,7 +1180,7 @@ public:
       luma_data_cbuffer_index = 12;
       luma_ui_cbuffer_index = -1;
 
-      sr_game_tooltip = "Needs Anti-Aliasing off in the game's options. DLSS and FSR 3 require Luma-Upscaler.exe next to the game's exe.\n";
+      sr_game_tooltip = "Needs Anti-Aliasing off in the game's options. DLSS, FSR and XeSS require Luma-Upscaler.exe next to the game's exe.\n";
 
       default_luma_global_game_settings.Dithering = 1.f;
       // Light AutoHDR on the movies (the TW1/ME1 pair: at 0.5 the peak is 165 nits)
@@ -2049,8 +1228,8 @@ public:
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("bloom.target", bloom_texture)});
       Mcp::RegisterInts({{"bloom_scale_override", &g_bloom_scale_override, 0, 4}});
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.pred_mask", smaa_predication_srv), MCP_GAME_TEXTURE("canvas.scene", scene_srv), MCP_GAME_TEXTURE("depth_prepass", depth_srv),
-         MCP_GAME_TEXTURE("mv.velocity", mv_texture), MCP_GAME_TEXTURE("mv.depth", mv_device_depth), MCP_GAME_TEXTURE("mv.prepass", prepass_depth_srv),
-         MCP_GAME_TEXTURE("sr.reactive", mv_reactive), MCP_GAME_TEXTURE("sr.transparency", mv_transparency), MCP_GAME_TEXTURE("sr.draws_mask", mv_reactive_target)});
+         MCP_GAME_TEXTURE("mv.velocity", mv.texture), MCP_GAME_TEXTURE("mv.depth", mv.device_depth), MCP_GAME_TEXTURE("mv.prepass", prepass_depth_srv),
+         MCP_GAME_TEXTURE("sr.reactive", mv.reactive), MCP_GAME_TEXTURE("sr.transparency", mv.transparency), MCP_GAME_TEXTURE("sr.draws_mask", mv.reactive_target)});
 #endif
 
       // SMAA: Core registers its 6 passes ("Luma_SMAA_impl.hlsl"); the predication mask from the depth prepass
@@ -2129,7 +1308,7 @@ public:
       return patched(DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::BLEND_INPUT, target->mask));
    }
 
-   // Every patch a draw may ask "GetPatchedShader" for: which one it takes depends on its state
+   // Every patch a draw may ask "SceneMotionVectors::GetPatchedShader" for: which one it takes depends on its state
    void AddShaderWarmupVariants(reshade::api::pipeline_subobject_type type, const std::vector<uint8_t>& code, std::vector<std::vector<uint8_t>>* variants) override
    {
       std::string error;
@@ -2144,9 +1323,9 @@ public:
       // dgVoodoo's own compute shaders have no variants
       if (type != reshade::api::pipeline_subobject_type::pixel_shader)
          return;
-      for (size_t patch = 0; patch < size_t(PixelShaderPatch::COUNT); patch++)
+      for (size_t patch = 0; patch <= size_t(COVERAGE_PATCH); patch++)
       {
-         if (std::vector<uint8_t> patched = PatchPixelShader(PixelShaderPatch(patch), code.data(), code.size(), &error); !patched.empty())
+         if (std::vector<uint8_t> patched = MotionVectorGame::PatchPixelShader(PixelShaderPatch(patch), code.data(), code.size(), &error); !patched.empty())
          {
             variants->push_back(std::move(patched));
          }
@@ -2167,18 +1346,7 @@ public:
          },
          &device_data);
       // The last complete frame's motion vector counts
-      const auto& mv_stats = GetGameDeviceData(device_data).mv_last_stats;
-      Mcp::RegisterCounters({{"mv.draws", &mv_stats.motion_vector_draws}, {"mv.jitter_draws", &mv_stats.jitter_draws}, {"mv.reactive_draws", &mv_stats.reactive_draws}, {"mv.matched", &mv_stats.matched},
-                               {"mv.camera_only", &mv_stats.camera_only}, {"mv.other_camera", &mv_stats.other_camera}, {"mv.uncopied", &mv_stats.uncopied}, {"mv.maps", &mv_stats.maps}, {"mv.updates", &mv_stats.updates},
-                               {"mv.other_maps", &mv_stats.other_maps}, {"mv.sr_draws", &mv_stats.sr_draws}, {"mv.tiebreak_collisions", &mv_stats.tiebreak_collisions}, {"mv.untransformed", &mv_stats.untransformed},
-                               {"mv.bound_state_mismatches", &mv_stats.bound_state_mismatches}, {"mv.constants_pool", &mv_stats.constants_pool},
-                               {"mv.prepass_drawn", &mv_stats.prepass_drawn}, { "mv.ended_by_hash",
-                                  &mv_stats.ended_by }},
-         &device_data);
-      for (size_t i = 0; i < std::size(MOTION_VECTOR_REJECT_NAMES); i++)
-      {
-         Mcp::RegisterCounter(std::string("mv.rejected.") + MOTION_VECTOR_REJECT_NAMES[i], &mv_stats.rejected[i], &device_data);
-      }
+      SceneMotionVectors::RegisterDevValues(GetGameDeviceData(device_data).mv, &device_data);
 #endif
    }
 
@@ -2217,7 +1385,7 @@ public:
       {
          game_device_data.canvas = src_resource;
       }
-      if (game_device_data.mv_scene_open && game_device_data.mv_scene_color && src_resource == reinterpret_cast<uint64_t>(game_device_data.mv_scene_color.get()))
+      if (game_device_data.mv.scene_open && game_device_data.mv.scene_color && src_resource == reinterpret_cast<uint64_t>(game_device_data.mv.scene_color.get()))
       {
          game_device_data.mv_scene_last_copy = reinterpret_cast<ID3D11Resource*>(dst_resource);
       }
@@ -2711,18 +1879,18 @@ public:
 
       // DLAA/FSR/Luma TAA: the scene's draws with motion vectors or jitter (see "DrawWithMotionVectors"), and the fill and upscaler at
       // its first post pass
-      if (game_device_data.mv_active && is_immediate)
+      if (game_device_data.mv.active && is_immediate)
       {
          // A game draw with a vertex shader, which the patched shaders can redo: replaced ones too (the particles translate to copytex,
-         // replaced by "Copy_0x91A6C437"; their patched versions come from the game's code, see "GetPatchedShader")
+         // replaced by "Copy_0x91A6C437"; their patched versions come from the game's code, see "SceneMotionVectors::GetPatchedShader")
          const bool game_mesh_draw = has_vertex_shader && original_shader_hashes.pixel_shaders[0] != SHADER_HASH_NONE;
-         if (!game_device_data.mv_scene_done && shader_hashes_ScenePost.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
+         if (!game_device_data.mv.scene_done && shader_hashes_ScenePost.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
          {
-            if (game_device_data.mv_scene_open)
+            if (game_device_data.mv.scene_open)
             {
 #if DEVELOPMENT
-               game_device_data.mv_stats.ended_by = pixel_shader_hash;
-               game_device_data.mv_stats.prepass_drawn = game_device_data.prepass_drawn;
+               game_device_data.mv.stats.ended_by = pixel_shader_hash;
+               game_device_data.mv.stats.prepass_drawn = game_device_data.prepass_drawn;
 #endif
                // The scene's last copy, if the pass reads it
                game_device_data.mv_scene_copy.reset();
@@ -2748,7 +1916,7 @@ public:
             }
          }
          // Until the scene opens only its targets matter (the shadow maps come first)
-         else if (!game_device_data.mv_scene_done && !game_device_data.mv_scene_open && game_mesh_draw)
+         else if (!game_device_data.mv.scene_done && !game_device_data.mv.scene_open && game_mesh_draw)
          {
             com_ptr<ID3D11RenderTargetView> rtvs[2];
             com_ptr<ID3D11DepthStencilView> scene_dsv;
@@ -2758,7 +1926,7 @@ public:
                OpenScene(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0], rtvs[0].get(), rtvs[1] != nullptr, scene_dsv.get());
             }
          }
-         if (game_device_data.mv_scene_open && game_mesh_draw)
+         if (game_device_data.mv.scene_open && game_mesh_draw)
          {
             com_ptr<ID3D11RenderTargetView> rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
             com_ptr<ID3D11DepthStencilView> dsv;
@@ -2777,7 +1945,7 @@ public:
                      com_ptr<ID3D11Resource> resource;
                      rtvs[0]->GetResource(&resource);
                      const D3D11_TEXTURE2D_DESC desc = GetTexture2DDesc(resource.get());
-                     if (desc.SampleDesc.Count == 1 && (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0 && uint2{desc.Width, desc.Height} == game_device_data.mv_scene_size)
+                     if (desc.SampleDesc.Count == 1 && (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0 && uint2{desc.Width, desc.Height} == game_device_data.mv.scene_size)
                      {
                         game_device_data.prepass_is_depth = true;
                         if (resource != game_device_data.prepass_depth)
@@ -2793,13 +1961,13 @@ public:
                }
                game_device_data.prepass_drawn |= game_device_data.prepass_is_depth;
             }
-            const bool motion_vectors = DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv.get());
+            const bool motion_vectors = SceneMotionVectors::DrawWithMotionVectors<MotionVectorGame>(&game_device_data.mv, native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv.get());
             // An alpha blending state blends the motion vector target by the alpha written there: a draw that doesn't write it (refused
             // above) must not have it bound
-            if (!motion_vectors && rtvs[MotionVectorPatches::target_slot] && rtvs[MotionVectorPatches::target_slot] == game_device_data.mv_rtv)
+            if (!motion_vectors && rtvs[MotionVectorPatches::target_slot] && rtvs[MotionVectorPatches::target_slot] == game_device_data.mv.rtv)
             {
-               ClassifyBoundBlend(native_device_context, &game_device_data);
-               if (game_device_data.mv_alpha_blended)
+               SceneMotionVectors::ClassifyBoundBlend(native_device_context, &game_device_data.mv);
+               if (game_device_data.mv.alpha_blended)
                {
                   rtvs[MotionVectorPatches::target_slot].reset();
                   ID3D11RenderTargetView* targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
@@ -2810,10 +1978,10 @@ public:
                   native_device_context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, targets, dsv.get());
                }
             }
-            const bool jitter = !motion_vectors && DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv.get());
+            const bool jitter = !motion_vectors && SceneMotionVectors::DrawWithJitter<MotionVectorGame>(&game_device_data.mv, native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv.get());
 #if DEVELOPMENT
             Mcp::Annotate(cmd_list_data, motion_vectors ? "mv" : (jitter ? "jitter" : "unpatched"));
-            if (const MotionVectorReject reject = std::exchange(game_device_data.mv_draw_reject, REJECT_COUNT); reject != REJECT_COUNT)
+            if (const SceneMotionVectors::MotionVectorReject reject = std::exchange(game_device_data.mv.draw_reject, SceneMotionVectors::REJECT_COUNT); reject != SceneMotionVectors::REJECT_COUNT)
             {
                Mcp::Annotate(cmd_list_data, "mv_reject", int(reject));
             }
@@ -2825,8 +1993,8 @@ public:
       // Every draw without a patched shader: the game's own, if the last patched draw's are still bound
       if (is_immediate)
       {
-         PatchedDraws::RestoreGameShader(native_device_context, &game_device_data.mv_bound_vertex_shader);
-         PatchedDraws::RestoreGameShader(native_device_context, &game_device_data.mv_bound_pixel_shader);
+         PatchedDraws::RestoreGameShader(native_device_context, &game_device_data.mv.bound_vertex_shader);
+         PatchedDraws::RestoreGameShader(native_device_context, &game_device_data.mv.bound_pixel_shader);
       }
 
       const bool is_bloom_source = shader_hashes_BloomSource.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel);
@@ -2932,7 +2100,7 @@ public:
          }
          if (GetTexture2DDesc(rt.get()).SampleDesc.Count >= 4)
          {
-            if (ID3D11PixelShader* const coverage_shader = GetPatchedShader<ID3D11PixelShader>(native_device, device_data, pixel_shader_hash, cmd_list_data.pipeline_state_original_pixel_shader, PixelShaderPatch::COVERAGE).shader.get())
+            if (ID3D11PixelShader* const coverage_shader = SceneMotionVectors::GetPatchedShader<MotionVectorGame, ID3D11PixelShader>(&game_device_data.mv, native_device, device_data, pixel_shader_hash, cmd_list_data.pipeline_state_original_pixel_shader, COVERAGE_PATCH).shader.get())
             {
                com_ptr<ID3D11PixelShader> game_shader;
                native_device_context->PSGetShader(&game_shader, nullptr, nullptr);
@@ -2991,10 +2159,10 @@ public:
       {
          game_device_data.ReleaseT2xFrames();
       }
-      const bool mv_was_active = game_device_data.mv_active.exchange((game_device_data.sr_active || game_device_data.t2x_active || g_mv_enable) && !game_device_data.msaa_active);
-      if (game_device_data.mv_active && !mv_was_active)
+      const bool mv_was_active = game_device_data.mv.active.exchange((game_device_data.sr_active || game_device_data.t2x_active || g_mv_enable) && !game_device_data.msaa_active);
+      if (game_device_data.mv.active && !mv_was_active)
       {
-         game_device_data.mv_constants.Restart();
+         game_device_data.mv.constants.Restart();
       }
       // SMAA turned off or replaced by an upscaler that drew: its ~80 MB of 4K intermediates go
       if ((!g_smaa_enable || game_device_data.mv_jitter_allowed) && game_device_data.smaa_resources_live)
@@ -3012,75 +2180,75 @@ public:
          game_device_data.sr_output_srv.reset();
          if (!g_mv_enable && !game_device_data.t2x_active)
          {
-            const std::unique_lock lock(game_device_data.mv_mutex);
-            game_device_data.ReleaseMotionVectorTargets();
+            const std::unique_lock lock(game_device_data.mv.mutex);
+            game_device_data.mv.ReleaseMotionVectorTargets();
             // The game's scene, depth, prepass and scene copy (taken again at the next scene), so a resize after None doesn't keep the
             // old ones alive; and the vc4 copies the object tables and the cameras hold
-            game_device_data.mv_depth.reset();
-            game_device_data.mv_scene_color.reset();
-            game_device_data.mv_scene_rtv.reset();
+            game_device_data.mv.depth.reset();
+            game_device_data.mv.scene_color.reset();
+            game_device_data.mv.scene_rtv.reset();
             game_device_data.mv_scene_copy.reset();
             game_device_data.mv_scene_last_copy.reset();
             game_device_data.mv_scene_copy_rtv.reset();
             game_device_data.prepass_depth.reset();
             game_device_data.prepass_depth_srv.reset();
-            game_device_data.mv_scene_size = {};
-            game_device_data.mv_objects.Reset();
-            game_device_data.mv_camera.reset();
-            game_device_data.mv_previous_camera.reset();
-            game_device_data.mv_fill_buffer.reset();
-            game_device_data.mv_jitter_buffer.reset();
-            game_device_data.mv_previous_constants = {}; // Its 4 MiB dynamic ring is address space too
-            game_device_data.mv_constants.ReleasePool();
+            game_device_data.mv.scene_size = {};
+            game_device_data.mv.objects.Reset();
+            game_device_data.mv.camera.reset();
+            game_device_data.mv.previous_camera.reset();
+            game_device_data.mv.fill_buffer.reset();
+            game_device_data.mv.jitter_buffer.reset();
+            game_device_data.mv.previous_constants = {}; // Its 4 MiB dynamic ring is address space too
+            game_device_data.mv.constants.ReleasePool();
          }
       }
-      game_device_data.mv_constants.TrimPool(game_device_data.mv_active);
+      game_device_data.mv.constants.TrimPool(game_device_data.mv.active);
 #if DEVELOPMENT
-      game_device_data.mv_stats.constants_pool = uint32_t(game_device_data.mv_constants.pool.size());
-      game_device_data.bound_states.check = g_bound_state_check;
-      game_device_data.mv_stats.bound_state_mismatches += std::exchange(game_device_data.bound_states.mismatches, 0);
+      game_device_data.mv.stats.constants_pool = uint32_t(game_device_data.mv.constants.pool.size());
+      game_device_data.mv.bound_states.check = g_bound_state_check;
+      game_device_data.mv.stats.bound_state_mismatches += std::exchange(game_device_data.mv.bound_states.mismatches, 0);
 #endif
       // The reactive masks go once the fill stopped writing them (DLSS, the masks off, SMAA)
-      if (game_device_data.mv_reactive_target && cb_luma_global_settings.FrameIndex - game_device_data.sr_reactive_frame > IDLE_RELEASE_FRAMES)
+      if (game_device_data.mv.reactive_target && cb_luma_global_settings.FrameIndex - game_device_data.mv.sr_reactive_frame > IDLE_RELEASE_FRAMES)
       {
-         const std::unique_lock lock(game_device_data.mv_mutex);
-         game_device_data.ReleaseReactiveMasks();
+         const std::unique_lock lock(game_device_data.mv.mutex);
+         game_device_data.mv.ReleaseReactiveMasks();
       }
       // A scene no post pass ended ends here: its jitter must not reach the next frame's draws before its first mesh
-      game_device_data.mv_scene_open = false;
-      game_device_data.mv_scene_done = false;
-      game_device_data.mv_frame_ended = true;
-      game_device_data.mv_fill_pending = false;
+      game_device_data.mv.scene_open = false;
+      game_device_data.mv.scene_done = false;
+      game_device_data.mv.frame_ended = true;
+      game_device_data.mv.fill_pending = false;
       game_device_data.open_refused_rtv = nullptr;
       game_device_data.open_refused_dsv = nullptr;
       // -1 at native resolution once the upscaler draws (Core biases the game's samplers at bias 0, the trilinear ones upgraded to
       // AF16x, see "DllMain"); none while the bridge's helper starts (SMAA on the unjittered scene)
       SetTextureMipLodBias(nullptr, device_data, ((game_device_data.sr_active && game_device_data.mv_jitter_allowed) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
 #if DEVELOPMENT
-      game_device_data.mv_last_stats = std::exchange(game_device_data.mv_stats, {});
+      game_device_data.mv.last_stats = std::exchange(game_device_data.mv.stats, {});
       // "MV Debug View": Core's debug draw of the target, absolute values in pixels
       {
-         const std::shared_lock lock(game_device_data.mv_mutex);
-         if (g_mv_debug_view && game_device_data.mv_texture)
+         const std::shared_lock lock(game_device_data.mv.mutex);
+         if (g_mv_debug_view && game_device_data.mv.texture)
          {
             D3D11_TEXTURE2D_DESC desc;
-            game_device_data.mv_texture->GetDesc(&desc);
+            game_device_data.mv.texture->GetDesc(&desc);
             debug_draw_auto_clear_texture = false;
             debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::Abs | (uint32_t)DebugDrawTextureOptionsMask::UVToPixelSpace;
-            device_data.debug_draw_texture = game_device_data.mv_texture.get();
+            device_data.debug_draw_texture = game_device_data.mv.texture.get();
             device_data.debug_draw_texture_format = desc.Format;
             device_data.debug_draw_texture_size = {desc.Width, desc.Height, 1, 1};
          }
-         else if (g_sr_reactive_debug_view && game_device_data.mv_reactive)
+         else if (g_sr_reactive_debug_view && game_device_data.mv.reactive)
          {
             debug_draw_auto_clear_texture = false;
             debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::RedOnly;
             debug_draw_options &= ~((uint32_t)DebugDrawTextureOptionsMask::Abs | (uint32_t)DebugDrawTextureOptionsMask::UVToPixelSpace);
-            device_data.debug_draw_texture = game_device_data.mv_reactive.get();
+            device_data.debug_draw_texture = game_device_data.mv.reactive.get();
             device_data.debug_draw_texture_format = DXGI_FORMAT_R8_UNORM;
-            device_data.debug_draw_texture_size = {game_device_data.mv_scene_size.x, game_device_data.mv_scene_size.y, 1, 1};
+            device_data.debug_draw_texture_size = {game_device_data.mv.scene_size.x, game_device_data.mv.scene_size.y, 1, 1};
          }
-         else if (device_data.debug_draw_texture && (device_data.debug_draw_texture.get() == game_device_data.mv_texture.get() || device_data.debug_draw_texture.get() == game_device_data.mv_reactive.get()))
+         else if (device_data.debug_draw_texture && (device_data.debug_draw_texture.get() == game_device_data.mv.texture.get() || device_data.debug_draw_texture.get() == game_device_data.mv.reactive.get()))
          {
             device_data.debug_draw_texture = nullptr;
          }
