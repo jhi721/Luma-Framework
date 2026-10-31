@@ -64,7 +64,6 @@ namespace
    // a plain copy the game also draws opaque elsewhere: only this draw blends ONE/ONE. The exposure meter (copy 0x7561D004, ps_down_sample_4x4,
    // with_glare 0x68A0C136) and the water read the glow target before it, so "Bloom Intensity" is applied here, not in the target
    const ShaderHashesList shader_hashes_glow_composite = {.pixel_shaders = {0xBA1E66BE}};
-   constexpr D3D12_RENDER_TARGET_BLEND_DESC additive_blend = {.BlendEnable = TRUE, .SrcBlend = D3D12_BLEND_ONE, .DestBlend = D3D12_BLEND_ONE, .BlendOp = D3D12_BLEND_OP_ADD, .SrcBlendAlpha = D3D12_BLEND_ONE, .DestBlendAlpha = D3D12_BLEND_ONE, .BlendOpAlpha = D3D12_BLEND_OP_ADD, .LogicOp = D3D12_LOGIC_OP_NOOP, .RenderTargetWriteMask = UINT8(D3D12_COLOR_WRITE_ENABLE_ALL)};
    constexpr uint32_t bloom_mip_count = 4; // 512x256 down to 64x32, the vanilla levels
    // c_ps_user (cb9, PS b9) in the engine's constant mirror: "FUN_1400f29c0(row, data, rows)" writes it with descriptor 0x35102002190000 | row << 4,
    // whose bits 44+ are its base in the data area (see "GetConstantMirror()")
@@ -81,14 +80,19 @@ namespace
    bool g_smaa_predication = true;
    // SMAA T2x without DLSS: the camera jitters by a quarter pixel in two phases and Core's SMAA blends with the previous frame along the motion vectors
    bool g_smaa_t2x = false;
-   float g_rcas_sharpness = 0.f;    // RCAS on SMAA's output (after T2x's resolve), 0 = off
-   bool g_hide_ui = false;          // Session only, so a restart always has a HUD
+   float g_rcas_sharpness = 0.f; // RCAS on SMAA's output (after T2x's resolve), 0 = off
+   bool g_hide_ui = false;       // Session only, so a restart always has a HUD
+#if DEVELOPMENT || TEST
+   bool g_status_overlay = false; // The live AA/SR/MV/AO state over the game (see "OnInit()")
+#endif
    bool g_luma_bloom_enable = true; // Not a setting: the DEV/MCP A/B against the game's glow pyramid
    float g_bloom_intensity = 1.f;
    bool g_gtao_enable = true;
    bool g_gtvbao_enable = false;         // GT-VBAO's main pass in place of XeGTAO's, on the same inputs, denoise and apply
    float g_gtao_final_value_power = 1.f; // DEV/TEST calibration knobs, not persisted
    float g_gtao_radius_override = 0.f;   // > 0 overrides the shader's EFFECT_RADIUS (view units, meters)
+   // The AO history's weight under the per frame noise (see "DrawXeGTAO()"), 0 turns it off. MELE's value (Luma_MELE_XeGTAO.hlsl)
+   PUBLISHING_CONSTEXPR float g_gtao_history_weight = 0.9f;
 #if DEVELOPMENT
    int g_gtao_debug_view = 0; // 0 off, 1 depth gradient, 2 normals, 3 AO x8, 4 edges
    int g_gtao_temporal = 0;   // 0 = under DLAA or SMAA T2x (see "DrawXeGTAO()"), 1 = off, 2 = on
@@ -299,10 +303,13 @@ namespace
       MV_REFUSED_NO_VERTEX_BUFFER,
       MV_REFUSED_BAD_VIEW,
       MV_REFUSED_NO_BUFFERS,
+      MV_DIAG_DRAWS, // TEMP diagnostic
+      MV_DIAG_PREPASS,
+      MV_DIAG_PAIR,
       MV_COUNT,
    };
 #if DEVELOPMENT
-   constexpr std::array<const char*, MV_COUNT> object_motion_count_names = {"mv.patched", "mv.matched", "mv.new", "mv.overflow", "mv.tiebreak_collisions", "mv.rigid_static", "mv.rigid_moving", "mv.rigid_new", "mv.refused.bundle", "mv.refused.render_pass", "mv.refused.not_indexed", "mv.refused.instanced", "mv.refused.base_vertex", "mv.refused.rt_count", "mv.refused.other_dsv", "mv.refused.no_texture", "mv.refused.no_game_params", "mv.refused.no_variant", "mv.refused.no_thread_slot", "mv.refused.no_mirror", "mv.refused.no_vertex_buffer", "mv.refused.bad_view", "mv.refused.no_buffers"};
+   constexpr std::array<const char*, MV_COUNT> object_motion_count_names = {"mv.patched", "mv.matched", "mv.new", "mv.overflow", "mv.tiebreak_collisions", "mv.rigid_static", "mv.rigid_moving", "mv.rigid_new", "mv.refused.bundle", "mv.refused.render_pass", "mv.refused.not_indexed", "mv.refused.instanced", "mv.refused.base_vertex", "mv.refused.rt_count", "mv.refused.other_dsv", "mv.refused.no_texture", "mv.refused.no_game_params", "mv.refused.no_variant", "mv.refused.no_thread_slot", "mv.refused.no_mirror", "mv.refused.no_vertex_buffer", "mv.refused.bad_view", "mv.refused.no_buffers", "mv.diag.draws", "mv.diag.prepass", "mv.diag.pair"};
    // Being counted, and the last frame's
    std::array<uint32_t, MV_COUNT> object_motion_counts = {};
    std::array<uint32_t, MV_COUNT> object_motion_counts_frame = {};
@@ -724,6 +731,11 @@ struct YakuzaKiwamiDeviceData final : public GameDeviceData
    reshade::api::resource gtao_depth_mips = {};
    std::array<reshade::api::resource, 2> gtao_working = {};
    reshade::api::resource gtao_final = {};
+   // The AO history, (AO, view Z) ping-ponged: "temporal_pass_cs" reads the last one written ("gtao_history_index") and writes the other. It
+   // restarts unless it was written the frame before
+   std::array<reshade::api::resource, 2> gtao_history = {};
+   uint32_t gtao_history_index = 0;
+   uint64_t gtao_history_present = UINT64_MAX;
    std::atomic<uint64_t> gtao_present = UINT64_MAX; // The present count of XeGTAO's last draw (its textures go when it's idle)
    // The command lists whose fx_ssao_test XeGTAO replaced: the rest of the chain on each (filters skipped, upsampling drawing XeGTAO's) follows,
    // and the upsampling takes it out. Not the present count, which the game's worker threads can see change within one frame's recording: a chain
@@ -743,6 +755,7 @@ struct YakuzaKiwamiDeviceData final : public GameDeviceData
    DeviceData::GamePassD3D12 bloom_composite_pass;
    DeviceData::GamePassD3D12 bloom_apply_pass;
    reshade::api::resource bloom_input = {};
+   reshade::api::resource glow_scene_copy = {};            // The scene before the glow composite (a shader resource), guarded by "bloom_apply_pass.mutex"
    std::atomic<uint64_t> bloom_drawn_present = UINT64_MAX; // glow_pass1 is skipped the frame after it too
 
    // DLAA (see "DrawDLAA()"). Each pass' mutex also guards its targets, kept in "state" between draws: the copy pass the depth copy (R32,
@@ -1183,6 +1196,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("YKR XeGTAO Main Pass CS"), ShaderDefinition{.file_name = "Luma_YKR_XeGTAO", .type = reshade::api::pipeline_subobject_type::compute_shader, .function_name = "main_pass_cs"});
       native_shaders_definitions.emplace(CompileTimeStringHash("YKR GT-VBAO Main Pass CS"), ShaderDefinition{.file_name = "Luma_YKR_XeGTAO", .type = reshade::api::pipeline_subobject_type::compute_shader, .function_name = "gtvbao_main_pass_cs"});
       native_shaders_definitions.emplace(CompileTimeStringHash("YKR GT-VBAO Temporal Main Pass CS"), ShaderDefinition{.file_name = "Luma_YKR_XeGTAO", .type = reshade::api::pipeline_subobject_type::compute_shader, .function_name = "gtvbao_main_pass_cs", .defines_data = {{"GTVBAO_SLICE_COUNT", "1.0"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("YKR XeGTAO Temporal Pass CS"), ShaderDefinition{.file_name = "Luma_YKR_XeGTAO", .type = reshade::api::pipeline_subobject_type::compute_shader, .function_name = "temporal_pass_cs"});
       native_shaders_definitions.emplace(CompileTimeStringHash("YKR XeGTAO Denoise Pass 1 CS"), ShaderDefinition{.file_name = "Luma_YKR_XeGTAO", .type = reshade::api::pipeline_subobject_type::compute_shader, .function_name = "denoise_pass_cs", .defines_data = {{"XE_GTAO_FINAL_APPLY", "0"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("YKR XeGTAO Denoise Pass 2 CS"), ShaderDefinition{.file_name = "Luma_YKR_XeGTAO", .type = reshade::api::pipeline_subobject_type::compute_shader, .function_name = "denoise_pass_cs", .defines_data = {{"XE_GTAO_FINAL_APPLY", "1"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("YKR XeGTAO Apply PS"), ShaderDefinition{.file_name = "Luma_YKR_XeGTAO", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "apply_ps"});
@@ -1193,12 +1207,78 @@ public:
       sr_game_tooltip = "DLAA only (no upscaling). Characters, hair, trees and moved world objects get their own motion; particles and other effects move with the camera's and can leave trails.\n";
 
       reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
+#if DEVELOPMENT || TEST
+      // "Status Overlay": ReShade calls this every frame, with its overlay open or closed (its "OSD" overlays only draw on the splash). The present
+      // thread runs it, after Core's present counted the next frame: the "present" stamps are frames ago, 1 = drawn in the frame just presented.
+      reshade::register_event<reshade::addon_event::reshade_overlay>([](reshade::api::effect_runtime* runtime)
+         {
+            DeviceData* const device_data = runtime->get_device()->get_private_data<DeviceData>();
+            if (!g_status_overlay || !device_data || !device_data->game)
+            {
+               return;
+            }
+            auto& game_device_data = static_cast<YakuzaKiwamiDeviceData&>(*device_data->game);
+            const uint64_t present_count = device_data->present_count.load(std::memory_order_relaxed);
+            const auto age = [present_count](uint64_t stamp)
+            {
+               return (stamp == UINT64_MAX ? std::string("never") : std::format("{} ago", present_count - stamp));
+            };
+
+            ImGui::SetNextWindowPos(ImVec2(10.f, 10.f));
+            ImGui::SetNextWindowBgAlpha(0.6f);
+            if (ImGui::Begin("Luma Status", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_AlwaysAutoResize))
+            {
+               constexpr std::array<const char*, 4> sr_type_names = {"DLSS", "FSR", "Luma TAA", "XeSS"}; // SR::Type order
+               const SR::InstanceData* const sr_instance_data = device_data->GetSRInstanceData();
+               const bool dlaa_active = game_device_data.dlaa_active.load(std::memory_order_relaxed);
+               if (device_data->sr_type == SR::Type::None || !sr_instance_data)
+               {
+                  ImGui::TextUnformatted("SR: off");
+               }
+               else
+               {
+                  const char* const version_name = sr_instance_data->version_name.load();
+                  const SR::SettingsData& sr_settings = sr_instance_data->settings_data;
+                  ImGui::Text("SR: %s%s%s | active %s | drawn %s", sr_type_names[size_t(device_data->sr_type)], version_name ? " " : "", version_name ? version_name : "", dlaa_active ? "yes" : "no", age(game_device_data.dlaa_drawn_present.load(std::memory_order_relaxed)).c_str());
+                  ImGui::Text("    %ux%u -> %ux%u | preset %u | mip bias %.2f", sr_settings.render_width, sr_settings.render_height, sr_settings.output_width, sr_settings.output_height, sr_settings.render_preset,
+                     (dlaa_active && g_dlaa_mip_bias) ? sr_implementations[device_data->sr_type]->GetMipLODBias(sr_instance_data) : 0.f);
+               }
+               {
+                  const std::shared_lock lock(camera_state.mutex);
+                  ImGui::Text("Camera: projection hook %s | motion %s | jitter (%+.3f, %+.3f) px | capture %s", set_projection_original ? "on" : "MISSING", camera_state.motion_active ? "on" : "off", camera_state.jitter_pixels[0], camera_state.jitter_pixels[1],
+                     camera_state.capture ? "yes" : "no");
+               }
+               ImGui::Text("MVs: pass %s | object MVs %s (ready %s) | rigid %s", age(game_device_data.motion_vectors_present.load(std::memory_order_relaxed)).c_str(), g_object_motion_vectors ? "on" : "off",
+                  age(game_device_data.object_motion_vectors_ready_present.load(std::memory_order_relaxed)).c_str(), g_object_mv_rigid ? "on" : "off");
+#if DEVELOPMENT
+               ImGui::Text("    %u patched (%u matched, %u new, %u overflowed) | rigid %u static, %u moving, %u new", object_motion_counts_frame[MV_PATCHED], object_motion_counts_frame[MV_MATCHED], object_motion_counts_frame[MV_NEW],
+                  object_motion_counts_frame[MV_OVERFLOW], object_motion_counts_frame[MV_RIGID_STATIC], object_motion_counts_frame[MV_RIGID_MOVING], object_motion_counts_frame[MV_RIGID_NEW]);
+               uint32_t refused = 0;
+               for (size_t i = MV_REFUSED_BUNDLE; i < MV_COUNT; i++)
+               {
+                  refused += object_motion_counts_frame[i];
+               }
+               ImGui::Text("    %u refused", refused);
+#endif
+               uint64_t predication_present = UINT64_MAX;
+               {
+                  const std::shared_lock lock(game_device_data.predication_pass.mutex);
+                  predication_present = game_device_data.predication_present;
+               }
+               ImGui::Text("SMAA: %s | predication %s | T2x %s (drawn %s) | RCAS %.2f", g_smaa_enable ? "on" : "off", age(predication_present).c_str(), game_device_data.t2x_active.load(std::memory_order_relaxed) ? "active" : "off",
+                  age(game_device_data.t2x_drawn_present.load(std::memory_order_relaxed)).c_str(), g_rcas_sharpness);
+               ImGui::Text("AO: %s %s (drawn %s) | Bloom: drawn %s", g_gtvbao_enable ? "GT-VBAO" : "XeGTAO", g_gtao_enable ? "on" : "off", age(game_device_data.gtao_present.load(std::memory_order_relaxed)).c_str(),
+                  age(game_device_data.bloom_drawn_present.load(std::memory_order_relaxed)).c_str());
+            }
+            ImGui::End(); });
+#endif
 #if DEVELOPMENT
       Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, {"smaa_enable", &g_smaa_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_t2x", &g_smaa_t2x}, {"dlaa_mip_bias", &g_dlaa_mip_bias}, {"object_motion_vectors", &g_object_motion_vectors}, {"mv_debug_view", &g_mv_debug_view},
          {"object_mv.rigid", &g_object_mv_rigid}, {"luma_bloom_enable", &g_luma_bloom_enable}, {"gtao_enable", &g_gtao_enable}, { "gtvbao_enable",
             &g_gtvbao_enable }});
       Mcp::RegisterValues({{"object_mv.match_distance", &g_object_mv_match_distance, 0.f, 10.f}, {"object_mv.max_distance", &g_object_mv_max_distance, 0.f, 100.f}, {"object_mv.rigid_match_distance", &g_object_mv_rigid_match_distance, 0.f, 10.f},
-         {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
+         {"bloom_intensity", &g_bloom_intensity, 0.f, 2.f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"gtao_final_value_power", &g_gtao_final_value_power, 0.3f, 4.5f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f},
+         {"gtao_history_weight", &g_gtao_history_weight, 0.f, 0.98f}});
       Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}, {"gtao_temporal", &g_gtao_temporal, 0, 2}});
       for (size_t i = 0; i < MV_COUNT; i++)
       {
@@ -1309,6 +1389,15 @@ public:
          const auto pair = std::ranges::find_if(MotionVectorShaders::PAIRS, [&original_shader_hashes](const MotionVectorShaders::Pair& candidate)
             { return candidate.vertex_shader_hash == original_shader_hashes.vertex_shaders[0] && candidate.pixel_shader_hash == original_shader_hashes.pixel_shaders[0]; });
          motion_vector_pair = ((pair != std::end(MotionVectorShaders::PAIRS)) ? &*pair : nullptr);
+      }
+      CountObjectMotion(MV_DIAG_DRAWS); // TEMP diagnostic
+      if (is_object_prepass && motion_active)
+      {
+         CountObjectMotion(MV_DIAG_PREPASS);
+      }
+      if (motion_vector_pair && motion_active)
+      {
+         CountObjectMotion(MV_DIAG_PAIR);
       }
       const bool is_normals_prepass = original_shader_hashes.Contains(shader_hashes_depth_prepass);
       if (is_normals_prepass || motion_vector_pair)
@@ -1529,21 +1618,42 @@ public:
          game_device_data.bloom_drawn_present.store(device_data.present_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
          return DrawOrDispatchOverrideType::Replaced;
       }
-      if (g_luma_bloom_enable && g_bloom_intensity != 1.f && original_shader_hashes.Contains(shader_hashes_glow_composite) && !state.render_target_views.empty() && !state.render_target_descs.empty())
+      // Always replaced (not only for "Bloom Intensity"): the fp16 scene lost the 8-bit cap of the game's additive blend, see "apply_ps"
+      if (original_shader_hashes.Contains(shader_hashes_glow_composite) && !state.render_target_views.empty() && !state.render_target_descs.empty())
       {
          const D3D12_BLEND_DESC* const blend = ((cmd_list_data.bound_cached_pipeline && cmd_list_data.bound_cached_pipeline->capture) ? cmd_list_data.bound_cached_pipeline->capture->Find<D3D12_BLEND_DESC>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND) : nullptr);
          const reshade::api::resource glow = {game_device_data.glow_target.load(std::memory_order_relaxed)};
          if (blend && blend->RenderTarget[0].BlendEnable && blend->RenderTarget[0].SrcBlend == D3D12_BLEND_ONE && blend->RenderTarget[0].DestBlend == D3D12_BLEND_ONE && glow.handle != 0)
          {
-            if (g_bloom_intensity <= 0.f)
+            const float intensity = (g_luma_bloom_enable ? g_bloom_intensity : 1.f);
+            if (intensity <= 0.f)
             {
                return DrawOrDispatchOverrideType::Replaced;
             }
-            // "GlowConstants" after the target's size: the weight scale (unused here), the intensity
-            const float constants[] = {1.f, g_bloom_intensity};
-            if (DrawFullscreenPassD3D12(cmd_list_data, device_data, &game_device_data.bloom_apply_pass, CompileTimeStringHash("YKR Bloom Apply PS"), "Bloom Apply", "Luma Bloom Apply", glow, game_device_data.glow_target_format.load(std::memory_order_relaxed), {state.render_target_views[0].resource}, state.render_target_descs[0], constants, additive_blend))
+            const reshade::api::resource scene = {state.render_target_views[0].resource};
+            reshade::api::device* const device = cmd_list_data.cmd_list->get_device();
+            const reshade::api::resource_desc scene_desc = device->get_resource_desc(scene);
+            std::unique_lock lock(game_device_data.bloom_apply_pass.mutex);
+            if (game_device_data.EnsurePassTarget(&game_device_data.bloom_apply_pass, &game_device_data.glow_scene_copy, device, device_data.present_count.load(std::memory_order_relaxed), scene_desc.texture.width, scene_desc.texture.height, scene_desc.texture.format, reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR Glow Scene Copy") &&
+                device->get_resource_desc(game_device_data.glow_scene_copy).texture.format == scene_desc.texture.format)
             {
-               return DrawOrDispatchOverrideType::Replaced;
+               const reshade::api::resource scene_copy = game_device_data.glow_scene_copy;
+               // "DrawFullscreenPassD3D12()" takes it. A copy retired meanwhile lives on until the lists recorded with it ran.
+               lock.unlock();
+               // The scene is a render target at this draw
+               const reshade::api::resource copy_resources[] = {scene, scene_copy};
+               const reshade::api::resource_usage copy_from[] = {reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource};
+               const reshade::api::resource_usage copy_to[] = {reshade::api::resource_usage::copy_source, reshade::api::resource_usage::copy_dest};
+               cmd_list_data.cmd_list->barrier(2, copy_resources, copy_from, copy_to);
+               cmd_list_data.cmd_list->copy_resource(scene, scene_copy);
+               cmd_list_data.cmd_list->barrier(2, copy_resources, copy_to, copy_from);
+               // "GlowConstants" after the target's size: whether the scene is the HDR one (in the weight scale), the intensity
+               const float constants[] = {(cb_luma_global_settings.DisplayMode == DisplayModeType::HDR ? 1.f : 0.f), intensity};
+               const D3D12FullscreenSource sources[] = {{.resource = glow, .format = game_device_data.glow_target_format.load(std::memory_order_relaxed)}, {.resource = scene_copy, .format = reshade::api::format_to_default_typed(scene_desc.texture.format)}};
+               if (DrawFullscreenPassD3D12(cmd_list_data, device_data, &game_device_data.bloom_apply_pass, CompileTimeStringHash("YKR Bloom Apply PS"), "Bloom Apply", "Luma Bloom Apply", sources, scene, state.render_target_descs[0], constants))
+               {
+                  return DrawOrDispatchOverrideType::Replaced;
+               }
             }
          }
       }
@@ -1909,6 +2019,19 @@ public:
       return true;
    }
 
+   // A captured camera's view projection as column vectors (the game's matrices multiply row vectors), in double: the reprojection of the DLAA
+   // motion vectors and of the AO history is the previous frame's times its inverse
+   static Math::Matrix44D GetViewProjection(const CameraState::Capture& capture)
+   {
+      Math::Matrix44D view;
+      Math::Matrix44D projection;
+      std::copy_n(capture.view.data(), 16, view.GetData());
+      std::copy_n(capture.projection.data(), 16, projection.GetData());
+      Math::Matrix44D view_projection = view * projection;
+      view_projection.Transpose();
+      return view_projection;
+   }
+
    // DLAA of the scene a ccr draw reads (see "shader_hashes_color_correct"), recorded before that draw, at most once a frame: camera motion
    // vectors from the depth copy, the scene decoded into DLSS' input, DLSS, then its output encoded back into the scene in place. Without a
    // piece (no depth copy this frame, no camera, another size) the scene stays as it is and FXAA or SMAA run; a failed DLSS turns it off
@@ -1996,13 +2119,8 @@ public:
          return;
       }
 
-      // Current clip space to the previous frame's, column vectors (the game's matrices multiply row vectors), in double
-      Math::Matrix44D current_view;
-      Math::Matrix44D current_projection;
-      std::copy_n(view.data(), 16, current_view.GetData());
-      std::copy_n(projection.data(), 16, current_projection.GetData());
-      Math::Matrix44D current = current_view * current_projection;
-      current.Transpose();
+      // Current clip space to the previous frame's
+      const Math::Matrix44D current = GetViewProjection(*capture);
       const bool has_previous = game_device_data->previous_view_projection_present != UINT64_MAX && game_device_data->previous_view_projection_present + 1 == present_count;
       const Math::Matrix44D previous = (has_previous ? game_device_data->previous_view_projection : current);
       game_device_data->previous_view_projection = current;
@@ -2197,8 +2315,36 @@ public:
       // The power matching the game's SSAO darkening at YKR_GTAO_RADIUS_SCALE (see NOTES.md "Calibration"): XeGTAO 1.3 (an office, one scene);
       // GT-VBAO 1, its strength is its thickness (Luma_YKR_XeGTAO.hlsl). "g_gtao_final_value_power" scales it
       const float final_value_power = g_gtao_final_value_power * (g_gtvbao_enable ? 1.f : 1.3f);
-      // "LumaGTAO" in Luma_YKR_XeGTAO.hlsl
-      const float constants[] = {1.f / float(width), 1.f / float(height), projection[10], projection[14], 2.f / p11, -2.f / p22, (projection[8] - 1.f) / p11, (1.f + projection[9]) / p22, final_value_power, g_gtao_radius_override, debug_view, noise_index, vanilla_radius[0], vanilla_radius[1], vanilla_radius[2], vanilla_radius[3]};
+      // "LumaGTAO" in Luma_YKR_XeGTAO.hlsl; the reprojection, jitter, history weight and object motion flag after the radius are the history's
+      std::array<float, 36> constants = {1.f / float(width), 1.f / float(height), projection[10], projection[14], 2.f / p11, -2.f / p22, (projection[8] - 1.f) / p11, (1.f + projection[9]) / p22, final_value_power, g_gtao_radius_override, debug_view, noise_index, vanilla_radius[0], vanilla_radius[1], vanilla_radius[2], vanilla_radius[3]};
+
+      // Under the per frame noise, the AO history ("temporal_pass_cs") between the main pass and the denoise, with both denoise passes (as MELE's). It reprojects as the DLAA motion
+      // vectors do: the captured camera against the view projection "DrawDLAA()" kept from the frame before, which it replaces later in this frame (at the color correct)
+      const std::optional<CameraState::Capture> capture = []
+      {
+         const std::shared_lock lock(camera_state.mutex);
+         return camera_state.capture;
+      }();
+      const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
+      const bool history_active = temporal && g_gtao_history_weight > 0.f && capture.has_value();
+      bool use_object_motion = false;
+      reshade::api::resource object_motion_vectors = {};
+      if (history_active)
+      {
+         const bool has_previous = game_device_data->previous_view_projection_present != UINT64_MAX && game_device_data->previous_view_projection_present + 1 == present_count;
+         const Math::Matrix44D current = GetViewProjection(*capture);
+         const Math::Matrix44D reprojection = (has_previous ? game_device_data->previous_view_projection : current) * current.GetInverted();
+         std::transform(reprojection.GetData(), reprojection.GetData() + 16, constants.begin() + 16, [](double value)
+            { return float(value); });
+         constants[32] = capture->jitter_ndc[0];
+         constants[33] = capture->jitter_ndc[1];
+         const bool history_valid = has_previous && game_device_data->gtao_history_present + 1 == present_count && !device_data.force_reset_sr;
+         constants[34] = (history_valid ? g_gtao_history_weight : 0.f);
+         // What the patched prepass draws wrote this frame (see "DrawDLAA()")
+         object_motion_vectors = {game_device_data->object_motion_vectors_handle.load(std::memory_order_relaxed)};
+         use_object_motion = object_motion_vectors.handle != 0 && game_device_data->object_motion_vectors_ready_present.load(std::memory_order_relaxed) == present_count && game_device_data->object_motion_vectors_size.load(std::memory_order_relaxed) == ((uint64_t(width) << 32) | height);
+         constants[35] = (use_object_motion ? 1.f : 0.f);
+      }
 
       auto& pass = game_device_data->gtao_pass;
       const std::unique_lock lock(pass.mutex);
@@ -2208,20 +2354,27 @@ public:
       sampler_range.visibility = reshade::api::shader_stage::compute;
       sampler_range.type = reshade::api::descriptor_type::sampler;
       sampler_range.static_samplers = &point_sampler;
-      // t0, t1, then u0-u4 (the prefilter writes the 5 depth mips, the others u0)
-      const reshade::api::descriptor_range view_ranges[] = {{.count = 2, .visibility = reshade::api::shader_stage::compute, .type = reshade::api::descriptor_type::texture_shader_resource_view}, {.binding = 2, .count = gtao_depth_mip_count, .visibility = reshade::api::shader_stage::compute, .type = reshade::api::descriptor_type::texture_unordered_access_view}};
+      // t0-t3 (the history pass reads them all), then u0-u4 (the prefilter writes the 5 depth mips, the history pass u0 and u1, the others u0)
+      const reshade::api::descriptor_range view_ranges[] = {{.count = 4, .visibility = reshade::api::shader_stage::compute, .type = reshade::api::descriptor_type::texture_shader_resource_view}, {.binding = 4, .count = gtao_depth_mip_count, .visibility = reshade::api::shader_stage::compute, .type = reshade::api::descriptor_type::texture_unordered_access_view}};
       const reshade::api::pipeline_layout_param layout_params[] = {reshade::api::constant_range{.count = uint32_t(std::size(constants)), .visibility = reshade::api::shader_stage::compute}, {uint32_t(std::size(view_ranges)), view_ranges}, {1, &sampler_range}};
-      constexpr uint32_t dispatch_count = 4;
+      // Prefilter, main pass, history, denoise 1, denoise 2
+      constexpr uint32_t dispatch_count = 5;
       const reshade::api::descriptor_table* const tables = PrepareD3D12GamePass(&pass, device_data, device, layout_params, 1, dispatch_count, "XeGTAO");
       if (!tables)
       {
          return false;
       }
+      // Without the history the temporal mode skips the first denoiser (Intel's XeGTAO.h with TAA), and without the temporal mode there's no history
+      const std::array<bool, dispatch_count> runs = {true, true, history_active, !temporal || history_active, true};
       auto* const native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
-      const std::array<uint32_t, dispatch_count> shader_hashes = {CompileTimeStringHash("YKR XeGTAO Prefilter Depths CS"), (temporal && g_gtvbao_enable) ? CompileTimeStringHash("YKR GT-VBAO Temporal Main Pass CS") : (g_gtvbao_enable ? CompileTimeStringHash("YKR GT-VBAO Main Pass CS") : CompileTimeStringHash("YKR XeGTAO Main Pass CS")), CompileTimeStringHash("YKR XeGTAO Denoise Pass 1 CS"), CompileTimeStringHash("YKR XeGTAO Denoise Pass 2 CS")};
+      const std::array<uint32_t, dispatch_count> shader_hashes = {CompileTimeStringHash("YKR XeGTAO Prefilter Depths CS"), (temporal && g_gtvbao_enable) ? CompileTimeStringHash("YKR GT-VBAO Temporal Main Pass CS") : (g_gtvbao_enable ? CompileTimeStringHash("YKR GT-VBAO Main Pass CS") : CompileTimeStringHash("YKR XeGTAO Main Pass CS")), CompileTimeStringHash("YKR XeGTAO Temporal Pass CS"), CompileTimeStringHash("YKR XeGTAO Denoise Pass 1 CS"), CompileTimeStringHash("YKR XeGTAO Denoise Pass 2 CS")};
       std::array<ID3D12PipelineState*, dispatch_count> pipelines = {};
       for (size_t i = 0; i < dispatch_count; i++)
       {
+         if (!runs[i])
+         {
+            continue;
+         }
          pipelines[i] = GetD3D12GamePassPipeline(&pass, native_device, 0, shader_hashes[i], DXGI_FORMAT_UNKNOWN, "XeGTAO");
          if (!pipelines[i])
          {
@@ -2229,16 +2382,18 @@ public:
          }
       }
 
-      const uint64_t present_count = device_data.present_count.load(std::memory_order_relaxed);
       constexpr reshade::api::resource_usage render_target_and_shader_resource = reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource;
       constexpr reshade::api::resource_usage unordered_access_and_shader_resource = reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::shader_resource;
       constexpr reshade::api::resource_usage at_rest = reshade::api::resource_usage::shader_resource;
+      bool history_created[2] = {};
       if (!game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_depth, device, present_count, width, height, reshade::api::format::r32_float, render_target_and_shader_resource, at_rest, L"Luma YKR XeGTAO Depth") ||
           !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_normals, device, present_count, width, height, reshade::api::format::r8g8b8a8_unorm, render_target_and_shader_resource, at_rest, L"Luma YKR XeGTAO Normals") ||
           !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_depth_mips, device, present_count, width, height, reshade::api::format::r32_float, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Depth Mips", nullptr, gtao_depth_mip_count) ||
           !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_working[0], device, present_count, width, height, reshade::api::format::r8g8_unorm, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Working 0") ||
           !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_working[1], device, present_count, width, height, reshade::api::format::r8g8_unorm, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Working 1") ||
-          !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_final, device, present_count, width, height, reshade::api::format::r8_unorm, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Final"))
+          !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_final, device, present_count, width, height, reshade::api::format::r8_unorm, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Final") ||
+          (history_active && (!game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_history[0], device, present_count, width, height, reshade::api::format::r16g16_float, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO History 0", &history_created[0]) ||
+                                !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_history[1], device, present_count, width, height, reshade::api::format::r16g16_float, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO History 1", &history_created[1]))))
       {
          static std::atomic_flag logged;
          if (!logged.test_and_set())
@@ -2246,6 +2401,11 @@ public:
             reshade::log::message(reshade::log::level::error, std::format("[XeGTAO] ReShade refused its {}x{} textures, so the game's SSAO runs", width, height).c_str());
          }
          return false;
+      }
+      // A new history texture holds nothing yet
+      if (history_created[0] || history_created[1])
+      {
+         constants[34] = 0.f;
       }
 
       // The inputs, copied by pixel shaders (the game's depth and normals stay in their state)
@@ -2282,21 +2442,50 @@ public:
       const std::array<reshade::api::resource_view, 2> working_srvs = {make_view(game_device_data->gtao_working[0], reshade::api::resource_usage::shader_resource, reshade::api::format::r8g8_unorm, 0, 1), make_view(game_device_data->gtao_working[1], reshade::api::resource_usage::shader_resource, reshade::api::format::r8g8_unorm, 0, 1)};
       const std::array<reshade::api::resource_view, 2> working_uavs = {make_view(game_device_data->gtao_working[0], reshade::api::resource_usage::unordered_access, reshade::api::format::r8g8_unorm, 0, 1), make_view(game_device_data->gtao_working[1], reshade::api::resource_usage::unordered_access, reshade::api::format::r8g8_unorm, 0, 1)};
       const reshade::api::resource_view final_uav = make_view(game_device_data->gtao_final, reshade::api::resource_usage::unordered_access, reshade::api::format::r8_unorm, 0, 1);
+      // The history reads the last one written and writes the other; the object motion vectors' stand-in is the depth copy (see "ObjectMotionRT")
+      const uint32_t history_previous = game_device_data->gtao_history_index;
+      const uint32_t history_next = history_previous ^ 1u;
+      reshade::api::resource_view history_srv = depth_srv;
+      reshade::api::resource_view history_uav = working_uavs[1];
+      reshade::api::resource_view motion_srv = depth_srv;
+      if (history_active)
+      {
+         history_srv = make_view(game_device_data->gtao_history[history_previous], reshade::api::resource_usage::shader_resource, reshade::api::format::r16g16_float, 0, 1);
+         history_uav = make_view(game_device_data->gtao_history[history_next], reshade::api::resource_usage::unordered_access, reshade::api::format::r16g16_float, 0, 1);
+         if (use_object_motion)
+         {
+            motion_srv = make_view(object_motion_vectors, reshade::api::resource_usage::shader_resource, reshade::api::format::r16g16_float, 0, 1);
+         }
+      }
       const bool views_made = std::ranges::none_of(views, [](reshade::api::resource_view view)
          { return view.handle == 0; });
+      // The main pass writes working 0; with the history, it turns that into working 1 and the denoisers go 1 -> 0 -> final; without it, 0 -> 1 -> final, or 0 -> final
+      // when the temporal mode skips the first denoiser
+      const uint32_t first_denoise_source = (history_active ? 1 : 0);
+      const uint32_t final_denoise_source = (temporal ? 0 : 1);
       if (views_made)
       {
          // Every slot of a table holds a valid view of a resource in a state it allows; the unused ones repeat the dispatch's output (UAVs) and source (SRVs)
-         const std::array<std::array<reshade::api::resource_view, 2>, dispatch_count> srvs = {{{depth_srv, depth_srv}, {depth_mips_srv, normals_srv}, {working_srvs[0], working_srvs[0]}, {working_srvs[temporal ? 0 : 1], working_srvs[temporal ? 0 : 1]}}};
-         const std::array<reshade::api::resource_view, dispatch_count> outputs = {mip_uavs[0], working_uavs[0], working_uavs[1], final_uav}; // The prefilter's are all the mips
+         const std::array<std::array<reshade::api::resource_view, 4>, dispatch_count> srvs = {{{depth_srv, depth_srv, depth_srv, depth_srv}, {depth_mips_srv, normals_srv, depth_mips_srv, depth_mips_srv}, {working_srvs[0], history_srv, motion_srv, depth_srv},
+            {working_srvs[first_denoise_source], working_srvs[first_denoise_source], working_srvs[first_denoise_source], working_srvs[first_denoise_source]},
+            {working_srvs[final_denoise_source], working_srvs[final_denoise_source], working_srvs[final_denoise_source], working_srvs[final_denoise_source]}}};
+         const std::array<reshade::api::resource_view, dispatch_count> outputs = {mip_uavs[0], working_uavs[0], working_uavs[1], working_uavs[first_denoise_source ^ 1], final_uav}; // The prefilter's are all the mips
          for (uint32_t i = 0; i < dispatch_count; i++)
          {
+            if (!runs[i])
+            {
+               continue;
+            }
             std::array<reshade::api::resource_view, gtao_depth_mip_count> uavs = mip_uavs;
             if (i != 0)
             {
                uavs.fill(outputs[i]);
             }
-            const reshade::api::descriptor_table_update updates[] = {{.table = tables[i], .count = 2, .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = srvs[i].data()}, {.table = tables[i], .binding = 2, .count = gtao_depth_mip_count, .type = reshade::api::descriptor_type::texture_unordered_access_view, .descriptors = uavs.data()}};
+            if (i == 2)
+            {
+               uavs[1] = history_uav;
+            }
+            const reshade::api::descriptor_table_update updates[] = {{.table = tables[i], .count = 4, .type = reshade::api::descriptor_type::texture_shader_resource_view, .descriptors = srvs[i].data()}, {.table = tables[i], .binding = 4, .count = gtao_depth_mip_count, .type = reshade::api::descriptor_type::texture_unordered_access_view, .descriptors = uavs.data()}};
             device->update_descriptor_tables(uint32_t(std::size(updates)), updates);
          }
       }
@@ -2312,21 +2501,42 @@ public:
          return false;
       }
 
-      // Each output goes to unordered access around its dispatch, so the next one reads it complete
-      const std::array<reshade::api::resource, dispatch_count> outputs = {game_device_data->gtao_depth_mips, game_device_data->gtao_working[0], game_device_data->gtao_working[1], game_device_data->gtao_final};
-      // Prefilter: 16x16 pixels a group; main: 8x8; denoise: 2 pixels a thread, 16x8
-      const std::array<std::array<uint32_t, 2>, dispatch_count> groups = {{{(width + 15) / 16, (height + 15) / 16}, {(width + 7) / 8, (height + 7) / 8}, {(width + 15) / 16, (height + 7) / 8}, {(width + 15) / 16, (height + 7) / 8}}};
+      // Each output goes to unordered access around its dispatch, so the next one reads it complete (the history pass has two)
+      const std::array<reshade::api::resource, dispatch_count> outputs = {game_device_data->gtao_depth_mips, game_device_data->gtao_working[0], game_device_data->gtao_working[1], game_device_data->gtao_working[first_denoise_source ^ 1], game_device_data->gtao_final};
+      // Prefilter: 16x16 pixels a group; main and history: 8x8; denoise: 2 pixels a thread, 16x8
+      const std::array<std::array<uint32_t, 2>, dispatch_count> groups = {{{(width + 15) / 16, (height + 15) / 16}, {(width + 7) / 8, (height + 7) / 8}, {(width + 7) / 8, (height + 7) / 8}, {(width + 15) / 16, (height + 7) / 8}, {(width + 15) / 16, (height + 7) / 8}}};
       for (uint32_t i = 0; i < dispatch_count; i++)
       {
-         // The first denoiser is skipped when temporal: the final one reads the main pass' output
-         if (temporal && i == 2)
+         if (!runs[i])
+         {
             continue;
+         }
+         const bool is_history = i == 2;
          cmd_list->barrier(outputs[i], at_rest, reshade::api::resource_usage::unordered_access);
+         if (is_history)
+         {
+            cmd_list->barrier(game_device_data->gtao_history[history_next], at_rest, reshade::api::resource_usage::unordered_access);
+            // The patched draws' target rests as a render target
+            if (use_object_motion)
+            {
+               cmd_list->barrier(object_motion_vectors, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
+            }
+         }
          cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{reinterpret_cast<uint64_t>(pipelines[i])});
-         cmd_list->push_constants(reshade::api::shader_stage::compute, pass.layout, 0, 0, uint32_t(std::size(constants)), constants);
+         cmd_list->push_constants(reshade::api::shader_stage::compute, pass.layout, 0, 0, uint32_t(constants.size()), constants.data());
          cmd_list->bind_descriptor_tables(reshade::api::shader_stage::compute, pass.layout, 1, 1, &tables[i]);
          cmd_list->dispatch(groups[i][0], groups[i][1], 1);
          cmd_list->barrier(outputs[i], reshade::api::resource_usage::unordered_access, at_rest);
+         if (is_history)
+         {
+            cmd_list->barrier(game_device_data->gtao_history[history_next], reshade::api::resource_usage::unordered_access, at_rest);
+            if (use_object_motion)
+            {
+               cmd_list->barrier(object_motion_vectors, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::render_target);
+            }
+            game_device_data->gtao_history_index = history_next;
+            game_device_data->gtao_history_present = present_count;
+         }
       }
       TraceLumaPass(&cmd_list_data, device_data, "Luma XeGTAO", {{.resource = game_device_data->gtao_depth.handle, .format = reshade::api::format::r32_float}, {.resource = game_device_data->gtao_normals.handle, .format = reshade::api::format::r8g8b8a8_unorm}}, {{.resource = game_device_data->gtao_final.handle, .format = reshade::api::format::r8_unorm}}, true);
       D3D12State::RestoreCompute(cmd_list, cmd_list_data.d3d12_state, {});
@@ -2438,10 +2648,11 @@ public:
       if (idle(game_device_data.gtao_present.load(std::memory_order_relaxed)))
       {
          const std::unique_lock lock(game_device_data.gtao_pass.mutex);
-         for (reshade::api::resource* const texture : {&game_device_data.gtao_depth, &game_device_data.gtao_normals, &game_device_data.gtao_depth_mips, &game_device_data.gtao_working[0], &game_device_data.gtao_working[1], &game_device_data.gtao_final})
+         for (reshade::api::resource* const texture : {&game_device_data.gtao_depth, &game_device_data.gtao_normals, &game_device_data.gtao_depth_mips, &game_device_data.gtao_working[0], &game_device_data.gtao_working[1], &game_device_data.gtao_final, &game_device_data.gtao_history[0], &game_device_data.gtao_history[1]})
          {
             RetireD3D12GamePassResource(&game_device_data.gtao_pass, present_count, texture);
          }
+         game_device_data.gtao_history_present = UINT64_MAX;
          game_device_data.gtao_present.store(UINT64_MAX, std::memory_order_relaxed);
       }
       if (idle(game_device_data.bloom_drawn_present.load(std::memory_order_relaxed)))
@@ -2555,6 +2766,9 @@ public:
       // Its control is DEVELOPMENT only: a saved "off" must not outlive it
       reshade::get_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
 #endif
+#if DEVELOPMENT || TEST
+      reshade::get_config_value(nullptr, NAME, "StatusOverlay", g_status_overlay);
+#endif
       reshade::get_config_value(nullptr, NAME, "SMAAT2x", g_smaa_t2x);
       reshade::get_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
       reshade::get_config_value(nullptr, NAME, "BloomIntensity", g_bloom_intensity);
@@ -2646,6 +2860,9 @@ public:
       {
          ImGui::SetTooltip("Disables the in-game UI.");
       }
+#if DEVELOPMENT || TEST
+      DrawSettingCheckbox("Status Overlay", "StatusOverlay", &g_status_overlay, false, "Shows the live state of DLAA/FSR/XeSS, the motion vectors, the jitter, SMAA, AO and bloom over the game, with the ReShade overlay closed.");
+#endif
    }
 
 #if DEVELOPMENT

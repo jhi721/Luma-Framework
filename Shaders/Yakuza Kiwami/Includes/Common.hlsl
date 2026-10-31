@@ -64,27 +64,26 @@ float4 YKR_LightBuffer(float4 light)
    return max(light, 0.0);
 }
 
-// A scene texel (gamma 2.0 encoded, i.e. sqrt of the material curve's output) as the vanilla 8-bit scene stored it. HDR display
-// mode: the materials' display tangent is inverted to y and run through the vanilla curve (exact for the materials; anything
-// else above the pivot, unlit or additive content and fog, is treated as a material too, so it comes out darker than vanilla
-// stored it). SDR display modes render the vanilla curve already: only the UNORM clamp is emulated. Per channel, like the curve.
+// One channel of an HDR display mode scene texel (gamma 2.0 encoded, i.e. sqrt of the material curve's output) as the vanilla 8-bit
+// scene stored it: the materials' display tangent is inverted to y and run through the vanilla curve (exact for the materials; anything
+// else above the pivot, unlit or additive content and fog, is treated as a material too, so it comes out darker than vanilla stored it)
+float YKR_VanillaSceneHDR(float scene)
+{
+   const float pivot_display = YKR_PivotDisplayCurve();
+   const float curve = sqr(max(scene, 0.0));
+   const float display = pow(curve, 1.1);
+   return display > pivot_display ? sqrt(saturate(YKR_VanillaMaterialCurve(YKR_MATERIAL_CURVE_PIVOT + (display - pivot_display) / YKR_PivotDisplayCurveSlope()))) : sqrt(curve);
+}
+
+// A scene texel as the vanilla 8-bit scene stored it, see "YKR_VanillaSceneHDR". SDR display modes render the vanilla curve already:
+// only the UNORM clamp is emulated. Per channel, like the curve.
 float4 YKR_VanillaScene(float4 scene)
 {
    if (LumaSettings.DisplayMode != 1)
    {
       return saturate(scene);
    }
-   const float pivot_display = YKR_PivotDisplayCurve();
-   const float pivot_slope = YKR_PivotDisplayCurveSlope();
-   float4 vanilla;
-   [unroll] for (uint i = 0; i < 3; i++)
-   {
-      const float curve = sqr(max(scene[i], 0.0));
-      const float display = pow(curve, 1.1);
-      vanilla[i] = display > pivot_display ? sqrt(saturate(YKR_VanillaMaterialCurve(YKR_MATERIAL_CURVE_PIVOT + (display - pivot_display) / pivot_slope))) : sqrt(curve);
-   }
-   vanilla.a = saturate(scene.a);
-   return vanilla;
+   return float4(YKR_VanillaSceneHDR(scene.r), YKR_VanillaSceneHDR(scene.g), YKR_VanillaSceneHDR(scene.b), saturate(scene.a));
 }
 
 // A bilinear sample of the scene as vanilla stored it (8-bit UNORM through the vanilla curve, every texel mapped before the filter,

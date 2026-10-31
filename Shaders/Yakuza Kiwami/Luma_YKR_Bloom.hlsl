@@ -6,6 +6,9 @@
 // The weights are the stage's (not constant): main.cpp reads them from the engine's constant mirror at the draw.
 // That target stays vanilla (the exposure meter and the water read it too): "Bloom Intensity" scales the glow where it is added to the scene.
 
+// For "YKR_VanillaSceneHDR" only: Luma's cbuffers aren't in these passes' root signature, nothing here reads them
+#include "Includes/Common.hlsl"
+
 cbuffer GlowConstants : register(b0)
 {
    float2 target_size;
@@ -15,7 +18,7 @@ cbuffer GlowConstants : register(b0)
 }
 
 Texture2D<float4> level : register(t0);
-Texture2D<float4> bloom : register(t1);
+Texture2D<float4> bloom : register(t1); // The scene copy in "apply_ps"
 SamplerState linear_sampler : register(s0);
 
 // L into the fp16 bloom input: pass2 is linear up to its saturate, so the weights fold in before the blur
@@ -42,8 +45,22 @@ float4 composite_ps(float4 pos : SV_Position) : SV_Target
 }
 
 // In place of the glow composite (FUN_1402e8840: ps_flickerfree_fast 0xBA1E66BE adding the glow target onto the scene, blend ONE/ONE on
-// rgb and alpha), drawn with the same blend: t0 = the glow target, bilinear over the scene as the game samples it
+// rgb and alpha), drawn opaque over the scene: t0 = the glow target, bilinear over the scene as the game samples it, t1 = a copy of the scene.
+// The vanilla 8-bit scene clipped that sum at 1. The fp16 scene doesn't, and the post chain reads anything above the materials' pivot as their
+// HDR extension, so glow on an already bright surface (rim lights on skin) blew out; clipping at 1 instead left a flat, hue shifted plateau at
+// an HDR level. So the glow adds the display light (scene encoding: display = x^2.2) it added in vanilla, clip included, to the pixel's own:
+// vanilla below the pivot, where both scenes are equal, and in SDR display modes. "weight_scale" is 1 for the HDR display mode here.
 float4 apply_ps(float4 pos : SV_Position) : SV_Target
 {
-   return level.SampleLevel(linear_sampler, pos.xy / target_size, 0.0) * bloom_intensity;
+   const float4 glow = level.SampleLevel(linear_sampler, pos.xy / target_size, 0.0) * bloom_intensity;
+   const float4 scene = bloom.Load(int3(pos.xy, 0));
+   float4 vanilla = saturate(scene);
+   if (weight_scale != 0.0)
+   {
+      vanilla.rgb = float3(YKR_VanillaSceneHDR(scene.r), YKR_VanillaSceneHDR(scene.g), YKR_VanillaSceneHDR(scene.b));
+   }
+   const float3 added_display = pow(saturate(vanilla.rgb + glow.rgb), 2.2) - pow(vanilla.rgb, 2.2);
+   const float3 lit = max(scene.rgb, 0.0);
+   // Added to the scene, not written over it: a negative channel (DoF leaves some) stays as it was where no glow lands
+   return float4(scene.rgb + pow(pow(lit, 2.2) + added_display, 1.0 / 2.2) - lit, scene.a + saturate(vanilla.a + glow.a) - vanilla.a);
 }
