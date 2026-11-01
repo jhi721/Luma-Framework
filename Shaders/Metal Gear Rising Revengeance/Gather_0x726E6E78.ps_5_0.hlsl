@@ -1,6 +1,7 @@
 // clang-format off
 #include "Includes/Common.hlsl" // game-local: LumaGameSettings before the shared Settings.hlsl, keep FIRST
 #include "../Includes/DgVoodoo.hlsl" // DGV_MAIN_SIGNATURE, ApplyDgvMask
+#include "../Includes/PlatinumToneCurve.hlsl" // PlatinumToneCurve::FitTangent (the HDR continuation)
 #include "../Includes/Reinhard.hlsl" // Reinhard::ReinhardPiecewise (hue reference)
 #include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020
 // clang-format on
@@ -13,8 +14,7 @@
 // g_Saido (c186 = cb4[194]) around Y' of the curved colour, the g_MulColor gain (c184 = cb4[192], with the light pre-scale's
 // inverse and the auto exposure: FUN_00eb50c0) and the vertical g_AddColor gradient (c185 = cb4[193]); then the bloom (t1) times
 // g_BloomColor (c187 = cb4[195]) is added and everything multiplied by g_Brightness (c188 = cb4[196], the brightness option).
-// HDR: one max-channel scalar compresses values above the shoulder into the curve's [0,1] domain and is divided back out, so every
-// pixel below the shoulder stays vanilla exact. Then the vanilla clip's hue turn (MacLeod-Boynton, hue only), the display map (a
+// HDR: the curve continued by its tangent above a pivot (PlatinumToneCurve), vanilla exact below it. Then the vanilla clip's hue turn (MacLeod-Boynton, hue only), the display map (a
 // max-channel C-infinity rolloff to the peak) and the UI paper white pre-scale (UI_DRAW_TYPE 2), encoded back for the Core
 // composition.
 
@@ -51,7 +51,7 @@ SamplerState s3_s : register(s3);
 
 float Curve(float x)
 {
-   return ApplyDgvMask(t2.Sample(s2_s, float2(x, 0.0)), cb3[48], cb3[49]).x;
+   return PlatinumToneCurve::Sample(t2, cb3[48], cb3[49], x);
 }
 
 float3 Curve(float3 color)
@@ -64,20 +64,18 @@ void main(DGV_MAIN_SIGNATURE)
    const float4 scene = ApplyDgvMask(t0.Sample(s0_s, v5.xy), cb3[44], cb3[45]);
    const float4 bloom = ApplyDgvMask(t1.Sample(s1_s, v5.xy), cb3[46], cb3[47]);
 
-   // The sampler clamps U, so below the shoulder this is the vanilla curve of the clipped scene
+   // The sampler clamps U, so this is the vanilla curve of the clipped scene
    float3 ungraded = saturate(scene.rgb);
-   float scale = 1.0;
+   float3 curved = Curve(ungraded);
    [branch] if (TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1)
    {
       ungraded = IsNaN_Strict(scene.rgb) ? 0.0 : max(scene.rgb, 0.0);
-      const float peak = max3(ungraded);
-      // The max channel is what the curve's domain must hold: asymptotic to its end
-      if (peak > kCurveShoulder)
+      // Every pivot is at least a window up, so the fit is skipped where no channel can pass it
+      [branch] if (max3(ungraded) > PlatinumToneCurve::kWindow)
       {
-         scale = Tonemap::CInfinityRollOff::Apply(peak, 1.0, kCurveShoulder, kCurveShoulderStrength) / peak;
+         curved = PlatinumToneCurve::Apply(PlatinumToneCurve::FitTangent(t2, cb3[48], cb3[49]), ungraded, Curve(ungraded));
       }
    }
-   float3 curved = Curve(ungraded * scale) / scale;
    // "Color Grading Intensity" fades the level's look (Bayonetta's): the curve toward identity, the saturation (an offset from the
    // colour, 0 = none) and the gradient toward none. The g_MulColor gain stays: it carries the auto exposure.
    const float gradeIntensity = LumaSettings.GameSettings.ColorGradingIntensity;

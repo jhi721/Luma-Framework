@@ -4,11 +4,11 @@
 // read per channel with the channel as U, then saturation g_Saido (c193.xyz) around Y' of the curved colour, the
 // g_MatrialColor gain (c192.xyz, which carries the auto exposure) and the vertical g_AddColor gradient (c194).
 // HDR: the scene target is upgraded to fp16, so the lighting's values above 1 (clipped by the 8-bit target in vanilla) reach
-// this pass. One max-channel scalar compresses the colour into the curve's [0,1] domain (identity below the shoulder), the
-// vanilla curve runs on it and the scalar is divided back out of its output: a scalar cannot move a channel ratio, and every
-// pixel below the shoulder stays vanilla exact. The display map is the scene copy's (Copy_0x91A6C437).
+// this pass. The curve is continued by its tangent above a pivot (PlatinumToneCurve), vanilla exact below it. The display map is
+// the scene copy's (Copy_0x91A6C437).
 
-#include "../Includes/DgVoodoo.hlsl" // DGV_MAIN_SIGNATURE, ApplyDgvMask
+#include "../Includes/DgVoodoo.hlsl"          // DGV_MAIN_SIGNATURE, ApplyDgvMask
+#include "../Includes/PlatinumToneCurve.hlsl" // PlatinumToneCurve::FitTangent (the HDR continuation)
 #include "Includes/Common.hlsl"
 
 cbuffer cb3 : register(b3)
@@ -29,7 +29,7 @@ SamplerState s1_s : register(s1);
 
 float Curve(float x)
 {
-   return ApplyDgvMask(t1.Sample(s1_s, float2(x, 0.0)), cb3[46], cb3[47]).x;
+   return PlatinumToneCurve::Sample(t1, cb3[46], cb3[47], x);
 }
 
 float3 Curve(float3 color)
@@ -55,12 +55,10 @@ void main(DGV_MAIN_SIGNATURE)
    [branch] if (hdr)
    {
       color = IsNaN_Strict(scene.rgb) ? 0.0 : max(scene.rgb, 0.0);
-      const float peak = max3(color);
-      // The max channel is what the curve's domain must hold
-      if (peak > kCurveShoulder)
+      // Every pivot is at least a window up, so the fit is skipped where no channel can pass it
+      [branch] if (max3(color) > PlatinumToneCurve::kWindow)
       {
-         const float scale = CurveDomainScale(peak);
-         curved = Curve(color * scale) / scale;
+         curved = PlatinumToneCurve::Apply(PlatinumToneCurve::FitTangent(t1, cb3[46], cb3[47]), color, curved);
          luma = dot(curved, kLumaWeights);
       }
    }
