@@ -59,10 +59,42 @@ float3 Curve(float3 color)
    return float3(Curve(color.r), Curve(color.g), Curve(color.b));
 }
 
+// Cubic B-spline in 4 bilinear taps (Sigg and Hadwiger, "Fast Third-Order Texture Filtering", as Bayonetta's bloom composite)
+float4 SampleBloomBSpline(float2 uv)
+{
+   float2 size;
+   t1.GetDimensions(size.x, size.y);
+   const float2 grid = uv * size - 0.5;
+   const float2 index = floor(grid);
+   const float2 f = grid - index;
+   const float2 g = 1.0 - f;
+   const float2 w0 = g * g * g / 6.0;
+   const float2 w1 = 2.0 / 3.0 - 0.5 * f * f * (2.0 - f);
+   const float2 w2 = 2.0 / 3.0 - 0.5 * g * g * (2.0 - g);
+   const float2 w3 = f * f * f / 6.0;
+   const float2 g0 = w0 + w1;
+   const float2 h0 = (index + w1 / g0 - 0.5) / size;
+   const float2 h1 = (index + w3 / (w2 + w3) + 1.5) / size;
+   const float4 t00 = ApplyDgvMask(t1.SampleLevel(s1_s, h0, 0.0), cb3[46], cb3[47]);
+   const float4 t10 = ApplyDgvMask(t1.SampleLevel(s1_s, float2(h1.x, h0.y), 0.0), cb3[46], cb3[47]);
+   const float4 t01 = ApplyDgvMask(t1.SampleLevel(s1_s, float2(h0.x, h1.y), 0.0), cb3[46], cb3[47]);
+   const float4 t11 = ApplyDgvMask(t1.SampleLevel(s1_s, h1, 0.0), cb3[46], cb3[47]);
+   return lerp(lerp(t11, t01, g0.x), lerp(t10, t00, g0.x), g0.y);
+}
+
 void main(DGV_MAIN_SIGNATURE)
 {
    const float4 scene = ApplyDgvMask(t0.Sample(s0_s, v5.xy), cb3[44], cb3[45]);
-   const float4 bloom = ApplyDgvMask(t1.Sample(s1_s, v5.xy), cb3[46], cb3[47]);
+   // Luma Bloom's texture (main.cpp, CustomData2 1): a B-spline magnification, not the bilinear's creases
+   float4 bloom;
+   [branch] if (LumaData.CustomData2 == 1)
+   {
+      bloom = SampleBloomBSpline(v5.xy);
+   }
+   else
+   {
+      bloom = ApplyDgvMask(t1.Sample(s1_s, v5.xy), cb3[46], cb3[47]);
+   }
 
    // The sampler clamps U, so this is the vanilla curve of the clipped scene
    float3 ungraded = saturate(scene.rgb);
