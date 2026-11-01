@@ -4092,7 +4092,7 @@ public:
 #endif
 #if DEVELOPMENT
       // Always on outside of development builds
-      DrawSettingCheckbox("HDR Fix", "HDRFix", &g_hdr_fix, kDefaultHDRFix, "Luma's display mapping of the game's HDR (DICE to the peak, paper white, UI white). Off = the game's own HDR.");
+      DrawSettingCheckbox("HDR Fix", "HDRFix", &g_hdr_fix, kDefaultHDRFix, "Luma's display mapping of the game's HDR (a C-infinity rolloff to the peak, paper white, UI white). Off = the game's own HDR.");
       ImGui::BeginDisabled(!g_hdr_fix);
       DrawSettingCheckbox("Gamma Correction", "HDRGammaCorrection", &g_hdr_gamma_correction, kDefaultHDRGammaCorrection, "Shows the shadows and the UI as a gamma 2.2 SDR display would, as the game was mastered.");
       ImGui::EndDisabled();
@@ -4233,7 +4233,6 @@ public:
                   "\nReShade"
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
-                  "\nDICE (HDR tonemapper)"
                   "\nSMAA (Iryoku)"
                   "\nAMD FidelityFX (RCAS + FSR 3)"
                   "\nNVIDIA NGX (DLSS)");

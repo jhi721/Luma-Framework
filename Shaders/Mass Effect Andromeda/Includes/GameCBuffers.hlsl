@@ -22,7 +22,7 @@ struct LumaGameSettings
    float Dithering;          // 0/1: one output code of noise against banding (10 bit PQ in HDR, 8 bit sRGB in SDR)
    float Contrast;           // 1 = vanilla: around mid gray, before the display map (HDR fix only)
    float Saturation;         // 1 = vanilla: after the display map (HDR fix only)
-   float HighlightDechroma;  // 0 = off: DICE's HighlightsDesaturation (HDR fix only)
+   float HighlightDechroma;  // 0 = off: the max channel display map, 1 = per channel (HDR fix only)
    float HideUI;             // 0/1: the gameplay present leaves out the UI layer
 };
 

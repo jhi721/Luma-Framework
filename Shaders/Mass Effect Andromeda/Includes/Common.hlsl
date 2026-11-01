@@ -4,14 +4,14 @@
 
 #include "GameCBuffers.hlsl"
 // Keep after GameCBuffers.hlsl (see above); this comment also stops clang-format from sorting the two
+#include "../../Includes/CInfinityRolloff.hlsl"
 #include "../../Includes/Common.hlsl"
-#include "../../Includes/DICE.hlsl"
 
 // The game's HDR10 output and the HDR fix on it, ported from RenoDX's Mass Effect: Andromeda mod (its "Vanilla+" tone mapper,
 // https://github.com/clshortfuse/renodx). The tone curve lives in the game's 33^3 grade LUT (the tonemap pass, untouched): its
 // PQ-encoded output goes through the present's 1D output LUT to scene-linear (1 = diffuse white), which the game sends to PQ at a
-// fixed 100 nits. The fix maps that to the display: paper white, an optional gamma 2.2 emulation, and DICE to the peak, then the UI
-// at its own white.
+// fixed 100 nits. The fix maps that to the display: paper white, an optional gamma 2.2 emulation, and a C-infinity rolloff to the
+// peak, then the UI at its own white.
 
 // Luma's Display Mode SDR leaves the game's own HDR output (the game, not Luma, owns HDR on/off)
 bool HDRFixEnabled()
@@ -41,11 +41,10 @@ float3 EmulateGamma22(float3 color)
    return gamma_to_linear(linear_to_sRGB_gamma(color, GCT_MIRROR), GCT_MIRROR, 2.2);
 }
 
-// Scene-linear (1 = diffuse white) to the display, in paper white units. DICE on the PQ-encoded relative luminance, then the
-// channels beyond the peak desaturated into it: of the mappers measured on the game's own grade LUT, the closest to the game's own
-// display mapping shoulder (its in-game HDR calibration, which Luma holds at 10000), within ~6 degrees of its hue and never past
-// the peak. The grade sliders as MELE's: the contrast before the display map (DICE contains what it pushes up), the highlights
-// desaturation DICE's own, the saturation after it.
+// Scene-linear (1 = diffuse white) to the display, in paper white units: a C-infinity rolloff (identity below 0.18, asymptotic to
+// the peak) on the max channel, which keeps the grade LUT's RGB ratios, as MGR:R's and Bayonetta's (strength 1: the paper white
+// stays within 1%). "Highlights Desaturation" blends toward the same rolloff per channel, which whitens what it compresses. Contrast
+// and saturation before the map, which contains what they push up.
 float3 DisplayMapScene(float3 color)
 {
    if (!HDRFixEnabled())
@@ -59,12 +58,16 @@ float3 DisplayMapScene(float3 color)
       const float mid_gray = 0.18;
       color = exp2(LumaSettings.GameSettings.Contrast * log2(max(color / mid_gray, 1e-30))) * mid_gray;
    }
-   const float paper_white = SceneWhiteNits() / sRGB_WhiteLevelNits;
-   const float peak_white = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
-   DICESettings settings = DefaultDICESettings(DICE_TYPE_BY_LUMINANCE_PQ_CORRECT_CHANNELS_BEYOND_PEAK_WHITE);
-   settings.HighlightsDesaturation = LumaSettings.GameSettings.HighlightDechroma;
-   color = DICETonemap(color * paper_white, peak_white, settings) / paper_white;
-   return Saturation(color, LumaSettings.GameSettings.Saturation);
+   color = Saturation(color, LumaSettings.GameSettings.Saturation);
+   // The peak can't go below paper white (the rolloff needs it above its 0.18 anchor)
+   const float paper_white = SceneWhiteNits();
+   const float peak = max(LumaSettings.PeakWhiteNits, paper_white) / paper_white;
+   const float3 mapped = Tonemap::CInfinityRollOff::MaxChannel(color, peak, 0.18, 1.0);
+   [branch] if (LumaSettings.GameSettings.HighlightDechroma > 0.0)
+   {
+      return lerp(mapped, Tonemap::CInfinityRollOff::Apply(color, peak, 0.18, 1.0), LumaSettings.GameSettings.HighlightDechroma);
+   }
+   return mapped;
 }
 
 // The scene with the UI over it, to HDR10. "ui" is linear, its white = 1. cb2 = the present's cb0[2]: .y gates the UI, .z scales its
