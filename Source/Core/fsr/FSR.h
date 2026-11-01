@@ -30,6 +30,8 @@ namespace FidelityFX
 #if DX12
    // Index in the upscaler versions the runtime lists for the device (logged at init), -1 for its default. Applies at the next context creation.
    inline int version_index_override = -1; // "core.fsr_version_index"
+   // The newest listed version of this major version (e.g. 3 for 3.1.6) when "version_index_override" is -1, 0 for the runtime's default. Applies at the next context creation.
+   inline int major_version_override = 0;
 #endif
 #if ENABLE_FSR_DEBUG_VIEW
    inline bool draw_debug_view = !DX12; // "core.fsr_debug_view" on D3D12

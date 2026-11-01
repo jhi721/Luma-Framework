@@ -50,6 +50,7 @@ namespace SR
 		FSR, // FSR 3 on D3D11, FSR 4 or 3.1 on D3D12
 		LumaTAA,
 		XeSS, // D3D12 only
+		FSR3, // The SR bridge's FSR at its newest 3.x ("FSR" is "FSR 4" there)
 	};
 
 	// Put these in order of preference (most preferred first). For automatic selection.
@@ -73,6 +74,7 @@ namespace SR
 		case SR::UserType::DLSS:
 			return type == Type::DLSS;
 		case SR::UserType::FSR:
+		case SR::UserType::FSR3:
 			return type == Type::FSR;
 		case SR::UserType::LumaTAA:
 			return type == Type::LumaTAA;

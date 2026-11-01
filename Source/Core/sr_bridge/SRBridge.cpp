@@ -13,6 +13,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <deque>
 #include <filesystem>
 #include <format>
 #include <string>
@@ -32,9 +33,9 @@ namespace SRBridge
       // The protocol's "<settings>"
       std::string FormatSettings(const SR::SettingsData& settings)
       {
-         return std::format("{} {} {} {} {} {} {} {} {} {} {} {}", settings.render_width, settings.render_height, settings.output_width, settings.output_height,
+         return std::format("{} {} {} {} {} {} {} {} {} {} {} {} {}", settings.render_width, settings.render_height, settings.output_width, settings.output_height,
             int(settings.hdr), int(settings.inverted_depth), int(settings.mvs_jittered), int(settings.auto_exposure), int(settings.dynamic_resolution), settings.mvs_x_scale,
-            settings.mvs_y_scale, settings.render_preset);
+            settings.mvs_y_scale, settings.render_preset, fsr_major_version);
       }
    } // namespace
 
@@ -46,10 +47,11 @@ namespace SRBridge
       // The running helper
       HANDLE job = nullptr; // Ends the helper with the game ("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE")
       HANDLE process = nullptr;
-      HANDLE pipe = nullptr;         // Its stdin
-      Reply* reply = nullptr;        // Until read
-      std::string version;           // "version_name", the first helper's (kept across restarts, the UI may hold it)
-      bool settings_pending = false; // Changed since the helper started: sent before the next frame
+      HANDLE pipe = nullptr;  // Its stdin
+      Reply* reply = nullptr; // Until read
+      int started_fsr_major_version = 0;
+      std::deque<std::string> versions; // "version_name" points into one: the UI may still read an older one (stable on "push_back")
+      bool settings_pending = false;    // Changed since the helper started: sent before the next frame
       bool failed = false;
 
       ~BridgeInstanceData()
@@ -172,20 +174,17 @@ namespace SRBridge
             CloseHandle(handle);
       }
       HANDLE remote_reply = nullptr; // 0: the helper doesn't reply
-      // Only until a helper told the version
-      if (version.empty())
+      if (const HANDLE reply_mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Reply), nullptr))
       {
-         if (const HANDLE reply_mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Reply), nullptr))
+         reply = static_cast<Reply*>(MapViewOfFile(reply_mapping, FILE_MAP_READ, 0, 0, sizeof(Reply)));
+         if (reply)
          {
-            reply = static_cast<Reply*>(MapViewOfFile(reply_mapping, FILE_MAP_READ, 0, 0, sizeof(Reply)));
-            if (reply)
-            {
-               DuplicateHandle(GetCurrentProcess(), reply_mapping, process, &remote_reply, 0, FALSE, DUPLICATE_SAME_ACCESS);
-            }
-            CloseHandle(reply_mapping);
+            DuplicateHandle(GetCurrentProcess(), reply_mapping, process, &remote_reply, 0, FALSE, DUPLICATE_SAME_ACCESS);
          }
+         CloseHandle(reply_mapping);
       }
       message += std::format(" {}\n", uint64_t(uintptr_t(remote_reply)));
+      started_fsr_major_version = fsr_major_version;
       if (!Send(message))
          return false;
       running = this;
@@ -289,6 +288,12 @@ namespace SRBridge
             Log(reshade::log::level::info, std::format("restarting the helper: a new {} texture", Link::names[changed]));
             custom_data.Stop();
          }
+         else if (custom_data.type == SR::Type::FSR && custom_data.started_fsr_major_version != fsr_major_version)
+         {
+            // Restarted, so its reply tells the new version
+            Log(reshade::log::level::info, std::format("restarting the helper: FSR {}", fsr_major_version));
+            custom_data.Stop();
+         }
       }
       if (!custom_data.process && !custom_data.Start(command_list, resources))
          return false;
@@ -306,10 +311,19 @@ namespace SRBridge
       }
       if (custom_data.reply && custom_data.reply->written.load(std::memory_order_acquire))
       {
-         custom_data.version.assign(custom_data.reply->version_name, strnlen(custom_data.reply->version_name, sizeof(Reply::version_name)));
-         if (!custom_data.version.empty())
+         const std::string version(custom_data.reply->version_name, strnlen(custom_data.reply->version_name, sizeof(Reply::version_name)));
+         if (version.empty())
          {
-            custom_data.version_name = custom_data.version.c_str();
+            custom_data.version_name = nullptr;
+         }
+         else
+         {
+            auto known = std::ranges::find(custom_data.versions, version);
+            if (known == custom_data.versions.end())
+            {
+               known = custom_data.versions.insert(known, version);
+            }
+            custom_data.version_name = known->c_str();
          }
          UnmapViewOfFile(custom_data.reply);
          custom_data.reply = nullptr;

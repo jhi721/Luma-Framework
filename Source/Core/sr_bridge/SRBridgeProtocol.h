@@ -9,7 +9,7 @@
 // Text lines over the helper's stdin, its stdout and stderr go to "Luma-Upscaler.log" next to the exe.
 //
 // Settings: "<render width> <render height> <output width> <output height> <hdr> <inverted depth> <jittered motion vectors>
-//   <auto exposure> <dynamic resolution> <motion vector scale x> <motion vector scale y> <DLSS render preset>"
+//   <auto exposure> <dynamic resolution> <motion vector scale x> <motion vector scale y> <DLSS render preset> <FSR major version (0: the newest)>"
 // Start line: "bridge <version> <upscaler> <luid low> <luid high> <settings> <a handle per "Resource" (0: none)> <fence in> <fence out> <reply>"
 // The helper signals "out" at "kReady" once the upscaler exists (it exits if it can't create it), and writes "Reply" (independently of "kReady").
 // Then a line per message:
@@ -20,7 +20,7 @@
 // EOF ends it.
 namespace SRBridgeProtocol
 {
-   constexpr int kVersion = 7;
+   constexpr int kVersion = 8;
 
    constexpr const wchar_t* kHelperName = L"Luma-Upscaler.exe";
    constexpr const wchar_t* kLogName = L"Luma-Upscaler.log";

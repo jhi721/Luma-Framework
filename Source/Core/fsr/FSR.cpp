@@ -6,6 +6,8 @@
 
 #include <include/reshade.hpp>
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <cassert>
@@ -259,6 +261,7 @@ namespace FidelityFX
 
       // The upscaler versions the runtime supports on this device (FSR 4 isn't listed on GPUs that can't run it)
       std::vector<uint64_t> version_ids;
+      std::vector<int> version_majors; // Of their names ("4.1.2"), for "major_version_override"
 
       ffxContext context = nullptr;
       int context_version_override = -1;
@@ -360,6 +363,7 @@ namespace FidelityFX
       for (size_t i = 0; i < version_names.size(); i++)
       {
          versions_text += std::format(" {}: {};", i, version_names[i] ? version_names[i] : "?");
+         custom_data->version_majors.push_back(version_names[i] ? std::atoi(version_names[i]) : 0);
       }
       reshade::log::message(reshade::log::level::info, versions_text.c_str());
 
@@ -422,7 +426,13 @@ namespace FidelityFX
       if (!command_list || !custom_data || !custom_data->is_supported)
          return false;
 
-      const int selected_version_override = ((version_index_override >= 0 && version_index_override < int(custom_data->version_ids.size())) ? version_index_override : -1);
+      int selected_version_override = ((version_index_override >= 0 && version_index_override < int(custom_data->version_ids.size())) ? version_index_override : -1);
+      if (selected_version_override < 0 && major_version_override > 0)
+      {
+         // The newest of that major version (the runtime lists the newest first), else the default
+         const auto major = std::ranges::find(custom_data->version_majors, major_version_override);
+         selected_version_override = (major != custom_data->version_majors.end() ? int(major - custom_data->version_majors.begin()) : -1);
+      }
       if (settings_data == custom_data->settings_data && custom_data->context && selected_version_override == custom_data->context_version_override)
       {
          return true;

@@ -29,6 +29,7 @@ namespace
       int hdr = 1, inverted_depth = 0, mvs_jittered = 0, auto_exposure = 0, dynamic_resolution = 0;
       float mvs_x_scale = 1.f, mvs_y_scale = 1.f;
       int render_preset = 0;
+      int fsr_major_version = 0;
 
       SR::SettingsData ToSr() const
       {
@@ -53,7 +54,7 @@ namespace
    std::istream& operator>>(std::istream& stream, Settings& settings)
    {
       return stream >> settings.render_width >> settings.render_height >> settings.output_width >> settings.output_height >> settings.hdr >> settings.inverted_depth >>
-             settings.mvs_jittered >> settings.auto_exposure >> settings.dynamic_resolution >> settings.mvs_x_scale >> settings.mvs_y_scale >> settings.render_preset;
+             settings.mvs_jittered >> settings.auto_exposure >> settings.dynamic_resolution >> settings.mvs_x_scale >> settings.mvs_y_scale >> settings.render_preset >> settings.fsr_major_version;
    }
 } // namespace
 
@@ -125,6 +126,7 @@ int main()
       runner.Quit();
       return exit_code;
    };
+   FidelityFX::major_version_override = settings.fsr_major_version;
    if (!runner.Create(std::move(upscaler_impl), adapter.Get(), settings.ToSr()))
    {
       return printf("[Luma Upscaler] FAIL %s init or create\n", SR::GetTypeName(type)), quit(1);
@@ -163,6 +165,7 @@ int main()
             printf("[Luma Upscaler] FAIL bad settings line\n");
             return quit(1);
          }
+         FidelityFX::major_version_override = settings.fsr_major_version;
          if (!runner.UpdateSettings(settings.ToSr()))
          {
             runner.ReleaseGame();

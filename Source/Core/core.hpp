@@ -11600,6 +11600,10 @@ namespace
       device_data.has_drawn_sr_imgui = device_data.has_drawn_sr;
       {
          const std::unique_lock sr_lock(device_data.sr_mutex);
+#if ENABLE_SR_BRIDGE
+         // Auto runs the newest
+         SRBridge::fsr_major_version = (sr_user_type == SR::UserType::FSR3 ? 3 : (sr_user_type == SR::UserType::FSR ? 4 : 0));
+#endif
          ApplySRType(device_data, device_data.sr_type_selected);
          for (const auto& [type, instance] : device_data.sr_implementations_instances)
          {
@@ -20797,7 +20801,14 @@ namespace
                selected_sr_user_type = "DLSS";
                break;
             case SR::UserType::FSR:
+#if ENABLE_SR_BRIDGE
+               selected_sr_user_type = "FSR 4";
+#else
                selected_sr_user_type = "FSR";
+#endif
+               break;
+            case SR::UserType::FSR3:
+               selected_sr_user_type = "FSR 3";
                break;
             case SR::UserType::LumaTAA:
                selected_sr_user_type = "Luma TAA";
@@ -20860,7 +20871,12 @@ namespace
                if (always_show_auto_sr || sr_auto_type != SR::Type::None)
                   AddComboItem("Auto", SR::UserType::Auto, sr_auto_type, !device_data.sr_implementations_instances.empty());
                AddComboItem("DLSS", SR::UserType::DLSS, SR::Type::DLSS, device_data.sr_implementations_instances.contains(SR::Type::DLSS));
+#if ENABLE_SR_BRIDGE // Its helper picks the FidelityFX API's version ("SRBridge::fsr_major_version")
+               AddComboItem("FSR 4", SR::UserType::FSR, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
+               AddComboItem("FSR 3", SR::UserType::FSR3, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
+#else
                AddComboItem("FSR", SR::UserType::FSR, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
+#endif
 #if ENABLE_XESS || (ENABLE_SR_BRIDGE && !defined(_WIN64)) || ENABLE_D3D12_SR // D3D12 only, or the SR bridge's helper, or the in-process D3D12 bridge
                AddComboItem("XeSS", SR::UserType::XeSS, SR::Type::XeSS, device_data.sr_implementations_instances.contains(SR::Type::XeSS));
 #endif

@@ -17,6 +17,9 @@
 
 namespace SRBridge
 {
+   // The FSR major version the helper runs, from the "FSR 4" / "FSR 3" choices (0: the runtime's newest). A change restarts a running FSR helper.
+   inline int fsr_major_version = 0;
+
    // A texture the bridge hands to its helper as is (NT handle shared), else a plain one (the bridge copies those every frame)
    inline HRESULT CreateSharableTexture(ID3D11Device* native_device, D3D11_TEXTURE2D_DESC desc, ID3D11Texture2D** texture)
    {
