@@ -11621,7 +11621,7 @@ namespace
 #endif
          ApplySRType(device_data, device_data.sr_type_selected);
 #if ENABLE_D3D12_SR
-         SRBridge::api_setting = (fsr_4 ? SRBridge::Api::D3D12 : SRBridge::Api::D3D11); // XeSS falls back on D3D12, it has nothing else
+         SRBridge::api_setting = (fsr_4 ? SRBridge::Api::D3D12 : SRBridge::Api::D3D11); // XeSS falls back on D3D12 where its D3D11 one isn't supported (not an Intel GPU)
 #endif
          for (const auto& [type, instance] : device_data.sr_implementations_instances)
          {
@@ -20895,7 +20895,7 @@ namespace
 #else
                AddComboItem("FSR", SR::UserType::FSR, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
 #endif
-#if ENABLE_XESS || (ENABLE_SR_BRIDGE && !defined(_WIN64)) || ENABLE_D3D12_SR // D3D12 only, or the SR bridge's helper, or the in-process D3D12 bridge
+#if ENABLE_XESS || (ENABLE_SR_BRIDGE && !defined(_WIN64)) || ENABLE_D3D12_SR // D3D12 games, or the SR bridge's helper, or the in-process D3D12 bridge
                AddComboItem("XeSS", SR::UserType::XeSS, SR::Type::XeSS, device_data.sr_implementations_instances.contains(SR::Type::XeSS));
 #endif
 #if ENABLE_LUMA_TAA // Only in games that enable it, rather than as an always disabled item
@@ -22889,18 +22889,21 @@ void Init(bool async)
 
    // Note: these shouldn't load any dlls etc, they are just creating an empty class
 #if ENABLE_D3D12_SR
-   // DLSS and FSR 3 run on their D3D11 implementation, FSR 4 and XeSS on the in-process D3D12 one, see "SRBridge::ApiSwitch"
+   // DLSS, FSR 3 and XeSS on Intel GPUs run on their D3D11 implementation, FSR 4 and XeSS elsewhere on the in-process D3D12 one, see "SRBridge::ApiSwitch"
    {
-      std::unique_ptr<SR::SuperResolutionImpl> d3d11_dlss, d3d11_fsr;
+      std::unique_ptr<SR::SuperResolutionImpl> d3d11_dlss, d3d11_fsr, d3d11_xess;
 #if ENABLE_NGX
       d3d11_dlss = std::make_unique<NGX::DLSS>();
 #endif
 #if ENABLE_FIDELITY_SK
       d3d11_fsr = std::make_unique<FidelityFX::FSR>();
 #endif
+#if ENABLE_XESS
+      d3d11_xess = std::make_unique<Intel::XeSS>();
+#endif
       sr_implementations[SR::Type::DLSS] = std::make_unique<SRBridge::ApiSwitch>(std::move(d3d11_dlss), std::make_unique<SRBridge::LocalBridge>(SR::Type::DLSS));
       sr_implementations[SR::Type::FSR] = std::make_unique<SRBridge::ApiSwitch>(std::move(d3d11_fsr), std::make_unique<SRBridge::LocalBridge>(SR::Type::FSR));
-      sr_implementations[SR::Type::XeSS] = std::make_unique<SRBridge::ApiSwitch>(nullptr, std::make_unique<SRBridge::LocalBridge>(SR::Type::XeSS));
+      sr_implementations[SR::Type::XeSS] = std::make_unique<SRBridge::ApiSwitch>(std::move(d3d11_xess), std::make_unique<SRBridge::LocalBridge>(SR::Type::XeSS));
    }
 #else
 #if ENABLE_NGX

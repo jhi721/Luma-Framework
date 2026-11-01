@@ -2,8 +2,9 @@
 
 #include "../includes/super_resolution.h"
 
-// D3D12 only: XeSS on D3D11 runs on Intel Arc GPUs only, on D3D12 on any GPU with SM 6.4 and DP4a
-#if defined(_WIN64) && DX12 && __has_include("xess/xess_d3d12.h")
+// D3D12 ("libxess.dll") on any GPU with SM 6.4 and DP4a, D3D11 ("libxess_dx11.dll") on Intel GPUs only: in the D3D11 mods built with
+// "UseLumaD3D12SR", where the D3D12 one runs on the others (see "SRBridge::ApiSwitch")
+#if defined(_WIN64) && ((DX12 && __has_include("xess/xess_d3d12.h")) || (!DX12 && __has_include("xess/xess_d3d11.h")))
 #ifndef ENABLE_XESS
 #define ENABLE_XESS 1
 #endif // ENABLE_XESS
@@ -20,7 +21,7 @@ namespace Intel::inline D3D12
 namespace Intel
 #endif
 {
-   // XeSS SR, from Intel's signed "libxess.dll" (loaded at runtime)
+   // XeSS SR, from Intel's signed "libxess.dll" or "libxess_dx11.dll" (loaded at runtime)
    class XeSS : public SR::SuperResolutionImpl
    {
    public:

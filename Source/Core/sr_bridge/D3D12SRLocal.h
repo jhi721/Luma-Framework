@@ -1,7 +1,7 @@
 #pragma once
 
 // The in-process D3D12 super resolution of an x64 D3D11 mod built with "UseLumaD3D12SR": DLSS, FSR (FSR 4 / 3.1) and XeSS run on
-// D3D12 in the game's own process ("D3D12SR.h") next to the D3D11 DLSS and FSR 3; the selected upscaler picks the API ("ApiSwitch"). Like the 32-bit games'
+// D3D12 in the game's own process ("D3D12SR.h") next to the D3D11 DLSS, FSR 3 and XeSS (Intel GPUs only); the selected upscaler picks the API ("ApiSwitch"). Like the 32-bit games'
 // bridge ("SRBridge.h") the D3D12 side works on NT-handle shared textures (zero copy for the game's own shared ones, else a copy per frame)
 // between two shared fences, but it is a call on the game's thread: no helper process, pipe or protocol lines. The game's GPU waits for the
 // output in the same frame.
@@ -22,8 +22,8 @@ namespace SRBridge
       D3D11,
       D3D12,
    };
-   // Set from the selected upscaler at present: D3D11 for DLSS and FSR 3 (D3D12 costs ~0.3-0.5 ms a frame: two fence hops and copies
-   // between the APIs), D3D12 for FSR 4 and XeSS
+   // Set from the selected upscaler at present: D3D11 for DLSS, FSR 3 and XeSS (D3D12 costs ~0.3-0.5 ms a frame: two fence hops and copies
+   // between the APIs), D3D12 for FSR 4. XeSS runs on D3D12 where its D3D11 one isn't supported (see "GetWantedApi()").
    inline Api api_setting = Api::D3D11;
 
    struct LocalInstanceData : public SR::InstanceData, public Link
@@ -289,7 +289,7 @@ namespace SRBridge
       Api active = Api::D3D12;
    };
 
-   // Registered as an SR type's implementation: forwards to its D3D11 implementation (DLSS, FSR 3; none for XeSS) or to the in-process D3D12 one
+   // Registered as an SR type's implementation: forwards to its D3D11 implementation (DLSS, FSR 3, XeSS on Intel GPUs) or to the in-process D3D12 one
    // ("LocalBridge"), whichever "api_setting" picks. Switching frees the old one's resources
    // ("ReleaseResources()") and starts the new one with the settings Core gave last, at the next "UpdateSettings()" or "Draw()".
    class ApiSwitch : public SR::SuperResolutionImpl

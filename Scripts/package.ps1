@@ -206,18 +206,20 @@ try {
         }
     }
 
-    # D3D12 XeSS and the SR bridge's helper load Intel's signed libxess.dll from the game folder. Without the (untracked) SDK the addon was built without
+    # D3D12 XeSS and the SR bridge's helper load Intel's signed libxess.dll from the game folder, the D3D12 SR games' D3D11 XeSS (Intel GPUs) libxess_dx11.dll. Without the (untracked) SDK the addon was built without
     # XeSS ("__has_include" in Source/Core/xess/XeSS.h).
     $xessHeader = Join-Path $repoRoot "Source\External\XeSS\inc\xess\xess_d3d12.h"
     if ($useLumaXeSS -and $isD3D12 -and -not (Test-Path $xessHeader)) {
         Write-Warning "XeSS SDK not found ($xessHeader): the addon was built without XeSS, libxess.dll isn't shipped"
     } elseif (($useLumaXeSS -and $isD3D12) -or $useLumaSRBridge -or $useLumaD3D12SR) {
-        $xessSrc = Join-Path $repoRoot "Source\External\XeSS\bin\libxess.dll"
-        if (-not (Test-Path $xessSrc)) {
-            Write-Error "libxess.dll not found: $xessSrc"
-            exit 1
+        foreach ($xessDll in @("libxess.dll") + @(if ($useLumaD3D12SR) { "libxess_dx11.dll" })) {
+            $xessSrc = Join-Path $repoRoot "Source\External\XeSS\bin\$xessDll"
+            if (-not (Test-Path $xessSrc)) {
+                Write-Error "$xessDll not found: $xessSrc"
+                exit 1
+            }
+            Copy-Item $xessSrc -Destination $tempDir -Force
         }
-        Copy-Item $xessSrc -Destination $tempDir -Force
     }
 
     # Addon at the zip root, under the canonical Luma-<Project>.addon name

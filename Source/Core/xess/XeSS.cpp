@@ -2,7 +2,12 @@
 
 #if ENABLE_XESS
 
+#if DX12
 #include "xess/xess_d3d12.h"
+#include <d3d12.h>
+#else
+#include "xess/xess_d3d11.h"
+#endif
 
 #include "../includes/debug.h"
 
@@ -15,7 +20,6 @@
 #include <format>
 #include <string>
 #include <wrl/client.h>
-#include <d3d12.h>
 
 #if DX12
 namespace Intel::inline D3D12
@@ -23,17 +27,33 @@ namespace Intel::inline D3D12
 namespace Intel
 #endif
 {
+#if DX12
+   constexpr const char* xess_dll_name = "libxess.dll";
+   using XeSSCreateContext = decltype(&xessD3D12CreateContext);
+   using XeSSInit = decltype(&xessD3D12Init);
+   using XeSSExecute = decltype(&xessD3D12Execute);
+   using XeSSInitParams = xess_d3d12_init_params_t;
+   using XeSSExecuteParams = xess_d3d12_execute_params_t;
+#else
+   constexpr const char* xess_dll_name = "libxess_dx11.dll";
+   using XeSSCreateContext = decltype(&xessD3D11CreateContext);
+   using XeSSInit = decltype(&xessD3D11Init);
+   using XeSSExecute = decltype(&xessD3D11Execute);
+   using XeSSInitParams = xess_d3d11_init_params_t;
+   using XeSSExecuteParams = xess_d3d11_execute_params_t;
+#endif
+
    struct XeSSInstanceData : public SR::InstanceData
    {
       HMODULE module = nullptr;
-      decltype(&xessD3D12CreateContext) create_context = nullptr;
-      decltype(&xessD3D12Init) init = nullptr;
-      decltype(&xessD3D12Execute) execute = nullptr;
+      XeSSCreateContext create_context = nullptr;
+      XeSSInit init = nullptr;
+      XeSSExecute execute = nullptr;
       decltype(&xessDestroyContext) destroy_context = nullptr;
       decltype(&xessGetOptimalInputResolution) get_optimal_input_resolution = nullptr;
       decltype(&xessSetVelocityScale) set_velocity_scale = nullptr;
       decltype(&xessSetLoggingCallback) set_logging_callback = nullptr;
-      Microsoft::WRL::ComPtr<ID3D12Device> device;
+      Microsoft::WRL::ComPtr<SR::Device> device;
       std::string version; // "version_name"
 
       xess_context_handle_t context = nullptr;
@@ -48,11 +68,19 @@ namespace Intel
          Deinit(data); // This will also null the pointer
       }
 
+#if !DX12
+      // The D3D11 XeSS only runs on Intel GPUs, the others run the D3D12 one
+      if (DXGI_ADAPTER_DESC adapter_desc = {}; !adapter || FAILED(adapter->GetDesc(&adapter_desc)) || adapter_desc.VendorId != SR::vendor_id_intel)
+      {
+         return false;
+      }
+#endif
+
       // From the game's folder, where the package puts it (not from the current directory)
-      HMODULE module = LoadLibraryExW(L"libxess.dll", nullptr, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+      HMODULE module = LoadLibraryExA(xess_dll_name, nullptr, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
       if (!module)
       {
-         reshade::log::message(reshade::log::level::warning, "XeSS: libxess.dll not found next to the game's executable");
+         reshade::log::message(reshade::log::level::warning, std::format("XeSS: {} not found next to the game's executable", xess_dll_name).c_str());
          return false;
       }
 
@@ -61,9 +89,15 @@ namespace Intel
       custom_data->module = module;
       custom_data->device = device;
       custom_data->min_resolution = 32;
-      custom_data->create_context = reinterpret_cast<decltype(&xessD3D12CreateContext)>(GetProcAddress(module, "xessD3D12CreateContext"));
-      custom_data->init = reinterpret_cast<decltype(&xessD3D12Init)>(GetProcAddress(module, "xessD3D12Init"));
-      custom_data->execute = reinterpret_cast<decltype(&xessD3D12Execute)>(GetProcAddress(module, "xessD3D12Execute"));
+#if DX12
+      custom_data->create_context = reinterpret_cast<XeSSCreateContext>(GetProcAddress(module, "xessD3D12CreateContext"));
+      custom_data->init = reinterpret_cast<XeSSInit>(GetProcAddress(module, "xessD3D12Init"));
+      custom_data->execute = reinterpret_cast<XeSSExecute>(GetProcAddress(module, "xessD3D12Execute"));
+#else
+      custom_data->create_context = reinterpret_cast<XeSSCreateContext>(GetProcAddress(module, "xessD3D11CreateContext"));
+      custom_data->init = reinterpret_cast<XeSSInit>(GetProcAddress(module, "xessD3D11Init"));
+      custom_data->execute = reinterpret_cast<XeSSExecute>(GetProcAddress(module, "xessD3D11Execute"));
+#endif
       custom_data->destroy_context = reinterpret_cast<decltype(&xessDestroyContext)>(GetProcAddress(module, "xessDestroyContext"));
       custom_data->get_optimal_input_resolution = reinterpret_cast<decltype(&xessGetOptimalInputResolution)>(GetProcAddress(module, "xessGetOptimalInputResolution"));
       custom_data->set_velocity_scale = reinterpret_cast<decltype(&xessSetVelocityScale)>(GetProcAddress(module, "xessSetVelocityScale"));
@@ -80,12 +114,12 @@ namespace Intel
       custom_data->version = std::format("{}.{}.{}", version.major, version.minor, version.patch);
       custom_data->version_name = custom_data->version.c_str();
 
-      // A context is the only support check (it fails without SM 6.4). It's destroyed right away: the ones that run are created by "UpdateSettings()"
+      // A context is the only support check (on D3D12 it fails without SM 6.4). It's destroyed right away: the ones that run are created by "UpdateSettings()"
       xess_context_handle_t probe_context = nullptr;
       const xess_result_t result = custom_data->create_context(device, &probe_context);
       if (result != XESS_RESULT_SUCCESS)
       {
-         reshade::log::message(reshade::log::level::warning, std::format("XeSS {}: not supported on this device ({})", custom_data->version, int(result)).c_str());
+         reshade::log::message(reshade::log::level::warning, std::format("XeSS {} ({}): not supported on this device ({})", custom_data->version, xess_dll_name, int(result)).c_str());
          return false;
       }
       if (is_optimal_driver(probe_context) == XESS_RESULT_WARNING_OLD_DRIVER)
@@ -93,7 +127,7 @@ namespace Intel
          reshade::log::message(reshade::log::level::warning, std::format("XeSS {}: the GPU driver is older than XeSS recommends", custom_data->version).c_str());
       }
       custom_data->destroy_context(probe_context);
-      reshade::log::message(reshade::log::level::info, std::format("XeSS {}: supported", custom_data->version).c_str());
+      reshade::log::message(reshade::log::level::info, std::format("XeSS {} ({}): supported", custom_data->version, xess_dll_name).c_str());
 
       custom_data->is_supported = true;
       return true;
@@ -147,10 +181,11 @@ namespace Intel
 
       custom_data->retired_contexts.Retire(&custom_data->context);
 
-      if (custom_data->create_context(custom_data->device.Get(), &custom_data->context) != XESS_RESULT_SUCCESS)
+      if (const xess_result_t result = custom_data->create_context(custom_data->device.Get(), &custom_data->context); result != XESS_RESULT_SUCCESS)
       {
          // No retry policy here: without a context "Draw()" fails, and the games then suppress SR until an upscaler is picked again
          custom_data->context = nullptr;
+         reshade::log::message(reshade::log::level::error, std::format("XeSS ({}): couldn't create the context ({})", xess_dll_name, int(result)).c_str());
          ASSERT_ONCE_MSG(false, "Couldn't create the XeSS context");
          return false;
       }
@@ -184,15 +219,16 @@ namespace Intel
          }
       }
 
-      const xess_d3d12_init_params_t init_params = {
+      const XeSSInitParams init_params = {
          .outputResolution = output_resolution,
          .qualitySetting = quality,
          .initFlags = uint32_t((settings_data.inverted_depth ? XESS_INIT_FLAG_INVERTED_DEPTH : 0) | (settings_data.mvs_jittered ? XESS_INIT_FLAG_JITTERED_MV : 0) | (settings_data.auto_exposure ? XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE : 0) | (settings_data.hdr ? 0 : XESS_INIT_FLAG_LDR_INPUT_COLOR)),
       };
       // Compiles its pipelines synchronously (a few hundred ms, once per context)
-      if (custom_data->init(custom_data->context, &init_params) != XESS_RESULT_SUCCESS)
+      if (const xess_result_t result = custom_data->init(custom_data->context, &init_params); result != XESS_RESULT_SUCCESS)
       {
          custom_data->retired_contexts.Retire(&custom_data->context);
+         reshade::log::message(reshade::log::level::error, std::format("XeSS ({}): couldn't initialize the context ({})", xess_dll_name, int(result)).c_str());
          ASSERT_ONCE_MSG(false, "Couldn't initialize the XeSS context");
          return false;
       }
@@ -223,10 +259,10 @@ namespace Intel
          return false;
       }
 
-      // XeSS reads the inputs in "D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE" and writes the output in "D3D12_RESOURCE_STATE_UNORDERED_ACCESS",
+      // On D3D12, XeSS reads the inputs in "D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE" and writes the output in "D3D12_RESOURCE_STATE_UNORDERED_ACCESS",
       // without barriers of its own (see "DrawData")
-      // ponytail: no exposure texture or responsive mask (XeSS needs their flags at the context creation), add them with a D3D12 consumer that has them.
-      const xess_d3d12_execute_params_t execute_params = {
+      // ponytail: no exposure texture or responsive mask (XeSS needs their flags at the context creation), add them with a consumer that has them.
+      const XeSSExecuteParams execute_params = {
          .pColorTexture = draw_data.source_color,
          .pVelocityTexture = draw_data.motion_vectors,
          .pDepthTexture = draw_data.depth_buffer,
@@ -241,9 +277,24 @@ namespace Intel
          .inputHeight = (draw_data.render_height ? draw_data.render_height : custom_data->settings_data.render_height),
       };
 
+#if DX12
       const xess_result_t result = custom_data->execute(custom_data->context, command_list, &execute_params);
-      ASSERT_ONCE_MSG(result == XESS_RESULT_SUCCESS, "XeSS execution failed");
-      return result == XESS_RESULT_SUCCESS;
+#else
+      // XeSS records into its device's immediate context: on a deferred one it would run out of order
+      if (command_list->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+      {
+         ASSERT_ONCE_MSG(false, "XeSS D3D11 needs to run on the immediate context");
+         return false;
+      }
+      const xess_result_t result = custom_data->execute(custom_data->context, &execute_params);
+#endif
+      if (result != XESS_RESULT_SUCCESS)
+      {
+         reshade::log::message(reshade::log::level::error, std::format("XeSS ({}): execution failed ({})", xess_dll_name, int(result)).c_str());
+         ASSERT_ONCE_MSG(false, "XeSS execution failed");
+         return false;
+      }
+      return true;
    }
 } // namespace Intel
 

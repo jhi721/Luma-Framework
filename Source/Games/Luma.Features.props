@@ -9,7 +9,7 @@
     <UseLumaFastNoise Condition="'$(UseLumaFastNoise)'==''">false</UseLumaFastNoise>
     <!-- 32-bit games: DLSS and FSR through the x64 "SR Bridge Helper" (Source/Core/sr_bridge); package.ps1 ships it and DLSS's dll. -->
     <UseLumaSRBridge Condition="'$(UseLumaSRBridge)'==''">false</UseLumaSRBridge>
-    <!-- x64 D3D11 games: DLSS, FSR 4 / 3.1 and XeSS on D3D12 inside the game's process (Source/Core/unity_build_d3d12.cpp, sr_bridge/D3D12SR.h). Ships the signed dlls of all three. -->
+    <!-- x64 D3D11 games: DLSS, FSR 4 / 3.1 and XeSS on D3D12 inside the game's process (Source/Core/unity_build_d3d12.cpp, sr_bridge/D3D12SR.h), and XeSS on D3D11 on Intel GPUs. Ships the signed dlls of all three. -->
     <UseLumaD3D12SR Condition="'$(UseLumaD3D12SR)'==''">false</UseLumaD3D12SR>
     <!-- On by default: NVAPI is a static lib that loads the driver's DLL at runtime, so it's harmless on non NVIDIA GPUs (init just fails). -->
     <UseLumaNVAPI Condition="'$(UseLumaNVAPI)'==''">true</UseLumaNVAPI>
@@ -120,7 +120,8 @@
       <AdditionalDependencies>ffx_backend_dx11_x64$(LumaFSRLibSuffix).lib;ffx_fsr3_x64$(LumaFSRLibSuffix).lib;ffx_frameinterpolation_x64$(LumaFSRLibSuffix).lib;ffx_fsr3upscaler_x64$(LumaFSRLibSuffix).lib;ffx_opticalflow_x64$(LumaFSRLibSuffix).lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ClCompile Condition="'$(LumaD3D12SR)'=='true'">
-      <PreprocessorDefinitions>UNICODE;_UNICODE;ENABLE_D3D12_SR=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(LumaD3D12SRXeSSRoot)\inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;ENABLE_D3D12_SR=1;ENABLE_XESS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link Condition="'$(LumaD3D12SR)'=='true'">
       <AdditionalDependencies>d3d12.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
@@ -159,6 +160,7 @@
       <_LumaD3D12SRRuntime Include="$(LumaD3D12SRNGXDll)" Condition="Exists('$(LumaD3D12SRNGXDll)')" />
       <_LumaD3D12SRRuntime Include="$(LumaD3D12SRFSRRoot)\signedbin\amd_fidelityfx_loader_dx12.dll;$(LumaD3D12SRFSRRoot)\signedbin\amd_fidelityfx_upscaler_dx12.dll" Condition="Exists('$(LumaD3D12SRFSRRoot)\signedbin\amd_fidelityfx_loader_dx12.dll') and Exists('$(LumaD3D12SRFSRRoot)\signedbin\amd_fidelityfx_upscaler_dx12.dll')" />
       <_LumaD3D12SRRuntime Include="$(LumaD3D12SRXeSSRoot)\bin\libxess.dll" Condition="Exists('$(LumaD3D12SRXeSSRoot)\bin\libxess.dll')" />
+      <_LumaD3D12SRRuntime Include="$(LumaD3D12SRXeSSRoot)\bin\libxess_dx11.dll" Condition="Exists('$(LumaD3D12SRXeSSRoot)\bin\libxess_dx11.dll')" />
     </ItemGroup>
     <Copy SourceFiles="@(_LumaD3D12SRRuntime)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
   </Target>
