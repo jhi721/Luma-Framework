@@ -30,6 +30,9 @@
 // which also makes dropping D3DCREATE_MULTITHREADED safe. With d3d9_memlog.on
 // the report adds the layer's per-frame counters.
 //
+// d3d9_fastlock.on next to this dll: dgVoodoo 2.87.6's device lock becomes a
+// cheaper recursive lock (see "DeviceLock").
+//
 // dgVoodoo workarounds, on whenever d3d9_chain.dll is dgVoodoo (d3d9_dgvfix.off
 // turns them off): see "dgVoodoo workarounds" below.
 #include "csmt.h"
@@ -107,6 +110,7 @@ namespace
    bool g_fix_requested = false;       // d3d9_vafix.on present
    bool g_strip_multithreaded = false; // d3d9_nomt.on present
    bool g_csmt_requested = false;      // d3d9_csmt.on present
+   bool g_fast_lock_requested = false; // d3d9_fastlock.on present
    bool g_fix_active = false;          // the device really is D3D9Ex (one device assumed)
    bool g_user_memory = false;         // the runtime takes user-memory SYSTEMMEM textures
    UINT g_available_texture_mb =
@@ -2900,8 +2904,189 @@ extern "C" const VertexConstantMirror* WINAPI LumaGetVertexConstants()
 
 namespace
 {
+   // d3d9_fastlock.on: dgVoodoo 2.87.6's device lock (D3DCREATE_MULTITHREADED, its window procedure, a few internal paths)
+   // is one critical section, taken and left through its IAT around every D3D9 call: ~26k times a frame in The Witcher 2,
+   // ~15% of the render thread, nearly all on the locked instructions of RtlTryEnter/RtlLeave (each drains the store
+   // buffer; a compare exchange of our own cost the same). Its IAT entries become an asymmetric lock; every other section
+   // goes to ntdll. dgVoodoo never reads the section's fields (docs/dgVoodoo-RE.md "CPU overhead"), so they stay as
+   // initialized.
+   // - The fast thread (the first to take the lock PROMOTE_STREAK times in a row: the render thread) takes it with plain
+   //   stores: it raises fast_held, then backs off while a slow owner exists.
+   // - Any other thread takes slow_owner by compare exchange; FlushProcessWriteBuffers then makes its slow_owner visible to
+   //   the fast thread's next load and the fast thread's fast_held visible to it (asymmetric Dekker), and it waits for the
+   //   fast thread to leave. A TryEnter waits SLOW_TRY_SPINS at most, so dgVoodoo's own retry loop keeps pumping messages.
+   // Waiters spin, then yield: nothing has to wake them.
+   namespace DeviceLock
+   {
+      constexpr DWORD IMAGE_SIZE = 0x1a3000;
+      constexpr DWORD SECTION_RVA = 0xdfea8;
+      constexpr DWORD SECTION_POINTER_RVAS[] = {0xdfaa4, 0xdfa98};
+      constexpr DWORD IAT_LEAVE_RVA = 0xd2124;
+      constexpr DWORD IAT_ENTER_RVA = 0xd2128;
+      constexpr DWORD IAT_TRY_ENTER_RVA = 0xd212c;
+      constexpr uint32_t SPINS_BEFORE_YIELD = 4096;
+      constexpr uint32_t SLOW_TRY_SPINS = 4096;
+      constexpr uint32_t PROMOTE_STREAK = 4096;
+
+      using SectionFn = LONG(WINAPI*)(RTL_CRITICAL_SECTION*);
+      SectionFn enter_original = nullptr;
+      SectionFn try_enter_original = nullptr;
+      SectionFn leave_original = nullptr;
+      RTL_CRITICAL_SECTION* section = nullptr;
+      std::atomic<DWORD> fast_thread{0};
+      std::atomic<uint32_t> fast_held{0};
+      uint32_t fast_recursion = 0; // the fast thread only
+      std::atomic<DWORD> slow_owner{0};
+      uint32_t slow_recursion = 0; // the slow owner only, like the streak
+      DWORD streak_thread = 0;
+      uint32_t streak = 0;
+
+      bool FastTryTake()
+      {
+         if (fast_recursion)
+         {
+            fast_recursion++;
+            return true;
+         }
+         fast_held.store(1, std::memory_order_relaxed);
+         std::atomic_signal_fence(std::memory_order_seq_cst); // the CPU may still pass the store: slow owners flush it
+         if (slow_owner.load(std::memory_order_acquire) != 0)
+         {
+            fast_held.store(0, std::memory_order_release);
+            return false;
+         }
+         fast_recursion = 1;
+         return true;
+      }
+
+      bool SlowTryTake(DWORD self, bool bounded)
+      {
+         if (slow_owner.load(std::memory_order_relaxed) == self)
+         {
+            slow_recursion++;
+            return true;
+         }
+         DWORD expected = 0;
+         if (!slow_owner.compare_exchange_strong(expected, self, std::memory_order_acquire))
+            return false;
+         if (fast_thread.load(std::memory_order_relaxed) != 0)
+         {
+            FlushProcessWriteBuffers();
+            for (uint32_t spins = 0; fast_held.load(std::memory_order_acquire) != 0; spins++)
+            {
+               if (bounded && spins == SLOW_TRY_SPINS)
+               {
+                  slow_owner.store(0, std::memory_order_release);
+                  return false;
+               }
+               _mm_pause();
+            }
+         }
+         slow_recursion = 1;
+         return true;
+      }
+
+      bool TryTake(bool bounded)
+      {
+         const DWORD self = GetCurrentThreadId();
+         return (self == fast_thread.load(std::memory_order_relaxed)) ? FastTryTake() : SlowTryTake(self, bounded);
+      }
+
+      LONG WINAPI TryEnter(RTL_CRITICAL_SECTION* cs)
+      {
+         if (cs != section)
+            return try_enter_original(cs);
+         return TryTake(true) ? TRUE : FALSE;
+      }
+
+      LONG WINAPI Enter(RTL_CRITICAL_SECTION* cs)
+      {
+         if (cs != section)
+            return enter_original(cs);
+         for (uint32_t spins = 0; !TryTake(false); spins++)
+         {
+            if (spins < SPINS_BEFORE_YIELD)
+            {
+               _mm_pause();
+            }
+            else if (!SwitchToThread())
+            {
+               Sleep(0);
+            }
+         }
+         return 0;
+      }
+
+      LONG WINAPI Leave(RTL_CRITICAL_SECTION* cs)
+      {
+         if (cs != section)
+            return leave_original(cs);
+         const DWORD self = GetCurrentThreadId();
+         if (self == fast_thread.load(std::memory_order_relaxed))
+         {
+            if (--fast_recursion == 0)
+            {
+               fast_held.store(0, std::memory_order_release);
+            }
+            return 0;
+         }
+         if (--slow_recursion != 0)
+            return 0;
+         if (fast_thread.load(std::memory_order_relaxed) == 0)
+         {
+            streak = (streak_thread == self) ? streak + 1 : 1;
+            streak_thread = self;
+            if (streak >= PROMOTE_STREAK)
+            {
+               fast_thread.store(self, std::memory_order_relaxed); // published by the release below
+               fprintf(g_log, "dgVoodoo device lock: fast thread %lu\n", self);
+            }
+         }
+         slow_owner.store(0, std::memory_order_release);
+         return 0;
+      }
+
+      // Before the first device: no thread holds the section yet, and every call that follows sees the new entries.
+      void Install()
+      {
+         static std::once_flag once;
+         std::call_once(once, []
+            {
+               BYTE* const base = (BYTE*)Chain();
+               MODULEINFO info = {};
+               GetModuleInformation(GetCurrentProcess(), Chain(), &info, sizeof(info));
+               const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+               auto* const candidate = (RTL_CRITICAL_SECTION*)(base + SECTION_RVA);
+               auto slot = [base](DWORD rva)
+               { return (void**)(base + rva); };
+               const bool known_build = info.SizeOfImage == IMAGE_SIZE &&
+                                        std::all_of(std::begin(SECTION_POINTER_RVAS), std::end(SECTION_POINTER_RVAS), [&](DWORD rva)
+                                           { return *slot(rva) == candidate; }) &&
+                                        *slot(IAT_ENTER_RVA) == GetProcAddress(ntdll, "RtlEnterCriticalSection") &&
+                                        *slot(IAT_TRY_ENTER_RVA) == GetProcAddress(ntdll, "RtlTryEnterCriticalSection") &&
+                                        *slot(IAT_LEAVE_RVA) == GetProcAddress(ntdll, "RtlLeaveCriticalSection");
+               if (!known_build || candidate->OwningThread || candidate->RecursionCount)
+               {
+                  fprintf(g_log, "dgVoodoo device lock not replaced (%s)\n", known_build ? "held" : "unknown build");
+                  return;
+               }
+               enter_original = (SectionFn)*slot(IAT_ENTER_RVA);
+               try_enter_original = (SectionFn)*slot(IAT_TRY_ENTER_RVA);
+               leave_original = (SectionFn)*slot(IAT_LEAVE_RVA);
+               section = candidate;
+               WriteSlot(slot(IAT_ENTER_RVA), (void*)&Enter);
+               WriteSlot(slot(IAT_TRY_ENTER_RVA), (void*)&TryEnter);
+               WriteSlot(slot(IAT_LEAVE_RVA), (void*)&Leave);
+               fprintf(g_log, "dgVoodoo device lock replaced\n"); });
+      }
+   } // namespace DeviceLock
+
    void HookDirect3D(IDirect3D9* d3d, bool ex)
    {
+      if (g_fast_lock_requested && ChainIsDgVoodoo())
+      {
+         DeviceLock::Install();
+      }
       Patch(d3d, SLOT_CREATE_DEVICE, (void*)&HookCreateDevice);
       if (ex)
       {
@@ -2984,6 +3169,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void*)
       g_strip_multithreaded = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
       swprintf_s(flag_path, L"%sd3d9_csmt.on", g_dir);
       g_csmt_requested = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
+      swprintf_s(flag_path, L"%sd3d9_fastlock.on", g_dir);
+      g_fast_lock_requested = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
       swprintf_s(flag_path, L"%sd3d9_dgvfix.off", g_dir);
       g_dgv_fixes_disabled = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
       fprintf(g_log, "---- d3d9_memlog attached, pid %lu, VA fix %s, multithreaded flag %s, CSMT %s\n",

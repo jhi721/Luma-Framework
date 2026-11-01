@@ -4,7 +4,7 @@
 // vertex buffer locked with DISCARD then NOOVERWRITE, MANAGED vertex/index buffers, UP draws whose arrays are
 // overwritten right after the call, a texture released while bound, render to texture through GetSurfaceLevel,
 // StretchRect, ColorFill, Clear with rects, viewport, scissor, occlusion and event queries.
-//   d3d9_csmt_test.exe <d3d9.dll> [frames=N] [reset] [redevice] [thread] [bench=DRAWS] [work=MS]
+//   d3d9_csmt_test.exe <d3d9.dll> [frames=N] [reset] [redevice] [thread] [thread_sleep=MS] [bench=DRAWS] [work=MS]
 // reset: Reset in every frame of the second half (DEFAULT resources released and recreated); redevice: a second device after the first is
 // released; thread: a second thread creates, fills, reads and releases textures while the scene renders;
 // bench=N: N extra draws per frame with a state change each (prints ms per frame); work=MS: busy CPU work per frame
@@ -955,8 +955,8 @@ int main(int argc, char** argv)
    SetUnhandledExceptionFilter(&CrashReport);
    StartWatchdog(8000);
    if (argc < 2)
-      return printf("usage: d3d9_csmt_test <d3d9.dll> [frames=N] [reset] [redevice] [thread] [ex] [bench=N] [work=MS]\n"), 2;
-   UINT frames = 6, bench_draws = 0;
+      return printf("usage: d3d9_csmt_test <d3d9.dll> [frames=N] [reset] [redevice] [thread] [thread_sleep=MS] [ex] [bench=N] [work=MS]\n"), 2;
+   UINT frames = 6, bench_draws = 0, thread_sleep_ms = 0;
    double work_ms = 0;
    bool reset = false, redevice = false, thread = false, constants = false, ex = false;
    for (int i = 2; i < argc; i++)
@@ -965,6 +965,7 @@ int main(int argc, char** argv)
       sscanf_s(argv[i], "frames=%u", &frames);
       sscanf_s(argv[i], "bench=%u", &bench_draws);
       sscanf_s(argv[i], "work=%lf", &work_ms);
+      sscanf_s(argv[i], "thread_sleep=%u", &thread_sleep_ms); // a rare second thread: the main one keeps most of the device lock
       reset |= !strcmp(argv[i], "reset");
       redevice |= !strcmp(argv[i], "redevice");
       thread |= !strcmp(argv[i], "thread");
@@ -1042,6 +1043,10 @@ int main(int argc, char** argv)
                   }
                   texture->Release();
                   thread_rounds++;
+                  if (thread_sleep_ms)
+                  {
+                     Sleep(thread_sleep_ms);
+                  }
                }
             });
       }
