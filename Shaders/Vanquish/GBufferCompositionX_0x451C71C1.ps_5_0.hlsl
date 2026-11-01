@@ -1,4 +1,4 @@
-#include "../Includes/Common.hlsl"
+#include "Includes/Common.hlsl"
 
 cbuffer cb3_buf : register(b3)
 {
@@ -102,4 +102,5 @@ void main(
     o0.x = ((((_330 * (_356 * asfloat(cb3_m[51u].x | (asuint(_365.x) & cb3_m[50u].x)))) * _414) + (((_272 * _356) * _414) * asfloat((asuint(_297.x) & cb3_m[44u].x) | cb3_m[45u].x))) * _432) * _437;
     o0.y = (((((_272 * _357) * _414) * asfloat((asuint(_297.y) & cb3_m[44u].y) | cb3_m[45u].y)) + ((_330 * (asfloat(cb3_m[51u].y | (asuint(_365.y) & cb3_m[50u].y)) * _357)) * _414)) * _432) * _437;
     o0.z = (((((_272 * _358) * _414) * asfloat((asuint(_297.z) & cb3_m[44u].z) | cb3_m[45u].z)) + ((_330 * (asfloat(cb3_m[51u].z | (asuint(_365.z) & cb3_m[50u].z)) * _358)) * _414)) * _432) * _437;
+    o0 = ClampSceneOutput(o0);
 }

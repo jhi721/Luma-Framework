@@ -1,0 +1,55 @@
+#ifndef LUMA_GAME_CB_STRUCTS
+#define LUMA_GAME_CB_STRUCTS
+
+#ifdef __cplusplus
+// This include is needed to allow reading shader types from c++.
+#include "../../../Source/Core/includes/shader_types.h"
+#endif
+
+// Mirrors c++ name spaces.
+namespace CB
+{
+struct LumaGameSettings
+{
+   float Dithering;              // 0/1. Animated triangular dither at output (Present_0x880A17D3) to break gradient banding.
+   float Exposure;               // Gather_0xBC9B20C2 on the g_MulColor gain (linear scale), 1 = vanilla
+   float Contrast;               // HDR, before the display map, 1 = vanilla
+   float Saturation;             // HDR, before the display map, 1 = vanilla
+   float HighlightsDesaturation; // HDR, purity toward the vanilla clip's reference, 0 = off
+   float ColorGradingIntensity;  // Gather_0xBC9B20C2: 1 = vanilla, 0 = no curve, saturation or gradient
+   float BloomIntensity;         // Gather_0xBC9B20C2 on the bloom it adds: 1 = vanilla, 0 = none
+   float VideoAutoHDREnable;     // Copy_0x91A6C437: 0/1. 1 = light PumboAutoHDR on the Sofdec movies (HDR only).
+   float VideoAutoHDRBoost;      // 0..1. Highlight-expansion strength; peak = lerp(sRGB white, 250 nits, boost). 0 = off.
+};
+
+struct LumaGameData
+{
+   float Dummy; // hlsl doesn't support empty structs
+};
+
+// The motion vector fill's constants (Luma_Vanquish_MotionVectorFill.hlsl, b0), written by "FillMotionVectors"
+struct MotionVectorFillConstants
+{
+   row_major float4x4 reprojection; // Current clip space to the previous frame's (column vectors)
+   float2 jitter_ndc;               // This frame's projection jitter: in the depth, not in the motion vectors
+   float reactive_scale;
+   float reactive_threshold;
+   float reactive_enabled; // 0/1
+   float3 padding;
+};
+
+// SMAA's metrics (Luma_SMAA_impl.hlsl, VS+PS b1), written by "DrawSMAAOnScene"
+struct SmaaMetrics
+{
+   float4 rt_metrics;        // (1/W, 1/H, W, H)
+   float4 predication;       // x = predication threshold scale: 2 with predication, 1 with a null predication texture (plain ULTRA 0.05)
+   float4 subsample_indices; // SMAA T2x's jitter phase "SMAA.hlsl" @SUBSAMPLE_INDICES, 0 when the scene didn't jitter (unread without T2x)
+};
+} // namespace CB
+
+#ifdef __cplusplus
+static_assert(sizeof(CB::MotionVectorFillConstants) == 96);
+static_assert(sizeof(CB::SmaaMetrics) == 48);
+#endif
+
+#endif // LUMA_GAME_CB_STRUCTS

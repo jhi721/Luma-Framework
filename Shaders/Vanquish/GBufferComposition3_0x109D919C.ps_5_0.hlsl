@@ -1,4 +1,4 @@
-#include "../Includes/Common.hlsl"
+#include "Includes/Common.hlsl"
 
 cbuffer cb3_buf : register(b3)
 {
@@ -69,4 +69,5 @@ void main(
 #if 1 // Emulate R8G8B8A8_UNORM_SRGB view with upgraded R16G16B16A16_FLOAT textures
     o0.rgb = linear_to_sRGB_gamma(o0.rgb, GCT_MIRROR);
 #endif
+    o0 = ClampSceneOutput(o0);
 }

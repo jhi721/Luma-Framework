@@ -1,4 +1,4 @@
-#include "../Includes/Common.hlsl"
+#include "Includes/Common.hlsl"
 
 Texture2D<float4> t2 : register(t2);
 Texture2D<float4> t1 : register(t1);
@@ -77,4 +77,5 @@ void main(
 #endif
   
   o0.w = r2.w;
+  o0 = ClampSceneOutput(o0);
 }
