@@ -1645,13 +1645,12 @@ public:
       D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
       UINT viewport_count = std::size(viewports);
       native_device_context->RSGetViewports(&viewport_count, viewports);
-      // The origin isn't scaled past a quarter texel right of the game's (dgVoodoo's 0.5, D3D9's pixel center): the game's quads
-      // start just inside the target's first texel, so scaled exactly they leave the first Luma texels unwritten, black for the
-      // blurs' clamped taps (a dark top and left edge).
+      // The origin scales exactly too: dgVoodoo's half texel offset is in clip space, so it scales with the viewport (capped at 0.75,
+      // every level drew ~0.8 game texel up and left of the game's)
       for (UINT i = 0; i < viewport_count; i++)
       {
-         viewports[i].TopLeftX = (std::min)(viewports[i].TopLeftX * gd.bloom_scale, viewports[i].TopLeftX + 0.25f);
-         viewports[i].TopLeftY = (std::min)(viewports[i].TopLeftY * gd.bloom_scale, viewports[i].TopLeftY + 0.25f);
+         viewports[i].TopLeftX *= gd.bloom_scale;
+         viewports[i].TopLeftY *= gd.bloom_scale;
          viewports[i].Width *= gd.bloom_scale;
          viewports[i].Height *= gd.bloom_scale;
       }
@@ -1670,12 +1669,20 @@ public:
       ID3D11RenderTargetView* const bloom_rtv = gd.bloom_rtv.get();
       native_device_context->OMSetRenderTargets(1, &bloom_rtv, nullptr);
       native_device_context->PSSetShaderResources(0, 1, &source);
-      // filter05 (BloomSource_0x8B6A8D61) averages the whole footprint of each texel
+      // filter05 (BloomSource_0x8B6A8D61) averages the whole footprint of each texel; the blurs (BlurV_0x91CC01D3, BlurH_0xCE62BA4B)
+      // widen each tap to a game texel at the scale (CustomData3)
       SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
-      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, is_bloom_source ? 1 : 0);
+      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, is_bloom_source ? 1 : 0, 0, float(gd.bloom_scale));
       *updated_cbuffers = true;
       draw();
       graphics_state.Restore(native_device_context);
+      // The game's quads start just inside the target's first texel, short of the first Luma row and column at the exact origin.
+      // Those repeat their neighbours, else they stay black and the blurs' clamped taps darken the top and left edge.
+      const uint2 size = GetViewTextureSize(gd.bloom_rtv.get());
+      const D3D11_BOX row = {.left = 0, .top = 1, .front = 0, .right = size.x, .bottom = 2, .back = 1};
+      native_device_context->CopySubresourceRegion(gd.bloom_texture.get(), 0, 0, 0, 0, gd.bloom_texture.get(), 0, &row);
+      const D3D11_BOX column = {.left = 1, .top = 0, .front = 0, .right = 2, .bottom = size.y, .back = 1};
+      native_device_context->CopySubresourceRegion(gd.bloom_texture.get(), 0, 0, 0, 0, gd.bloom_texture.get(), 0, &column);
       return true;
    }
 
