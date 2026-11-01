@@ -1146,14 +1146,7 @@ public:
             reshade::unregister_event<event>(callback);
          }
       };
-      if (enable)
-      {
-         SceneMotionVectors::RegisterEvents<GetSceneMotionVectors>();
-      }
-      else
-      {
-         SceneMotionVectors::UnregisterEvents<GetSceneMotionVectors>();
-      }
+      SceneMotionVectors::SetEvents<GetSceneMotionVectors>(enable);
       set.template operator()<reshade::addon_event::create_resource>(OnCreateResource);
       set.template operator()<reshade::addon_event::copy_resource>(OnCopyResource);
       set.template operator()<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);

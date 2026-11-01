@@ -813,14 +813,13 @@ public:
    // is in every blend state too, see "REACTIVE_SLOT") and the resources' extra binds
    static void SetEvents(bool enable)
    {
+      SceneMotionVectors::SetEvents<GetSceneMotionVectors>(enable);
       if (enable)
       {
-         SceneMotionVectors::RegisterEvents<GetSceneMotionVectors>();
          reshade::register_event<reshade::addon_event::create_resource>(OnCreateResource);
       }
       else
       {
-         SceneMotionVectors::UnregisterEvents<GetSceneMotionVectors>();
          reshade::unregister_event<reshade::addon_event::create_resource>(OnCreateResource);
       }
    }

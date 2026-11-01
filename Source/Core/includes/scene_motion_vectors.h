@@ -17,7 +17,7 @@
 
 // A scene's motion vectors from the game's own mesh draws (dgVoodoo D3D9 games): each draw's vertex shader runs a second time with the
 // previous frame's vc4 of the same object ("motion_vector_patch.h"), found by its draw key and tie-break transform ("patched_draws.h").
-// The state machine written for Bayonetta: the CPU copies of vc4, the patched shader caches, the draw key and previous frame match, the
+// The state machine: the CPU copies of vc4, the patched shader caches, the draw key and previous frame match, the
 // camera-only fallback, the motion vector target and the reactive mask target, the jitter. A game decides when its scene opens and
 // ends (OpenScene's refusals, the fill, the upscaler); it calls "BeginFrame", "DrawWithMotionVectors" and "DrawWithJitter".
 // Include after "core.hpp", with the game defining LUMA_PATCH_BYTECODE_SYNC (the shaders are read from the patch context). A game provides a "Game" type (template argument) with:
@@ -37,6 +37,8 @@
 //                                                                     // accepted stays "scene_color"), with the same scene depth
 //   optional: static constexpr PixelShaderPatch blended_mask_patch;  // "BLENDED" plus the reactive mask, for the unmatched alpha blended
 //   optional: static bool MaskUnmatchedBlended(DeviceData&);   // draws into "reactive_target" (their own motion is unknown)
+//   optional: static bool PatchesReplacement(uint32_t pixel_shader_hash); // Its pixel shaders are patched from their replacement file
+//                                                                          // (when loaded), not from the game's code
 namespace SceneMotionVectors
 {
    namespace Dg = MotionVectorPatch::DgVoodoo;
@@ -164,9 +166,10 @@ namespace SceneMotionVectors
       // Motion vectors and jitter this frame: an upscaler or a development toggle (set at present by the game)
       std::atomic<bool> active = false;
       std::shared_mutex mutex;
-      std::unordered_map<uint32_t, PatchedShader<ID3D11VertexShader>> vertex_shaders;
+      // By the shader hash, and the replacement's version above it for "Game::PatchesReplacement" (see "GetPatchedShader")
+      std::unordered_map<uint64_t, PatchedShader<ID3D11VertexShader>> vertex_shaders;
       // By "PixelShaderPatch"
-      std::unordered_map<uint32_t, PatchedShader<ID3D11PixelShader>> patched_pixel_shaders[size_t(PixelShaderPatch::COUNT)];
+      std::unordered_map<uint64_t, PatchedShader<ID3D11PixelShader>> patched_pixel_shaders[size_t(PixelShaderPatch::COUNT)];
       // The motion vector target (sized like the scene; the alpha blending states blend it like their color, the others write it
       // unblended, see "PatchedDraws::OnCreateBlendState")
       com_ptr<ID3D11Texture2D> texture;
@@ -373,18 +376,6 @@ namespace SceneMotionVectors
       set.template operator()<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion<get>);
    }
 
-   template <State* (*get)(reshade::api::device*)>
-   void RegisterEvents()
-   {
-      SetEvents<get>(true);
-   }
-
-   template <State* (*get)(reshade::api::device*)>
-   void UnregisterEvents()
-   {
-      SetEvents<get>(false);
-   }
-
    // A refused "DrawWithMotionVectors": always false
    inline bool Refuse([[maybe_unused]] State* state, [[maybe_unused]] MotionVectorReject reason)
    {
@@ -446,9 +437,32 @@ namespace SceneMotionVectors
          else
             return &state->patched_pixel_shaders[size_t(patch)];
       }();
+      // A shader patched from its replacement is also keyed by the replacement's version, so a replacement that compiles after the first
+      // use, or is reloaded, makes new variants. Until it's loaded, the game's code is patched under the plain hash. "replacement" is
+      // copied outside "s_mutex_generic", so we never nest it with "s_mutex_shader_objects".
+      const auto replacement_key = [&](std::vector<uint8_t>* replacement)
+      {
+         uint64_t key = hash;
+         if constexpr (!vertex && requires { Game::PatchesReplacement(hash); })
+         {
+            if (Game::PatchesReplacement(hash))
+            {
+               const std::shared_lock lock(s_mutex_shader_objects);
+               if (const auto it = custom_shaders_cache.find(hash); it != custom_shaders_cache.end() && it->second && !it->second->code.empty())
+               {
+                  key |= uint64_t(uint32_t(it->second->preprocessed_hash) | 1u) << 32;
+                  if (replacement)
+                  {
+                     *replacement = it->second->code;
+                  }
+               }
+            }
+         }
+         return key;
+      };
       {
          const std::shared_lock lock(state->mutex);
-         if (const auto it = shaders->find(hash); it != shaders->end())
+         if (const auto it = shaders->find(replacement_key(nullptr)); it != shaders->end())
             return it->second;
       }
 #if DEVELOPMENT
@@ -457,6 +471,13 @@ namespace SceneMotionVectors
       std::vector<uint8_t> patched;
       std::string error; // Written by a refusal only
       PatchedShader<T> record;
+      std::vector<uint8_t> replacement;
+      const uint64_t key = replacement_key(&replacement);
+      if (!replacement.empty())
+      {
+         patched = Game::PatchPixelShader(patch, replacement.data(), replacement.size(), &error);
+      }
+      else
       {
          const std::shared_lock lock(s_mutex_generic);
          if (const auto it = device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle); it != device_data.pipeline_cache_by_pipeline_handle.end() && it->second->subobjects_cache)
@@ -552,13 +573,17 @@ namespace SceneMotionVectors
          if (shader)
          {
             status = (error.empty() ? std::string("patched") : "patched, " + error);
+            if (!replacement.empty())
+            {
+               status += " (replacement)";
+            }
          }
          reshade::log::message(((shader || expected) ? reshade::log::level::info : reshade::log::level::warning),
             std::format("[{}] {} 0x{:08X} {}", Game::log_tag, (vertex ? "MV VS" : Game::patch_names[size_t(patch)]), hash, status).c_str());
       }
       record.shader = shader;
       const std::unique_lock lock(state->mutex);
-      const auto [entry, inserted] = shaders->try_emplace(hash, std::move(record));
+      const auto [entry, inserted] = shaders->try_emplace(key, std::move(record));
       return entry->second;
    }
 
