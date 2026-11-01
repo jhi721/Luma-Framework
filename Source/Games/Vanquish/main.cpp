@@ -48,6 +48,16 @@ const ShaderHashesList shader_hashes_Copy = {.pixel_shaders = {0x91A6C437}};
 // level 0 (the first opaque, the 80x48, 48x32 and 32x16 ones SRC_ALPHA / ONE), which the gather pass reads as t1.
 const ShaderHashesList shader_hashes_BloomSource = {.pixel_shaders = {0x8B6A8D61, 0x9C312037, 0xAD095D6B}};
 const ShaderHashesList shader_hashes_BloomBlur = {.pixel_shaders = {0x3B0C76B0, 0xCC2E3748, 0x8D9CA7F2, 0x55E02134, 0xCCB5D7CF, 0x383F18C2}};
+// Every list above "OnDrawOrDispatch" tests: a draw in none of them (most of the scene) skips their lookups
+const ShaderHashesList shader_hashes_Listed = []
+{
+   ShaderHashesList<> listed;
+   for (const ShaderHashesList<>* list : {&shader_hashes_Gather, &shader_hashes_GameAA, &shader_hashes_AAOffCopy, &shader_hashes_DepthPrepass, &shader_hashes_DgVoodooPresent, &shader_hashes_VideoUnpack, &shader_hashes_Copy, &shader_hashes_BloomSource, &shader_hashes_BloomBlur})
+   {
+      listed.pixel_shaders.insert(list->pixel_shaders.begin(), list->pixel_shaders.end());
+   }
+   return listed;
+}();
 // The motion blur's velocity: (ndc - previous ndc) * scale + 0.5 in o0.xy, which the 8-bit target clamped and quantized
 // (modelshadervelocitymappl, mapscr, nomovevelocitymap, directionvelocitymap), its dilation (blurpass2) and downsampling
 // (modelshaderdownsampling, only seen on the velocity). Clamped as it stored it now that the scene sized and shaped targets are fp16.
@@ -307,6 +317,9 @@ struct VanquishGameDeviceData final : public GameDeviceData
    // resource bind, see "OnCreateResource"); the last frame's tells the jittered draws before this frame's scene opens
    com_ptr<ID3D11Resource> scene_depth;
    com_ptr<ID3D11ShaderResourceView> scene_depth_srv;
+   // The last depth view found to be of "scene_depth": the scene's draws match it without a "GetResource" (referenced, so its address
+   // can't come back for a view of another resource)
+   com_ptr<ID3D11DepthStencilView> scene_dsv;
    // The size of the last gather pass' scene: the depth prepass' target of this size opens the scene (the shadow maps draw R32F targets
    // too)
    uint2 scene_size_hint = {};
@@ -543,16 +556,18 @@ class Vanquish final : public Game
 
    // Whether the bound draw tests depth against the scene's depth: the scene's draws (the depth prepass, the G-buffer, the lights, the
    // velocity pass, the translucents), not full screen passes or shadow maps
-   static bool IsSceneDepthTested(ID3D11DeviceContext* native_device_context, VanquishGameDeviceData* gd)
+   static bool IsSceneDepthTested(ID3D11DeviceContext* native_device_context, VanquishGameDeviceData* gd, const com_ptr<ID3D11DepthStencilView>& dsv)
    {
-      com_ptr<ID3D11DepthStencilView> dsv;
-      native_device_context->OMGetRenderTargets(0, nullptr, &dsv);
       if (!dsv)
          return false;
-      com_ptr<ID3D11Resource> depth;
-      dsv->GetResource(&depth);
-      if (depth != gd->scene_depth)
-         return false;
+      if (dsv != gd->scene_dsv)
+      {
+         com_ptr<ID3D11Resource> depth;
+         dsv->GetResource(&depth);
+         if (depth != gd->scene_depth)
+            return false;
+         gd->scene_dsv = dsv;
+      }
       ID3D11DepthStencilState* const state = gd->mv.bound_states.DepthStencilState(native_device_context);
       if (state != gd->depth_test_state)
       {
@@ -622,6 +637,7 @@ class Vanquish final : public Game
       if (depth != gd.scene_depth)
       {
          gd.scene_depth = depth;
+         gd.scene_dsv.reset();
          gd.scene_depth_srv.reset();
          const D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = CD3D11_SHADER_RESOURCE_VIEW_DESC(D3D11_SRV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R24_UNORM_X8_TYPELESS);
          native_device->CreateShaderResourceView(depth.get(), &srv_desc, &gd.scene_depth_srv);
@@ -1265,8 +1281,15 @@ public:
          }
          return resource;
       };
+      // Every draw of the frame goes through here: one lookup for a draw in no list, each list tested once
+      const bool is_listed = original_shader_hashes.Contains(shader_hashes_Listed);
+      const auto is_in = [&](const ShaderHashesList<>& list)
+      {
+         return is_listed && original_shader_hashes.Contains(list);
+      };
+      const bool is_depth_prepass = is_in(shader_hashes_DepthPrepass);
       // The first prepass draw of the frame names its target (not returned: the scene opens at it below)
-      if (g_smaa_enable && is_immediate && !game_device_data.depth_prepass && original_shader_hashes.Contains(shader_hashes_DepthPrepass))
+      if (g_smaa_enable && is_immediate && !game_device_data.depth_prepass && is_depth_prepass)
       {
          if (const auto resource = bound_render_target())
          {
@@ -1278,7 +1301,7 @@ public:
       // gather pass
       if (game_device_data.mv.active && is_immediate && !game_device_data.has_drawn_gather)
       {
-         if (!game_device_data.mv.scene_open && !game_device_data.mv.scene_done && original_shader_hashes.Contains(shader_hashes_DepthPrepass))
+         if (!game_device_data.mv.scene_open && !game_device_data.mv.scene_done && is_depth_prepass)
          {
             com_ptr<ID3D11DepthStencilView> dsv;
             native_device_context->OMGetRenderTargets(0, nullptr, &dsv);
@@ -1289,7 +1312,9 @@ public:
          }
          if (game_device_data.mv.scene_open)
          {
-            const bool scene_draw = IsSceneDepthTested(native_device_context, &game_device_data);
+            com_ptr<ID3D11DepthStencilView> dsv;
+            native_device_context->OMGetRenderTargets(0, nullptr, &dsv);
+            const bool scene_draw = IsSceneDepthTested(native_device_context, &game_device_data, dsv);
             if (game_device_data.jitter != std::array<float, 2>{} || game_device_data.viewport_jittered)
             {
                JitterSceneViewport(native_device_context, &game_device_data, scene_draw);
@@ -1298,8 +1323,7 @@ public:
             if (scene_draw && can_draw && !is_custom_pass && has_vertex_shader && original_shader_hashes.pixel_shaders[0] != SHADER_HASH_NONE)
             {
                com_ptr<ID3D11RenderTargetView> rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
-               com_ptr<ID3D11DepthStencilView> dsv;
-               native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv);
+               native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], nullptr);
                game_device_data.mv.object_motion = g_mv_enable;
                // The draws that write depth (the depth prepass' meshes; the G-buffer's draws have several targets) and the alpha blended
                // ones (hair, smoke: their own motion blended by their alpha), into the prepass' target or the gather pass' scene (another
@@ -1354,11 +1378,12 @@ public:
          PatchedDraws::RestoreGameShader(native_device_context, &game_device_data.mv.bound_pixel_shader);
       }
       // Luma Bloom's chain and its level copies (the copy shader also draws them into the bloom target); false: the game's draw
-      const bool is_bloom_source = original_shader_hashes.Contains(shader_hashes_BloomSource);
-      if (can_draw && (is_bloom_source || original_shader_hashes.Contains(shader_hashes_BloomBlur) || original_shader_hashes.Contains(shader_hashes_Copy)) &&
+      const bool is_bloom_source = is_in(shader_hashes_BloomSource);
+      const bool is_copy = is_in(shader_hashes_Copy);
+      if (can_draw && (is_bloom_source || is_copy || is_in(shader_hashes_BloomBlur)) &&
           DrawBloomPass(native_device, native_device_context, cmd_list_data, device_data, stages, is_bloom_source, *original_draw_dispatch_func, &updated_cbuffers))
          return DrawOrDispatchOverrideType::Replaced;
-      if (original_shader_hashes.Contains(shader_hashes_Gather))
+      if (is_in(shader_hashes_Gather))
       {
          device_data.has_drawn_main_post_processing = true;
          game_device_data.has_drawn_gather = true;
@@ -1466,7 +1491,8 @@ public:
          }
          return DrawOrDispatchOverrideType::Replaced;
       }
-      const bool is_canvas_writer = game_device_data.has_drawn_gather && (original_shader_hashes.Contains(shader_hashes_GameAA) || original_shader_hashes.Contains(shader_hashes_AAOffCopy));
+      const bool is_game_aa = is_in(shader_hashes_GameAA);
+      const bool is_canvas_writer = game_device_data.has_drawn_gather && (is_game_aa || is_in(shader_hashes_AAOffCopy));
       if (can_draw && is_canvas_writer)
       {
          game_device_data.canvas_target = uint64_t(bound_render_target().get());
@@ -1476,15 +1502,15 @@ public:
       const auto is_hidden_ui_draw = [&]
       {
          if (!g_hide_ui || !can_draw || !game_device_data.has_drawn_gather || original_shader_hashes.pixel_shaders[0] == SHADER_HASH_NONE ||
-             is_canvas_writer || original_shader_hashes.Contains(shader_hashes_DgVoodooPresent))
+             is_canvas_writer || is_in(shader_hashes_DgVoodooPresent))
             return false;
          const uint64_t target = uint64_t(bound_render_target().get());
          return target != 0 && (target == game_device_data.gather_target || target == game_device_data.canvas_target);
       };
-      if (!original_shader_hashes.Contains(shader_hashes_Copy) && is_hidden_ui_draw())
+      if (!is_copy && is_hidden_ui_draw())
          return DrawOrDispatchOverrideType::Replaced;
       // SMAA or the upscaler ran on the gather target: the game's FXAA or edge AA (t0 that target, a new target out) becomes a copy
-      if (can_draw && (game_device_data.has_drawn_smaa || device_data.has_drawn_sr) && original_shader_hashes.Contains(shader_hashes_GameAA))
+      if (can_draw && (game_device_data.has_drawn_smaa || device_data.has_drawn_sr) && is_game_aa)
       {
          auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
          auto* const copy_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Copy PS"));
@@ -1502,13 +1528,13 @@ public:
             return DrawOrDispatchOverrideType::Replaced;
          }
       }
-      if (original_shader_hashes.Contains(shader_hashes_VideoUnpack))
+      if (is_in(shader_hashes_VideoUnpack))
       {
          game_device_data.video_frame = bound_render_target();
          return DrawOrDispatchOverrideType::None;
       }
       // Every copy gets the flag: the luma data cbuffer stays bound between draws
-      if (can_draw && original_shader_hashes.Contains(shader_hashes_Copy))
+      if (can_draw && is_copy)
       {
          bool is_video = false;
          if (game_device_data.video_frame)
@@ -1532,7 +1558,7 @@ public:
       }
       // The present blit: clamp the UI to the scene before it, once. It always gets the flag: the luma data cbuffer stays bound between
       // draws.
-      if (can_draw && original_shader_hashes.Contains(shader_hashes_DgVoodooPresent))
+      if (can_draw && is_in(shader_hashes_DgVoodooPresent))
       {
          const bool clamp_ui = game_device_data.has_scene_snapshot;
          game_device_data.has_scene_snapshot = false;
@@ -1614,6 +1640,7 @@ public:
          const std::unique_lock lock(game_device_data.mv.mutex);
          game_device_data.mv.ReleaseMotionVectorTargets();
          game_device_data.scene_depth_srv.reset();
+         game_device_data.scene_dsv.reset();
          game_device_data.scene_depth.reset();
          // The scene, its depth and the vc4 copies the object tables and the cameras hold (taken again at the next scene), so a resize
          // after None doesn't keep the old ones alive
