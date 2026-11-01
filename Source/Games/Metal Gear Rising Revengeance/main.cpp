@@ -685,13 +685,16 @@ class MetalGearRisingRevengeance final : public Game
                .output_height = scene_desc.Height,
                .render_width = scene_desc.Width,
                .render_height = scene_desc.Height,
-               // The scene before the gather pass: the fp16 mirror of the game's A8R8G8B8 target, gamma encoded (1 = SDR white)
-               .hdr = false,
+               // The scene before the gather pass: the fp16 mirror of the game's A8R8G8B8 target, gamma encoded (1 = SDR white, the values
+               // above it kept by the upgrade)
+               .hdr = true,
                // The motion vectors are UV deltas, previous minus current
                .mvs_x_scale = float(scene_desc.Width),
                .mvs_y_scale = float(scene_desc.Height),
                .auto_exposure = sr.type != SR::Type::FSR,
-               .render_preset = dlss_render_preset,
+               // DLAA on HDR input takes preset J or K, never L or M (DLSS-Best-Practices PRE-4): "Default" picks
+               // K (11), so NVIDIA can't change it over the air; an explicit choice is kept
+               .render_preset = (dlss_render_preset != 0 ? dlss_render_preset : 11u),
             };
             sr.implementation->UpdateSettings(sr.instance_data, native_device_context, settings_data);
             // FSR requires a FOV (it errors on 0): a camera without a usable projection keeps the last one. The projection alone (the
