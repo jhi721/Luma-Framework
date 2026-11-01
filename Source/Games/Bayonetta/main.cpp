@@ -120,16 +120,16 @@ static constexpr UINT GTAO_KNOBS_CB_SLOT = 9;
 static constexpr UINT GTAO_TEMPORAL_CB_SLOT = 10;
 // The prefilter's view depth mips, "XE_GTAO_DEPTH_MIP_LEVELS" in Includes/XeGTAO.hlsl
 static constexpr UINT GTAO_DEPTH_MIPS = 5;
-// Darkness dials (higher = darker). They sit halfway between 1 and the powers that matched the thin contact lines of the game's SSAO
-// (Fix High Resolution Effects on) where it darkens on the lit station platform: 0.3 for XeGTAO, about 0.18 for GT-VBAO. Other scenes
-// differ (NOTES.md).
+// Darkness dials (higher = darker). Their darkening sits about halfway between power 1's and that of the powers that matched the
+// thin contact lines of the game's SSAO (Fix High Resolution Effects on) on the lit station platform: 0.3 for XeGTAO, about 0.18 for
+// GT-VBAO. Other scenes differ (NOTES.md).
 static float g_gtao_final_value_power = 0.55f;
 static float g_gtvbao_final_value_power = 0.35f;
 static float g_gtao_depth_scale = 1.f;     // View depth divisor (game units -> ~meters)
 static float g_gtao_radius_override = 0.f; // > 0 overrides the shader's EFFECT_RADIUS (view units after the depth scale)
 #if DEVELOPMENT
 static int g_gtao_debug_view = 0; // 0 off, 1 depth gradient, 2 normals, 3 AO x8, 4 edges (the shader's debug blocks are DEVELOPMENT only)
-// The AO history's weight under DLSS/FSR (see "RunXeGTAO"), 0 turns it off
+// The AO history's weight under an upscaler (see "RunXeGTAO"), 0 turns it off
 static float g_gtao_history_weight = 0.9f;
 #else
 constexpr int g_gtao_debug_view = 0;
@@ -468,7 +468,7 @@ struct BayonettaGameDeviceData final : public GameDeviceData
    ComPtr<ID3D11Texture2D> gtao_output; // R8 visibility
    ComPtr<ID3D11UnorderedAccessView> gtao_output_uav;
    ComPtr<ID3D11ShaderResourceView> gtao_output_srv;
-   // The AO history under DLSS/FSR, R16G16_FLOAT (AO, view Z), ping-ponged: written by "temporal_pass_cs", created at its first use
+   // The AO history under an upscaler, R16G16_FLOAT (AO, view Z), ping-ponged: written by "temporal_pass_cs", created at its first use
    ComPtr<ID3D11Texture2D> gtao_history[2];
    ComPtr<ID3D11UnorderedAccessView> gtao_history_uavs[2];
    ComPtr<ID3D11ShaderResourceView> gtao_history_srvs[2];
@@ -517,9 +517,9 @@ struct BayonettaGameDeviceData final : public GameDeviceData
    AAStats aa_last_stats;
 #endif
 
-   // ---- DLAA / FSR 3 Native AA / Luma TAA with motion vectors and jitter from patched shaders (Mirror's Edge's path with The Witcher
-   // 2's CPU cuts, one per-draw buffer: dgVoodoo's vc4; the state machine is Core's "SceneMotionVectors") ----
-   // DLSS and FSR run in the x64 helper of Core's SR bridge (the game is 32-bit, see "SRBridge.h"), Luma TAA in process.
+   // ---- DLAA / FSR 3 Native AA / XeSS / Luma TAA with motion vectors and jitter from patched shaders (Mirror's Edge's path with The
+   // Witcher 2's CPU cuts, one per-draw buffer: dgVoodoo's vc4; the state machine is Core's "SceneMotionVectors") ----
+   // DLSS, FSR and XeSS run in the x64 helper of Core's SR bridge (the game is 32-bit, see "SRBridge.h"), Luma TAA in process.
    // An upscaler is picked, hasn't failed (it then gives way to SMAA until picked again) and the game's MSAA is off, latched at present
    // for the whole frame: a selection made after the motion vector state was set would otherwise run the upscaler on mixed state
    bool sr_active = false;
@@ -589,7 +589,7 @@ struct BayonettaGameDeviceData final : public GameDeviceData
       gtao_size = {};
    }
 
-   // The AO history (~66 MB at 4K): released with the scratch, when DLSS/FSR stop and after "IDLE_RELEASE_FRAMES" without a write
+   // The AO history (~66 MB at 4K): released with the scratch, when the upscaler stops and after "IDLE_RELEASE_FRAMES" without a write
    void ReleaseGTAOHistory()
    {
       for (int i = 0; i < 2; i++)
@@ -770,7 +770,7 @@ class Bayonetta final : public Game
 #endif
    }
 
-   // ---- DLAA / FSR 3 Native AA / Luma TAA (the vc4 layout is in "MotionVectorPatches.h") ----
+   // ---- DLAA / FSR 3 Native AA / XeSS / Luma TAA (the vc4 layout is in "MotionVectorPatches.h") ----
    // The view projection's vc4 byte offset: the camera FSR reads
    static constexpr UINT VIEW_PROJECTION_OFFSET = MotionVectorPatches::view_projection_row * 16;
 
@@ -918,7 +918,7 @@ class Bayonetta final : public Game
       }
    }
 
-   // DLAA, FSR 3 Native AA or Luma TAA on the jittered scene, its depth (from the depth prepass, see the fill) and the motion vectors;
+   // DLAA, FSR 3 Native AA, XeSS or Luma TAA on the jittered scene, its depth (from the depth prepass, see the fill) and the motion vectors;
    // the result goes back into the scene's color (and its copy, see "mv_scene_copy"), its alpha (the bloom source's threshold input)
    // kept. False if it didn't draw (missing input, or the upscaler failed). "reactive_mask": the fill wrote this scene's masks.
    static bool DrawUpscaler(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, bool reactive_mask)
@@ -1273,7 +1273,7 @@ public:
          ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps", {{"SMAA_T2X", "1"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta SMAA T2x Resolve PS"),
          ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_resolve_ps", {{"SMAA_T2X", "1"}}});
-      // DLAA/FSR/Luma TAA: their depth and the camera motion from the depth prepass, the CPU copies of vc4 (dgVoodoo maps it or updates
+      // DLAA/FSR/XeSS/Luma TAA: their depth and the camera motion from the depth prepass, the CPU copies of vc4 (dgVoodoo maps it or updates
       // it), and the motion vector target written by every blend state
       native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta Motion Vector Fill CS"), ShaderDefinition("Luma_Bayonetta_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta Copy Back PS"), ShaderDefinition("Luma_Bayonetta_CopyBack", reshade::api::pipeline_subobject_type::pixel_shader));
@@ -1985,7 +1985,6 @@ public:
          return DrawOrDispatchOverrideType::Replaced;
       };
 
-      // The pixel kernels' target size
       if (shader_hashes_PixelKernels.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel) || shader_hashes_ShadowReceivers.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
       {
          BindPixelKernelTargetSize(native_device, native_device_context, &game_device_data);
@@ -1998,7 +1997,7 @@ public:
          TakePrepassCamera(native_device, native_device_context, cmd_list_data, device_data, uint32_t(original_shader_hashes.vertex_shaders[0]));
       }
 
-      // DLAA/FSR/Luma TAA: the scene's draws with motion vectors or jitter (see "DrawWithMotionVectors"), and the fill and upscaler at
+      // DLAA/FSR/XeSS/Luma TAA: the scene's draws with motion vectors or jitter (see "DrawWithMotionVectors"), and the fill and upscaler at
       // its first post pass
       if (game_device_data.mv.active && is_immediate)
       {
@@ -2259,7 +2258,7 @@ public:
          game_device_data.ReleaseGTAOHistory();
       }
 
-      // DLSS/FSR/Luma TAA: the history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the
+      // DLSS/FSR/XeSS/Luma TAA: the history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the
       // motion vector state are fixed here for the next frame (see "sr_active")
       game_device_data.mv_jitter_allowed = device_data.has_drawn_sr;
       // Not on a multisampled scene (the motion vector draws refuse it): with MSAA the motion vector path stays off

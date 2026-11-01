@@ -29,7 +29,7 @@ RWTexture2D<float> previous_additive : register(u4); // The additive draws' mask
       // The additive draws write y = 0, so x > y is theirs (sparks, glows), scaled and capped at 0.9 without a threshold, else they
       // smear, and kept from the previous frame (a blinking one that went out is still lit in the upscaler's history); the alpha
       // blended ones (x = y = a: smoke, haze) only over the threshold, as a continuous mask over them shakes the whole sprite
-      // (Bayonetta's TAA lab, 2026-10-31)
+      // (Bayonetta's TAA lab)
       const float2 mask = mask_input.Load(int3(id.xy, 0));
       const float current_additive = (mask.x > mask.y ? mask.x : 0.0);
       const float additive = min(max(current_additive, previous_additive[id.xy]) * fill.reactive_scale, 0.9);

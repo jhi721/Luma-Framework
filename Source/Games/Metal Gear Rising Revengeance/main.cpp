@@ -4,13 +4,13 @@
 #define DISABLE_AUTO_DEBUGGER 1
 // "SceneMotionVectors" reads the shaders as created from the patch context, after the output clamps ("PatchShaderBytecodeSync")
 #define LUMA_PATCH_BYTECODE_SYNC 1
-// Outside DEVELOPMENT only this define makes original_draw_dispatch_func non-null (the gather pass is drawn, then snapshotted)
+// Outside DEVELOPMENT only this define makes "original_draw_dispatch_func" non-null (the gather pass is drawn, then snapshotted)
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads "last_draw_dispatch_data", which Publishing only fills with this
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
 // The game's AA is MSAA only (its FXAA never draws), so SMAA adds rather than replaces
 #define ENABLE_SMAA 1
-// SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
+// SMAA's area texture without the U-shape smoothing (see "SMAA_AreaTex_SharpU.h")
 #define SMAA_SMOOTH_U_SHAPES 0
 // RCAS sharpening after SMAA or the upscaler, opt-in (Bayonetta's)
 #define ENABLE_RCAS 1
@@ -27,7 +27,7 @@
 // translates each pixel shader once per alpha test function in use: the lists hold the plain one first, then GREATEREQUAL, GREATER.
 // FilterShaderGather (shader2.dat): the final pass (render layer 0x62), the grade's curve, saturation and gradient plus the bloom and
 // the brightness option. Its replacement does the HDR display map. FilterShaderGatherNoise, the same pass times a noise texture, drawn
-// in its place (seen in game), follows. In game (2026-10-28, title screen, MSAA 4x): it writes the render resolution scene target (MSAA),
+// in its place (seen in game), follows. In game (title screen, MSAA 4x) it writes the render resolution scene target (MSAA),
 // the movie and the UI draw on that target, it is resolved, then the game's copy (filtershadercopytex) scales it into dgVoodoo's D3D9
 // back buffer (the canvas, the output resolution), which is resolved and presented by dgVoodoo's blit.
 const ShaderHashesList shader_hashes_Gather = {.pixel_shaders = {0x726E6E78, 0x562F84D7, 0xDD1B4599, 0xCE6E1597, 0x970F67BD, 0xF263AE82, 0xC9453909, 0x0CDD2BDB, 0x252B2AE7, 0xD7D5CA35, 0xB3BB0D35, 0xFF4AFD3B}};
@@ -37,16 +37,11 @@ const ShaderHashesList shader_hashes_Copy = {.pixel_shaders = {0x91A6C437}};
 const ShaderHashesList shader_hashes_DgVoodooPresent = {.pixel_shaders = {0x880A17D3}};
 // The movies' Y'CbCr -> R'G'B' (hwshaderpftyuv / hwshaderpftyuva and their alpha test twins, Video_0x43A3099D.ps_5_0.hlsl)
 const ShaderHashesList shader_hashes_Video = {.pixel_shaders = {0x43A3099D, 0x0CFBCBEF, 0xC1C26B88, 0x71B4A727, 0x6CF5789C, 0x52502A77}};
-// The bloom chain, all into the fixed size 320x176 bloom target (in game 2026-11-01, 4K): filter05 (the scene into level 0, then each
+// The bloom chain, all into the fixed size 320x176 bloom target (seen in game at 4K): filter05 (the scene into level 0, then each
 // level into the next: 80x48, 48x32), filter02 / filter01 (each level's V / H blur), then filter08 (the levels' copies added into level
 // 0), which the gather pass reads as t1
 const ShaderHashesList shader_hashes_BloomSource = {.pixel_shaders = {0x0A08457E, 0x1F727666, 0xCE7D760B}};
 const ShaderHashesList shader_hashes_BloomChain = {.pixel_shaders = {0x4B19F442, 0xE454B49F, 0x0B206431, 0x07C81AB1, 0x9F72067C, 0xBBDF2A11, 0x2A5D2B3A, 0x76B8D0F9, 0x9A10CDCF}};
-// The depth prepass (plain and alpha tested, seen in game 2026-10-28): linear view depth into a scene sized R32F target (MSAA with the
-// game's MSAA on, then resolved), which the deferred passes and the soft particles read. SMAA's predication source.
-// (modelshaderzmapscr and zmapscrnki, with their alpha test twins). Its single R32F target is the carrier of the scene's motion vectors:
-// the G-buffer draws have several targets, which Core's "SceneMotionVectors" refuses, and the velocity pass only exists with the game's
-// Motion Blur on.
 // The motion blur's velocity map (modelshadervelocitymap, mappl, mappl_ps3, mapscrnki, weight, fixed, directionvelocitymap) and its dilation
 // (modelshaderblurpass2..5): (ndc - previous ndc) * scale + 0.5 in o0.xy, which the 8-bit target clamped and quantized. Clamped as it
 // stored it now that the scene sized targets are fp16.
@@ -54,6 +49,10 @@ const std::unordered_set<uint32_t> velocity_pixel_shaders = {
    0xD6459C7A, 0xBF53671F, 0xD70457EA, 0x25928798, 0x9A548B81, 0x38A99388, 0x9BF3EB98, 0xBE302C8A, 0x0AF5AAD0, 0x5940BF0B, 0xF727984C,
    0xFDA6E45C, 0x5FB1861B, 0xA2AC97CD, 0x9B28456F, 0xADA34A43, 0xF70D9E33, 0x91E4602E, 0x54B4AD50, 0x670A6C0E, 0xDB974526, 0x133DFF5C,
    0x2243A7CF, 0x8D2C9DE2, 0x94845320, 0x9F29B50B, 0xA0C5CD2B, 0x8A3332B1, 0xEE3C798B, 0x5804E7AC, 0x13C80FDF, 0x73C2030B, 0xAF5C87AB};
+// The depth prepass (modelshaderzmapscr and zmapscrnki, plain and with their alpha test twins, seen in game): linear view depth into a
+// scene sized R32F target (MSAA with the game's MSAA on, then resolved), which the deferred passes and the soft particles read. SMAA's
+// predication source. Its single R32F target is the carrier of the scene's motion vectors: the G-buffer draws have several targets,
+// which Core's "SceneMotionVectors" refuses, and the velocity pass only exists with the game's Motion Blur on.
 const ShaderHashesList shader_hashes_DepthPrepass = {.pixel_shaders = {0x522D69B1, 0x36772BFA, 0xAC6B358B, 0xCF1201CF, 0x3E5410CC, 0xE5B37BFF}};
 // FSR's and Luma TAA's masks, written by the scene's alpha blended draws past dgVoodoo's targets (their pixel shaders patched with
 // "PatchPixelShaderReactive", the slot max blended in every blend state: "PatchedDraws::OnCreateBlendState")
@@ -141,8 +140,8 @@ struct MetalGearRisingRevengeanceGameDeviceData final : public GameDeviceData
    std::atomic<bool> msaa_resolved = false;
    std::atomic<bool> msaa_active = false;
 
-   // ---- DLAA / FSR Native AA / XeSS / Luma TAA (Core's SR bridge: the game is 32-bit) on the motion vectors of Core's "SceneMotionVectors"
-   // (vc4 layout in "MotionVectorPatches"), before the gather pass ----
+   // DLAA, FSR Native AA, XeSS or Luma TAA (Core's SR bridge: the game is 32-bit) on the motion vectors of Core's "SceneMotionVectors"
+   // (vc4 layout in "MotionVectorPatches"), before the gather pass
    // An upscaler is picked, hasn't failed and the game's MSAA is off, latched at present for the whole frame
    bool sr_active = false;
    // The motion vector targets, camera, objects and vc4 copies; "mv.active": the motion vector draws this frame (set at present)
@@ -584,7 +583,7 @@ class MetalGearRisingRevengeance final : public Game
          return false;
 #if ENABLE_LUMA_TAA
       // Luma TAA without its 2x history flickered on lasers at the High scale in Bayonetta's TAA lab: half of it balanced flicker and
-      // smear (_tools/taa_lab/reactive_bayo_eval.py, 2026-10-31)
+      // smear (_tools/taa_lab/reactive_bayo_eval.py)
       const float reactive_scale = (device_data.sr_type == SR::Type::LumaTAA && LumaTAA::quality.load() < LumaTAA::history_2x_quality ? 0.5f : 1.f) * g_sr_reactive_scale;
 #else
       const float reactive_scale = g_sr_reactive_scale;
@@ -950,7 +949,7 @@ class MetalGearRisingRevengeance final : public Game
       UINT viewport_count = std::size(viewports);
       native_device_context->RSGetViewports(&viewport_count, viewports);
       // The origin (dgVoodoo's 0.5) scales too: its quads carry D3D9's half pixel offset in clip space, which scales with the viewport.
-      // Measured in game (2026-11-01, k 3): Bayonetta's origin (0.75) left the last row and column unwritten and moved each pass a
+      // Measured in game at scale 3: Bayonetta's origin (0.75) left the last row and column unwritten and moved each pass a
       // quarter of a game texel up and left (about 4 Luma texels against the game's level 0).
       for (UINT i = 0; i < viewport_count; i++)
       {

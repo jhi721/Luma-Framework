@@ -3,7 +3,7 @@
 #include "../Includes/DgVoodoo.hlsl" // DGV_MAIN_SIGNATURE, ApplyDgvMask
 #include "../Includes/PlatinumToneCurve.hlsl" // PlatinumToneCurve::FitTangent (the HDR continuation)
 #include "../Includes/Reinhard.hlsl" // Reinhard::ReinhardPiecewise (hue reference)
-#include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueOnlyBT2020
+#include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueAndPurityEmulationBT2020
 // clang-format on
 
 // MGR:R final pass "FilterShaderGather" (shader2.dat, D3D9 ps_3_0, dgVoodoo 2.87.5 -> ps_5_0 0x726E6E78 without alpha test;
@@ -14,9 +14,9 @@
 // g_Saido (c186 = cb4[194]) around Y' of the curved colour, the g_MulColor gain (c184 = cb4[192], with the light pre-scale's
 // inverse and the auto exposure: FUN_00eb50c0) and the vertical g_AddColor gradient (c185 = cb4[193]); then the bloom (t1) times
 // g_BloomColor (c187 = cb4[195]) is added and everything multiplied by g_Brightness (c188 = cb4[196], the brightness option).
-// HDR: the curve continued by its tangent above a pivot (PlatinumToneCurve), vanilla exact below it. Then the vanilla clip's hue turn (MacLeod-Boynton, hue only), the display map (a
-// max-channel C-infinity rolloff to the peak) and the UI paper white pre-scale (UI_DRAW_TYPE 2), encoded back for the Core
-// composition.
+// HDR: the curve continued by its tangent above a pivot (PlatinumToneCurve), vanilla exact below it. Then the vanilla clip's hue turn
+// (MacLeod-Boynton, with its whitening scaled by "Highlights Desaturation"), the display map (a max-channel C-infinity rolloff to the
+// peak) and the UI paper white pre-scale (UI_DRAW_TYPE 2), encoded back for the Core composition.
 
 cbuffer cb3 : register(b3)
 {
@@ -158,8 +158,8 @@ void main(DGV_MAIN_SIGNATURE)
    float3 color = IsNaN_Strict(o0.rgb) ? 0.0 : max(o0.rgb, 0.0);
    // Vanilla clipped per channel in 8-bit (the scene before the curve, the canvas here), turning bright highlights toward the
    // primaries; the max-channel curve and map keep the unclipped hue. Restore only that hue turn, from a per-channel Reinhard
-   // (ceiling 5, shoulder 1.5: identity below it, so the scene under 1.5 stays exact), the reference our RenoDX ports ship. Hue 1;
-   // "Highlights Desaturation" is the chrominance strength, the share of the reference's whitening (0 = none, vanilla's at 1).
+   // (ceiling 5, shoulder 1.5: identity below it, so the scene under 1.5 stays exact), the reference our RenoDX ports ship. The hue is restored
+   // fully, and "Highlights Desaturation" is the chrominance strength, the share of the reference's whitening (0 = none, vanilla's at 1).
    // Before the map on purpose: it is hue neutral and contains any channel the turn lifts. Below the shoulder the reference is the
    // colour itself, so the solve (some 300 instructions) is skipped there.
    color = gamma_to_linear(color, GCT_MIRROR);

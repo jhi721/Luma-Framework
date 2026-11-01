@@ -35,7 +35,7 @@ struct GTAOKnobs
    float radius_override;      // > 0 overrides EFFECT_RADIUS (view units after depth_scale)
    float debug_view;           // DEVELOPMENT debug view (legend in Includes/XeGTAO.hlsl), shown alone by Luma_Bayonetta_XeGTAOApply.hlsl
    float2 viewport_pixel_size; // 1 / the depth's size
-   float noise_index;          // XeGTAO's temporal noise: frame % 64 while DLSS/FSR accumulates the AO, else 0
+   float noise_index;          // XeGTAO's temporal noise: frame % 64 while an upscaler accumulates the AO, else 0
    float camera_affine_row;    // b4's first row of the prepass draw's affine view transform (3 rows)
    float camera_matrix_row;    // b4's first row of the same transform followed by the projection (4 rows)
    float3 padding;

@@ -31,8 +31,9 @@ cbuffer SmaaMetricsCB : register(b1)
 #define SMAA_PRESET_ULTRA
 #define SMAA_PREDICATION       1
 #define SMAA_PREDICATION_SCALE smaa_metrics.predication.x
-// Predication is live (CS mask, SCALE 2.0), so both values below are load-bearing: flat = SCALE * SMAA_THRESHOLD =
-// 0.10, silhouette = flat * (1 - STRENGTH) = 0.05 (ULTRA base). SMAA_PREDICATION_THRESHOLD 0.5 is scale-free; tune the CS.
+// Predication is on (the CS mask, scale 2), so both values below matter: the flat threshold is SCALE * SMAA_THRESHOLD = 0.10, the
+// silhouette one flat * (1 - STRENGTH) = 0.05 (ULTRA's). SMAA_PREDICATION_THRESHOLD 0.5 doesn't depend on the scale: tune the CS
+// instead.
 #define SMAA_PREDICATION_STRENGTH  0.5
 #define SMAA_PREDICATION_THRESHOLD 0.5
 #define SMAAGather(tex, coord)     tex.Gather(LinearSampler, coord, 0)

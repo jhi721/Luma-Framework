@@ -83,8 +83,8 @@ void main(DGV_MAIN_SIGNATURE)
 #if TONEMAP_TYPE >= 1
    float3 color = IsNaN_Strict(o0.rgb) ? 0.0 : max(o0.rgb, 0.0);
    // Vanilla clipped per channel in 8-bit (the scene before the grade, the canvas here), turning bright highlights toward the
-   // primaries; the max-channel grade fit and map keep the unclipped hue. Restore only that hue turn, from a per-channel Reinhard
-   // (ceiling 5, shoulder 1.5: identity below it, so the scene under 1.5 stays exact), the reference our RenoDX ports ship, at hue
+   // primaries; the grades' tangent continuation and the max-channel map keep the unclipped hue. Restore only that hue turn, from a
+   // per-channel Reinhard (ceiling 5, shoulder 1.5: identity below it, so the scene under 1.5 stays exact), the reference our RenoDX ports ship, at hue
    // strength 1. "Highlights Desaturation" is the chrominance strength, the share of the reference's whitening (0 = none, 1 = vanilla's).
    // Before the map on purpose: it is hue neutral and contains any channel the turn lifts. Below the shoulder the reference is the
    // colour itself, so the solve (some 300 instructions) is skipped there.

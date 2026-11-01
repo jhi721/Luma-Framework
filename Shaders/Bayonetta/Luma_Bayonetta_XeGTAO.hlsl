@@ -10,8 +10,8 @@
 //   prepass draw of the frame (main.cpp). Every prepass vertex shader has an affine view transform (3 rows) and the same transform
 //   followed by the projection (4 rows): "Rmodelview" c20 + "Rmodelviewproj" c24, or "view" c0 + "g_ViewProjection" c8. The projection
 //   is the second times the inverse of the first.
-// - Noise: frozen at 0 without an upscaler (nothing accumulates: a moving pattern would boil), frame % 64 with DLSS/FSR, which
-//   accumulate the lit scene the AO multiplies. There the AO history ("temporal_pass_cs") runs before the denoise.
+// - Noise: frozen at 0 without an upscaler (nothing accumulates: a moving pattern would boil), frame % 64 under an upscaler, which
+//   accumulates the lit scene the AO multiplies. There the AO history ("temporal_pass_cs") runs before the denoise.
 
 #define XE_GTAO_GENERATE_NORMALS 1
 #include "../Includes/RenoDX/math.hlsl"
@@ -119,7 +119,7 @@ Texture2DArray<float4> fast_noise : register(t4);
 #define GTVBAO_NOISE(pixCoord) fast_noise.Load(int4((pixCoord) & 127u, uint(NoiseIndexRT) & 63u, 0)).xyz
 #endif
 #include "../Includes/GTVBAO.hlsl"
-// The AO history ("temporal_pass_cs") under DLSS/FSR (main.cpp, "RunXeGTAO"), from the prepass' "1 - z/w" at t3 (saturate drops a NaN,
+// The AO history ("temporal_pass_cs") under an upscaler (main.cpp, "RunXeGTAO"), from the prepass' "1 - z/w" at t3 (saturate drops a NaN,
 // as the motion vector fill's)
 #define XE_GTAO_TEMPORAL_DEVICE_DEPTH(depth) saturate(1.0 - (depth))
 #include "../Includes/XeGTAOTemporal.hlsl"
