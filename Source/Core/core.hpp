@@ -135,7 +135,7 @@ using NativeCommandList = ID3D11DeviceContext;
 #ifndef ENABLE_XESS
 #define ENABLE_XESS 0
 #endif // ENABLE_XESS
-// 32-bit only: DLSS and FSR through an x64 helper process (see "SRBridge.h")
+// 32-bit only: DLSS, FSR and XeSS through an x64 helper process (see "SRBridge.h")
 #ifndef ENABLE_SR_BRIDGE
 #define ENABLE_SR_BRIDGE 0
 #endif // ENABLE_SR_BRIDGE
@@ -143,7 +143,7 @@ using NativeCommandList = ID3D11DeviceContext;
 #ifndef ENABLE_D3D12_SR
 #define ENABLE_D3D12_SR 0
 #endif // ENABLE_D3D12_SR
-// Luma's own native resolution TAA, in process on any GPU and on 32-bit (see "taa/LumaTAA.hpp")
+// Luma's own TAA and upscaler, in process on any GPU and on 32-bit (see "taa/LumaTAA.hpp")
 #ifndef ENABLE_LUMA_TAA
 #define ENABLE_LUMA_TAA 0
 #endif // ENABLE_LUMA_TAA
@@ -20808,10 +20808,17 @@ namespace
             }
 
             SR::Type sr_type = device_data.sr_type;
-            // The running version, when the implementation knows it (e.g. "FSR (4.1.1)": FSR 4 where the GPU supports it on D3D12, 3.1 elsewhere)
+            // The running version, when the implementation knows it (e.g. "FSR (4.1.1)": FSR 4 where the GPU supports it on D3D12, 3.1 elsewhere),
+            // and what Auto picked (e.g. "Auto (DLSS 310.4.0)")
             if (const SR::InstanceData* sr_instance_data = device_data.GetSRInstanceData(); sr_instance_data && sr_user_type != SR::UserType::None)
             {
-               if (const char* const version_name = sr_instance_data->version_name.load())
+               const char* const version_name = sr_instance_data->version_name.load();
+               if (sr_user_type == SR::UserType::Auto)
+               {
+                  selected_sr_name = (version_name ? std::format("Auto ({} {})", SR::GetTypeName(sr_type), version_name) : std::format("Auto ({})", SR::GetTypeName(sr_type)));
+                  selected_sr_user_type = selected_sr_name.c_str();
+               }
+               else if (version_name)
                {
                   selected_sr_name = std::format("{} ({})", selected_sr_user_type, version_name);
                   selected_sr_user_type = selected_sr_name.c_str();
@@ -20854,7 +20861,7 @@ namespace
                   AddComboItem("Auto", SR::UserType::Auto, sr_auto_type, !device_data.sr_implementations_instances.empty());
                AddComboItem("DLSS", SR::UserType::DLSS, SR::Type::DLSS, device_data.sr_implementations_instances.contains(SR::Type::DLSS));
                AddComboItem("FSR", SR::UserType::FSR, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
-#if ENABLE_XESS || ENABLE_SR_BRIDGE || ENABLE_D3D12_SR // D3D12 only, or the SR bridge's helper, or the in-process D3D12 bridge
+#if ENABLE_XESS || (ENABLE_SR_BRIDGE && !defined(_WIN64)) || ENABLE_D3D12_SR // D3D12 only, or the SR bridge's helper, or the in-process D3D12 bridge
                AddComboItem("XeSS", SR::UserType::XeSS, SR::Type::XeSS, device_data.sr_implementations_instances.contains(SR::Type::XeSS));
 #endif
 #if ENABLE_LUMA_TAA // Only in games that enable it, rather than as an always disabled item

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 // The protocol between a 32-bit game's SR bridge ("SRBridge.h") and the x64 "Luma-Upscaler.exe" next to the game's exe
@@ -9,8 +10,8 @@
 //
 // Settings: "<render width> <render height> <output width> <output height> <hdr> <inverted depth> <jittered motion vectors>
 //   <auto exposure> <dynamic resolution> <motion vector scale x> <motion vector scale y> <DLSS render preset>"
-// Start line: "bridge <version> <upscaler> <luid low> <luid high> <settings> <a handle per "Resource" (0: none)> <fence in> <fence out>"
-// The helper signals "out" at "kReady" once the upscaler exists (it exits if it can't create it).
+// Start line: "bridge <version> <upscaler> <luid low> <luid high> <settings> <a handle per "Resource" (0: none)> <fence in> <fence out> <reply>"
+// The helper signals "out" at "kReady" once the upscaler exists (it exits if it can't create it), and writes "Reply" (independently of "kReady").
 // Then a line per message:
 // "settings <settings>": the helper recreates the upscaler on the same textures (it exits if it can't).
 // "frame <n> <jitter x> <jitter y> <reset> <render width> <render height> <pre exposure> <sharpness> <near> <far> <vertical fov>":
@@ -19,7 +20,7 @@
 // EOF ends it.
 namespace SRBridgeProtocol
 {
-   constexpr int kVersion = 6;
+   constexpr int kVersion = 7;
 
    constexpr const wchar_t* kHelperName = L"Luma-Upscaler.exe";
    constexpr const wchar_t* kLogName = L"Luma-Upscaler.log";
@@ -45,6 +46,13 @@ namespace SRBridgeProtocol
    };
 
    constexpr uint64_t kReady = 1;
+
+   // The start line's "<reply>": a file mapping of this, which the helper fills once the upscaler exists (same layout on 32 and 64-bit)
+   struct Reply
+   {
+      char version_name[60] = {};        // Null terminated, empty if the upscaler doesn't know it
+      std::atomic<uint32_t> written = 0; // Set after "version_name"
+   };
 
    // The "frame" line's values: what the upscaler needs of a frame besides the shared textures (also the in-process host's "RunFrame()")
    struct Frame

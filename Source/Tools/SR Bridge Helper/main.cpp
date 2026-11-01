@@ -66,7 +66,7 @@ int main()
    int version = 0, upscaler = kDlss;
    Settings settings;
    LUID luid = {};
-   uint64_t handles[kCount] = {}, fence_handles[2] = {};
+   uint64_t handles[kCount] = {}, fence_handles[2] = {}, reply_handle = 0;
    std::cin >> mode >> version;
    if (mode != "bridge" || version != kVersion)
    {
@@ -77,7 +77,7 @@ int main()
    {
       std::cin >> handle;
    }
-   std::cin >> fence_handles[0] >> fence_handles[1];
+   std::cin >> fence_handles[0] >> fence_handles[1] >> reply_handle;
    if (!std::cin)
    {
       return printf("[Luma Upscaler] FAIL bad start line\n"), 1;
@@ -130,6 +130,16 @@ int main()
       return printf("[Luma Upscaler] FAIL %s init or create\n", SR::GetTypeName(type)), quit(1);
    }
    const char* version_name = runner.data->version_name.load();
+   if (const HANDLE reply_mapping = HANDLE(uintptr_t(reply_handle)))
+   {
+      if (auto* const reply = static_cast<Reply*>(MapViewOfFile(reply_mapping, FILE_MAP_WRITE, 0, 0, sizeof(Reply))))
+      {
+         strncpy_s(reply->version_name, version_name ? version_name : "", _TRUNCATE);
+         reply->written.store(1, std::memory_order_release);
+         UnmapViewOfFile(reply);
+      }
+      CloseHandle(reply_mapping);
+   }
    printf("[Luma Upscaler] ready: %s%s%s %ux%u -> %ux%u\n", SR::GetTypeName(type), version_name ? " " : "", version_name ? version_name : "", settings.render_width, settings.render_height,
       settings.output_width, settings.output_height);
    fflush(stdout);

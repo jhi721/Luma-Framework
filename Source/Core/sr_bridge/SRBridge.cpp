@@ -46,7 +46,9 @@ namespace SRBridge
       // The running helper
       HANDLE job = nullptr; // Ends the helper with the game ("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE")
       HANDLE process = nullptr;
-      HANDLE pipe = nullptr; // Its stdin
+      HANDLE pipe = nullptr;         // Its stdin
+      Reply* reply = nullptr;        // Until read
+      std::string version;           // "version_name", the first helper's (kept across restarts, the UI may hold it)
       bool settings_pending = false; // Changed since the helper started: sent before the next frame
       bool failed = false;
 
@@ -75,7 +77,12 @@ namespace SRBridge
       }
       if (job)
          CloseHandle(job); // Ends it if it's still running
+      if (reply)
+      {
+         UnmapViewOfFile(reply);
+      }
       job = process = pipe = nullptr;
+      reply = nullptr;
       Reset();
       settings_pending = false;
       if (running == this)
@@ -164,7 +171,21 @@ namespace SRBridge
          if (handle)
             CloseHandle(handle);
       }
-      message += "\n";
+      HANDLE remote_reply = nullptr; // 0: the helper doesn't reply
+      // Only until a helper told the version
+      if (version.empty())
+      {
+         if (const HANDLE reply_mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Reply), nullptr))
+         {
+            reply = static_cast<Reply*>(MapViewOfFile(reply_mapping, FILE_MAP_READ, 0, 0, sizeof(Reply)));
+            if (reply)
+            {
+               DuplicateHandle(GetCurrentProcess(), reply_mapping, process, &remote_reply, 0, FALSE, DUPLICATE_SAME_ACCESS);
+            }
+            CloseHandle(reply_mapping);
+         }
+      }
+      message += std::format(" {}\n", uint64_t(uintptr_t(remote_reply)));
       if (!Send(message))
          return false;
       running = this;
@@ -282,6 +303,16 @@ namespace SRBridge
          }
          custom_data.frame = kReady;
          Log(reshade::log::level::info, std::format("running {}", SR::GetTypeName(custom_data.type)));
+      }
+      if (custom_data.reply && custom_data.reply->written.load(std::memory_order_acquire))
+      {
+         custom_data.version.assign(custom_data.reply->version_name, strnlen(custom_data.reply->version_name, sizeof(Reply::version_name)));
+         if (!custom_data.version.empty())
+         {
+            custom_data.version_name = custom_data.version.c_str();
+         }
+         UnmapViewOfFile(custom_data.reply);
+         custom_data.reply = nullptr;
       }
       if (custom_data.settings_pending)
       {

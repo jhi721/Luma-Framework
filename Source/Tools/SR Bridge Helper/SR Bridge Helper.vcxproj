@@ -110,6 +110,7 @@
     <ClCompile Include="..\..\Core\dlss\DLSS.cpp" />
     <ClCompile Include="..\..\Core\fsr\FSR.cpp" />
     <ClCompile Include="..\..\Core\xess\XeSS.cpp" />
+    <ClCompile Include="..\..\Core\utils\system.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\Core\sr_bridge\SRBridgeProtocol.h" />

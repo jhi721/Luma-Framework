@@ -5,11 +5,14 @@
 #include "nvsdk_ngx_helpers.h"
 
 #include "../includes/debug.h"
+#include "../utils/system.h"
 
 #include <include/reshade.hpp>
 
 #include <cstring>
 #include <cassert>
+#include <format>
+#include <string>
 #include <unordered_set>
 #include <vector>
 #include <wrl/client.h>
@@ -63,6 +66,7 @@ namespace NGX
 		Microsoft::WRL::ComPtr<SR::Device>			device;
 		// Set by a successful draw into a new output ("DrawData::output_recreated")
 		mutable bool										recreate_feature = false;
+		std::string											version; // "version_name"
 #if DX12
 		SR::DeferredReleases<DLSSInternalInstance> retired_features;
 #endif
@@ -215,6 +219,17 @@ namespace NGX
 			// Continue even if we got an error, we handle them later.
 			// If this mode creation failed, it's likely it will always fail anyway.
 			assert(NVSDK_NGX_SUCCEED(create_result));
+
+			// NGX has no version query: the file version of the "nvngx_dlss.dll" it loaded for the feature (the game's, or the driver's override)
+			if (NVSDK_NGX_SUCCEED(create_result) && version.empty())
+			{
+				uint64_t file_version = 0, product_version = 0;
+				if (const HMODULE module = GetModuleHandleW(L"nvngx_dlss.dll"); module && System::GetDLLVersion(System::GetModulePath(module), file_version, product_version))
+				{
+					version = std::format("{}.{}.{}", file_version >> 48, (file_version >> 32) & 0xFFFF, (file_version >> 16) & 0xFFFF);
+					version_name = version.c_str();
+				}
+			}
 
 #if DX12
 			return DLSSInternalInstance{ feature, runtime_params };
