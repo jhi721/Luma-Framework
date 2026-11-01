@@ -21010,7 +21010,9 @@ namespace
             {
                // DLSS and FSR have a D3D11 and a D3D12 implementation (FSR 4 on RDNA4, else 3.1; XeSS has only D3D12)
                const std::shared_lock lock_sr(device_data.sr_mutex);
-               const SR::InstanceData* const api_instance = device_data.GetSRInstanceData();
+               // Only these are wrapped in "SRBridge::ApiSwitch" (see "Init()"), the others' instances aren't its data (e.g. Luma TAA)
+               const bool api_switch_type = device_data.sr_type == SR::Type::DLSS || device_data.sr_type == SR::Type::FSR || device_data.sr_type == SR::Type::XeSS;
+               const SR::InstanceData* const api_instance = (api_switch_type ? device_data.GetSRInstanceData() : nullptr);
                const bool api_forced = api_instance && !SRBridge::ApiSwitch::CanPick(api_instance);
                const char* const api_names[] = {"D3D11", "D3D12"};
                const int api_shown = (api_forced ? int(SRBridge::Api::D3D12) : int(SRBridge::api_setting));
