@@ -931,14 +931,32 @@ namespace SceneMotionVectors
          {
             HashCombine(key, value);
          }
+         constexpr UINT frame_matrix_offset = Game::frame_camera.row * 16;
+         constexpr UINT frame_projection_offset = Game::frame_camera.projection_row * 16;
          // The tie-break between the objects sharing a key (props, characters): the 3x4 transform at the shader's translation row (the
          // first bone, the world matrix; see "PatchedDraws::ObjectTransform"), copied as it is. The effects without a world matrix have
          // none: their draws keep their own constants with last frame's camera (static).
          PatchedDraws::ObjectTransform transform = {};
-         const bool untransformed = vertex_shader.translation_offset == 0;
+         bool untransformed = vertex_shader.translation_offset == 0;
          if (!untransformed)
          {
             std::memcpy(transform.data(), constants->data() + vertex_shader.translation_offset, sizeof(transform));
+         }
+         else if constexpr (Game::frame_camera.type == CameraType::VIEW_AND_PROJECTION)
+         {
+            // A world view shader's object (the statics, which still move: platforms, doors) has no world matrix row: its world is
+            // inverse(view) * world view, the view from the frame camera's rows of the same draw (see "ReadSceneDrawConstants")
+            if (vertex_shader.camera_type == CameraType::WORLD_VIEW_AND_PROJECTION)
+            {
+               Math::Matrix44D world = ReadAffineMatrix(*constants, frame_matrix_offset);
+               world.Invert();
+               world = world * ReadAffineMatrix(*constants, vertex_shader.camera_offset);
+               for (size_t i = 0; i < transform.size(); i++)
+               {
+                  transform[i] = float(world.GetData()[i]);
+               }
+               untransformed = false;
+            }
          }
 #if DEVELOPMENT
          state->stats.untransformed += untransformed;
@@ -951,8 +969,6 @@ namespace SceneMotionVectors
             match = state->objects.FindNearest(key, transform, [&](const auto& candidate)
                { return candidate.constants->size() == constants->size(); });
          }
-         constexpr UINT frame_matrix_offset = Game::frame_camera.row * 16;
-         constexpr UINT frame_projection_offset = Game::frame_camera.projection_row * 16;
          const auto same_rows = [&](UINT offset)
          { return std::memcmp(constants->data() + offset, state->camera->data() + offset, CAMERA_SIZE) == 0; };
          // Drawn with the frame's camera (a world view projection shader's can't be told)
