@@ -2341,9 +2341,9 @@ public:
       game_device_data.mv.fill_pending = false;
       game_device_data.open_refused_rtv = nullptr;
       game_device_data.open_refused_dsv = nullptr;
-      // -1 at native resolution once the upscaler draws (Core biases the game's samplers at bias 0, the trilinear ones upgraded to
-      // AF16x, see "DllMain"); none while the bridge's helper starts (SMAA on the unjittered scene)
-      SetTextureMipLodBias(nullptr, device_data, ((game_device_data.sr_active && game_device_data.mv_jitter_allowed) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
+      // -1 at native resolution once the upscaler draws, 0 with XeSS (Core biases the game's samplers at bias 0, the trilinear ones
+      // upgraded to AF16x, see "DllMain"); none while the bridge's helper starts (SMAA on the unjittered scene)
+      SetTextureMipLodBias(nullptr, device_data, ((game_device_data.sr_active && game_device_data.mv_jitter_allowed) ? SR::GetMipLODBias(device_data.sr_type, device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
 #if DEVELOPMENT
       game_device_data.mv.last_stats = std::exchange(game_device_data.mv.stats, {});
       // "MV Debug View": Core's debug draw of the target, absolute values in pixels

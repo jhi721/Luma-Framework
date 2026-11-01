@@ -1748,9 +1748,9 @@ public:
       gd.mv_scene_done = false;
       gd.mv_frame_ended = true;
       gd.mv_fill_pending = false;
-      // -1 at native resolution once the upscaler draws (Core biases the game's anisotropic samplers, the trilinear ones upgraded to
+      // -1 at native resolution, 0 with XeSS once the upscaler draws (Core biases the game's anisotropic samplers, the trilinear ones upgraded to
       // AF16x); none while the bridge's helper starts (SMAA on the unjittered scene)
-      SetTextureMipLodBias(nullptr, device_data, ((gd.sr_active && gd.mv_jitter_allowed) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
+      SetTextureMipLodBias(nullptr, device_data, ((gd.sr_active && gd.mv_jitter_allowed) ? SR::GetMipLODBias(device_data.sr_type, device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
 #if DEVELOPMENT
       gd.mv_last_stats = std::exchange(gd.mv_stats, {});
       // "MV Debug View": Core's debug draw of the target, absolute values in pixels

@@ -3254,8 +3254,8 @@ public:
       game_device_data.mv_frame_ended = true;
       game_device_data.mv_not_scene_dsv = nullptr;
       game_device_data.mv_fill_pending = false;
-      // Core biases the anisotropic samplers (all of the game's with the AF16x upgrade): -1 at native resolution, -1.58 at 67%, -2 at 50%
-      game_device_data.scene_mip_bias = (game_device_data.sr_active ? SR::GetMipLODBias(device_data.output_resolution.y * RenderArea::next_scale, device_data.output_resolution.y) : 0.f);
+      // Core biases the anisotropic samplers (all of the game's with the AF16x upgrade): -1 at native resolution, -1.58 at 67%, -2 at 50%, 1 less with XeSS
+      game_device_data.scene_mip_bias = (game_device_data.sr_active ? SR::GetMipLODBias(device_data.sr_type, device_data.output_resolution.y * RenderArea::next_scale, device_data.output_resolution.y) : 0.f);
       {
          com_ptr<ID3D11DeviceContext> native_device_context;
          native_device->GetImmediateContext(&native_device_context);

@@ -3486,8 +3486,8 @@ public:
       gd.mv_scene_done = false;
       gd.mv_frame_ended = true;
       gd.mv_fill_pending = false;
-      // -1 at native resolution (Core biases the game's anisotropic samplers, all upgraded to AF16x)
-      SetTextureMipLodBias(nullptr, device_data, (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
+      // -1 at native resolution, 0 with XeSS (Core biases the game's anisotropic samplers, all upgraded to AF16x)
+      SetTextureMipLodBias(nullptr, device_data, (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.sr_type, device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
 #if DEVELOPMENT
       gd.mv_stats.bound_state_mismatches += std::exchange(gd.bound_states.mismatches, 0);
       gd.mv_last_stats = std::exchange(gd.mv_stats, {});

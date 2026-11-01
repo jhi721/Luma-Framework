@@ -1233,8 +1233,8 @@ public:
             game_device_data.jitter = GetSRJitter(device_data, sr.instance_data);
          }
       }
-      // -1 at native resolution while the upscaler draws (Core biases the game's samplers at bias 0, see "DllMain")
-      SetTextureMipLodBias(nullptr, device_data, (game_device_data.jitter != std::array<float, 2>{} ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
+      // -1 at native resolution while the upscaler draws, 0 with XeSS (Core biases the game's samplers at bias 0, see "DllMain")
+      SetTextureMipLodBias(nullptr, device_data, (game_device_data.jitter != std::array<float, 2>{} ? SR::GetMipLODBias(device_data.sr_type, device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
       // None picked: Core stopped the SR bridge's helper, our inputs and output go too (recreated when an upscaler is picked again)
       if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false))
       {

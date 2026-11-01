@@ -4015,10 +4015,10 @@ public:
       }
 #endif
 
-      // From the last resolve's render height to the output: -1 at native resolution, -2 at half (Core biases the game's
-      // anisotropic samplers, all upgraded to AF16x); vanilla without SR
+      // From the last resolve's render height to the output: -1 at native resolution, -2 at half, 1 less with XeSS (Core biases
+      // the game's anisotropic samplers, all upgraded to AF16x); vanilla without SR
 #if ENABLE_SR
-      const float mip_lod_bias = (gd.sr_active ? SR::GetMipLODBias(device_data.render_resolution.y, device_data.output_resolution.y) : 0.f);
+      const float mip_lod_bias = (gd.sr_active ? SR::GetMipLODBias(device_data.sr_type, device_data.render_resolution.y, device_data.output_resolution.y) : 0.f);
 #else
       constexpr float mip_lod_bias = 0.f;
 #endif

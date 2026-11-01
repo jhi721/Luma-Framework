@@ -1873,9 +1873,9 @@ class MassEffectLE final : public Game
       const bool viewport_valid = viewport_count != 0 && viewport.Width >= 1.f && viewport.Height >= 1.f && viewport.Width <= device_data.output_resolution.x && viewport.Height <= device_data.output_resolution.y;
       game_device_data.render_size = (viewport_valid ? std::array<uint32_t, 2>{uint32_t(viewport.Width), uint32_t(viewport.Height)} : std::array<uint32_t, 2>{uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y)});
       // The upscaler's mip bias for this frame's own render size (a render scale change takes effect on the frame after the slider's
-      // release), -1 at native resolution. The scene opens inside its first draw: Core rebinds the bound samplers right away. Without
+      // release), -1 at native resolution (0 with XeSS). The scene opens inside its first draw: Core rebinds the bound samplers right away. Without
       // an upscaler it's reset at present.
-      SetTextureMipLodBias(native_device_context, device_data, (sr_instance_data ? SR::GetMipLODBias(float(game_device_data.render_size[1]), device_data.output_resolution.y) : 0.f), &cmd_list_data);
+      SetTextureMipLodBias(native_device_context, device_data, (sr_instance_data ? SR::GetMipLODBias(device_data.sr_type, float(game_device_data.render_size[1]), device_data.output_resolution.y) : 0.f), &cmd_list_data);
       game_device_data.mv_jitter_ndc = {game_device_data.mv_jitter[0] * 2.f / float(game_device_data.render_size[0]), game_device_data.mv_jitter[1] * -2.f / float(game_device_data.render_size[1])};
       const float ndc_jitter[4] = {game_device_data.mv_jitter_ndc[0], game_device_data.mv_jitter_ndc[1], 0.f, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))

@@ -2319,8 +2319,8 @@ public:
          const std::lock_guard lock(gd.mv_constants_mutex);
          gd.mv_constants.TrimPool(gd.mv_active);
       }
-      // -1 at native resolution (Core biases the anisotropic samplers, all of the game's with the AF16x upgrade)
-      SetTextureMipLodBias(nullptr, device_data, (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
+      // -1 at native resolution, 0 with XeSS (Core biases the anisotropic samplers, all of the game's with the AF16x upgrade)
+      SetTextureMipLodBias(nullptr, device_data, (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.sr_type, device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
 #if DEVELOPMENT
       gd.mv_last_stats = std::exchange(gd.mv_stats, {});
       // The DEV panel's counts in ReShade.log every 300 frames while motion vectors run

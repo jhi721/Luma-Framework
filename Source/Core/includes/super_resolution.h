@@ -146,6 +146,11 @@ namespace SR
 	{
 		return std::log2(float(render_height) / float((std::max)(render_height, output_height)));
 	}
+	// The running upscaler's bias for a game's own heights (e.g. "DeviceData::sr_type"): XeSS's, else DLSS and FSR's
+	static float GetMipLODBias(Type type, float render_height, float output_height)
+	{
+		return GetMipLODBias(render_height, output_height) + (type == Type::XeSS ? 1.f : 0.f);
+	}
 
 	// The camera an upscaler needs (FSR), from a view projection with an affine view: element (row, column) at m[row * 4 + column] for
 	// column vectors (clip = M * p), at m[column * 4 + row] with "row_vectors" (clip = p * M). Clip z = A * clip w + B, so device

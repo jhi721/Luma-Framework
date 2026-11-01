@@ -3070,8 +3070,8 @@ public:
       gd.mv_scene_done = false;
       gd.mv_frame_ended = true;
       gd.mv_fill_pending = false;
-      // -1 at native resolution (Core biases the anisotropic samplers, all of the game's with the AF16x upgrade)
-      SetTextureMipLodBias(nullptr, device_data, (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
+      // -1 at native resolution, 0 with XeSS (Core biases the anisotropic samplers, all of the game's with the AF16x upgrade)
+      SetTextureMipLodBias(nullptr, device_data, (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.sr_type, device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
       {
          // The pooled vc4 copies only the pool holds (superseded, no object or camera keeps them) are free for the next ones, as many
          // as the last frame asked for: frames without a scene (loading, videos, menus) still copy every Unmap, and would keep their
