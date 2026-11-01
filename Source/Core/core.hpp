@@ -11605,6 +11605,10 @@ namespace
          SRBridge::fsr_major_version = (sr_user_type == SR::UserType::FSR3 ? 3 : (sr_user_type == SR::UserType::FSR ? 4 : 0));
 #endif
          ApplySRType(device_data, device_data.sr_type_selected);
+#if ENABLE_D3D12_SR
+         // Auto's FSR runs the newest, FSR 4
+         SRBridge::api_setting = ((sr_user_type == SR::UserType::FSR3 || device_data.sr_type == SR::Type::DLSS) ? SRBridge::Api::D3D11 : SRBridge::Api::D3D12);
+#endif
          for (const auto& [type, instance] : device_data.sr_implementations_instances)
          {
             if (instance)
@@ -20801,7 +20805,7 @@ namespace
                selected_sr_user_type = "DLSS";
                break;
             case SR::UserType::FSR:
-#if ENABLE_SR_BRIDGE
+#if ENABLE_SR_BRIDGE || ENABLE_D3D12_SR
                selected_sr_user_type = "FSR 4";
 #else
                selected_sr_user_type = "FSR";
@@ -20871,7 +20875,7 @@ namespace
                if (always_show_auto_sr || sr_auto_type != SR::Type::None)
                   AddComboItem("Auto", SR::UserType::Auto, sr_auto_type, !device_data.sr_implementations_instances.empty());
                AddComboItem("DLSS", SR::UserType::DLSS, SR::Type::DLSS, device_data.sr_implementations_instances.contains(SR::Type::DLSS));
-#if ENABLE_SR_BRIDGE // Its helper picks the FidelityFX API's version ("SRBridge::fsr_major_version")
+#if ENABLE_SR_BRIDGE || ENABLE_D3D12_SR // The FidelityFX API's version ("SRBridge::fsr_major_version"), or D3D12 vs D3D11 ("SRBridge::api_setting")
                AddComboItem("FSR 4", SR::UserType::FSR, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
                AddComboItem("FSR 3", SR::UserType::FSR3, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
 #else
@@ -21005,37 +21009,6 @@ namespace
                device_data.sr_type_selected = sr_type;
             }
 #endif // ENABLE_SR
-
-#if ENABLE_D3D12_SR
-            {
-               // DLSS and FSR have a D3D11 and a D3D12 implementation (FSR 4 on RDNA4, else 3.1; XeSS has only D3D12)
-               const std::shared_lock lock_sr(device_data.sr_mutex);
-               // Only these are wrapped in "SRBridge::ApiSwitch" (see "Init()"), the others' instances aren't its data (e.g. Luma TAA)
-               const bool api_switch_type = device_data.sr_type == SR::Type::DLSS || device_data.sr_type == SR::Type::FSR || device_data.sr_type == SR::Type::XeSS;
-               const SR::InstanceData* const api_instance = (api_switch_type ? device_data.GetSRInstanceData() : nullptr);
-               const bool api_forced = api_instance && !SRBridge::ApiSwitch::CanPick(api_instance);
-               const char* const api_names[] = {"D3D11", "D3D12"};
-               const int api_shown = (api_forced ? int(SRBridge::Api::D3D12) : int(SRBridge::api_setting));
-               ImGui::BeginDisabled(api_forced);
-               if (ImGui::BeginCombo("Super Resolution API", api_names[api_shown]))
-               {
-                  for (int i = 0; i < IM_ARRAYSIZE(api_names); i++)
-                  {
-                     if (ImGui::Selectable(api_names[i], api_shown == i))
-                     {
-                        SRBridge::api_setting = SRBridge::Api(i);
-                        reshade::set_config_value(runtime, NAME, "SuperResolutionAPI", i);
-                     }
-                  }
-                  ImGui::EndCombo();
-               }
-               ImGui::EndDisabled();
-               if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-               {
-                  ImGui::SetTooltip("The graphics API the upscaler runs on.\nD3D11: DLSS, FSR 3.\nD3D12: DLSS, FSR 4 (with INT8 fallback for non-RDNA4 GPUs), XeSS.\nDLSS and FSR 3 give the same quality on either API.");
-               }
-            }
-#endif // ENABLE_D3D12_SR
 
 #if ENABLE_REFLEX
             {
@@ -22902,7 +22875,7 @@ void Init(bool async)
 
    // Note: these shouldn't load any dlls etc, they are just creating an empty class
 #if ENABLE_D3D12_SR
-   // The user picks the D3D11 implementation (DLSS, FSR 3) or the in-process D3D12 one (XeSS has only that), see "SRBridge::ApiSwitch"
+   // DLSS and FSR 3 run on their D3D11 implementation, FSR 4 and XeSS on the in-process D3D12 one, see "SRBridge::ApiSwitch"
    {
       std::unique_ptr<SR::SuperResolutionImpl> d3d11_dlss, d3d11_fsr;
 #if ENABLE_NGX
@@ -22997,9 +22970,8 @@ void Init(bool async)
       dlss_render_preset = static_cast<unsigned int>(dlss_render_preset_i);
 #endif
 #if ENABLE_D3D12_SR
-      int sr_api_i = int(SRBridge::api_setting);
-      reshade::get_config_value(runtime, NAME, "SuperResolutionAPI", sr_api_i);
-      SRBridge::api_setting = SRBridge::Api(std::clamp(sr_api_i, int(SRBridge::Api::D3D11), int(SRBridge::Api::D3D12)));
+      // So the SR instances start on the API the first present picks (Auto's type isn't known yet, it's D3D11 for DLSS)
+      SRBridge::api_setting = (sr_user_type == SR::UserType::FSR ? SRBridge::Api::D3D12 : SRBridge::Api::D3D11);
 #endif
 #if ENABLE_LUMA_TAA
       int taa_quality = LumaTAA::quality.load();

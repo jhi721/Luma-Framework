@@ -1,7 +1,7 @@
 #pragma once
 
 // The in-process D3D12 super resolution of an x64 D3D11 mod built with "UseLumaD3D12SR": DLSS, FSR (FSR 4 / 3.1) and XeSS run on
-// D3D12 in the game's own process ("D3D12SR.h") next to the D3D11 DLSS and FSR 3, and the user picks the API ("ApiSwitch"). Like the 32-bit games'
+// D3D12 in the game's own process ("D3D12SR.h") next to the D3D11 DLSS and FSR 3; the selected upscaler picks the API ("ApiSwitch"). Like the 32-bit games'
 // bridge ("SRBridge.h") the D3D12 side works on NT-handle shared textures (zero copy for the game's own shared ones, else a copy per frame)
 // between two shared fences, but it is a call on the game's thread: no helper process, pipe or protocol lines. The game's GPU waits for the
 // output in the same frame.
@@ -17,13 +17,14 @@
 
 namespace SRBridge
 {
-   // The persisted "SuperResolutionAPI" pick, in this order
    enum class Api
    {
       D3D11,
       D3D12,
    };
-   inline Api api_setting = Api::D3D11; // Cheaper: D3D12 costs ~0.3-0.5 ms a frame (two fence hops and copies between the APIs)
+   // Set from the selected upscaler at present: D3D11 for DLSS and FSR 3 (D3D12 costs ~0.3-0.5 ms a frame: two fence hops and copies
+   // between the APIs), D3D12 for FSR 4 and XeSS
+   inline Api api_setting = Api::D3D11;
 
    struct LocalInstanceData : public SR::InstanceData, public Link
    {
@@ -418,13 +419,6 @@ namespace SRBridge
          return impls[int(Api::D3D11)] && impls[int(Api::D3D11)]->NeedsStateRestoration();
       }
 
-      // Whether both APIs are there for the user to pick between (XeSS has only D3D12)
-      static bool CanPick(const SR::InstanceData* data)
-      {
-         const auto* const custom_data = static_cast<const ApiInstanceData*>(data);
-         return custom_data && IsInnerSupported(*custom_data, Api::D3D11) && IsInnerSupported(*custom_data, Api::D3D12);
-      }
-
    private:
       static bool IsInnerSupported(const ApiInstanceData& data, Api api)
       {
@@ -433,7 +427,7 @@ namespace SRBridge
 
       static Api GetWantedApi(const ApiInstanceData& data)
       {
-         // The one that exists, else the pick
+         // The one that exists, else the selected upscaler's
          if (!IsInnerSupported(data, Api::D3D11))
          {
             return Api::D3D12;
