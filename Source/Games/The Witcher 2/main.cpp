@@ -19,7 +19,7 @@
 #define ENABLE_SMAA 1 // replaces the final grade's built-in FXAA with SMAA ULTRA (+RCAS); core registers the 6 "SMAA ..." passes
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
 #define SMAA_SMOOTH_U_SHAPES 0
-// A third "Super Resolution" choice next to the bridge's DLSS and FSR 3, drawn in process on any GPU, upscaling under the render scale
+// A "Super Resolution" choice next to the bridge's DLSS, FSR and XeSS, drawn in process on any GPU, upscaling under the render scale
 #define ENABLE_LUMA_TAA 1
 #define ENABLE_RCAS 1
 // SMAA runs POST-final-grade via the post-draw callback, so it needs original_draw_dispatch_func non-null.
@@ -2784,7 +2784,7 @@ public:
 
       // DLSS/FSR: their depth and the camera motion from the G-buffer's linear depth, the CPU copies of vc4 (dgVoodoo maps it or
       // updates it), and the motion vector target written by every blend state
-      sr_game_tooltip = "Requires Luma-Upscaler.exe next to the game's exe.\n";
+      sr_game_tooltip = "DLSS, FSR and XeSS require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
       native_shaders_definitions.emplace(CompileTimeStringHash("TW2 Motion Vector Fill CS"),
          ShaderDefinition("Luma_TW2_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(CompileTimeStringHash("TW2 Render Area Point Stretch PS"),

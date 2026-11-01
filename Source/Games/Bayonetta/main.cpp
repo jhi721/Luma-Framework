@@ -1211,7 +1211,7 @@ public:
       luma_data_cbuffer_index = 12;
       luma_ui_cbuffer_index = -1;
 
-      sr_game_tooltip = "Needs Anti-Aliasing off in the game's options. DLSS, FSR and XeSS require Luma-Upscaler.exe next to the game's exe.\n";
+      sr_game_tooltip = "Needs Anti-Aliasing off in the game's options. DLSS, FSR and XeSS require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
 
       default_luma_global_game_settings.Dithering = 1.f;
       // Light AutoHDR on the movies (the TW1/ME1 pair: at 0.5 the peak is 165 nits)

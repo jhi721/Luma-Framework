@@ -19,7 +19,7 @@
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
-// A third "Super Resolution" choice next to the SR bridge's DLSS and FSR 3, drawn in process on any GPU
+// A "Super Resolution" choice next to the SR bridge's DLSS, FSR and XeSS, drawn in process on any GPU
 #define ENABLE_LUMA_TAA 1
 
 #include "..\..\Core\core.hpp"
@@ -2077,7 +2077,7 @@ public:
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
 
-      sr_game_tooltip = "DLSS and FSR require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
+      sr_game_tooltip = "DLSS, FSR and XeSS require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
 
 #if ENABLE_SMAA
       // Core auto-registers the 6 SMAA passes. Added here: the predication CS turning scene alpha into R16F edge-ness in [0,1].

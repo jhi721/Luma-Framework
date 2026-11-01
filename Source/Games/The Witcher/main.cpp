@@ -10,7 +10,7 @@
 
 #define ENABLE_NGX 0 // NGX is x64-only and the game is 32-bit: DLSS and FSR run in the SR bridge's x64 helper
 #define ENABLE_FIDELITY_SK 0
-// A third "Super Resolution" choice next to the SR bridge's DLSS and FSR 3, drawn in process on any GPU
+// A "Super Resolution" choice next to the SR bridge's DLSS, FSR and XeSS, drawn in process on any GPU
 #define ENABLE_LUMA_TAA 1
 #define GEOMETRY_SHADER_SUPPORT 0
 // Outside DEVELOPMENT only this define makes original_draw_dispatch_func non-null (the motion vector draws redo the game's)
@@ -1153,7 +1153,7 @@ public:
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
 
-      sr_game_tooltip = "DLSS and FSR require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
+      sr_game_tooltip = "DLSS, FSR and XeSS require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
 
       // DLSS/FSR: its depth and the camera motion from the scene depth, the CPU copies of vc4 (dgVoodoo maps it or updates it), the
       // motion vector target written by every blend state, and the scene's end before the UI

@@ -31,7 +31,7 @@
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 // The motion vector draw key reads the draw's arguments ("last_draw_dispatch_data")
 #define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
-// A third "Super Resolution" choice next to the SR bridge's DLSS and FSR 3, drawn in process on any GPU
+// A "Super Resolution" choice next to the SR bridge's DLSS, FSR and XeSS, drawn in process on any GPU
 #define ENABLE_LUMA_TAA 1
 
 #include "..\..\Core\core.hpp"
@@ -1778,7 +1778,7 @@ public:
          ShaderDefinition("Luma_MOHA_DepthExtract", reshade::api::pipeline_subobject_type::compute_shader));
 #endif
 
-      sr_game_tooltip = "DLSS and FSR require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
+      sr_game_tooltip = "DLSS, FSR and XeSS require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
 
       // DLSS/FSR: its depth and the camera motion from the scene's alpha, the CPU copies of vc4 (dgVoodoo maps it or updates it), and the
       // motion vector target written by every blend state

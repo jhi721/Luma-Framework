@@ -897,7 +897,7 @@ public:
          ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_resolve_ps", {{"SMAA_T2X", "1"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("MGRR Motion Vector Fill CS"), ShaderDefinition("Luma_MGRR_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
 
-      sr_game_tooltip = "Needs Anti-Aliasing off in the game's options. DLSS, FSR and XeSS require Luma-Upscaler.exe next to the game's exe.\n";
+      sr_game_tooltip = "Needs Anti-Aliasing off in the game's options. DLSS, FSR and XeSS require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
 
 #if DEVELOPMENT
       Mcp::RegisterToggles({

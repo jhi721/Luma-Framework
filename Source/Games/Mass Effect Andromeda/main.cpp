@@ -13,7 +13,7 @@
 #define GEOMETRY_SHADER_SUPPORT 0
 #define ENABLE_SMAA 1 // replaces the game's FXAA pass (FXAA AA mode) with SMAA
 #define ENABLE_RCAS 1 // optional sharpening of the SMAA or DLSS/FSR output (Core's "RCAS PS")
-// A third "Super Resolution" choice next to DLSS and FSR 3, drawn in process on any GPU, upscaling under the render scale
+// A "Super Resolution" choice next to DLSS, FSR and XeSS, drawn in process on any GPU, upscaling under the render scale
 #define ENABLE_LUMA_TAA 1
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
 #define SMAA_SMOOTH_U_SHAPES 0
