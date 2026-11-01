@@ -21007,7 +21007,7 @@ namespace
                ImGui::EndDisabled();
                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                {
-                  ImGui::SetTooltip("The graphics API the upscaler runs on.\nD3D11: DLSS, FSR 3.\nD3D12: DLSS, FSR 4 (RDNA4 GPUs, else FSR 3.1), XeSS.\nDLSS and FSR 3 give the same quality on either API.");
+                  ImGui::SetTooltip("The graphics API the upscaler runs on.\nD3D11: DLSS, FSR 3.\nD3D12: DLSS, FSR 4 (RDNA4 GPUs; its heavier INT8 model on NVIDIA and Intel GPUs; else FSR 3.1), XeSS.\nDLSS and FSR 3 give the same quality on either API.");
                }
             }
 #endif // ENABLE_D3D12_SR
