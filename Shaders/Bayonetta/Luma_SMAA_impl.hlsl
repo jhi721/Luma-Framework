@@ -2,7 +2,7 @@
 
 // SMAA ULTRA + colour edge detection, as Mass Effect 2007's (same dgVoodoo stack), on top of the game's MSAA (or alone with AA
 // off). Run by main.cpp on the canvas right after the scene copy (ResetRender, already display mapped), before the UI; Display
-// Composition runs after. Edges are detected on the GAMMA canvas, the neighborhood blend filters it in linear light (below) and
+// Composition runs after. Edges are detected on the gamma encoded canvas, the neighborhood blend filters it in linear light (below) and
 // re-encodes. The predication mask comes from Luma_Bayonetta_DepthEdges.
 
 // "SMAA_T2X" 1 is SMAA T2x (main.cpp's "Bayonetta SMAA T2x" passes, Mirror's Edge's design): the scene jitters by a quarter pixel
@@ -23,7 +23,7 @@ cbuffer SmaaMetricsCB : register(b1)
 #if SMAA_T2X
 #define SMAA_SUBSAMPLE_INDICES smaa_metrics.subsample_indices
 #define SMAA_REPROJECTION      1
-// The motion vector target ("mv_texture" in main.cpp) holds the UV delta from the current to the previous position. SMAA's velocity
+// The motion vector target ("mv.texture" in main.cpp) holds the UV delta from the current to the previous position. SMAA's velocity
 // is the opposite.
 #define SMAA_DECODE_VELOCITY(sample) (-(sample).rg)
 #endif
@@ -32,8 +32,9 @@ cbuffer SmaaMetricsCB : register(b1)
 #define SMAA_PRESET_ULTRA
 #define SMAA_PREDICATION       1
 #define SMAA_PREDICATION_SCALE smaa_metrics.predication.x
-// Predication is live (CS mask, SCALE 2.0), so both values below are load-bearing: flat = SCALE * SMAA_THRESHOLD =
-// 0.10, silhouette = flat * (1 - STRENGTH) = 0.05 (ULTRA base). SMAA_PREDICATION_THRESHOLD 0.5 is scale-free; tune the CS.
+// Predication is live (the compute shader's mask, scale 2), so both values below matter: the flat threshold is SCALE *
+// SMAA_THRESHOLD = 0.10 and the silhouette one is flat * (1 - STRENGTH) = 0.05 (the ULTRA base). SMAA_PREDICATION_THRESHOLD 0.5
+// doesn't depend on the scale, so tune the compute shader instead.
 #define SMAA_PREDICATION_STRENGTH  0.5
 #define SMAA_PREDICATION_THRESHOLD 0.5
 #define SMAAGather(tex, coord)     tex.Gather(LinearSampler, coord, 0)
@@ -45,7 +46,7 @@ cbuffer SmaaMetricsCB : register(b1)
 
 // SMAAEdgeDetection
 // tex0 = colorTexGamma (gamma-encoded graded canvas)
-// tex1 = predicationTex (edge-ness in [0,1]; null fallback -> reads 0, scale 1.0 = plain ULTRA threshold)
+// tex1 = predicationTex (edge-ness in [0,1]; a null texture reads 0, with scale 1 for the plain ULTRA threshold)
 
 // SMAANeighborhoodBlending
 // tex0 = colorTex (the same snapshot, filtered in linear light), tex1 = blendTex. Re-encode to the canvas' gamma; the alpha is

@@ -2,16 +2,18 @@
 // on dgVoodoo 2.87.5, 0xC32759B1 on 2.81.3). Source: https://github.com/GameTechDev/XeGTAO
 //
 // Bayonetta specifics:
-// - Inputs are the SSAO draw's own: its t2 (R32F "1 - z/w" from the depth prepass) to the prefilter, its t1 (the prepass' view space
-//   normals, "normalize(normal * modelview) * 0.5 + 0.5") to the main pass. The final visibility (R8_UNORM) is applied by
-//   "Luma_Bayonetta_XeGTAOApply.hlsl", drawn in place of the game's SSAO shader.
+// - Input is the SSAO draw's t2 (R32F "1 - z/w" from the depth prepass) to the prefilter. The normals come from that depth, not from
+//   the SSAO draw's t1 (the prepass' "normalize(normal * modelview) * 0.5 + 0.5"): those vertex normals are smoothed across flat walls
+//   and corners, and the main pass' horizons, measured against them, darkened wide bands of flat walls that slid with the camera. The
+//   final visibility (R8_UNORM) is applied by "Luma_Bayonetta_XeGTAOApply.hlsl", drawn in place of the game's SSAO shader.
 // - No projection reaches the SSAO draw: b4 is a copy of the vertex constants (dgVoodoo's cb4, D3D9 c(n) = row n + 20) of a depth
 //   prepass draw of the frame (main.cpp). Every prepass vertex shader has an affine view transform (3 rows) and the same transform
 //   followed by the projection (4 rows): "Rmodelview" c20 + "Rmodelviewproj" c24, or "view" c0 + "g_ViewProjection" c8. The projection
 //   is the second times the inverse of the first.
 // - Noise: frozen at 0 without an upscaler (nothing accumulates: a moving pattern would boil), frame % 64 with DLSS/FSR, which
-//   accumulate the lit scene the AO multiplies. Denoise runs twice either way.
+//   accumulate the lit scene the AO multiplies. There the AO history ("temporal_pass_cs") runs before the denoise.
 
+#define XE_GTAO_GENERATE_NORMALS 1
 #include "../Includes/RenoDX/math.hlsl"
 #include "Includes/GameCBuffers.hlsl"
 
@@ -98,15 +100,26 @@ float XeGTAO_ScreenSpaceToViewSpaceDepth(const float screenDepth)
 #define XE_GTAO_FINAL_OUTPUT_TYPE                         unorm float
 #define XE_GTAO_ENCODE_FINAL(v)                           (v)
 
-Texture2D tex1 : register(t1);
-
-float3 XeGTAO_LoadViewspaceNormal(uint2 pixCoord)
-{
-   // The full xyz view space normal (BL GOTY's decode), its z in the camera-ahead view (see "ProjectionTerms")
-   float3 normal = tex1.Load(int3(pixCoord, 0)).xyz * 2.0 - 1.0;
-   normal.z *= GetProjectionTerms().view_direction;
-   return normalize(normal);
-}
-
-// tex0 = the SSAO draw's t2, the R32F "1 - z/w" depth
-#include "../Includes/XeGTAO.hlsl"
+// tex0 = the SSAO draw's t2, the R32F "1 - z/w" depth.
+// GT-VBAO's main pass ("gtvbao_main_pass_cs", "GT-VBAO Enable") on top of XeGTAO's, which it includes, as MELE's. Steps and
+// thickness follow Yakuza Kiwami's calibration, not yet measured against the game's SSAO. Slices: YK's and MELE's 2, as they run at
+// one AO pixel per scene pixel too, and 1 under the history (main.cpp defines it). The denoise runs twice either way, as MELE keeps
+// for GT-VBAO's coarser bitmask noise.
+#ifndef GTVBAO_SLICE_COUNT
+#define GTVBAO_SLICE_COUNT 2.0
+#endif
+#ifndef GTVBAO_STEP_COUNT
+#define GTVBAO_STEP_COUNT 8.0
+#endif
+#define GTVBAO_THICKNESS(effectRadius) (0.2 * (effectRadius))
+// Core's "FAST Noise" (Shaders/Global/Textures/FAST: 64 layers of 128x128 RGBA, spatio-temporal noise for a 1 pixel gaussian and a
+// temporal filter) in place of the R2 sequence, a layer per frame, with the history (main.cpp defines it), as MELE and FF7R
+#if GTVBAO_FAST_NOISE
+Texture2DArray<float4> fast_noise : register(t4);
+#define GTVBAO_NOISE(pixCoord) fast_noise.Load(int4((pixCoord) & 127u, uint(NoiseIndexRT) & 63u, 0)).xyz
+#endif
+#include "../Includes/GTVBAO.hlsl"
+// The AO history ("temporal_pass_cs") under DLSS/FSR (main.cpp, "RunXeGTAO"), from the prepass' "1 - z/w" at t3 (saturate drops a NaN,
+// as the motion vector fill's)
+#define XE_GTAO_TEMPORAL_DEVICE_DEPTH(depth) saturate(1.0 - (depth))
+#include "../Includes/XeGTAOTemporal.hlsl"

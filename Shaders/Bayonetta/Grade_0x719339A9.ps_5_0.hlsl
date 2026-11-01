@@ -78,7 +78,9 @@ void main(DGV_MAIN_SIGNATURE)
       gradientTint *= gradeIntensity;
    }
 
-   o0.rgb = ((curved - luma) * saturation + curved) * cb4[192].xyz + gradientTint;
+   // "Exposure" rides on the g_MatrialColor gain, where the vanilla auto exposure is (encoded: its linear scale through the 2.2 decode)
+   const float3 gain = cb4[192].xyz * pow(LumaSettings.GameSettings.Exposure, 1.0 / DefaultGamma);
+   o0.rgb = ((curved - luma) * saturation + curved) * gain + gradientTint;
    // The 8-bit target floored the saturation's negatives and, in SDR, clipped the top
    o0.rgb = hdr ? max(o0.rgb, 0.0) : saturate(o0.rgb);
 }

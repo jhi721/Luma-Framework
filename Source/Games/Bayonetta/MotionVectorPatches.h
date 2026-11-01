@@ -3,18 +3,15 @@
 #include "..\..\Core\includes\motion_vector_patch.h"
 #include "..\..\Core\includes\scene_motion_vectors.h"
 
-// The game's slots for Core's DXBC motion vector patch (described in "motion_vector_patch.h"; dgVoodoo's registers in
+// The game's slots and rows for Core's DXBC motion vector patch (see "motion_vector_patch.h"; dgVoodoo's registers are in
 // "MotionVectorPatch::DgVoodoo"). The second vertex shader run reads the previous frame's per-draw constants (vc4: view projection or
 // world view projection, world matrix, bone palette) from another slot.
 namespace MotionVectorPatches
 {
-   using MotionVectorPatch::DgVoodoo::jitter_slot;
    using MotionVectorPatch::DgVoodoo::object_row_offset;
-   using MotionVectorPatch::DgVoodoo::object_slot;
-   using MotionVectorPatch::DgVoodoo::previous_slots;
-   using MotionVectorPatch::DgVoodoo::target_slot;
-   // The reactive masks, written by the scene's alpha blended draws (their pixel shaders patched with "PatchPixelShaderReactive")
-   constexpr uint32_t reactive_slot = target_slot + 1;
+   using SceneMotionVectors::object_slot;
+   using SceneMotionVectors::reactive_slot;
+   using SceneMotionVectors::target_slot;
 
    // vc4 rows (c<N> at row N + 20; census of the 84 vertex shaders of the 2.87.5 in-game dump). No vertex
    // shader reads both cameras. Matrices are column vector math (one row per clip space component); the per-object ones are 3x4,

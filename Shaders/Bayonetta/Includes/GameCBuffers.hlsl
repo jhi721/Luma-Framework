@@ -14,9 +14,10 @@ struct LumaGameSettings
    float Dithering;              // 0/1. Animated triangular dither at output (Present_0x880A17D3) to break gradient banding.
    float VideoAutoHDREnable;     // Video_0xC60649FD: 0/1. 1 = light PumboAutoHDR on the Sofdec movies (HDR only).
    float VideoAutoHDRBoost;      // 0..1. Highlight-expansion strength; peak = lerp(sRGB white, 250 nits, boost). 0 = off.
-   float Contrast;               // HDR (PsychoV31 in Copy_0x91A6C437), 1 = vanilla
-   float Saturation;             // HDR, 1 = vanilla
-   float HighlightsDesaturation; // HDR (PsychoV "dechroma"), 0 = off
+   float Exposure;               // Grade_0x719339A9 / GradeLuma_0xB7A08D4A on the g_MatrialColor gain (linear scale), 1 = vanilla
+   float Contrast;               // HDR (Copy_0x91A6C437), before the display map, 1 = vanilla
+   float Saturation;             // HDR, before the display map, 1 = vanilla
+   float HighlightsDesaturation; // HDR, purity toward the vanilla clip's reference, 0 = off
    float ColorGradingIntensity;  // Grade_0x719339A9 / GradeLuma_0xB7A08D4A: 1 = vanilla, 0 = no curve, saturation or gradient
    float BloomIntensity;         // Copy_0x91A6C437 on the bloom composite: 1 = vanilla, 0 = none
 };
@@ -51,6 +52,15 @@ struct MotionVectorFillConstants
    float3 padding;
 };
 
+// The AO history's constants ("LumaGTAOTemporal" in Includes/XeGTAOTemporal.hlsl, b10), written by "RunXeGTAO"
+struct GTAOTemporalConstants
+{
+   row_major float4x4 reprojection; // Current clip space to the previous frame's
+   float2 jitter_ndc;               // This frame's projection jitter: in the depth, not in the motion vectors
+   float history_weight;            // 0 restarts the history
+   float padding;
+};
+
 // SMAA's metrics (Luma_SMAA_impl.hlsl, VS+PS b1), written by "DrawSMAAOnCanvas"
 struct SmaaMetrics
 {
@@ -71,6 +81,7 @@ struct DepthEdgesConstants
 #ifdef __cplusplus
 static_assert(sizeof(CB::GTAOKnobs) == 48); // The HLSL cbuffers' sizes
 static_assert(sizeof(CB::MotionVectorFillConstants) == 96);
+static_assert(sizeof(CB::GTAOTemporalConstants) == 80);
 static_assert(sizeof(CB::SmaaMetrics) == 48);
 static_assert(sizeof(CB::DepthEdgesConstants) == 16);
 #endif

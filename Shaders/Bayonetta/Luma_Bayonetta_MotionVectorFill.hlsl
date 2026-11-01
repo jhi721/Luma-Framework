@@ -28,7 +28,7 @@ RWTexture2D<float> previous_additive : register(u4); // The additive draws' mask
       // "WriteFsrMasks" with the additive and the alpha blended draws apart: the additive ones write y = 0, so x > y is theirs
       // (lasers, glows: cores ~0.3, glows 0.05-0.2), scaled and capped at 0.9 without a threshold, else they smear; the alpha
       // blended ones (x = y = a: smoke, haze) only over the threshold, as a continuous mask over them shook the whole sprite
-      // in the TAA lab (_tools/taa_lab/reactive_bayo_eval.py, 2026-10-31). The additive part keeps the previous frame's: a blinking
+      // in the TAA lab (_tools/taa_lab/reactive_bayo_eval.py). The additive part keeps the previous frame's: a blinking
       // laser that went out writes nothing, but the upscaler's history still has it lit (lab: it blinked at about half its range
       // without, three quarters with)
       const float2 mask = mask_input.Load(int3(id.xy, 0));

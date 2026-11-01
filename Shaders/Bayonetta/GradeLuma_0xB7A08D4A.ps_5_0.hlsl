@@ -35,15 +35,11 @@ void main(DGV_MAIN_SIGNATURE)
    const float3 scene = ApplyDgvMask(t0.Sample(s0_s, v5.xy), cb3[44], cb3[45]).rgb;
    const bool hdr = TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1;
    // SDR: Y' of the scene as the 8-bit target clipped it
-   float3 color = saturate(scene);
-   float scale = 1.0;
-   [branch] if (hdr)
-   {
-      color = IsNaN_Strict(scene) ? 0.0 : max(scene, 0.0);
-      scale = CurveDomainScale(dot(color, kLumaWeights));
-   }
+   const float3 color = hdr ? (IsNaN_Strict(scene) ? 0.0 : max(scene, 0.0)) : saturate(scene);
+   const float colorLuma = dot(color, kLumaWeights);
+   const float scale = hdr ? CurveDomainScale(colorLuma) : 1.0;
    // The compression is a scalar, so it cancels out of color/luma: only the curve's input moves
-   const float luma = dot(color, kLumaWeights) * scale;
+   const float luma = colorLuma * scale;
    float curved = Curve(luma);
    // "Color Grading Intensity" fades the curve toward identity and the saturation (an offset from the colour) toward none, as in
    // Grade_0x719339A9; the g_MatrialColor gain (auto exposure) stays
@@ -55,7 +51,8 @@ void main(DGV_MAIN_SIGNATURE)
       saturation *= gradeIntensity;
    }
    const float3 toned = color * scale * curved * DgVoodooRcp(luma);
-   o0.rgb = ((toned - curved) * saturation + toned) / scale * cb4[192].xyz;
+   // "Exposure" on the g_MatrialColor gain, as in Grade_0x719339A9
+   o0.rgb = ((toned - curved) * saturation + toned) / scale * cb4[192].xyz * pow(LumaSettings.GameSettings.Exposure, 1.0 / DefaultGamma);
    // The 8-bit target floored the saturation's negatives and, in SDR, clipped the top
    o0.rgb = hdr ? max(o0.rgb, 0.0) : saturate(o0.rgb);
    o0.a = saturate(cb4[192].w);

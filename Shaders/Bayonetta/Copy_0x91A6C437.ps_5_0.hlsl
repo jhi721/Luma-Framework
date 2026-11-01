@@ -1,17 +1,19 @@
 // clang-format off
 #include "Includes/Common.hlsl" // game-local: LumaGameSettings before the shared Settings.hlsl, keep FIRST
-#include "../Includes/PsychoV31.hlsl" // PsychoVDisplayMap
 #include "../Includes/DgVoodoo.hlsl" // DGV_MAIN_SIGNATURE, ApplyDgvMask
+#include "../Includes/Reinhard.hlsl" // Reinhard::ReinhardPiecewise (hue reference)
+#include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueAndPurityEmulationBT2020
 // clang-format on
 
 // Bayonetta "filtershadercopytex" (D3D9 ps_3_0, dgVoodoo 2.87.5 -> ps_5_0 0x91A6C437; "espshadermultiparticle*" translate to the
 // same code): t0 * c192. The game copies with it everywhere (bloom levels and composite, the scene to the back buffer).
 // main.cpp flags one draw a frame with LumaData.CustomData1: "ResetRender", the scene copied into dgVoodoo's D3D9 back buffer (the
 // canvas) right before the UI and the movies draw on it. The scene is gamma encoded (1 = paper white, gamma 2.2 display) with the
-// grade's and the bloom's values above 1, so that copy carries the HDR display map: linearize, RenoDX's PsychoV31 to the peak (with
-// the user's contrast, saturation and highlights desaturation, neutral at their defaults), the UI paper white pre-scale
-// (UI_DRAW_TYPE 2), encode back for the Core composition. Elsewhere the copy is vanilla, its colour unclamped on the fp16 targets
-// (the bloom levels are 8-bit and clamp on their own), except for the bloom composite's alpha (CustomData1 2 and 3).
+// grade's and the bloom's values above 1, so that copy carries the HDR path, as MGR:R's Gather: linearize, the vanilla clip's hue
+// turn (MacLeod-Boynton), the user's contrast and saturation, the display map (a max-channel C-infinity rolloff to the peak), the UI
+// paper white pre-scale (UI_DRAW_TYPE 2), encode back for the Core composition. Elsewhere the copy is vanilla, its colour unclamped
+// on the fp16 targets (the bloom levels are 8-bit and clamp on their own), except for the bloom composite's alpha (CustomData1 2
+// and 3).
 
 cbuffer cb3 : register(b3)
 {
@@ -80,7 +82,33 @@ void main(DGV_MAIN_SIGNATURE)
    }
 #if TONEMAP_TYPE >= 1
    float3 color = IsNaN_Strict(o0.rgb) ? 0.0 : max(o0.rgb, 0.0);
-   color = PsychoVDisplayMap(gamma_to_linear(color, GCT_MIRROR), LumaSettings.GameSettings.Contrast, LumaSettings.GameSettings.Saturation, LumaSettings.GameSettings.HighlightsDesaturation);
+   // Vanilla clipped per channel in 8-bit (the scene before the grade, the canvas here), turning bright highlights toward the
+   // primaries; the max-channel grade fit and map keep the unclipped hue. Restore only that hue turn, from a per-channel Reinhard
+   // (ceiling 5, shoulder 1.5: identity below it, so the scene under 1.5 stays exact), the reference our RenoDX ports ship, at hue
+   // strength 1. "Highlights Desaturation" is the chrominance strength, the share of the reference's whitening (0 = none, 1 = vanilla's).
+   // Before the map on purpose: it is hue neutral and contains any channel the turn lifts. Below the shoulder the reference is the
+   // colour itself, so the solve (some 300 instructions) is skipped there.
+   color = gamma_to_linear(color, GCT_MIRROR);
+   const float3 color2020 = BT709_To_BT2020(color);
+   [branch] if (max3(color2020) > 1.5)
+   {
+      color = BT2020_To_BT709(MacLeodBoynton::HueAndPurityEmulationBT2020(color2020, Reinhard::ReinhardPiecewise(color2020, 5.0, 1.5), 1.0,
+                                                                          LumaSettings.GameSettings.HighlightsDesaturation));
+   }
+   // Contrast (a power around mid gray) and saturation, as Sunset Overdrive's DICE path: the map below doesn't take them
+   const float contrast = LumaSettings.GameSettings.Contrast;
+   [branch] if (contrast != 1.0)
+   {
+      color *= pow(max(GetLuminance(color, CS_BT709), FLT_MIN) / MidGray, contrast - 1.0);
+   }
+   const float saturationScale = LumaSettings.GameSettings.Saturation;
+   [branch] if (saturationScale != 1.0)
+   {
+      color = Saturation(color, saturationScale, CS_BT709);
+   }
+   // Linear BT.709, 1 = paper white; the peak can't go below paper white (the rolloff needs it above its 0.18 anchor)
+   const float paperWhite = max(GamePaperWhiteNits, 1.0);
+   color = Tonemap::CInfinityRollOff::MaxChannel(color, max(PeakWhiteNits, paperWhite) / paperWhite, 0.18, kDisplayMapStrength);
 #else
    // The vanilla clip, on the HDR canvas: only the UI paper white pre-scale the composition expects
    float3 color = gamma_to_linear(saturate(o0.rgb), GCT_MIRROR);
