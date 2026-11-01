@@ -62,7 +62,6 @@ namespace FidelityFX
    // hooks only run around those, for the upscaler dll's calls. Same as OptiScaler's "Fsr4GpuSupport" and upstream Luma's "FidelityFXHooks".
    namespace
    {
-      constexpr UINT vendor_id_amd = 0x1002;
       // The AMD driver private adapter data, the upscaler reads the ASIC family and revision from it (see "amdgpu_asic_addr.h" in Mesa)
       constexpr UINT amd_private_data_size = 608;
       constexpr size_t amd_asic_family_index = 12;
@@ -110,7 +109,7 @@ namespace FidelityFX
          const HRESULT hr = original_adapter_get_desc1(adapter, desc);
          if (SUCCEEDED(hr) && desc && IsSpoofedCaller(_ReturnAddress()))
          {
-            desc->VendorId = vendor_id_amd;
+            desc->VendorId = SR::vendor_id_amd;
          }
          return hr;
       }
@@ -316,7 +315,7 @@ namespace FidelityFX
          factory->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&adapter_1));
       }
       DXGI_ADAPTER_DESC1 adapter_desc = {};
-      if (adapter_1 && SUCCEEDED(adapter_1->GetDesc1(&adapter_desc)) && adapter_desc.VendorId != vendor_id_amd)
+      if (adapter_1 && SUCCEEDED(adapter_1->GetDesc1(&adapter_desc)) && adapter_desc.VendorId != SR::vendor_id_amd)
       {
          // The loader loads the upscaler from its own folder, by name: loading it first gives the same module
          wchar_t loader_path[MAX_PATH] = {};

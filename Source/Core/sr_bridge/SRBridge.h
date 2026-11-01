@@ -17,7 +17,7 @@
 
 namespace SRBridge
 {
-   // The FSR major version the helper runs, from the "FSR 4" / "FSR 3" choices (0: the runtime's newest). A change restarts a running FSR helper.
+   // The FSR major version the helper runs, from the "FSR 3" / "FSR 4" choices and "Auto" (the helper's 0 default: the runtime's newest). A change restarts a running FSR helper.
    inline int fsr_major_version = 0;
 
    // A texture the bridge hands to its helper as is (NT handle shared), else a plain one (the bridge copies those every frame)

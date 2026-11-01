@@ -17,6 +17,10 @@ struct IDXGIAdapter;
 
 namespace SR
 {
+	// GPU PCI vendor ids, for what an upscaler runs or what "Auto" picks
+	constexpr uint32_t vendor_id_amd = 0x1002;
+	constexpr uint32_t vendor_id_intel = 0x8086;
+
 	// The objects of an API. DLSS, FSR and XeSS have a D3D12 path, which a D3D11 build can host too (its D3D12 implementations live in
 	// "unity_build_d3d12.cpp", see "sr_bridge/D3D12SR.h").
 	struct D3D11Api
@@ -69,8 +73,6 @@ namespace SR
 		{	
 		case SR::UserType::None:
 			return type == Type::None;
-		case SR::UserType::Auto:
-			return true; // Always accept it for now, given that it's the first one we find compatible
 		case SR::UserType::DLSS:
 			return type == Type::DLSS;
 		case SR::UserType::FSR:

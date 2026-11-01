@@ -843,6 +843,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    // upscaler objects go, while a list records the draw
    std::shared_mutex sr_mutex;
    std::map<SR::Type, SR::InstanceData*> sr_implementations_instances; // All implementations allowed by the current mod, might not all be compatible
+   UINT adapter_vendor_id = 0; // The GPU's PCI vendor id, which "Auto" picks by. 0 on D3D12 (no adapter at device init).
    SR::InstanceData* GetSRInstanceData() const
    {
       auto it = sr_implementations_instances.find(sr_type);

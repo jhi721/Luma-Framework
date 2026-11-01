@@ -3765,6 +3765,21 @@ namespace
    }
 #endif // DX11
 
+#if ENABLE_SR
+   // What "Auto" picks: DLSS, XeSS on Intel GPUs (elsewhere it runs a fallback model heavier than FSR), FSR, Luma TAA
+   SR::Type GetSRAutoType(const DeviceData& device_data)
+   {
+      for (const SR::Type type : {SR::Type::DLSS, SR::Type::XeSS, SR::Type::FSR, SR::Type::LumaTAA})
+      {
+         if (type == SR::Type::XeSS && device_data.adapter_vendor_id != SR::vendor_id_intel)
+            continue;
+         if (const auto it = device_data.sr_implementations_instances.find(type); it != device_data.sr_implementations_instances.end() && it->second && it->second->is_supported)
+            return type;
+      }
+      return SR::Type::None;
+   }
+#endif
+
    void OnInitDevice(reshade::api::device* device)
    {
       // Always skip this one, don't use "SKIP_UNSUPPORTED_DEVICE_API", some games create devices of other graphics API without actually doing anything with them (e.g. Deus Ex HR)
@@ -3931,6 +3946,10 @@ namespace
          hr = native_dxgi_device->GetAdapter(&native_adapter);
          assert(SUCCEEDED(hr));
       }
+      if (DXGI_ADAPTER_DESC adapter_desc = {}; native_adapter && SUCCEEDED(native_adapter->GetDesc(&adapter_desc)))
+      {
+         device_data.adapter_vendor_id = adapter_desc.VendorId;
+      }
 #endif
 
       bool selected_sr_implementation = false;
@@ -3970,6 +3989,10 @@ namespace
                device_data.sr_implementations_instances.erase(sr_implementation.first);
             }
          }
+      }
+      if (const std::shared_lock lock_reshade(s_mutex_reshade); sr_user_type == SR::UserType::Auto)
+      {
+         device_data.sr_type = GetSRAutoType(device_data); // Once all of them are initialized
       }
       if (device_data.sr_type == SR::Type::None)
       {
@@ -8905,17 +8928,6 @@ namespace
 #endif
 
 #if ENABLE_SR
-   // The first supported SR type (the implementations are in order of preference), what "Auto" picks
-   SR::Type GetSRAutoType(const DeviceData& device_data)
-   {
-      for (const auto& [type, instance] : device_data.sr_implementations_instances)
-      {
-         if (instance && instance->is_supported)
-            return type;
-      }
-      return SR::Type::None;
-   }
-
    // The upscaler's jitter phase count (at least 1), or the native TAA default without an upscaler instance
    int GetSRJitterPhases(const DeviceData& device_data, const SR::InstanceData* sr_instance_data)
    {
@@ -11600,14 +11612,16 @@ namespace
       device_data.has_drawn_sr_imgui = device_data.has_drawn_sr;
       {
          const std::unique_lock sr_lock(device_data.sr_mutex);
+#if ENABLE_SR_BRIDGE || ENABLE_D3D12_SR
+         // Auto's FSR is FSR 4 on AMD GPUs only, elsewhere FSR 4 runs its INT8 fallback model, heavier than FSR 3
+         const bool fsr_4 = sr_user_type == SR::UserType::FSR || (sr_user_type == SR::UserType::Auto && device_data.adapter_vendor_id == SR::vendor_id_amd);
+#endif
 #if ENABLE_SR_BRIDGE
-         // Auto runs the newest
-         SRBridge::fsr_major_version = (sr_user_type == SR::UserType::FSR3 ? 3 : (sr_user_type == SR::UserType::FSR ? 4 : 0));
+         SRBridge::fsr_major_version = (fsr_4 ? 4 : 3);
 #endif
          ApplySRType(device_data, device_data.sr_type_selected);
 #if ENABLE_D3D12_SR
-         // Auto's FSR runs the newest, FSR 4
-         SRBridge::api_setting = ((sr_user_type == SR::UserType::FSR3 || device_data.sr_type == SR::Type::DLSS) ? SRBridge::Api::D3D11 : SRBridge::Api::D3D12);
+         SRBridge::api_setting = (fsr_4 ? SRBridge::Api::D3D12 : SRBridge::Api::D3D11); // XeSS falls back on D3D12, it has nothing else
 #endif
          for (const auto& [type, instance] : device_data.sr_implementations_instances)
          {
@@ -20876,8 +20890,8 @@ namespace
                   AddComboItem("Auto", SR::UserType::Auto, sr_auto_type, !device_data.sr_implementations_instances.empty());
                AddComboItem("DLSS", SR::UserType::DLSS, SR::Type::DLSS, device_data.sr_implementations_instances.contains(SR::Type::DLSS));
 #if ENABLE_SR_BRIDGE || ENABLE_D3D12_SR // The FidelityFX API's version ("SRBridge::fsr_major_version"), or D3D12 vs D3D11 ("SRBridge::api_setting")
-               AddComboItem("FSR 4", SR::UserType::FSR, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
                AddComboItem("FSR 3", SR::UserType::FSR3, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
+               AddComboItem("FSR 4", SR::UserType::FSR, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
 #else
                AddComboItem("FSR", SR::UserType::FSR, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
 #endif
@@ -22970,7 +22984,7 @@ void Init(bool async)
       dlss_render_preset = static_cast<unsigned int>(dlss_render_preset_i);
 #endif
 #if ENABLE_D3D12_SR
-      // So the SR instances start on the API the first present picks (Auto's type isn't known yet, it's D3D11 for DLSS)
+      // So the SR instances start on the API the first present picks. The GPU isn't known yet: Auto starts on D3D11, and switches at the first present on AMD (FSR 4).
       SRBridge::api_setting = (sr_user_type == SR::UserType::FSR ? SRBridge::Api::D3D12 : SRBridge::Api::D3D11);
 #endif
 #if ENABLE_LUMA_TAA
