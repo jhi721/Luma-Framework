@@ -380,7 +380,8 @@ namespace Shader
    template <typename T1, typename T2>
    bool ShaderHashesContains(const std::unordered_set<T1>& container, const T2& value)
    {
-      return container.contains(value);
+      // Most stages of a list are empty: skip the hash and the bucket walk (once per stage of every list a draw is tested against)
+      return !container.empty() && container.contains(value);
    }
    template <typename T1, typename T2, std::size_t N>
    bool ShaderHashesContains(const std::array<T1, N>& container, const T2& value)
