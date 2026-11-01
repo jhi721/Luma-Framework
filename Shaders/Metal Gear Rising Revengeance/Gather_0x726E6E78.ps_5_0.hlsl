@@ -64,9 +64,9 @@ void main(DGV_MAIN_SIGNATURE)
    const float4 scene = ApplyDgvMask(t0.Sample(s0_s, v5.xy), cb3[44], cb3[45]);
    const float4 bloom = ApplyDgvMask(t1.Sample(s1_s, v5.xy), cb3[46], cb3[47]);
 
-   // The sampler clamps U, so this is the vanilla curve of the clipped scene
+   // The sampler clamps U, so below the shoulder this is the vanilla curve of the clipped scene
    float3 ungraded = saturate(scene.rgb);
-   float3 curved = Curve(scene.rgb);
+   float scale = 1.0;
    [branch] if (TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1)
    {
       ungraded = IsNaN_Strict(scene.rgb) ? 0.0 : max(scene.rgb, 0.0);
@@ -74,10 +74,10 @@ void main(DGV_MAIN_SIGNATURE)
       // The max channel is what the curve's domain must hold: asymptotic to its end
       if (peak > kCurveShoulder)
       {
-         const float scale = Tonemap::CInfinityRollOff::Apply(peak, 1.0, kCurveShoulder, kCurveShoulderStrength) / peak;
-         curved = Curve(ungraded * scale) / scale;
+         scale = Tonemap::CInfinityRollOff::Apply(peak, 1.0, kCurveShoulder, kCurveShoulderStrength) / peak;
       }
    }
+   float3 curved = Curve(ungraded * scale) / scale;
    // "Color Grading Intensity" fades the level's look (Bayonetta's): the curve toward identity, the saturation (an offset from the
    // colour, 0 = none) and the gradient toward none. The g_MulColor gain stays: it carries the auto exposure.
    const float gradeIntensity = LumaSettings.GameSettings.ColorGradingIntensity;
@@ -90,7 +90,9 @@ void main(DGV_MAIN_SIGNATURE)
       gradient *= gradeIntensity;
    }
    const float luma = dot(curved, kLumaWeights);
-   const float3 graded = ((curved - luma) * saturation + curved) * cb4[192].xyz + gradient;
+   // "Exposure" rides on the g_MulColor gain, where the vanilla auto exposure is (encoded: its linear scale through the 2.2 decode)
+   const float3 gain = cb4[192].xyz * pow(LumaSettings.GameSettings.Exposure, 1.0 / DefaultGamma);
+   const float3 graded = ((curved - luma) * saturation + curved) * gain + gradient;
    o0 = (float4(graded, 0.0) + bloom * cb4[195] * LumaSettings.GameSettings.BloomIntensity) * cb4[196];
 #if GATHER_NOISE
 #if GATHER_NOISE == 2
@@ -126,14 +128,27 @@ void main(DGV_MAIN_SIGNATURE)
    float3 color = IsNaN_Strict(o0.rgb) ? 0.0 : max(o0.rgb, 0.0);
    // Vanilla clipped per channel in 8-bit (the scene before the curve, the canvas here), turning bright highlights toward the
    // primaries; the max-channel curve and map keep the unclipped hue. Restore only that hue turn, from a per-channel Reinhard
-   // (ceiling 5, shoulder 1.5: identity below it, so the scene under 1.5 stays exact), the reference our RenoDX ports ship. Hue 1 /
-   // chrominance 0: no vanilla whitening. Before the map on purpose: it is hue neutral and contains any channel the turn lifts.
-   // Below the shoulder the reference is the colour itself, so the solve (some 300 instructions) is skipped there.
+   // (ceiling 5, shoulder 1.5: identity below it, so the scene under 1.5 stays exact), the reference our RenoDX ports ship. Hue 1;
+   // "Highlights Desaturation" is the chrominance strength, the share of the reference's whitening (0 = none, vanilla's at 1).
+   // Before the map on purpose: it is hue neutral and contains any channel the turn lifts. Below the shoulder the reference is the
+   // colour itself, so the solve (some 300 instructions) is skipped there.
    color = gamma_to_linear(color, GCT_MIRROR);
    const float3 color2020 = BT709_To_BT2020(color);
    [branch] if (max3(color2020) > 1.5)
    {
-      color = BT2020_To_BT709(MacLeodBoynton::HueOnlyBT2020(color2020, Reinhard::ReinhardPiecewise(color2020, 5.0, 1.5)));
+      color = BT2020_To_BT709(MacLeodBoynton::HueAndPurityEmulationBT2020(color2020, Reinhard::ReinhardPiecewise(color2020, 5.0, 1.5), 1.0,
+                                                                          LumaSettings.GameSettings.HighlightsDesaturation));
+   }
+   // Contrast (a power around mid gray) and saturation, as Sunset Overdrive's DICE path: the map below doesn't take them
+   const float contrast = LumaSettings.GameSettings.Contrast;
+   [branch] if (contrast != 1.0)
+   {
+      color *= pow(max(GetLuminance(color, CS_BT709), FLT_MIN) / MidGray, contrast - 1.0);
+   }
+   const float saturationScale = LumaSettings.GameSettings.Saturation;
+   [branch] if (saturationScale != 1.0)
+   {
+      color = Saturation(color, saturationScale, CS_BT709);
    }
    // Linear BT.709, 1 = paper white; the peak can't go below paper white (the rolloff needs it above its 0.18 anchor)
    const float paperWhite = max(GamePaperWhiteNits, 1.0);

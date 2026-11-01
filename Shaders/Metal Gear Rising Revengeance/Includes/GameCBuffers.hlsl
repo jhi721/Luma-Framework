@@ -11,11 +11,15 @@ namespace CB
 {
 struct LumaGameSettings
 {
-   float VideoAutoHDREnable;    // Video_0x43A3099D: 0/1. 1 = light PumboAutoHDR on the CRI movies (HDR only).
-   float VideoAutoHDRBoost;     // 0..1. Highlight-expansion strength; peak = lerp(sRGB white, 250 nits, boost). 0 = off.
-   float Dithering;             // 0/1. Animated triangular dither at output (Present_0x880A17D3) to break gradient banding.
-   float ColorGradingIntensity; // Gather_0x726E6E78: 1 = vanilla, 0 = no curve, saturation or gradient
-   float BloomIntensity;        // Gather_0x726E6E78 on the bloom it adds: 1 = vanilla, 0 = none
+   float VideoAutoHDREnable;     // Video_0x43A3099D: 0/1. 1 = light PumboAutoHDR on the CRI movies (HDR only).
+   float VideoAutoHDRBoost;      // 0..1. Highlight-expansion strength; peak = lerp(sRGB white, 250 nits, boost). 0 = off.
+   float Dithering;              // 0/1. Animated triangular dither at output (Present_0x880A17D3) to break gradient banding.
+   float Exposure;               // Gather_0x726E6E78 on the g_MulColor gain (linear scale), 1 = vanilla
+   float Contrast;               // HDR, before the display map, 1 = vanilla
+   float Saturation;             // HDR, before the display map, 1 = vanilla
+   float HighlightsDesaturation; // HDR, purity toward the vanilla clip's reference, 0 = off
+   float ColorGradingIntensity;  // Gather_0x726E6E78: 1 = vanilla, 0 = no curve, saturation or gradient
+   float BloomIntensity;         // Gather_0x726E6E78 on the bloom it adds: 1 = vanilla, 0 = none
 };
 
 struct LumaGameData
@@ -23,7 +27,7 @@ struct LumaGameData
    float Dummy; // hlsl doesn't support empty structs
 };
 
-// The motion vector fill's constants (Luma_MGRR_MotionVectorFill.hlsl, b0), written by "DrawUpscaler"
+// The motion vector fill's constants (Luma_MGRR_MotionVectorFill.hlsl, b0), written by "FillMotionVectors"
 struct MotionVectorFillConstants
 {
    row_major float4x4 reprojection; // Current clip space to the previous frame's (column vectors)
@@ -44,6 +48,7 @@ struct SmaaMetrics
 } // namespace CB
 
 #ifdef __cplusplus
+static_assert(sizeof(CB::MotionVectorFillConstants) == 96);
 static_assert(sizeof(CB::SmaaMetrics) == 48);
 #endif
 

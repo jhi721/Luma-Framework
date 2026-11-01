@@ -37,8 +37,6 @@ const ShaderHashesList shader_hashes_Copy = {.pixel_shaders = {0x91A6C437}};
 const ShaderHashesList shader_hashes_DgVoodooPresent = {.pixel_shaders = {0x880A17D3}};
 // The movies' Y'CbCr -> R'G'B' (hwshaderpftyuv / hwshaderpftyuva and their alpha test twins, Video_0x43A3099D.ps_5_0.hlsl)
 const ShaderHashesList shader_hashes_Video = {.pixel_shaders = {0x43A3099D, 0x0CFBCBEF, 0xC1C26B88, 0x71B4A727, 0x6CF5789C, 0x52502A77}};
-// filter09: FXAA 3 Console (layer 0x5D, gated by the game's flag 0x100000), from the scene into the next target
-const ShaderHashesList shader_hashes_FXAA = {.pixel_shaders = {0x14F88B41, 0x5F6FD3B9, 0xDEFECE82}};
 // The depth prepass (plain and alpha tested, seen in game 2026-10-28): linear view depth into a scene sized R32F target (MSAA with the
 // game's MSAA on, then resolved), which the deferred passes and the soft particles read. SMAA's predication source.
 // (modelshaderzmapscr and zmapscrnki, with their alpha test twins). Its single R32F target is the carrier of the scene's motion vectors:
@@ -55,15 +53,9 @@ const ShaderHashesList shader_hashes_DepthPrepass = {.pixel_shaders = {0x522D69B
 // FSR's and Luma TAA's masks, written by the scene's alpha blended draws past dgVoodoo's targets (their pixel shaders patched with
 // "PatchPixelShaderReactive", the slot max blended in every blend state: "PatchedDraws::OnCreateBlendState")
 constexpr UINT REACTIVE_SLOT = MotionVectorPatches::reactive_slot;
-
-// A game pixel shader's patch: the MSAA alpha to coverage, or the mask target of an alpha blended or additive draw
-enum class PixelShaderPatch : uint8_t
-{
-   COVERAGE,
-   MASK_ALPHA,
-   MASK_ADDITIVE,
-};
-constexpr const char* PIXEL_SHADER_PATCH_NAMES[] = {"Coverage", "Mask", "Mask (additive)"};
+using SceneMotionVectors::PixelShaderPatch;
+// The MSAA alpha to coverage, after the game's blended mask patch ("MotionVectorGame::blended_mask_patch")
+constexpr PixelShaderPatch COVERAGE_PATCH = PixelShaderPatch::GAME_1;
 
 // "Luma MSAA Enable": the HDR-weighted resolve of the fp16 mirrors and the alpha tested materials' alpha to coverage (Bayonetta's)
 static bool g_msaa_resolve_enable = true;
@@ -72,7 +64,6 @@ static bool g_smaa_t2x = false;      // SMAA T2x: a two phase jitter and the pre
 static bool g_hide_ui = false;       // Session-only, never persisted: a stuck "on" would look like a broken HUD
 static float g_rcas_sharpness = 0.f; // RCAS on the antialiased scene, 0 = off
 #if DEVELOPMENT
-static bool g_fxaa_enable = true; // Off: the FXAA draw becomes a copy of its source (A/B, and the AA a later upscaler replaces)
 static bool g_msaa_coverage_enable = true;
 static bool g_smaa_predication = true;      // Off: plain SMAA ULTRA (the fallback without the prepass, e.g. at the title screen)
 static float g_smaa_pred_tolerance = 0.02f; // A fraction of view depth (TW2/Bayonetta's value)
@@ -85,7 +76,6 @@ static float g_sr_reactive_scale = 2.f;
 static float g_sr_reactive_threshold = 0.5f;
 static bool g_sr_reactive_debug_view = false;
 #else
-constexpr bool g_fxaa_enable = true;
 constexpr bool g_mv_enable = true;
 constexpr bool g_msaa_coverage_enable = true;
 constexpr bool g_smaa_predication = true;
@@ -126,10 +116,6 @@ struct MetalGearRisingRevengeanceGameDeviceData final : public GameDeviceData
    // "msaa_resolved" this frame, "msaa_active" the last one (the coverage draws come before this frame's resolves)
    std::atomic<bool> msaa_resolved = false;
    std::atomic<bool> msaa_active = false;
-   // The game's pixel shaders' patches by original hash and patch ("GetPatchedPixelShader"), null for one that can't be patched (an
-   // alpha to coverage version of a shader without a clip). Never erased.
-   std::shared_mutex patched_mutex;
-   std::unordered_map<uint64_t, com_ptr<ID3D11PixelShader>> patched_pixel_shaders;
 
    // ---- DLAA / FSR Native AA / XeSS / Luma TAA (Core's SR bridge: the game is 32-bit) on the motion vectors of Core's "SceneMotionVectors"
    // (vc4 layout in "MotionVectorPatches"), before the gather pass ----
@@ -159,43 +145,28 @@ struct MetalGearRisingRevengeanceGameDeviceData final : public GameDeviceData
    bool viewport_jittered = false;
    D3D11_VIEWPORT game_viewport = {};
    D3D11_VIEWPORT jittered_viewport = {};
-   // "IsSceneDepthTested"'s last depth stencil state, whether it tests depth and whether it writes it (forgotten at present: a
-   // released state's address comes back for another)
+   // "IsSceneDepthTested"'s last depth stencil state, whether it tests depth and whether it writes it (forgotten when the scene
+   // opens: a released state's address comes back for another)
    ID3D11DepthStencilState* depth_test_state = nullptr;
    bool depth_test = false;
    bool depth_write = false;
 
-   // FSR's and Luma TAA's masks: what the alpha blended draws wrote (x reactive, y transparency & composition, max blended; the module's
-   // "reactive_target", made here), the masks the fill makes of it, and the additive draws' mask of the last frame
-   // ("Luma_MGRR_MotionVectorFill.hlsl")
-   com_ptr<ID3D11Texture2D> reactive;
-   com_ptr<ID3D11UnorderedAccessView> reactive_uav;
-   com_ptr<ID3D11Texture2D> transparency;
-   com_ptr<ID3D11UnorderedAccessView> transparency_uav;
-   com_ptr<ID3D11Texture2D> reactive_previous;
-   com_ptr<ID3D11UnorderedAccessView> reactive_previous_uav;
-   // This frame's mask target was cleared when the scene opened: the alpha blended draws after it write it
+   // FSR's and Luma TAA's masks ("mv.reactive_target", "mv.reactive", "mv.transparency", "mv.reactive_previous"), made here: this
+   // frame's mask target was cleared when the scene opened, the alpha blended draws after it write it
    bool reactive_ready = false;
-   // "DrawWithReactiveMask"'s last blend state and its mask patch, none if not blended by source alpha (forgotten at present)
-   ID3D11BlendState* blend_state = nullptr;
-   std::optional<PixelShaderPatch> blend_patch;
 #if DEVELOPMENT
    // This frame's and the last complete frame's "DrawWithReactiveMask" draws
    uint32_t reactive_draws = 0;
    uint32_t last_reactive_draws = 0;
 #endif
 
-   void ReleaseReactiveMasks()
+   void ReleaseSmaaPredication()
    {
-      mv.reactive_target_srv.reset();
-      mv.reactive_target_rtv.reset();
-      mv.reactive_target.reset();
-      reactive_uav.reset();
-      reactive.reset();
-      transparency_uav.reset();
-      transparency.reset();
-      reactive_previous_uav.reset();
-      reactive_previous.reset();
+      smaa_predication_srv.reset();
+      smaa_predication_uav.reset();
+      smaa_predication.reset();
+      smaa_depth_srv.reset();
+      smaa_depth.reset();
    }
 
    void ReleaseT2xFrames()
@@ -217,7 +188,7 @@ class MetalGearRisingRevengeance final : public Game
    }
 
    // Copies (or resolves) the bound render target 0 into "scene_texture", recreated on a size or format change
-   static void SnapshotScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, MetalGearRisingRevengeanceGameDeviceData& game_device_data)
+   static void SnapshotScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, MetalGearRisingRevengeanceGameDeviceData* game_device_data)
    {
       ComPtr<ID3D11RenderTargetView> rtv;
       native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
@@ -234,31 +205,31 @@ class MetalGearRisingRevengeance final : public Game
       D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
       rtv->GetDesc(&rtv_desc);
       D3D11_TEXTURE2D_DESC scene_desc = {};
-      if (game_device_data.scene_texture)
+      if (game_device_data->scene_texture)
       {
-         game_device_data.scene_texture->GetDesc(&scene_desc);
+         game_device_data->scene_texture->GetDesc(&scene_desc);
       }
       if (scene_desc.Width != target_desc.Width || scene_desc.Height != target_desc.Height || scene_desc.Format != rtv_desc.Format)
       {
-         game_device_data.scene_srv.reset();
-         game_device_data.scene_texture.reset();
+         game_device_data->scene_srv.reset();
+         game_device_data->scene_texture.reset();
          const D3D11_TEXTURE2D_DESC desc = {.Width = target_desc.Width, .Height = target_desc.Height, .MipLevels = 1, .ArraySize = 1, .Format = rtv_desc.Format, .SampleDesc = {.Count = 1}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE};
-         if (FAILED(native_device->CreateTexture2D(&desc, nullptr, game_device_data.scene_texture.put())) || FAILED(native_device->CreateShaderResourceView(game_device_data.scene_texture.get(), nullptr, game_device_data.scene_srv.put())))
+         if (FAILED(native_device->CreateTexture2D(&desc, nullptr, game_device_data->scene_texture.put())) || FAILED(native_device->CreateShaderResourceView(game_device_data->scene_texture.get(), nullptr, game_device_data->scene_srv.put())))
          {
-            game_device_data.scene_srv.reset();
-            game_device_data.scene_texture.reset();
+            game_device_data->scene_srv.reset();
+            game_device_data->scene_texture.reset();
             return;
          }
       }
       if (target_desc.SampleDesc.Count > 1)
       {
-         native_device_context->ResolveSubresource(game_device_data.scene_texture.get(), 0, target.get(), 0, rtv_desc.Format);
+         native_device_context->ResolveSubresource(game_device_data->scene_texture.get(), 0, target.get(), 0, rtv_desc.Format);
       }
       else
       {
-         native_device_context->CopySubresourceRegion(game_device_data.scene_texture.get(), 0, 0, 0, 0, target.get(), 0, nullptr);
+         native_device_context->CopySubresourceRegion(game_device_data->scene_texture.get(), 0, 0, 0, 0, target.get(), 0, nullptr);
       }
-      game_device_data.has_scene_snapshot = true;
+      game_device_data->has_scene_snapshot = true;
    }
 
    // SMAA ULTRA on the gather pass' snapshot, written back into its target (all samples alike when multisampled) before the UI draws on
@@ -280,22 +251,14 @@ class MetalGearRisingRevengeance final : public Game
       bool predication = g_smaa_predication && predication_shader && depth_desc.Format == DXGI_FORMAT_R32_FLOAT && depth_desc.Width == size.x && depth_desc.Height == size.y;
       if (predication && GetViewTextureSize(gd.smaa_predication_srv.get()) != size)
       {
-         gd.smaa_predication_srv.reset();
-         gd.smaa_predication_uav.reset();
-         gd.smaa_predication.reset();
-         gd.smaa_depth_srv.reset();
-         gd.smaa_depth.reset();
+         gd.ReleaseSmaaPredication();
          const CD3D11_TEXTURE2D_DESC smaa_depth_desc(DXGI_FORMAT_R32_FLOAT, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE);
          const CD3D11_TEXTURE2D_DESC predication_desc(DXGI_FORMAT_R16_FLOAT, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
          if (FAILED(native_device->CreateTexture2D(&smaa_depth_desc, nullptr, gd.smaa_depth.put())) || FAILED(native_device->CreateShaderResourceView(gd.smaa_depth.get(), nullptr, gd.smaa_depth_srv.put())) ||
              FAILED(native_device->CreateTexture2D(&predication_desc, nullptr, gd.smaa_predication.put())) || FAILED(native_device->CreateUnorderedAccessView(gd.smaa_predication.get(), nullptr, gd.smaa_predication_uav.put())) ||
              FAILED(native_device->CreateShaderResourceView(gd.smaa_predication.get(), nullptr, gd.smaa_predication_srv.put())))
          {
-            gd.smaa_predication_srv.reset();
-            gd.smaa_predication_uav.reset();
-            gd.smaa_predication.reset();
-            gd.smaa_depth_srv.reset();
-            gd.smaa_depth.reset();
+            gd.ReleaseSmaaPredication();
          }
       }
       const float tolerance[4] = {g_smaa_pred_tolerance, 0.f, 0.f, 0.f};
@@ -328,6 +291,14 @@ class MetalGearRisingRevengeance final : public Game
          }
          t2x = gd.t2x_frames[0].get() != nullptr;
       }
+      if (t2x && !gd.rgb_blend_state)
+      {
+         D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
+         blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
+         native_device->CreateBlendState(&blend_desc, &gd.rgb_blend_state);
+      }
+      // Without it the resolve would write the gather target's alpha: 1x
+      t2x = t2x && gd.rgb_blend_state;
       // b1 ("Luma_SMAA_impl.hlsl"'s "SmaaMetricsCB"): T2x's subsample indices for the jitter phase (see "OpenScene", the phase is the
       // frame's parity), 0 for 1x or a scene that didn't jitter (only T2x jitters with it active)
       const float subsample_indices = ((t2x && gd.jitter[0] != 0.f) ? float(t2x_current + 1) : 0.f);
@@ -384,12 +355,6 @@ class MetalGearRisingRevengeance final : public Game
          DrawSMAA(native_device, native_device_context, device_data, target_rtv, gd.scene_srv.get(), gd.scene_srv.get(), predication ? gd.smaa_predication_srv.get() : nullptr, gd.smaa_metrics_buffer.get());
          return;
       }
-      if (!gd.rgb_blend_state)
-      {
-         D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
-         blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
-         native_device->CreateBlendState(&blend_desc, &gd.rgb_blend_state);
-      }
       // The game's state back after the resolve (dgVoodoo doesn't rebind what it thinks is bound)
       DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
       graphics_state.Cache(native_device_context, device_data.uav_max_count);
@@ -410,50 +375,6 @@ class MetalGearRisingRevengeance final : public Game
       gd.t2x_frame = frame_index;
    }
 
-   // The bound pixel shader's "patch", from the pipeline cache's bytecode on first use (null if it can't be patched, e.g. an alpha to
-   // coverage version of a shader without a clip)
-   static ID3D11PixelShader* GetPatchedPixelShader(ID3D11Device* native_device, DeviceData& device_data, uint64_t hash, reshade::api::pipeline pipeline, PixelShaderPatch patch)
-   {
-      auto& game_device_data = GetGameDeviceData(device_data);
-      const uint64_t key = hash | (uint64_t(patch) << 32);
-      {
-         const std::shared_lock lock(game_device_data.patched_mutex);
-         if (const auto it = game_device_data.patched_pixel_shaders.find(key); it != game_device_data.patched_pixel_shaders.end())
-            return it->second.get();
-      }
-      std::vector<uint8_t> patched;
-      std::string error;
-      {
-         const std::shared_lock lock(s_mutex_generic);
-         if (const auto it = device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle); it != device_data.pipeline_cache_by_pipeline_handle.end() && it->second->subobjects_cache)
-         {
-            const auto* desc = static_cast<const reshade::api::shader_desc*>(it->second->subobjects_cache[0].data);
-            const auto* code = static_cast<const uint8_t*>(desc->code);
-            if (patch == PixelShaderPatch::COVERAGE)
-            {
-               // The alpha tested materials clip at 0.5 and 0.8; the clips at 0.01 and 0.0001 skip blended draws' invisible texels
-               patched = CoveragePatch::PatchPixelShader(code, desc->code_size, &error, 0.1f);
-            }
-            else
-            {
-               patched = MotionVectorPatch::PatchPixelShaderReactive(code, desc->code_size, MotionVectorPatch::DgVoodoo::MakeLayout(), REACTIVE_SLOT,
-                  (patch == PixelShaderPatch::MASK_ADDITIVE ? MotionVectorPatch::ReactiveMode::ADDITIVE : MotionVectorPatch::ReactiveMode::ALPHA), &error);
-            }
-         }
-      }
-      com_ptr<ID3D11PixelShader> shader;
-      if (!patched.empty() && FAILED(native_device->CreatePixelShader(patched.data(), patched.size(), nullptr, &shader)))
-      {
-         error = "create failed";
-      }
-      if (shader || !error.starts_with("no clip"))
-      {
-         reshade::log::message(shader ? reshade::log::level::info : reshade::log::level::warning, std::format("[MGRR] {} 0x{:08X} {}", PIXEL_SHADER_PATCH_NAMES[size_t(patch)], uint32_t(hash), shader ? (error.empty() ? std::string("patched") : "patched, " + error) : error).c_str());
-      }
-      const std::unique_lock lock(game_device_data.patched_mutex);
-      return game_device_data.patched_pixel_shaders.try_emplace(key, shader).first->second.get();
-   }
-
    // Whether the bound draw tests depth against the scene's depth: the scene's draws (the depth prepass, the G-buffer, the lights, the
    // velocity pass, the translucents), not full screen passes or shadow maps
    static bool IsSceneDepthTested(ID3D11DeviceContext* native_device_context, MetalGearRisingRevengeanceGameDeviceData* gd)
@@ -466,9 +387,8 @@ class MetalGearRisingRevengeance final : public Game
       dsv->GetResource(&depth);
       if (depth != gd->scene_depth)
          return false;
-      com_ptr<ID3D11DepthStencilState> state;
-      native_device_context->OMGetDepthStencilState(&state, nullptr);
-      if (state.get() != gd->depth_test_state)
+      ID3D11DepthStencilState* const state = gd->mv.bound_states.DepthStencilState(native_device_context);
+      if (state != gd->depth_test_state)
       {
          D3D11_DEPTH_STENCIL_DESC desc = CD3D11_DEPTH_STENCIL_DESC(D3D11_DEFAULT);
          if (state)
@@ -477,7 +397,7 @@ class MetalGearRisingRevengeance final : public Game
          }
          gd->depth_test = desc.DepthEnable;
          gd->depth_write = desc.DepthEnable && desc.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO;
-         gd->depth_test_state = state.get();
+         gd->depth_test_state = state;
       }
       return gd->depth_test;
    }
@@ -540,6 +460,7 @@ class MetalGearRisingRevengeance final : public Game
          const D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = CD3D11_SHADER_RESOURCE_VIEW_DESC(D3D11_SRV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R24_UNORM_X8_TYPELESS);
          native_device->CreateShaderResourceView(depth.get(), &srv_desc, &gd.scene_depth_srv);
       }
+      gd.depth_test_state = nullptr;
       if (!SceneMotionVectors::BeginFrame(&gd.mv, native_device, native_device_context, dsv, depth_size, {}))
          return;
       // SMAA T2x: the sample offsets (0.25, 0.25) then (-0.25, -0.25) in y down pixels, for "SMAA.hlsl"'s T2x subsample indices 1 and 2
@@ -554,25 +475,25 @@ class MetalGearRisingRevengeance final : public Game
       // The masks at the scene's size; what the alpha blended draws write starts from zero every frame
       if (reactive && GetViewTextureSize(gd.mv.reactive_target_srv.get()) != depth_size)
       {
-         gd.ReleaseReactiveMasks();
+         gd.mv.ReleaseReactiveMasks();
          const CD3D11_TEXTURE2D_DESC target_desc(DXGI_FORMAT_R8G8_UNORM, depth_size.x, depth_size.y, 1, 1, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
          const CD3D11_TEXTURE2D_DESC mask_desc(DXGI_FORMAT_R8_UNORM, depth_size.x, depth_size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
          const CD3D11_TEXTURE2D_DESC previous_desc(DXGI_FORMAT_R32_FLOAT, depth_size.x, depth_size.y, 1, 1, D3D11_BIND_UNORDERED_ACCESS);
          if (FAILED(native_device->CreateTexture2D(&target_desc, nullptr, &gd.mv.reactive_target)) || FAILED(native_device->CreateRenderTargetView(gd.mv.reactive_target.get(), nullptr, &gd.mv.reactive_target_rtv)) ||
-             FAILED(native_device->CreateShaderResourceView(gd.mv.reactive_target.get(), nullptr, &gd.mv.reactive_target_srv)) || FAILED(SRBridge::CreateSharableTexture(native_device, mask_desc, &gd.reactive)) ||
-             FAILED(native_device->CreateUnorderedAccessView(gd.reactive.get(), nullptr, &gd.reactive_uav)) || FAILED(SRBridge::CreateSharableTexture(native_device, mask_desc, &gd.transparency)) ||
-             FAILED(native_device->CreateUnorderedAccessView(gd.transparency.get(), nullptr, &gd.transparency_uav)) || FAILED(native_device->CreateTexture2D(&previous_desc, nullptr, &gd.reactive_previous)) ||
-             FAILED(native_device->CreateUnorderedAccessView(gd.reactive_previous.get(), nullptr, &gd.reactive_previous_uav)))
+             FAILED(native_device->CreateShaderResourceView(gd.mv.reactive_target.get(), nullptr, &gd.mv.reactive_target_srv)) || FAILED(SRBridge::CreateSharableTexture(native_device, mask_desc, &gd.mv.reactive)) ||
+             FAILED(native_device->CreateUnorderedAccessView(gd.mv.reactive.get(), nullptr, &gd.mv.reactive_uav)) || FAILED(SRBridge::CreateSharableTexture(native_device, mask_desc, &gd.mv.transparency)) ||
+             FAILED(native_device->CreateUnorderedAccessView(gd.mv.transparency.get(), nullptr, &gd.mv.transparency_uav)) || FAILED(native_device->CreateTexture2D(&previous_desc, nullptr, &gd.mv.reactive_previous)) ||
+             FAILED(native_device->CreateUnorderedAccessView(gd.mv.reactive_previous.get(), nullptr, &gd.mv.reactive_previous_uav)))
          {
-            gd.ReleaseReactiveMasks();
+            gd.mv.ReleaseReactiveMasks();
          }
          else
          {
             constexpr float zero[4] = {};
-            native_device_context->ClearUnorderedAccessViewFloat(gd.reactive_previous_uav.get(), zero);
+            native_device_context->ClearUnorderedAccessViewFloat(gd.mv.reactive_previous_uav.get(), zero);
          }
       }
-      gd.reactive_ready = reactive && gd.reactive_previous_uav;
+      gd.reactive_ready = reactive && gd.mv.reactive_previous_uav;
       if (gd.reactive_ready)
       {
          constexpr FLOAT zero[4] = {};
@@ -592,35 +513,19 @@ class MetalGearRisingRevengeance final : public Game
    static bool DrawWithReactiveMask(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, uint64_t pixel_shader_hash, reshade::api::pipeline pipeline, const std::function<void()>& draw)
    {
       auto& gd = GetGameDeviceData(device_data);
-      com_ptr<ID3D11BlendState> blend_state;
-      native_device_context->OMGetBlendState(&blend_state, nullptr, nullptr);
-      if (blend_state.get() != gd.blend_state)
-      {
-         D3D11_BLEND_DESC desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
-         if (blend_state)
-         {
-            blend_state->GetDesc(&desc);
-         }
-         // SRC_ALPHA / ONE (sparks, glows): reactive; SRC_ALPHA / INV_SRC_ALPHA (smoke, glass): reactive and transparency & composition
-         const D3D11_RENDER_TARGET_BLEND_DESC& rt0 = desc.RenderTarget[0];
-         gd.blend_patch = std::nullopt;
-         if (rt0.BlendEnable && rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA)
-         {
-            gd.blend_patch = (rt0.DestBlend == D3D11_BLEND_ONE ? PixelShaderPatch::MASK_ADDITIVE : PixelShaderPatch::MASK_ALPHA);
-         }
-         gd.blend_state = blend_state.get();
-      }
+      SceneMotionVectors::ClassifyBoundBlend(native_device_context, &gd.mv);
       // A blended draw that writes depth is solid geometry (the masks are for content without motion vectors): masking it only makes
-      // its edges flicker
-      if (!gd.blend_patch || !IsSceneDepthTested(native_device_context, &gd) || gd.depth_write)
+      // its edges flicker. The caller tested the scene's depth.
+      if (gd.mv.reactive_blend == SceneMotionVectors::ReactiveBlend::NONE || gd.depth_write)
          return false;
       com_ptr<ID3D11RenderTargetView> rtvs[REACTIVE_SLOT];
       com_ptr<ID3D11DepthStencilView> dsv;
       native_device_context->OMGetRenderTargets(REACTIVE_SLOT, &rtvs[0], &dsv);
-      // Into the scene: a full size target (not a smaller particle buffer)
-      if (!rtvs[0] || GetViewTextureSize(rtvs[0].get()) != GetViewTextureSize(gd.mv.reactive_target_srv.get()))
+      // Into the scene: a full size target (not a smaller particle buffer); the mask target is the scene's size
+      if (!rtvs[0] || GetViewTextureSize(rtvs[0].get()) != gd.mv.scene_size)
          return false;
-      ID3D11PixelShader* const mask_shader = GetPatchedPixelShader(native_device, device_data, pixel_shader_hash, pipeline, *gd.blend_patch);
+      const PixelShaderPatch patch = (gd.mv.reactive_blend == SceneMotionVectors::ReactiveBlend::ADDITIVE ? PixelShaderPatch::MASK_ADDITIVE : PixelShaderPatch::MASK_ALPHA);
+      ID3D11PixelShader* const mask_shader = SceneMotionVectors::GetPatchedShader<MotionVectorGame, ID3D11PixelShader>(&gd.mv, native_device, device_data, uint32_t(pixel_shader_hash), pipeline, patch).shader.get();
       if (!mask_shader)
          return false;
 
@@ -678,8 +583,8 @@ class MetalGearRisingRevengeance final : public Game
       native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
       ID3D11Buffer* const buffer = gd.mv.fill_buffer.get();
       ID3D11ShaderResourceView* const srvs[2] = {gd.scene_depth_srv.get(), (write_reactive ? gd.mv.reactive_target_srv.get() : nullptr)};
-      ID3D11UnorderedAccessView* const uavs[5] = {gd.mv.uav.get(), gd.mv.device_depth_uav.get(), (write_reactive ? gd.reactive_uav.get() : nullptr), (write_reactive ? gd.transparency_uav.get() : nullptr),
-         (write_reactive ? gd.reactive_previous_uav.get() : nullptr)};
+      ID3D11UnorderedAccessView* const uavs[5] = {gd.mv.uav.get(), gd.mv.device_depth_uav.get(), (write_reactive ? gd.mv.reactive_uav.get() : nullptr), (write_reactive ? gd.mv.transparency_uav.get() : nullptr),
+         (write_reactive ? gd.mv.reactive_previous_uav.get() : nullptr)};
       native_device_context->CSSetConstantBuffers(0, 1, &buffer);
       native_device_context->CSSetShaderResources(0, UINT(std::size(srvs)), srvs);
       native_device_context->CSSetUnorderedAccessViews(0, UINT(std::size(uavs)), uavs, nullptr);
@@ -757,7 +662,7 @@ class MetalGearRisingRevengeance final : public Game
                .output_height = scene_desc.Height,
                .render_width = scene_desc.Width,
                .render_height = scene_desc.Height,
-               // The scene before the gather pass is 8-bit, gamma encoded (1 = SDR white)
+               // The scene before the gather pass: the fp16 mirror of the game's A8R8G8B8 target, gamma encoded (1 = SDR white)
                .hdr = false,
                // The motion vectors are UV deltas, previous minus current
                .mvs_x_scale = float(scene_desc.Width),
@@ -784,8 +689,8 @@ class MetalGearRisingRevengeance final : public Game
                .source_color = scene_texture.get(),
                .motion_vectors = gd.mv.texture.get(),
                .depth_buffer = gd.mv.device_depth.get(),
-               .bias_mask = (reactive_mask ? gd.reactive.get() : nullptr),
-               .transparency_alpha = (reactive_mask ? gd.transparency.get() : nullptr),
+               .bias_mask = (reactive_mask ? gd.mv.reactive.get() : nullptr),
+               .transparency_alpha = (reactive_mask ? gd.mv.transparency.get() : nullptr),
                // As applied (pixels, +y down)
                .jitter_x = gd.jitter[0],
                .jitter_y = gd.jitter[1],
@@ -839,12 +744,12 @@ class MetalGearRisingRevengeance final : public Game
       static constexpr auto cameras = MotionVectorPatches::cameras;
       static constexpr auto tie_break_rows = MotionVectorPatches::tie_break_rows;
       static constexpr auto frame_camera = MotionVectorPatches::frame_camera;
-      static constexpr const char* patch_names[size_t(SceneMotionVectors::PixelShaderPatch::COUNT)] = {"MV PS", "MV PS (mask)", "MV PS (mask)", "MV PS (blended)", "MV PS (blended, mask)", "", "", ""};
+      static constexpr const char* patch_names[size_t(PixelShaderPatch::COUNT)] = {"MV PS", "Mask", "Mask (additive)", "MV PS (blended)", "MV PS (blended, mask)", "Coverage", "", ""};
       static constexpr bool second_scene_color = true;
-      static constexpr SceneMotionVectors::PixelShaderPatch blended_mask_patch = SceneMotionVectors::PixelShaderPatch::GAME_0;
+      static constexpr PixelShaderPatch blended_mask_patch = PixelShaderPatch::GAME_0;
 
       // The carrier of the opaque meshes' motion vectors: the depth prepass' R32F target (it is no shader resource of the upscaler, the
-      // gather pass' input is), and the second one, the gather pass' 8-bit scene the alpha blended draws go to (picked by the caller,
+      // gather pass' input is), and the second one, the gather pass' scene (its fp16 mirror) the alpha blended draws go to (picked by the caller,
       // see "scene_color_hint"). The G-buffer's draws are refused (several targets). Single sample both.
       static bool AcceptSceneColor(const D3D11_RENDER_TARGET_VIEW_DESC& rtv_desc, const D3D11_TEXTURE2D_DESC& color_desc)
       {
@@ -885,12 +790,19 @@ class MetalGearRisingRevengeance final : public Game
       {
          switch (patch)
          {
-         case SceneMotionVectors::PixelShaderPatch::MOTION_VECTORS:
+         case PixelShaderPatch::MOTION_VECTORS:
             return MotionVectorPatch::PatchPixelShader(code, code_size, MotionVectorPatches::layout, error, /* targets_only */ true);
-         case SceneMotionVectors::PixelShaderPatch::BLENDED:
+         case PixelShaderPatch::MASK_ALPHA:
+         case PixelShaderPatch::MASK_ADDITIVE:
+            return MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, REACTIVE_SLOT,
+               (patch == PixelShaderPatch::MASK_ADDITIVE ? MotionVectorPatch::ReactiveMode::ADDITIVE : MotionVectorPatch::ReactiveMode::ALPHA), error);
+         case PixelShaderPatch::BLENDED:
             return MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, UINT32_MAX, MotionVectorPatch::ReactiveMode::ALPHA_MOTION_VECTORS, error);
          case blended_mask_patch:
-            return MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, MotionVectorPatches::reactive_slot, MotionVectorPatch::ReactiveMode::ALPHA_MOTION_VECTORS, error);
+            return MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, REACTIVE_SLOT, MotionVectorPatch::ReactiveMode::ALPHA_MOTION_VECTORS, error);
+         case COVERAGE_PATCH:
+            // The alpha tested materials clip at 0.5 and 0.8; the clips at 0.01 and 0.0001 skip blended draws' invisible texels
+            return CoveragePatch::PatchPixelShader(code, code_size, error, 0.1f);
          }
          return {};
       }
@@ -963,6 +875,10 @@ public:
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;
       default_luma_global_game_settings.Dithering = 1.f;
       // The gather pass' grading, neutral
+      default_luma_global_game_settings.Exposure = 1.f;
+      default_luma_global_game_settings.Contrast = 1.f;
+      default_luma_global_game_settings.Saturation = 1.f;
+      default_luma_global_game_settings.HighlightsDesaturation = 0.f;
       default_luma_global_game_settings.ColorGradingIntensity = 1.f;
       default_luma_global_game_settings.BloomIntensity = 1.f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
@@ -987,7 +903,6 @@ public:
 #if DEVELOPMENT
       Mcp::RegisterToggles({
          {"hide_ui", &g_hide_ui},
-         {"fxaa_enable", &g_fxaa_enable},
          {"msaa_resolve_enable", &g_msaa_resolve_enable},
          {"msaa_coverage_enable", &g_msaa_coverage_enable},
          {"smaa_enable", &g_smaa_enable},
@@ -1000,7 +915,7 @@ public:
          {"sr_reactive_debug_view", &g_sr_reactive_debug_view},
       });
       Mcp::RegisterValues({{"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"sr_reactive_scale", &g_sr_reactive_scale, 0.f, 4.f}, {"sr_reactive_threshold", &g_sr_reactive_threshold, 0.f, 1.f}});
-      Mcp::RegisterTextures({MCP_GAME_TEXTURE("mv.velocity", mv.texture), MCP_GAME_TEXTURE("mv.depth", mv.device_depth), MCP_GAME_TEXTURE("sr.reactive", reactive), MCP_GAME_TEXTURE("sr.transparency", transparency), MCP_GAME_TEXTURE("sr.draws_mask", mv.reactive_target)});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("mv.velocity", mv.texture), MCP_GAME_TEXTURE("mv.depth", mv.device_depth), MCP_GAME_TEXTURE("sr.reactive", mv.reactive), MCP_GAME_TEXTURE("sr.transparency", mv.transparency), MCP_GAME_TEXTURE("sr.draws_mask", mv.reactive_target)});
 #endif
       SetEvents(true);
    }
@@ -1191,14 +1106,14 @@ public:
             ID3D11ShaderResourceView* const game_scene = scene.get();
             native_device_context->PSSetShaderResources(0, 1, &game_scene);
          }
-         SnapshotScene(native_device, native_device_context, game_device_data);
+         SnapshotScene(native_device, native_device_context, &game_device_data);
          if (g_smaa_enable && !device_data.has_drawn_sr && game_device_data.has_scene_snapshot)
          {
             ComPtr<ID3D11RenderTargetView> target_rtv;
             native_device_context->OMGetRenderTargets(1, target_rtv.put(), nullptr);
             DrawSMAAOnScene(native_device, native_device_context, device_data, target_rtv.get());
             // Again, so the UI clamp's floor is the antialiased scene (Bayonetta's order)
-            SnapshotScene(native_device, native_device_context, game_device_data);
+            SnapshotScene(native_device, native_device_context, &game_device_data);
          }
          // RCAS after SMAA or the upscaler, the same way
          if (g_rcas_sharpness > 0.f && game_device_data.has_scene_snapshot)
@@ -1209,7 +1124,7 @@ public:
                ComPtr<ID3D11RenderTargetView> target_rtv;
                native_device_context->OMGetRenderTargets(1, target_rtv.put(), nullptr);
                DrawRCAS(native_device_context, device_data, game_device_data.scene_srv.get(), target_rtv.get(), g_rcas_sharpness);
-               SnapshotScene(native_device, native_device_context, game_device_data);
+               SnapshotScene(native_device, native_device_context, &game_device_data);
             }
          }
          return DrawOrDispatchOverrideType::Replaced;
@@ -1257,7 +1172,7 @@ public:
          }
          if (rt_desc.SampleDesc.Count >= 4)
          {
-            if (ID3D11PixelShader* const coverage_shader = GetPatchedPixelShader(native_device, device_data, original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader, PixelShaderPatch::COVERAGE))
+            if (ID3D11PixelShader* const coverage_shader = SceneMotionVectors::GetPatchedShader<MotionVectorGame, ID3D11PixelShader>(&game_device_data.mv, native_device, device_data, uint32_t(original_shader_hashes.pixel_shaders[0]), cmd_list_data.pipeline_state_original_pixel_shader, COVERAGE_PATCH).shader.get())
             {
                com_ptr<ID3D11PixelShader> game_shader;
                native_device_context->PSGetShader(&game_shader, nullptr, nullptr);
@@ -1268,35 +1183,7 @@ public:
             }
          }
       }
-      if (g_fxaa_enable || !is_immediate || !original_shader_hashes.Contains(shader_hashes_FXAA))
-         return DrawOrDispatchOverrideType::None;
-
-      // FXAA writes a new target from the scene, so skipping it would leave that target unwritten: copy the source instead
-      ComPtr<ID3D11ShaderResourceView> source_srv;
-      native_device_context->PSGetShaderResources(0, 1, source_srv.put());
-      ComPtr<ID3D11RenderTargetView> target_rtv;
-      native_device_context->OMGetRenderTargets(1, target_rtv.put(), nullptr);
-      if (!source_srv || !target_rtv)
-         return DrawOrDispatchOverrideType::None;
-      uint4 source_size;
-      uint4 target_size;
-      DXGI_FORMAT format;
-      GetResourceInfo(source_srv.get(), source_size, format);
-      GetResourceInfo(target_rtv.get(), target_size, format);
-      // "Copy PS" loads texel to texel
-      if (source_size.x != target_size.x || source_size.y != target_size.y)
-         return DrawOrDispatchOverrideType::None;
-
-      const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-      auto* const vs = FindShader(device_data.native_vertex_shaders, "Copy VS"_h);
-      auto* const ps = FindShader(device_data.native_pixel_shaders, "Copy PS"_h);
-      if (!vs || !ps)
-         return DrawOrDispatchOverrideType::None;
-      DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
-      draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
-      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, vs, ps, source_srv.get(), target_rtv.get(), target_size.x, target_size.y);
-      draw_state_stack.Restore(native_device_context);
-      return DrawOrDispatchOverrideType::Replaced;
+      return DrawOrDispatchOverrideType::None;
    }
 
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
@@ -1334,9 +1221,7 @@ public:
       game_device_data.mv.fill_pending = false;
       game_device_data.open_refused_dsv = nullptr;
       game_device_data.viewport_jittered = false;
-      game_device_data.depth_test_state = nullptr;
       game_device_data.reactive_ready = false;
-      game_device_data.blend_state = nullptr;
 #if DEVELOPMENT
       game_device_data.last_reactive_draws = std::exchange(game_device_data.reactive_draws, 0);
 #endif
@@ -1388,12 +1273,12 @@ public:
       if (!IsReactiveMaskUsed(device_data) && game_device_data.mv.reactive_target)
       {
 #if DEVELOPMENT
-         if (device_data.debug_draw_texture && device_data.debug_draw_texture.get() == game_device_data.reactive.get())
+         if (device_data.debug_draw_texture && device_data.debug_draw_texture.get() == game_device_data.mv.reactive.get())
          {
             device_data.debug_draw_texture = nullptr;
          }
 #endif
-         game_device_data.ReleaseReactiveMasks();
+         game_device_data.mv.ReleaseReactiveMasks();
       }
 #if DEVELOPMENT
       // "MV Debug View": Core's debug draw of the target, absolute values in pixels. No lock: the motion vector draw creates the target
@@ -1408,18 +1293,18 @@ public:
          device_data.debug_draw_texture_format = desc.Format;
          device_data.debug_draw_texture_size = {desc.Width, desc.Height, 1, 1};
       }
-      else if (g_sr_reactive_debug_view && game_device_data.reactive)
+      else if (g_sr_reactive_debug_view && game_device_data.mv.reactive)
       {
          D3D11_TEXTURE2D_DESC desc;
-         game_device_data.reactive->GetDesc(&desc);
+         game_device_data.mv.reactive->GetDesc(&desc);
          debug_draw_auto_clear_texture = false;
          debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::RedOnly;
          debug_draw_options &= ~((uint32_t)DebugDrawTextureOptionsMask::Abs | (uint32_t)DebugDrawTextureOptionsMask::UVToPixelSpace);
-         device_data.debug_draw_texture = game_device_data.reactive.get();
+         device_data.debug_draw_texture = game_device_data.mv.reactive.get();
          device_data.debug_draw_texture_format = desc.Format;
          device_data.debug_draw_texture_size = {desc.Width, desc.Height, 1, 1};
       }
-      else if (device_data.debug_draw_texture && (device_data.debug_draw_texture.get() == game_device_data.mv.texture.get() || device_data.debug_draw_texture.get() == game_device_data.reactive.get()))
+      else if (device_data.debug_draw_texture && (device_data.debug_draw_texture.get() == game_device_data.mv.texture.get() || device_data.debug_draw_texture.get() == game_device_data.mv.reactive.get()))
       {
          device_data.debug_draw_texture = nullptr;
       }
@@ -1451,6 +1336,10 @@ public:
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", cb_luma_global_settings.GameSettings.VideoAutoHDRBoost);
       reshade::get_config_value(nullptr, NAME, "Dithering", cb_luma_global_settings.GameSettings.Dithering);
+      reshade::get_config_value(nullptr, NAME, "Exposure", cb_luma_global_settings.GameSettings.Exposure);
+      reshade::get_config_value(nullptr, NAME, "Contrast", cb_luma_global_settings.GameSettings.Contrast);
+      reshade::get_config_value(nullptr, NAME, "Saturation", cb_luma_global_settings.GameSettings.Saturation);
+      reshade::get_config_value(nullptr, NAME, "HighlightsDesaturation", cb_luma_global_settings.GameSettings.HighlightsDesaturation);
       reshade::get_config_value(nullptr, NAME, "ColorGradingIntensity", cb_luma_global_settings.GameSettings.ColorGradingIntensity);
       reshade::get_config_value(nullptr, NAME, "BloomIntensity", cb_luma_global_settings.GameSettings.BloomIntensity);
    }
@@ -1463,19 +1352,19 @@ public:
       ImGui::SeparatorText("Anti-Aliasing");
       if (device_data.sr_type != SR::Type::None && msaa_active)
       {
-         ImGui::TextColored(ImVec4(1.f, 0.8f, 0.f, 1.f), "MSAA is on: DLAA, FSR and XeSS need Anti-Aliasing off in the game's options.");
+         ImGui::TextColored(ImVec4(1.f, 0.8f, 0.f, 1.f), "MSAA is on: DLAA, FSR, XeSS and Luma TAA need Anti-Aliasing off in the game's options.");
       }
       // Both act only with the game's MSAA on
       ImGui::BeginDisabled(!msaa_active);
-      DrawSettingCheckbox("Luma MSAA Enable", "MSAAResolveEnable", &g_msaa_resolve_enable, true, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, sky, grass, foliage and fences; requires Anti-Aliasing enabled in the game's display settings).", !msaa_active);
+      DrawSettingCheckbox("Luma MSAA Enable", "MSAAResolveEnable", &g_msaa_resolve_enable, true, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, sky, grass, foliage and fences; requires Anti-Aliasing enabled in the game's options; not used with DLSS/FSR/XeSS or Luma TAA).", !msaa_active);
       ImGui::EndDisabled();
       // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: greyed, its value kept
       ImGui::BeginDisabled(gd.sr_active);
-      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own MSAA (or alone with it off; not used with DLAA/FSR/XeSS).", gd.sr_active);
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own MSAA (or alone with it off; not used with DLSS/FSR/XeSS or Luma TAA).", gd.sr_active);
       ImGui::EndDisabled();
       const bool t2x_unavailable = gd.sr_active || msaa_active;
       ImGui::BeginDisabled(!g_smaa_enable || t2x_unavailable);
-      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLAA/FSR/XeSS or the game's MSAA (Anti-Aliasing in the game's options).", t2x_unavailable);
+      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS/FSR/XeSS, Luma TAA or the game's MSAA (Anti-Aliasing in the game's options).", t2x_unavailable);
       ImGui::EndDisabled();
 #if DEVELOPMENT
       // Predication only relaxes the edge threshold back to ULTRA's on geometry, never below: off is strictly worse (MoH 2010, ME1)
@@ -1496,7 +1385,13 @@ public:
 
       // Read in Gather_0x726E6E78.ps_5_0.hlsl
       ImGui::SeparatorText("Grade");
+      DrawSettingSlider("Exposure", "Exposure", &gs.Exposure, default_luma_global_game_settings.Exposure, 0.f, 2.f, "Overall image brightness (1 = vanilla).");
+      DrawSettingSlider("Contrast", "Contrast", &gs.Contrast, default_luma_global_game_settings.Contrast, 0.f, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
+      DrawSettingSlider("Saturation", "Saturation", &gs.Saturation, default_luma_global_game_settings.Saturation, 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).");
+      DrawSettingSlider("Highlights Desaturation", "HighlightsDesaturation", &gs.HighlightsDesaturation, default_luma_global_game_settings.HighlightsDesaturation, 0.f, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
       DrawSettingSlider("Color Grading Intensity", "ColorGradingIntensity", &gs.ColorGradingIntensity, default_luma_global_game_settings.ColorGradingIntensity, 0.f, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
+
+      ImGui::SeparatorText("Bloom");
       DrawSettingSlider("Bloom Intensity", "BloomIntensity", &gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, 0.f, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
 
       ImGui::SeparatorText("Effects");
@@ -1520,21 +1415,26 @@ public:
 #if DEVELOPMENT
    void DrawImGuiDevSettings(DeviceData& device_data) override
    {
-      ImGui::Checkbox("Game FXAA (filter09)", &g_fxaa_enable);
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-         ImGui::SetTooltip("Off: the FXAA draw copies its source instead.");
       ImGui::Checkbox("MV Object Motion", &g_mv_enable);
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Off: the motion vector draws keep their own constants with last frame's camera (camera motion only), for A/B.");
+      }
       ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Shows the motion vectors' absolute value in pixels instead of the frame.");
+      }
       ImGui::Checkbox("Reactive Mask", &g_sr_reactive_enable);
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("FSR's and Luma TAA's reactive and transparency masks from the alpha blended draws.");
+      }
       ImGui::Checkbox("Reactive Mask Debug View", &g_sr_reactive_debug_view);
       if (ImGui::IsItemHovered())
+      {
          ImGui::SetTooltip("Shows the reactive mask (red) instead of the frame.");
+      }
    }
 #endif
 
@@ -1543,7 +1443,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Metal Gear Rising: Revengeance\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR, SMAA and an HDR-aware MSAA with alpha to coverage.\n"
+         "It adds HDR, DLAA, FSR 3 or XeSS native anti-aliasing or Luma TAA, SMAA (with T2x) and an HDR-aware MSAA with alpha to coverage.\n"
          "It runs through dgVoodoo2 (DirectX 9 -> 11).\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
@@ -1586,8 +1486,11 @@ public:
                   "\nReShade"
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
+                  "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
-                  "\nAMD FidelityFX (RCAS)"
+                  "\nAMD FidelityFX (RCAS + FSR 3)"
+                  "\nNVIDIA NGX (DLSS)"
+                  "\nIntel XeSS"
                   "\ndgVoodoo2 by Dege (DirectX 9 -> 11 wrapper, required)");
    }
 };

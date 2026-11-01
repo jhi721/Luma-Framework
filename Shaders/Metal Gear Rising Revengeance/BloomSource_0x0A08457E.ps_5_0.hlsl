@@ -27,7 +27,7 @@ void main(DGV_MAIN_SIGNATURE)
    const float4 second = saturate(ApplyDgvMask(t0.Sample(s0_s, v5.xy + offset), cb3[44], cb3[45]));
    const float4 brightest = max(float4(second.rgb * second.a, second.a), float4(first.rgb * first.a, first.a));
    const float4 color = lerp(second, brightest, brightest.a);
-   const float level = (max3(color.rgb) + dot(color.rgb, float3(0.298912, 0.586611, 0.114478))) * 0.5;
+   const float level = (max3(color.rgb) + dot(color.rgb, kLumaWeights)) * 0.5;
    const float2 threshold = lerp(cb4[192].xy, cb4[192].zw, color.a);
    o0.rgb = saturate((level - threshold.x) * threshold.y) * (color.rgb + color.rgb);
    o0.a = color.a;

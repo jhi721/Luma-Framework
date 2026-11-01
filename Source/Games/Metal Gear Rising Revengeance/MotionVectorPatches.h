@@ -7,10 +7,7 @@
 // "MotionVectorPatch::DgVoodoo"). The second vertex shader run reads the previous frame's per-draw constants (vc4) from another slot.
 namespace MotionVectorPatches
 {
-   using MotionVectorPatch::DgVoodoo::jitter_slot;
    using MotionVectorPatch::DgVoodoo::object_row_offset;
-   using MotionVectorPatch::DgVoodoo::object_slot;
-   using MotionVectorPatch::DgVoodoo::previous_slots;
    using MotionVectorPatch::DgVoodoo::target_slot;
    // The reactive masks, written by the scene's alpha blended draws (their pixel shaders patched with "PatchPixelShaderReactive")
    constexpr uint32_t reactive_slot = target_slot + 1;
