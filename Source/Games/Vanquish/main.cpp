@@ -795,7 +795,7 @@ namespace FrameConstants
       Scaling scaling;
       double k = 0.0; // DECAY_INPUT's and EMA_INPUT's decay
    };
-   constexpr std::array<Site, 81> SITES = {{
+   constexpr auto SITES = std::to_array<Site>({
       // Frame counters of 1.0 (0xD78CF8). Object 0x3000c's lifetime +0x2B38 (FUN_00578980, 240 frames, then it is freed)
       {0x5791EC, Scaling::PER_FRAME},
       // The player's auto-turn timer +0xE9F4 (FUN_004de2f0, 10 frames of 3 degrees; its turns are in "SnapApproaches")
@@ -900,7 +900,7 @@ namespace FrameConstants
       {0x520E99, Scaling::DECAY},
       // Effect keyframe age +0x474 "+= 1" (FUN_00488fe0; keys fire on prev < key <= age, so fractional ages are safe)
       {0x48933E, Scaling::PER_FRAME},
-   }};
+   });
    constexpr std::array<uint8_t, 4> OPCODES = {0x10, 0x58, 0x59, 0x5C}; // movsd, addsd, mulsd, subsd
    constexpr size_t OPCODE_OFFSET = 2;
    constexpr size_t MODRM_OFFSET = 3;
