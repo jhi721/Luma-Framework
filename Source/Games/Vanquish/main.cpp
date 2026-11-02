@@ -2895,8 +2895,7 @@ public:
                                    BlockCalls::installed;
       ImGui::BeginDisabled(!fixes_installed);
       DrawSettingCheckbox("Fix Frame Rate Bugs", "FixFrameRateBugs", &g_fix_frame_rate_bugs, true,
-         "Gameplay runs as it does at 30 fps at any frame rate: homing missiles, lasers and enemies turn and aim as fast, beams and other continuous attacks do "
-         "as much damage and stun as long, the player's post-hit windows and some enemy timers last as long, and below 30 fps the game no longer runs too fast.",
+         "Gameplay runs as it does at 30 fps at any frame rate: homing, aiming, beam damage, stuns and timers.",
          !fixes_installed);
       ImGui::EndDisabled();
    }
