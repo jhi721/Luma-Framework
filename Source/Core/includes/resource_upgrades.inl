@@ -455,6 +455,7 @@ bool ResourceUpgradeManager::FindOrCreateIndirectUpgradedResource(
          {
             original_resources_to_mirrored_upgraded_resources[in_resource] = IndirectUpgradedResource{ mirrored_upgraded_resource.handle, needs_scale, original_width, original_height, target_desc.texture.width, target_desc.texture.height };
             any_mirror.store(true, std::memory_order_release);
+            views_without_mirror.clear();
             out_resource = mirrored_upgraded_resource.handle;
 
             // TODO: optionally copy the content of "in_resource"?
@@ -497,6 +498,9 @@ bool ResourceUpgradeManager::FindOrCreateIndirectUpgradedResourceView(
    std::shared_lock<std::shared_mutex>& lock_device_read)
 {
    bool replaced = false;
+
+   if (views_without_mirror.contains(in_rv))
+      return false;
 
    // See if we already have a indirect resource view mapped to this resource view
    auto original_resource_view_to_mirrored_upgraded_resource_view = in_rv ? original_resource_views_to_mirrored_upgraded_resource_views.find(in_rv) : original_resource_views_to_mirrored_upgraded_resource_views.end();
@@ -567,6 +571,19 @@ bool ResourceUpgradeManager::FindOrCreateIndirectUpgradedResourceView(
             ASSERT_ONCE_MSG(false, "Failed to create an indirect upgraded texture view (maybe some format mismatch)");
          }
 
+         lock_device_read.lock();
+      }
+      else
+      {
+         lock_device_read.unlock();
+         {
+            const std::unique_lock lock_device_write(*lock_device_read.mutex());
+            // A mirror linked while unlocked clears the set: cache the miss only if there's still none
+            if (!original_resources_to_mirrored_upgraded_resources.contains(resource.handle))
+            {
+               views_without_mirror.insert(in_rv);
+            }
+         }
          lock_device_read.lock();
       }
    }
@@ -723,6 +740,7 @@ void ResourceUpgradeManager::OnResourceViewDestroyed(uint64_t view_handle)
    original_upgraded_resource_views_formats.erase(view_handle);
 #endif
    original_views_to_original_resources.erase(view_handle);
+   views_without_mirror.erase(view_handle);
 
    auto original_resource_view_to_mirrored_upgraded_resource_view = original_resource_views_to_mirrored_upgraded_resource_views.find(view_handle);
    if (original_resource_view_to_mirrored_upgraded_resource_view != original_resource_views_to_mirrored_upgraded_resource_views.end())

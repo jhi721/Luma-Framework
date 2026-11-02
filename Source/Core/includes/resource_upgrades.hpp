@@ -230,6 +230,9 @@ public:
 #endif
    std::unordered_map<uint64_t, IndirectUpgradedResource> original_resources_to_mirrored_upgraded_resources; // TODO: convert/copy the initial/current data from the source texture when created. Also rename to "indirect_upgraded"
    std::unordered_map<uint64_t, uint64_t> original_resource_views_to_mirrored_upgraded_resource_views;
+   // Views found to have no mirror (most textures a game binds): their binds skip the view -> resource -> mirror lookups. Cleared
+   // whenever a mirror is linked, as views created before it would then need one
+   std::unordered_set<uint64_t> views_without_mirror;
    // Set with the first mirror (never cleared), read lock free: until then no view can be replaced by a mirror view, so the view bind
    // hooks skip the device lock
    std::atomic<bool> any_mirror = false;

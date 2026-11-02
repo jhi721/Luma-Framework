@@ -14216,6 +14216,7 @@ namespace
                ASSERT(!device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.contains(resource.handle)); // The game re-used the ptr (can rarely happen), and we haven't cleared our mirrored verson yet
                device_data.resource_upgrades.original_resources_to_mirrored_upgraded_resources.emplace(resource.handle, ResourceUpgradeManager::IndirectUpgradedResource{mirrored_upgraded_resource.handle, texture_scaled, desc.texture.width, desc.texture.height, upgraded_desc.texture.width, upgraded_desc.texture.height});
                device_data.resource_upgrades.any_mirror.store(true, std::memory_order_release);
+               device_data.resource_upgrades.views_without_mirror.clear();
             }
             if (new_initial_data_ptr)
                delete[] static_cast<uint8_t*>(new_initial_data_ptr->data);
