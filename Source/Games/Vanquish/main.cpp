@@ -75,6 +75,7 @@ static float g_rcas_sharpness = 0.f;      // RCAS on the antialiased scene, 0 = 
 static bool g_luma_bloom_enable = true;   // The game's bloom chain drawn at a higher resolution (see "DrawBloomPass")
 static bool g_fix_frame_rate_bugs = true; // See "HomingSteering" and the namespaces after it
 static bool g_hide_ui = false;            // Session-only, never persisted: a stuck "on" would look like a broken HUD
+static bool g_fixes_installed = false;    // Any of the fixes went in (only the Steam executable is patched)
 #if DEVELOPMENT
 static int g_bloom_scale_override = 0;      // Luma Bloom's scale, 0 = from the resolution
 static bool g_smaa_predication = true;      // Off: plain SMAA ULTRA (the fallback without the prepass, e.g. in the menus)
@@ -105,6 +106,24 @@ static bool IsSteamExecutable()
    return reinterpret_cast<const IMAGE_NT_HEADERS*>(image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew)->FileHeader.TimeDateStamp == STEAM_TIME_DATE_STAMP;
 }
 
+// DAT_00f0318c: the frame time in 1/30 s
+const float* const FRAME_TIME = reinterpret_cast<const float*>(0xF0318C);
+// An object's time scale; its frame step is time scale * frame time
+constexpr size_t TIME_SCALE = 0x440;
+
+// A console per frame rate applied over the frame time (per 1/30 s)
+static float PerConsoleFrame(float rate, float frame_time)
+{
+   return 1.f - std::pow(1.f - rate, frame_time);
+}
+
+// The hook goes on only if the function starts as expected
+template <typename Function, size_t N>
+static bool AttachVerified(MinHook::HookedFunction<Function>* hooked, uint8_t* target, const std::array<uint8_t, N>& prologue, std::type_identity_t<Function> detour)
+{
+   return std::memcmp(target, prologue.data(), N) == 0 && MinHook::Attach(hooked, target, detour);
+}
+
 // Homing projectiles turned slower the higher the frame rate (half as fast at 60 fps as at 30).
 // FUN_004a3030 (this = projectile, target, direction, rate, max step, scale) turns the projectile by
 // min(angle * rate, max step) (FUN_00b9dec0); with "scale" set it multiplies both by the projectile's frame step (its time scale
@@ -118,7 +137,6 @@ namespace HomingSteering
    uint8_t* const STEER = reinterpret_cast<uint8_t*>(0x4A3030);
    // "push ebp; mov ebp, esp; and esp, 0FFFFFFF0h; sub esp, 98h"
    constexpr std::array<uint8_t, 12> PROLOGUE = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x81, 0xEC, 0x98, 0x00, 0x00, 0x00};
-   const float* const FRAME_TIME = reinterpret_cast<const float*>(0xF0318C);
    // FUN_004a1a90: the projectile's frame step, the value "scale" multiplies by
    using FrameStep = float(__thiscall*)(void* projectile);
    const FrameStep FRAME_STEP = reinterpret_cast<FrameStep>(0x4A1A90);
@@ -136,8 +154,7 @@ namespace HomingSteering
    constexpr float DEFLECTION_RATE = 0.3f;   // 0xD7B3FC
    constexpr float SLOW_MOTION_SCALE = 0.5f; // 0xD7A5F8
 
-   static Steer original = nullptr;
-   static bool installed = false;
+   static MinHook::HookedFunction<Steer> hooked;
 
    static void __fastcall Detour(void* projectile, void* edx, const float* target, const float* direction, float rate, float max_step, int scale)
    {
@@ -145,7 +162,7 @@ namespace HomingSteering
       const float frame_time = *FRAME_TIME;
       if (!g_fix_frame_rate_bugs || !(frame_time > 0.f))
       {
-         original(projectile, edx, target, direction, rate, max_step, scale);
+         hooked.original(projectile, edx, target, direction, rate, max_step, scale);
          return;
       }
       if (std::ranges::find(PRESCALED_MAX_STEP_RETURNS, caller) != PRESCALED_MAX_STEP_RETURNS.end())
@@ -169,27 +186,17 @@ namespace HomingSteering
          max_step = slow_motion ? max_step : (max_step / frame_time);
          scale = slow_motion ? 0 : 1;
       }
-      original(projectile, edx, target, direction, rate, max_step, scale);
+      hooked.original(projectile, edx, target, direction, rate, max_step, scale);
    }
 
-   static void Install()
+   static bool Install()
    {
-      if (!IsSteamExecutable() || std::memcmp(STEER, PROLOGUE.data(), PROLOGUE.size()) != 0 || !InitializeMinHook())
-         return;
-      installed = MH_CreateHook(STEER, reinterpret_cast<void*>(&Detour), reinterpret_cast<void**>(&original)) == MH_OK && MH_EnableHook(STEER) == MH_OK;
-      if (!installed)
-      {
-         MH_RemoveHook(STEER);
-      }
+      return IsSteamExecutable() && AttachVerified(&hooked, STEER, PROLOGUE, &Detour);
    }
 
    static void Uninstall()
    {
-      if (installed)
-      {
-         MH_RemoveHook(STEER);
-         installed = false;
-      }
+      MinHook::Detach(&hooked);
    }
 } // namespace HomingSteering
 
@@ -204,15 +211,13 @@ namespace UnscaledTurns
    uint8_t* const ROTATE = reinterpret_cast<uint8_t*>(0xB9DEC0);
    // "push ebp; mov ebp, esp; and esp, 0FFFFFFF0h; mov ecx, [ebp+0Ch]"
    constexpr std::array<uint8_t, 9> PROLOGUE = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x8B, 0x4D, 0x0C};
-   const float* const FRAME_TIME = reinterpret_cast<const float*>(0xF0318C);
    // The return addresses of the per-frame calls with constant arguments: em0092 ground alignment (FUN_007e99e0, FUN_0080ef80,
    // ~0x80f3b0; 0.2, 5 degrees), em0130 ground alignment (FUN_00872bb0; 0.3, 10), em00f1 (FUN_0094e030; 0.8, 10), object 0x3000c
    // turning to the player (FUN_00578980; 0.3, 30), em0090-92 self-righting (FUN_007ae730; 0.1, pi), the camera's collision up-axis turn (FUN_00605210, "TtV_CHAR_COLLISION"; 0.3, 10).
    // Not FUN_005e9410's call (0x5E965A), whose caller is not proven to run every frame.
    constexpr std::array<uintptr_t, 8> UNSCALED_RETURNS = {0x7E9C4A, 0x80F35E, 0x80FB3E, 0x872CAE, 0x94EBE8, 0x578E7D, 0x7AE81E, 0x5E965F};
 
-   static Rotate original = nullptr;
-   static bool installed = false;
+   static MinHook::HookedFunction<Rotate> hooked;
 
    static float* __cdecl Detour(float* out, const float* current, const float* target, const float* axis, float rate, float max_angle)
    {
@@ -220,30 +225,20 @@ namespace UnscaledTurns
       if (g_fix_frame_rate_bugs && frame_time > 0.f && rate < 1.f &&
           std::ranges::find(UNSCALED_RETURNS, reinterpret_cast<uintptr_t>(_ReturnAddress())) != UNSCALED_RETURNS.end())
       {
-         rate = 1.f - std::pow(1.f - rate, frame_time);
+         rate = PerConsoleFrame(rate, frame_time);
          max_angle *= frame_time;
       }
-      return original(out, current, target, axis, rate, max_angle);
+      return hooked.original(out, current, target, axis, rate, max_angle);
    }
 
-   static void Install()
+   static bool Install()
    {
-      if (!IsSteamExecutable() || std::memcmp(ROTATE, PROLOGUE.data(), PROLOGUE.size()) != 0 || !InitializeMinHook())
-         return;
-      installed = MH_CreateHook(ROTATE, reinterpret_cast<void*>(&Detour), reinterpret_cast<void**>(&original)) == MH_OK && MH_EnableHook(ROTATE) == MH_OK;
-      if (!installed)
-      {
-         MH_RemoveHook(ROTATE);
-      }
+      return IsSteamExecutable() && AttachVerified(&hooked, ROTATE, PROLOGUE, &Detour);
    }
 
    static void Uninstall()
    {
-      if (installed)
-      {
-         MH_RemoveHook(ROTATE);
-         installed = false;
-      }
+      MinHook::Detach(&hooked);
    }
 } // namespace UnscaledTurns
 
@@ -256,7 +251,6 @@ namespace PlayerFrameCounters
    uint8_t* const UPDATE = reinterpret_cast<uint8_t*>(0x553BC0);
    // "push ebp; mov ebp, esp; and esp, 0FFFFFFF0h; sub esp, 0B4h"
    constexpr std::array<uint8_t, 12> PROLOGUE = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x81, 0xEC, 0xB4, 0x00, 0x00, 0x00};
-   const float* const FRAME_TIME = reinterpret_cast<const float*>(0xF0318C);
    // Decremented when non zero at the top of the update (0x553BD0, 0x553BE5)
    constexpr size_t NO_DEATH_FRAMES = 0xEAD4;       // uint16_t: 11 from FUN_004ce500; HP <= 0 is set back to 5 while non zero (0x55536C)
    constexpr size_t TYPE_8F_HIT_COOLDOWN = 0x13714; // int32_t: 4 after a type 0x8F hit with flag 0x20 (0x554EEB)
@@ -264,8 +258,7 @@ namespace PlayerFrameCounters
    constexpr size_t HIT_COOLDOWN = 0x10240;     // int32_t: 10 on a hit (0x554D03)
    constexpr size_t FLAGGED_COOLDOWN = 0x12AD4; // uint16_t: 10 (0x554563), counted while the byte at 0x12AD6 is set
 
-   static Update original = nullptr;
-   static bool installed = false;
+   static MinHook::HookedFunction<Update> hooked;
    static std::atomic<bool> is_tick_frame = true;
    static float tick_phase = 0.f; // In 1/30 s
 
@@ -292,7 +285,7 @@ namespace PlayerFrameCounters
    {
       if (!g_fix_frame_rate_bugs || is_tick_frame)
       {
-         original(player, edx);
+         hooked.original(player, edx);
          return;
       }
       auto* const no_death_frames = reinterpret_cast<uint16_t*>(player + NO_DEATH_FRAMES);
@@ -311,7 +304,7 @@ namespace PlayerFrameCounters
       // The others are undone after the update if they ran (a reset to 10 then a decrement is held at 10 too)
       const int32_t hit_cooldown_before = *hit_cooldown;
       const uint16_t flagged_cooldown_before = *flagged_cooldown;
-      original(player, edx);
+      hooked.original(player, edx);
       if (hit_cooldown_before != 0 && *hit_cooldown == hit_cooldown_before - 1)
       {
          *hit_cooldown = hit_cooldown_before;
@@ -322,24 +315,14 @@ namespace PlayerFrameCounters
       }
    }
 
-   static void Install()
+   static bool Install()
    {
-      if (!IsSteamExecutable() || std::memcmp(UPDATE, PROLOGUE.data(), PROLOGUE.size()) != 0 || !InitializeMinHook())
-         return;
-      installed = MH_CreateHook(UPDATE, reinterpret_cast<void*>(&Detour), reinterpret_cast<void**>(&original)) == MH_OK && MH_EnableHook(UPDATE) == MH_OK;
-      if (!installed)
-      {
-         MH_RemoveHook(UPDATE);
-      }
+      return IsSteamExecutable() && AttachVerified(&hooked, UPDATE, PROLOGUE, &Detour);
    }
 
    static void Uninstall()
    {
-      if (installed)
-      {
-         MH_RemoveHook(UPDATE);
-         installed = false;
-      }
+      MinHook::Detach(&hooked);
    }
 } // namespace PlayerFrameCounters
 
@@ -357,7 +340,6 @@ namespace ContinuousDamage
       0xC0, 0x0F, 0x5A, 0xC9, 0xF2, 0x0F, 0x59, 0xC1, 0xF2, 0x0F, 0x2C, 0xC0, 0x89, 0x84, 0x24, 0xC0, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x7F, 0x0B, 0xC7, 0x84,
       0x24, 0xC0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00};
    constexpr size_t CALL_OFFSET = 6; // The rel32 of "call TakeDamage"
-   const float* const FRAME_TIME = reinterpret_cast<const float*>(0xF0318C);
 
    struct Receivers
    {
@@ -410,10 +392,10 @@ namespace ContinuousDamage
       }
    }
 
-   static void Install()
+   static bool Install()
    {
       if (!IsSteamExecutable() || std::memcmp(SCALE_BLOCK, ORIGINAL.data(), ORIGINAL.size()) != 0)
-         return;
+         return false;
       // push ecx; push [esp+60h]; call TakeDamage; test eax, eax; jz drop
       // mov [esp+0C0h], eax; jmp 0x608852 (append the record)
       // drop: mov edi, [esp+1Ch]; mov esi, [esp+24h] (as 0x60886E after an append); jmp 0x60887E (the next contact); nop padding
@@ -423,6 +405,7 @@ namespace ContinuousDamage
       const int32_t call = int32_t(reinterpret_cast<intptr_t>(&TakeDamage) - reinterpret_cast<intptr_t>(SCALE_BLOCK + CALL_OFFSET + sizeof(int32_t)));
       std::memcpy(patched.data() + CALL_OFFSET, &call, sizeof(call));
       installed = System::PatchMemory(SCALE_BLOCK, patched.data(), patched.size(), System::PatchMemoryType::Code);
+      return installed;
    }
 
    static void Uninstall()
@@ -449,9 +432,10 @@ namespace ConsoleSlowdown
    static bool patchable = false;
    static bool patched = false;
 
-   static void Install()
+   static bool Install()
    {
       patchable = IsSteamExecutable() && std::memcmp(GATE, ORIGINAL.data(), ORIGINAL.size()) == 0 && std::memcmp(GATE + ORIGINAL.size(), JUMP.data(), JUMP.size()) == 0;
+      return patchable;
    }
 
    static void Apply(bool patch)
@@ -475,7 +459,6 @@ namespace UnscaledApproaches
    uint8_t* const APPROACH = reinterpret_cast<uint8_t*>(0xB9B680);
    // "movss xmm1, [esp+4]; movss xmm0, [esp+8]"
    constexpr std::array<uint8_t, 12> PROLOGUE = {0xF3, 0x0F, 0x10, 0x4C, 0x24, 0x04, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x08};
-   const float* const FRAME_TIME = reinterpret_cast<const float*>(0xF0318C);
    // The return addresses of the per-frame calls with constant arguments: em00f0's sweep (FUN_0094c6c0 sub-states 1 and 2, yaw and
    // pitch; 0.3 and 0.15, 1.5 degrees), the yaw clamp of FUN_008dd680's move (rate 1, 6 degrees), and the angles +0x7050/+0x7054
    // eased to their targets (0.95, 4.5 to 9 degrees) in FUN_007d7650, FUN_008d8e00 and FUN_008e8e00 (next to step scaled code).
@@ -489,10 +472,8 @@ namespace UnscaledApproaches
    // 0x8A28F0): the aim yaw/pitch +0x6F0C/+0x6F10 and +0x6D84/+0x6D88 (0.95, 3 degrees), edi = the object. The rate becomes the
    // console's per frame rate (rate * time scale) applied over the frame time, divided by the step multiplied in afterwards.
    constexpr std::array<uintptr_t, 6> STEP_SCALED_RETURNS = {0x7D907B, 0x7D90B6, 0x7D95A4, 0x8DC088, 0x8DC0C3, 0x8DC5A5};
-   constexpr size_t TIME_SCALE = 0x440;
 
-   static Approach original = nullptr;
-   static bool installed = false;
+   static MinHook::HookedFunction<Approach> hooked;
    // ponytail: one global for the game thread's calls; a per-thread copy if FUN_00b9b680 ever runs on several threads at once
    static uintptr_t caller_edi = 0;
 
@@ -500,29 +481,29 @@ namespace UnscaledApproaches
    {
       const float frame_time = *FRAME_TIME;
       if (!g_fix_frame_rate_bugs || !(frame_time > 0.f))
-         return original(current, target, rate, max_step);
+         return hooked.original(current, target, rate, max_step);
       const auto return_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
       if (std::ranges::find(UNSCALED_RETURNS, return_address) != UNSCALED_RETURNS.end())
       {
          if (rate < 1.f)
          {
-            rate = 1.f - std::pow(1.f - rate, frame_time);
+            rate = PerConsoleFrame(rate, frame_time);
          }
          max_step *= frame_time;
       }
       else if (frame_time < 1.f && std::ranges::find(LINEAR_RETURNS, return_address) != LINEAR_RETURNS.end())
       {
-         rate = 1.f - std::pow(1.f - (std::min)(rate / frame_time, 1.f), frame_time);
+         rate = PerConsoleFrame((std::min)(rate / frame_time, 1.f), frame_time);
       }
       else if (frame_time < 1.f && std::ranges::find(STEP_SCALED_RETURNS, return_address) != STEP_SCALED_RETURNS.end())
       {
          const float time_scale = *reinterpret_cast<const float*>(caller_edi + TIME_SCALE);
          if (time_scale > 0.f)
          {
-            rate = (1.f - std::pow(1.f - (std::min)(rate * time_scale, 1.f), frame_time)) / (time_scale * frame_time);
+            rate = PerConsoleFrame((std::min)(rate * time_scale, 1.f), frame_time) / (time_scale * frame_time);
          }
       }
-      return original(current, target, rate, max_step);
+      return hooked.original(current, target, rate, max_step);
    }
 
    // The hook's entry: edi is callee saved, so it still holds the caller's
@@ -535,24 +516,14 @@ namespace UnscaledApproaches
       }
    }
 
-   static void Install()
+   static bool Install()
    {
-      if (!IsSteamExecutable() || std::memcmp(APPROACH, PROLOGUE.data(), PROLOGUE.size()) != 0 || !InitializeMinHook())
-         return;
-      installed = MH_CreateHook(APPROACH, reinterpret_cast<void*>(&Entry), reinterpret_cast<void**>(&original)) == MH_OK && MH_EnableHook(APPROACH) == MH_OK;
-      if (!installed)
-      {
-         MH_RemoveHook(APPROACH);
-      }
+      return IsSteamExecutable() && AttachVerified(&hooked, APPROACH, PROLOGUE, reinterpret_cast<Approach>(&Entry));
    }
 
    static void Uninstall()
    {
-      if (installed)
-      {
-         MH_RemoveHook(APPROACH);
-         installed = false;
-      }
+      MinHook::Detach(&hooked);
    }
 } // namespace UnscaledApproaches
 
@@ -567,49 +538,36 @@ namespace LinearTurnRate
    uint8_t* const TURN = reinterpret_cast<uint8_t*>(0x6285D0);
    // "movss xmm2, [esp+4]; comiss xmm2, [0xD7A458]"
    constexpr std::array<uint8_t, 13> PROLOGUE = {0xF3, 0x0F, 0x10, 0x54, 0x24, 0x04, 0x0F, 0x2F, 0x15, 0x58, 0xA4, 0xD7, 0x00};
-   const float* const FRAME_TIME = reinterpret_cast<const float*>(0xF0318C);
-   constexpr size_t TIME_SCALE = 0x440;
    constexpr size_t YAW = 0x84;
    constexpr size_t TARGET_YAW = 0x3D4;
    constexpr double SNAP_MAX_STEP = 3.1415927410125732; // 0xD78CD0
 
-   static Turn original = nullptr;
-   static bool installed = false;
+   static MinHook::HookedFunction<Turn> hooked;
 
    static void __fastcall Detour(uint8_t* enemy, void* edx, float rate, float max_step)
    {
       const float frame_time = *FRAME_TIME;
       if (!g_fix_frame_rate_bugs || !(frame_time > 0.f && frame_time < 1.f) || (rate >= 1.f && double(max_step) >= SNAP_MAX_STEP))
       {
-         original(enemy, edx, rate, max_step);
+         hooked.original(enemy, edx, rate, max_step);
          return;
       }
       const float time_scale = *reinterpret_cast<const float*>(enemy + TIME_SCALE);
       const float console_rate = (std::min)(rate * time_scale, 1.f);
       auto* const yaw = reinterpret_cast<float*>(enemy + YAW);
-      *yaw = UnscaledApproaches::original(*yaw, *reinterpret_cast<const float*>(enemy + TARGET_YAW), 1.f - std::pow(1.f - console_rate, frame_time),
+      *yaw = UnscaledApproaches::hooked.original(*yaw, *reinterpret_cast<const float*>(enemy + TARGET_YAW), PerConsoleFrame(console_rate, frame_time),
          max_step * time_scale * frame_time);
    }
 
-   static void Install()
+   static bool Install()
    {
       // Calls FUN_00b9b680 through its trampoline
-      if (!UnscaledApproaches::installed || std::memcmp(TURN, PROLOGUE.data(), PROLOGUE.size()) != 0)
-         return;
-      installed = MH_CreateHook(TURN, reinterpret_cast<void*>(&Detour), reinterpret_cast<void**>(&original)) == MH_OK && MH_EnableHook(TURN) == MH_OK;
-      if (!installed)
-      {
-         MH_RemoveHook(TURN);
-      }
+      return UnscaledApproaches::hooked.target && AttachVerified(&hooked, TURN, PROLOGUE, &Detour);
    }
 
    static void Uninstall()
    {
-      if (installed)
-      {
-         MH_RemoveHook(TURN);
-         installed = false;
-      }
+      MinHook::Detach(&hooked);
    }
 } // namespace LinearTurnRate
 
@@ -625,7 +583,6 @@ namespace SnapApproaches
    uint8_t* const APPROACH = reinterpret_cast<uint8_t*>(0x6287F0);
    // "movss xmm0, [esp+0Ch]; movss xmm1, [esp+8]"
    constexpr std::array<uint8_t, 12> PROLOGUE = {0xF3, 0x0F, 0x10, 0x44, 0x24, 0x0C, 0xF3, 0x0F, 0x10, 0x4C, 0x24, 0x08};
-   const float* const FRAME_TIME = reinterpret_cast<const float*>(0xF0318C);
    // Player states, rate frame time (or step) * 0.1 to 0.6, snap 0.01 to 10 degrees, max step 3 to 30 degrees
    constexpr std::array<uintptr_t, 28> LINEAR_RETURNS = {0x4CE6D3, 0x4DE8A5, 0x4DE94C, 0x4DF550, 0x4DF866, 0x4E0FC0, 0x4E12D6, 0x4E1F3D, 0x4E2253,
       0x4E2C3B, 0x4E60A2, 0x4E623B, 0x4FFAB4, 0x500645, 0x500F75, 0x502065, 0x5033A6, 0x5042E8, 0x504B4D, 0x5062A5, 0x506BD5, 0x507C07, 0x507D81,
@@ -644,29 +601,27 @@ namespace SnapApproaches
    // The large actors' (FUN_00695620) k^step rates (k 0.1 and 0.3), with the snap and max step multiplied by the step twice
    constexpr std::array<uintptr_t, 6> POW_RATE_SQUARED_RETURNS = {0x696154, 0x696307, 0x6963E0, 0x6964C3, 0x696797, 0x69686A};
    static_assert(std::ranges::is_sorted(LINEAR_RETURNS) && std::ranges::is_sorted(UNSCALED_RETURNS)); // binary searched
-   constexpr size_t TIME_SCALE = 0x440;
 
-   static Approach original = nullptr;
-   static bool installed = false;
+   static MinHook::HookedFunction<Approach> hooked;
 
    static int __fastcall Detour(void* ecx, void* edx, float* out, float current, float target, float rate, float snap, float max_step)
    {
       const float frame_time = *FRAME_TIME;
       if (!g_fix_frame_rate_bugs || !(frame_time > 0.f))
-         return original(ecx, edx, out, current, target, rate, snap, max_step);
+         return hooked.original(ecx, edx, out, current, target, rate, snap, max_step);
       const auto return_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
       if (std::ranges::binary_search(UNSCALED_RETURNS, return_address))
       {
          if (rate < 1.f)
          {
-            rate = 1.f - std::pow(1.f - rate, frame_time);
+            rate = PerConsoleFrame(rate, frame_time);
          }
          snap *= frame_time;
          max_step *= frame_time;
       }
       else if (frame_time < 1.f && std::ranges::binary_search(LINEAR_RETURNS, return_address))
       {
-         rate = 1.f - std::pow(1.f - (std::min)(rate / frame_time, 1.f), frame_time);
+         rate = PerConsoleFrame((std::min)(rate / frame_time, 1.f), frame_time);
          snap *= frame_time;
          max_step *= frame_time;
       }
@@ -680,34 +635,24 @@ namespace SnapApproaches
             if (step > 0.f && rate > 0.f)
             {
                const float k = std::pow(rate, 1.f / step);
-               rate = 1.f - std::pow(1.f - k, step);
+               rate = PerConsoleFrame(k, step);
                const float extent_scale = squared ? (1.f / step) : step;
                snap *= extent_scale;
                max_step *= extent_scale;
             }
          }
       }
-      return original(ecx, edx, out, current, target, rate, snap, max_step);
+      return hooked.original(ecx, edx, out, current, target, rate, snap, max_step);
    }
 
-   static void Install()
+   static bool Install()
    {
-      if (!IsSteamExecutable() || std::memcmp(APPROACH, PROLOGUE.data(), PROLOGUE.size()) != 0 || !InitializeMinHook())
-         return;
-      installed = MH_CreateHook(APPROACH, reinterpret_cast<void*>(&Detour), reinterpret_cast<void**>(&original)) == MH_OK && MH_EnableHook(APPROACH) == MH_OK;
-      if (!installed)
-      {
-         MH_RemoveHook(APPROACH);
-      }
+      return IsSteamExecutable() && AttachVerified(&hooked, APPROACH, PROLOGUE, &Detour);
    }
 
    static void Uninstall()
    {
-      if (installed)
-      {
-         MH_RemoveHook(APPROACH);
-         installed = false;
-      }
+      MinHook::Detach(&hooked);
    }
 } // namespace SnapApproaches
 
@@ -721,25 +666,22 @@ namespace VectorApproaches
    uint8_t* const APPROACH = reinterpret_cast<uint8_t*>(0x628970);
    // "push ebp; mov ebp, esp; and esp, -10h; sub esp, 30h; mov ecx, [ebp+0Ch]"
    constexpr std::array<uint8_t, 12> PROLOGUE = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x83, 0xEC, 0x30, 0x8B, 0x4D, 0x0C};
-   const float* const FRAME_TIME = reinterpret_cast<const float*>(0xF0318C);
-   constexpr size_t TIME_SCALE = 0x440;
    // Rate 0.1 to 0.5, snap 0.01 to 0.1, max step 0.5 or the projectile's +0x8
    constexpr std::array<uintptr_t, 6> UNSCALED_RETURNS = {0x4C7237, 0x4DEFFB, 0x4E03EF, 0x4E0BCB, 0x4E1B45, 0x6B039E};
    // Player states: rate step * 0.6, snap step * 0.05, max step step * 0.15, the object in ecx
    constexpr std::array<uintptr_t, 6> LINEAR_RETURNS = {0x4DF4D2, 0x4DF7E8, 0x4E0F42, 0x4E1258, 0x4E1EBF, 0x4E21D5};
 
-   static Approach original = nullptr;
-   static bool installed = false;
+   static MinHook::HookedFunction<Approach> hooked;
 
    static int __fastcall Detour(void* ecx, void* edx, float* out, const float* current, const float* target, float rate, float snap, float max_step)
    {
       const float frame_time = *FRAME_TIME;
       if (!g_fix_frame_rate_bugs || !(frame_time > 0.f))
-         return original(ecx, edx, out, current, target, rate, snap, max_step);
+         return hooked.original(ecx, edx, out, current, target, rate, snap, max_step);
       const auto return_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
       if (std::ranges::find(UNSCALED_RETURNS, return_address) != UNSCALED_RETURNS.end())
       {
-         rate = 1.f - std::pow(1.f - rate, frame_time);
+         rate = PerConsoleFrame(rate, frame_time);
          snap *= frame_time;
          max_step *= frame_time;
       }
@@ -748,30 +690,20 @@ namespace VectorApproaches
          const float step = *reinterpret_cast<const float*>(static_cast<uint8_t*>(ecx) + TIME_SCALE) * frame_time;
          if (step > 0.f && step < 1.f)
          {
-            rate = 1.f - std::pow(1.f - (std::min)(rate / step, 1.f), step);
+            rate = PerConsoleFrame((std::min)(rate / step, 1.f), step);
          }
       }
-      return original(ecx, edx, out, current, target, rate, snap, max_step);
+      return hooked.original(ecx, edx, out, current, target, rate, snap, max_step);
    }
 
-   static void Install()
+   static bool Install()
    {
-      if (!IsSteamExecutable() || std::memcmp(APPROACH, PROLOGUE.data(), PROLOGUE.size()) != 0 || !InitializeMinHook())
-         return;
-      installed = MH_CreateHook(APPROACH, reinterpret_cast<void*>(&Detour), reinterpret_cast<void**>(&original)) == MH_OK && MH_EnableHook(APPROACH) == MH_OK;
-      if (!installed)
-      {
-         MH_RemoveHook(APPROACH);
-      }
+      return IsSteamExecutable() && AttachVerified(&hooked, APPROACH, PROLOGUE, &Detour);
    }
 
    static void Uninstall()
    {
-      if (installed)
-      {
-         MH_RemoveHook(APPROACH);
-         installed = false;
-      }
+      MinHook::Detach(&hooked);
    }
 } // namespace VectorApproaches
 
@@ -905,7 +837,6 @@ namespace FrameConstants
    constexpr size_t OPCODE_OFFSET = 2;
    constexpr size_t MODRM_OFFSET = 3;
    constexpr size_t ADDRESS_OFFSET = 4;
-   const float* const FRAME_TIME = reinterpret_cast<const float*>(0xF0318C);
 
    static std::array<uint32_t, SITES.size()> constant_addresses = {};
    static std::array<double, SITES.size()> constants = {};
@@ -958,15 +889,15 @@ namespace FrameConstants
       }
    }
 
-   static void Install()
+   static bool Install()
    {
       if (!IsSteamExecutable())
-         return;
+         return false;
       for (size_t i = 0; i < SITES.size(); i++)
       {
          const auto* const code = reinterpret_cast<const uint8_t*>(SITES[i].instruction);
          if (code[0] != 0xF2 || code[1] != 0x0F || std::ranges::find(OPCODES, code[OPCODE_OFFSET]) == OPCODES.end() || (code[MODRM_OFFSET] & 0xC7) != 0x05)
-            return;
+            return false;
          std::memcpy(&constant_addresses[i], code + ADDRESS_OFFSET, sizeof(uint32_t));
          constants[i] = *reinterpret_cast<const double*>(uintptr_t(constant_addresses[i]));
          values[i] = constants[i];
@@ -981,6 +912,7 @@ namespace FrameConstants
       {
          Restore();
       }
+      return installed;
    }
 
    static void Uninstall()
@@ -1002,7 +934,6 @@ namespace ConsoleFrameTime
    constexpr std::array<uintptr_t, 2> SITES = {0x8D54FA, 0x8D5556};
    constexpr std::array<std::array<uint8_t, 8>, 2> ORIGINALS = {{{0xF3, 0x0F, 0x10, 0x2D, 0x8C, 0x31, 0xF0, 0x00}, {0xF3, 0x0F, 0x10, 0x15, 0x8C, 0x31, 0xF0, 0x00}}};
    constexpr size_t ADDRESS_OFFSET = 4;
-   const float* const FRAME_TIME = reinterpret_cast<const float*>(0xF0318C);
 
    static float value = 1.f; // Read by the game in place of the frame time
    static bool installed = false;
@@ -1017,21 +948,21 @@ namespace ConsoleFrameTime
 
    static void Restore()
    {
-      const uint32_t original_address = 0xF0318C;
+      const auto original_address = uint32_t(reinterpret_cast<uintptr_t>(FRAME_TIME));
       for (const uintptr_t site : SITES)
       {
          System::PatchMemory(reinterpret_cast<void*>(site + ADDRESS_OFFSET), &original_address, sizeof(original_address), System::PatchMemoryType::Code);
       }
    }
 
-   static void Install()
+   static bool Install()
    {
       if (!IsSteamExecutable())
-         return;
+         return false;
       for (size_t i = 0; i < SITES.size(); i++)
       {
          if (std::memcmp(reinterpret_cast<const void*>(SITES[i]), ORIGINALS[i].data(), ORIGINALS[i].size()) != 0)
-            return;
+            return false;
       }
       value = *FRAME_TIME;
       installed = true;
@@ -1044,6 +975,7 @@ namespace ConsoleFrameTime
       {
          Restore();
       }
+      return installed;
    }
 
    static void Uninstall()
@@ -1082,10 +1014,10 @@ namespace StuckRecovery
       return *stuck_frames > MAX_STUCK_FRAMES;
    }
 
-   static void Install()
+   static bool Install()
    {
       if (!IsSteamExecutable() || std::memcmp(COUNT, ORIGINAL.data(), ORIGINAL.size()) != 0)
-         return;
+         return false;
       // push esi; call IsStuck; test eax, eax; jz NOT_STUCK; nop padding
       std::array<uint8_t, ORIGINAL.size()> patched = {0x56, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x0F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90};
       const int32_t call = int32_t(reinterpret_cast<intptr_t>(&IsStuck) - reinterpret_cast<intptr_t>(COUNT + CALL_OFFSET + sizeof(int32_t)));
@@ -1093,6 +1025,7 @@ namespace StuckRecovery
       std::memcpy(patched.data() + CALL_OFFSET, &call, sizeof(call));
       std::memcpy(patched.data() + JUMP_OFFSET, &jump, sizeof(jump));
       installed = System::PatchMemory(COUNT, patched.data(), patched.size(), System::PatchMemoryType::Code);
+      return installed;
    }
 
    static void Uninstall()
@@ -1118,8 +1051,6 @@ namespace StuckRecovery
 //   "v -= frame time" so the spawn rate is 30 per second at any frame rate.
 namespace BlockCalls
 {
-   const float* const FRAME_TIME = reinterpret_cast<const float*>(0xF0318C);
-   constexpr size_t TIME_SCALE = 0x440;
    constexpr size_t VELOCITY = 0x6DD0;
    constexpr size_t TRAJECTORY_OFFSET = 0x6EF0;
    constexpr size_t TRAJECTORY_TARGET = 0x6F00;
@@ -1190,7 +1121,7 @@ namespace BlockCalls
             *impulse = float(double(*impulse) * std::pow(k, std::floor(age) - std::floor(impulse_age)));
             impulse_age = age;
          }
-         rate = k * ((1.0 - std::pow(1.0 - k, double(frame_time))) / (1.0 - (1.0 - k)));
+         rate = 1.0 - std::pow(1.0 - k, double(frame_time));
       }
       else if (!impulse_held)
       {
@@ -1202,7 +1133,7 @@ namespace BlockCalls
    static void DustTimer(uint8_t* player)
    {
       auto* const timer = reinterpret_cast<float*>(player + DUST_TIMER);
-      *timer = g_fix_frame_rate_bugs ? ((*timer > -1.f ? *timer : -1.f) + 1.f) : 1.f;
+      *timer = g_fix_frame_rate_bugs ? ((std::max)(-1.f, *timer) + 1.f) : 1.f;
    }
 
    struct Block
@@ -1298,15 +1229,15 @@ namespace BlockCalls
       }
    }
 
-   static void Install()
+   static bool Install()
    {
       if (!IsSteamExecutable())
-         return;
+         return false;
       for (const Block& block : BLOCKS)
       {
          const auto* const code = reinterpret_cast<const uint8_t*>(block.check_instruction);
          if ((code[0] != 0xF2 && code[0] != 0xF3) || code[1] != 0x0F || std::memcmp(code + 4, &block.check_address, sizeof(uint32_t)) != 0)
-            return;
+            return false;
       }
       installed = true;
       for (size_t i = 0; i < BLOCKS.size() && installed; i++)
@@ -1331,6 +1262,7 @@ namespace BlockCalls
             Restore(i);
          }
       }
+      return installed;
    }
 
    static void Uninstall()
@@ -1342,6 +1274,31 @@ namespace BlockCalls
       }
    }
 } // namespace BlockCalls
+
+// Every fix above, installed in this order and uninstalled in reverse (LinearTurnRate calls UnscaledApproaches' trampoline)
+struct Fix
+{
+   bool (*install)();
+   void (*uninstall)();
+   void (*on_present)() = nullptr;
+};
+constexpr auto FIXES = std::to_array<Fix>({
+   {HomingSteering::Install, HomingSteering::Uninstall},
+   {ContinuousDamage::Install, ContinuousDamage::Uninstall, ContinuousDamage::OnPresent},
+   {UnscaledTurns::Install, UnscaledTurns::Uninstall},
+   {PlayerFrameCounters::Install, PlayerFrameCounters::Uninstall, PlayerFrameCounters::OnPresent},
+   {ConsoleSlowdown::Install, []
+      { ConsoleSlowdown::Apply(false); }, []
+      { ConsoleSlowdown::Apply(g_fix_frame_rate_bugs); }},
+   {UnscaledApproaches::Install, UnscaledApproaches::Uninstall},
+   {LinearTurnRate::Install, LinearTurnRate::Uninstall},
+   {SnapApproaches::Install, SnapApproaches::Uninstall},
+   {VectorApproaches::Install, VectorApproaches::Uninstall},
+   {FrameConstants::Install, FrameConstants::Uninstall, FrameConstants::OnPresent},
+   {ConsoleFrameTime::Install, ConsoleFrameTime::Uninstall, ConsoleFrameTime::OnPresent},
+   {StuckRecovery::Install, StuckRecovery::Uninstall},
+   {BlockCalls::Install, BlockCalls::Uninstall},
+});
 
 struct VanquishGameDeviceData final : public GameDeviceData
 {
@@ -1542,10 +1499,16 @@ class Vanquish final : public Game
       // and the next one doesn't jitter.
       auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
       bool t2x = gd.t2x_active && gd.mv_filled && gd.mv.srv && copy_vs && GetViewTextureSize(gd.mv.srv.get()) == size;
-      ID3D11PixelShader* const t2x_weight_ps = (t2x ? FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Vanquish SMAA T2x Blending Weight Calculation PS")) : nullptr);
-      ID3D11PixelShader* const t2x_blend_ps = (t2x ? FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Vanquish SMAA T2x Neighborhood Blending PS")) : nullptr);
-      ID3D11PixelShader* const t2x_resolve_ps = (t2x ? FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Vanquish SMAA T2x Resolve PS")) : nullptr);
-      t2x = t2x && t2x_weight_ps && t2x_blend_ps && t2x_resolve_ps;
+      ID3D11PixelShader* t2x_weight_ps = nullptr;
+      ID3D11PixelShader* t2x_blend_ps = nullptr;
+      ID3D11PixelShader* t2x_resolve_ps = nullptr;
+      if (t2x)
+      {
+         t2x_weight_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Vanquish SMAA T2x Blending Weight Calculation PS"));
+         t2x_blend_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Vanquish SMAA T2x Neighborhood Blending PS"));
+         t2x_resolve_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Vanquish SMAA T2x Resolve PS"));
+         t2x = t2x_weight_ps && t2x_blend_ps && t2x_resolve_ps;
+      }
       const uint32_t frame_index = cb_luma_global_settings.FrameIndex;
       const int t2x_current = int(frame_index & 1);
       bool t2x_history = gd.t2x_frames[0] && gd.t2x_frame + 1 == frame_index;
@@ -1779,7 +1742,7 @@ class Vanquish final : public Game
    // An alpha blended scene draw after the opaque scene (the translucents: smoke, glass, sparks, glows), which has no motion vectors of
    // its own, also writes its mask: its pixel shader patched, the mask target added at "REACTIVE_SLOT", both put back after. False if it
    // isn't one or can't be patched: the caller lets the game draw it.
-   static bool DrawWithReactiveMask(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, uint64_t pixel_shader_hash, reshade::api::pipeline pipeline, const std::function<void()>& draw)
+   static bool DrawWithReactiveMask(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, uint64_t pixel_shader_hash, reshade::api::pipeline pipeline, const std::function<void()>& draw, const com_ptr<ID3D11RenderTargetView>* rtvs, ID3D11DepthStencilView* dsv)
    {
       auto& gd = GetGameDeviceData(device_data);
       SceneMotionVectors::ClassifyBoundBlend(native_device_context, &gd.mv);
@@ -1787,9 +1750,6 @@ class Vanquish final : public Game
       // its edges flicker. The caller tested the scene's depth.
       if (gd.mv.reactive_blend == SceneMotionVectors::ReactiveBlend::NONE || gd.depth_write)
          return false;
-      com_ptr<ID3D11RenderTargetView> rtvs[REACTIVE_SLOT];
-      com_ptr<ID3D11DepthStencilView> dsv;
-      native_device_context->OMGetRenderTargets(REACTIVE_SLOT, &rtvs[0], &dsv);
       // Into the scene: a full size target (not a smaller particle buffer); the mask target is the scene's size
       if (!rtvs[0] || GetViewTextureSize(rtvs[0].get()) != gd.mv.scene_size)
          return false;
@@ -1806,11 +1766,11 @@ class Vanquish final : public Game
          targets[slot] = rtvs[slot].get();
       }
       targets[REACTIVE_SLOT] = gd.mv.reactive_target_rtv.get();
-      native_device_context->OMSetRenderTargets(REACTIVE_SLOT + 1, targets, dsv.get());
+      native_device_context->OMSetRenderTargets(REACTIVE_SLOT + 1, targets, dsv);
       native_device_context->PSSetShader(mask_shader, nullptr, 0);
       draw();
       native_device_context->PSSetShader(game_shader.get(), nullptr, 0);
-      native_device_context->OMSetRenderTargets(REACTIVE_SLOT, targets, dsv.get());
+      native_device_context->OMSetRenderTargets(REACTIVE_SLOT, targets, dsv);
 #if DEVELOPMENT
       gd.reactive_draws++;
 #endif
@@ -1830,7 +1790,8 @@ class Vanquish final : public Game
 #if ENABLE_LUMA_TAA
       // Luma TAA without its 2x history flickered on lasers at the High scale in Bayonetta's TAA lab: half of it balanced flicker and
       // smear
-      const float reactive_scale = (device_data.sr_type == SR::Type::LumaTAA && LumaTAA::quality.load() < LumaTAA::history_2x_quality ? 0.5f : 1.f) * g_sr_reactive_scale;
+      const bool luma_taa_without_2x_history = device_data.sr_type == SR::Type::LumaTAA && LumaTAA::quality.load() < LumaTAA::history_2x_quality;
+      const float reactive_scale = (luma_taa_without_2x_history ? 0.5f : 1.f) * g_sr_reactive_scale;
 #else
       const float reactive_scale = g_sr_reactive_scale;
 #endif
@@ -2101,7 +2062,9 @@ class Vanquish final : public Game
       const D3D11_BOX box = (source_box ? D3D11_BOX{.left = source_box->left * scale, .top = source_box->top * scale, .front = 0, .right = source_box->right * scale, .bottom = source_box->bottom * scale, .back = 1}
                                         : D3D11_BOX{.left = 0, .top = 0, .front = 0, .right = dest_desc.Width * scale, .bottom = dest_desc.Height * scale, .back = 1});
       auto* const native_device_context = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
-      native_device_context->CopySubresourceRegion(shadow->texture.get(), 0, (dest_box ? (dest_box->left * scale) : 0), (dest_box ? (dest_box->top * scale) : 0), 0, gd.bloom_texture.get(), 0, &box);
+      const UINT dest_x = (dest_box ? (dest_box->left * scale) : 0);
+      const UINT dest_y = (dest_box ? (dest_box->top * scale) : 0);
+      native_device_context->CopySubresourceRegion(shadow->texture.get(), 0, dest_x, dest_y, 0, gd.bloom_texture.get(), 0, &box);
    }
 
    static bool OnCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest)
@@ -2297,8 +2260,7 @@ public:
          {"fix_frame_rate_bugs", &g_fix_frame_rate_bugs},
       });
       Mcp::RegisterValues({{"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"sr_reactive_scale", &g_sr_reactive_scale, 0.f, 4.f}, {"sr_reactive_threshold", &g_sr_reactive_threshold, 0.f, 1.f}});
-      Mcp::RegisterTextures({MCP_GAME_TEXTURE("mv.velocity", mv.texture), MCP_GAME_TEXTURE("mv.depth", mv.device_depth), MCP_GAME_TEXTURE("sr.reactive", mv.reactive), MCP_GAME_TEXTURE("sr.transparency", mv.transparency), MCP_GAME_TEXTURE("sr.draws_mask", mv.reactive_target)});
-      Mcp::RegisterTextures({MCP_GAME_TEXTURE("bloom.target", bloom_texture)});
+      Mcp::RegisterTextures({MCP_GAME_TEXTURE("mv.velocity", mv.texture), MCP_GAME_TEXTURE("mv.depth", mv.device_depth), MCP_GAME_TEXTURE("sr.reactive", mv.reactive), MCP_GAME_TEXTURE("sr.transparency", mv.transparency), MCP_GAME_TEXTURE("sr.draws_mask", mv.reactive_target), MCP_GAME_TEXTURE("bloom.target", bloom_texture)});
       Mcp::RegisterInts({{"bloom_scale_override", &g_bloom_scale_override, 0, 4}});
 #endif
 
@@ -2314,19 +2276,10 @@ public:
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
       SetEvents(true);
-      HomingSteering::Install();
-      ContinuousDamage::Install();
-      UnscaledTurns::Install();
-      PlayerFrameCounters::Install();
-      ConsoleSlowdown::Install();
-      UnscaledApproaches::Install();
-      LinearTurnRate::Install();
-      SnapApproaches::Install();
-      VectorApproaches::Install();
-      FrameConstants::Install();
-      ConsoleFrameTime::Install();
-      StuckRecovery::Install();
-      BlockCalls::Install();
+      for (const Fix& fix : FIXES)
+      {
+         g_fixes_installed |= fix.install();
+      }
    }
 
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
@@ -2467,7 +2420,7 @@ public:
 #endif
                if (motion_vectors)
                   return DrawOrDispatchOverrideType::Replaced;
-               if (game_device_data.reactive_ready && DrawWithReactiveMask(native_device, native_device_context, device_data, original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader, *original_draw_dispatch_func))
+               if (game_device_data.reactive_ready && DrawWithReactiveMask(native_device, native_device_context, device_data, original_shader_hashes.pixel_shaders[0], cmd_list_data.pipeline_state_original_pixel_shader, *original_draw_dispatch_func, rtvs, dsv.get()))
                   return DrawOrDispatchOverrideType::Replaced;
             }
          }
@@ -2678,12 +2631,24 @@ public:
 
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
-      ContinuousDamage::OnPresent();
-      PlayerFrameCounters::OnPresent();
-      FrameConstants::OnPresent();
-      ConsoleFrameTime::OnPresent();
-      ConsoleSlowdown::Apply(g_fix_frame_rate_bugs);
+      for (const Fix& fix : FIXES)
+      {
+         if (fix.on_present)
+         {
+            fix.on_present();
+         }
+      }
       auto& game_device_data = GetGameDeviceData(device_data);
+#if DEVELOPMENT
+      // Ends Core's debug draw of a target about to be released or no longer shown
+      const auto stop_debug_view = [&device_data](const auto* texture)
+      {
+         if (device_data.debug_draw_texture && device_data.debug_draw_texture.get() == texture)
+         {
+            device_data.debug_draw_texture = nullptr;
+         }
+      };
+#endif
       game_device_data.has_scene_snapshot = false;
       game_device_data.has_drawn_gather = false;
       game_device_data.gather_target = 0;
@@ -2731,16 +2696,14 @@ public:
          }
       }
       // -1 at native resolution while the upscaler draws, 0 with XeSS (Core biases the game's samplers at bias 0, see "DllMain")
-      SetTextureMipLodBias(nullptr, device_data, (game_device_data.jitter != std::array<float, 2>{} ? SR::GetMipLODBias(device_data.sr_type, device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
+      const float mip_lod_bias = (game_device_data.jitter != std::array<float, 2>{} ? SR::GetMipLODBias(device_data.sr_type, device_data.output_resolution.y, device_data.output_resolution.y) : 0.f);
+      SetTextureMipLodBias(nullptr, device_data, mip_lod_bias);
       // None picked: Core stopped the SR bridge's helper, our inputs and output go too (recreated when an upscaler is picked again)
       if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false))
       {
          game_device_data.sr_output_srv.reset();
 #if DEVELOPMENT
-         if (device_data.debug_draw_texture && device_data.debug_draw_texture.get() == game_device_data.mv.texture.get())
-         {
-            device_data.debug_draw_texture = nullptr;
-         }
+         stop_debug_view(game_device_data.mv.texture.get());
 #endif
          const std::unique_lock lock(game_device_data.mv.mutex);
          game_device_data.mv.ReleaseMotionVectorTargets();
@@ -2770,10 +2733,7 @@ public:
       if (!IsReactiveMaskUsed(device_data) && game_device_data.mv.reactive_target)
       {
 #if DEVELOPMENT
-         if (device_data.debug_draw_texture && device_data.debug_draw_texture.get() == game_device_data.mv.reactive.get())
-         {
-            device_data.debug_draw_texture = nullptr;
-         }
+         stop_debug_view(game_device_data.mv.reactive.get());
 #endif
          game_device_data.mv.ReleaseReactiveMasks();
       }
@@ -2801,9 +2761,10 @@ public:
          device_data.debug_draw_texture_format = desc.Format;
          device_data.debug_draw_texture_size = {desc.Width, desc.Height, 1, 1};
       }
-      else if (device_data.debug_draw_texture && (device_data.debug_draw_texture.get() == game_device_data.mv.texture.get() || device_data.debug_draw_texture.get() == game_device_data.mv.reactive.get()))
+      else
       {
-         device_data.debug_draw_texture = nullptr;
+         stop_debug_view(game_device_data.mv.texture.get());
+         stop_debug_view(game_device_data.mv.reactive.get());
       }
 #endif
    }
@@ -2889,14 +2850,10 @@ public:
       }
 
       ImGui::SeparatorText("Fixes");
-      // Only the Steam executable is patched (each "Install" checks its bytes)
-      const bool fixes_installed = HomingSteering::installed || UnscaledTurns::installed || PlayerFrameCounters::installed || ContinuousDamage::installed || ConsoleSlowdown::patchable ||
-                                   UnscaledApproaches::installed || LinearTurnRate::installed || SnapApproaches::installed || VectorApproaches::installed || FrameConstants::installed || ConsoleFrameTime::installed || StuckRecovery::installed ||
-                                   BlockCalls::installed;
-      ImGui::BeginDisabled(!fixes_installed);
+      ImGui::BeginDisabled(!g_fixes_installed);
       DrawSettingCheckbox("Fix Frame Rate Bugs", "FixFrameRateBugs", &g_fix_frame_rate_bugs, true,
          "Gameplay runs as it does at 30 fps at any frame rate: homing, aiming, beam damage, stuns and timers.",
-         !fixes_installed);
+         !g_fixes_installed);
       ImGui::EndDisabled();
    }
 
@@ -3078,19 +3035,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
    else if (ul_reason_for_call == DLL_PROCESS_DETACH)
    {
       Vanquish::SetEvents(false);
-      HomingSteering::Uninstall();
-      ContinuousDamage::Uninstall();
-      UnscaledTurns::Uninstall();
-      PlayerFrameCounters::Uninstall();
-      ConsoleSlowdown::Apply(false);
-      BlockCalls::Uninstall();
-      StuckRecovery::Uninstall();
-      FrameConstants::Uninstall();
-      ConsoleFrameTime::Uninstall();
-      VectorApproaches::Uninstall();
-      SnapApproaches::Uninstall();
-      LinearTurnRate::Uninstall();
-      UnscaledApproaches::Uninstall();
+      for (const Fix& fix : FIXES | std::views::reverse)
+      {
+         fix.uninstall();
+      }
    }
 
    CoreMain(hModule, ul_reason_for_call, lpReserved);
