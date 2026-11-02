@@ -17,7 +17,7 @@ RWTexture2D<float2> motion_vectors : register(u0);
 RWTexture2D<float> device_depth : register(u1);
 RWTexture2D<float> reactive : register(u2);
 RWTexture2D<float> transparency : register(u3);
-RWTexture2D<float> previous_additive : register(u4); // The additive draws' mask of the previous frame, replaced here
+RWTexture2D<float> previous_additive : register(u4); // The additive and alpha blended draws' masks of the previous frame, replaced here
 
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
    uint2 size;
@@ -29,12 +29,18 @@ RWTexture2D<float> previous_additive : register(u4); // The additive draws' mask
       // The additive draws write y = 0, so x > y is theirs (sparks, glows), scaled and capped at 0.9 without a threshold, else they
       // smear, and kept from the previous frame (a blinking one that went out is still lit in the upscaler's history); the alpha
       // blended ones (x = y = a: smoke, haze) only over the threshold, as a continuous mask over them shakes the whole sprite
-      // (Bayonetta's TAA lab)
+      // (Bayonetta's TAA lab), and only where their alpha changed since the previous frame by more than
+      // "alpha_change_threshold": the game also draws static glass panes and corridor end caps as large alpha blended particle
+      // quads (037EC99A), whose history the mask threw away, so the aliasing behind them shimmered under Luma TAA and FSR
+      const float alpha_change_threshold = 0.1;
       const float2 mask = mask_input.Load(int3(id.xy, 0));
       const float current_additive = (mask.x > mask.y ? mask.x : 0.0);
-      const float additive = min(max(current_additive, previous_additive[id.xy]) * fill.reactive_scale, 0.9);
-      previous_additive[id.xy] = current_additive;
-      const float alpha_blended = (mask.y < fill.reactive_threshold ? 0.0 : 0.9);
+      // Both previous masks in the R32_FLOAT texture, as 8-bit integers (exact in a float): additive * 256 + alpha
+      const float previous_masks = previous_additive[id.xy];
+      const float previous_alpha = fmod(previous_masks, 256.0) / 255.0;
+      const float additive = min(max(current_additive, floor(previous_masks / 256.0) / 255.0) * fill.reactive_scale, 0.9);
+      previous_additive[id.xy] = round(current_additive * 255.0) * 256.0 + round(mask.y * 255.0);
+      const float alpha_blended = (mask.y < fill.reactive_threshold || abs(mask.y - previous_alpha) <= alpha_change_threshold ? 0.0 : 0.9);
       reactive[id.xy] = max(additive, alpha_blended);
       transparency[id.xy] = mask.y;
    }
