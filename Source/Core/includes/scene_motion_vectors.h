@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -33,12 +34,17 @@
 //   static bool CanFill(DeviceData& device_data);                    // The fill can run this frame (its depth and shader exist)
 //   static std::vector<uint8_t> PatchPixelShader(PixelShaderPatch patch, const uint8_t* code, size_t code_size, std::string* error);
 //   optional: static void FillMarkersBeforeBlend(ID3D11Device*, ID3D11DeviceContext*, DeviceData&);
+//   optional: static bool AcceptFrameCamera(const std::vector<uint8_t>& constants); // A draw's vc4 can be the frame's camera (else
+//                                                                                     // the next draw of its kind is asked)
 //   optional: static constexpr bool second_scene_color = true;       // A second color target "AcceptSceneColor" passes (the first one
 //                                                                     // accepted stays "scene_color"), with the same scene depth
 //   optional: static constexpr PixelShaderPatch blended_mask_patch;  // "BLENDED" plus the reactive mask, for the unmatched alpha blended
 //   optional: static bool MaskUnmatchedBlended(DeviceData&);   // draws into "reactive_target" (their own motion is unknown)
 //   optional: static bool PatchesReplacement(uint32_t pixel_shader_hash); // Its pixel shaders are patched from their replacement file
 //                                                                          // (when loaded), not from the game's code
+//   optional: static constexpr uint32_t previous_vertices_slot;      // A free VS resource slot: the opaque draws from dynamic vertex
+//                                                                     // buffers move by their previous vertices too (see
+//                                                                     // "MotionVectorPatch::PreviousVertices")
 namespace SceneMotionVectors
 {
    namespace Dg = MotionVectorPatch::DgVoodoo;
@@ -52,7 +58,8 @@ namespace SceneMotionVectors
    constexpr UINT CAMERA_SIZE = 4 * 16;
    static_assert(sizeof(PatchedDraws::ObjectTransform) == 3 * 16);
 
-   // Column vector matrices in vc4 (one row per clip space component). Rows are absolute (include "Dg::object_row_offset").
+   // Column vector matrices in vc4 (one row per clip space component), or row vector ones ("row_vectors": UE3's). Rows are absolute
+   // (include "Dg::object_row_offset").
    enum class CameraType : uint8_t
    {
       VIEW_PROJECTION,           // "row": the product
@@ -68,13 +75,19 @@ namespace SceneMotionVectors
       // How many rows of each matrix a vertex shader must read to be of this kind (a position uses all 4 of a product, a view may
       // have 3)
       uint32_t rows_read = 4;
+      bool row_vectors = false; // The transpose (VIEW_PROJECTION only)
+      // The rows compared and swapped with the camera (VIEW_PROJECTION only): its matrix, and the rows after it that move with it
+      // (UE3's camera position, which camera facing vertices read)
+      uint32_t camera_rows = 4;
       constexpr bool operator==(const Camera&) const = default;
    };
-   // The tie-break transform between the draws sharing a key: the 3x4 at "row" (a "relative" index: a bone palette's first bone)
+   // The tie-break transform between the draws sharing a key: the 3x4 at "row" (a "relative" index: a bone palette's first bone), or
+   // with "row_vectors" the 4x4 row vector matrix there ("PatchedDraws::ReadRowVectorTransform")
    struct TieBreakRow
    {
       uint32_t row;
       bool relative = false;
+      bool row_vectors = false;
    };
 
    // "DrawWithMotionVectors" refusals, counted per frame in DEVELOPMENT ("mv.rejected.*")
@@ -131,9 +144,11 @@ namespace SceneMotionVectors
       com_ptr<T> shader;
       UINT read_size = 0;
       UINT camera_offset = 0;
-      UINT projection_offset = 0; // The second matrix of the two matrix kinds
-      UINT camera_end = 0;        // The bytes of vc4 the camera needs
+      UINT projection_offset = 0;     // The second matrix of the two matrix kinds
+      UINT camera_end = 0;            // The bytes of vc4 the camera needs
+      UINT camera_size = CAMERA_SIZE; // A VIEW_PROJECTION camera's bytes ("Camera::camera_rows")
       UINT translation_offset = 0;
+      bool row_vector_transform = false; // Its tie-break's "row_vectors"
       CameraType camera_type = CameraType::VIEW_PROJECTION;
       bool frame_camera = false; // Of the game's "frame_camera" kind
    };
@@ -144,7 +159,21 @@ namespace SceneMotionVectors
    {
       PatchedDraws::ObjectTransform transform;
       ConstantsCopy constants;
+      // A dynamic vertex buffer's vertices as drawn, from the draw's first vertex (raw view): taken over by the draw matching the object
+      // a frame later, which reads them and copies its own over them (mutable: matches are found in last frame's const list)
+      mutable com_ptr<ID3D11Buffer> vertices;
+      mutable com_ptr<ID3D11ShaderResourceView> vertices_srv;
    };
+
+   // An input layout's POSITION (semantic index 0) of 3 or 4 floats, for the previous vertices
+   struct InputPosition
+   {
+      UINT slot;
+      UINT offset;
+      UINT components;
+   };
+   // The previous vertices' copy limit per draw: an indexed draw's last vertex isn't known, it copies to its buffer's end
+   constexpr UINT PREVIOUS_VERTICES_MAX_BYTES = 256 * 1024;
 
 #if DEVELOPMENT
    // Per frame counts for the MCP (the last complete frame's)
@@ -156,6 +185,13 @@ namespace SceneMotionVectors
       uint32_t bound_state_mismatches = 0;
       uint32_t constants_pool = 0;
       uint32_t prepass_drawn = 0;
+      uint32_t previous_vertices = 0;     // Draws reading their previous vertices
+      uint32_t vertex_copies = 0;         // Dynamic vertex buffer copies (the previous vertices of the next frame)
+      uint32_t vertex_copies_clipped = 0; // Of them, cut at "PREVIOUS_VERTICES_MAX_BYTES"
+      uint32_t vertex_writes = 0;         // Vertex buffer writes recorded
+      uint32_t no_input_position = 0;     // Opaque draws whose input layout has no known POSITION
+      uint32_t cpu_vertex_draws = 0;      // Opaque draws from a vertex buffer the CPU wrote, and of them the matched ones
+      uint32_t cpu_vertex_matched = 0;
       uint32_t ended_by = 0; // The ending pass's PS hash
       uint32_t rejected[REJECT_COUNT] = {};
    };
@@ -255,6 +291,12 @@ namespace SceneMotionVectors
       Math::Matrix44D reprojection;
       uint32_t frame_index = 0;              // The Luma frame index of the last motion vector frame
       std::vector<uint8_t> camera_only_copy; // An unmatched draw's constants with last frame's camera (reused)
+      // By input layout (under "mutex"), see "OnInitInputLayout"
+      std::unordered_map<const void*, InputPosition> input_positions;
+      // The previous vertices: the vertex buffers the CPU wrote, by resource, with the Luma frame index of their last write (under
+      // "mutex"). Recorded once a game draw opted in. A destroyed buffer's address can come back: its stale frame index never matches.
+      std::atomic<bool> track_vertex_writes = false;
+      std::unordered_map<uint64_t, uint32_t> vertex_writes;
       // Off (a development A/B): the draws keep their own constants with last frame's camera, no object motion
       bool object_motion = true;
 #if DEVELOPMENT
@@ -299,6 +341,18 @@ namespace SceneMotionVectors
       return ((state && cmd_list_data && cmd_list_data->is_primary) ? &state->bound_states : nullptr);
    }
 
+   // The previous vertices: a CPU write to a vertex buffer this frame
+   inline void RecordVertexWrite(reshade::api::device* device, State* state, reshade::api::resource resource)
+   {
+      if (!state->track_vertex_writes || (device->get_resource_desc(resource).usage & reshade::api::resource_usage::vertex_buffer) == 0)
+         return;
+      const std::unique_lock lock(state->mutex);
+      state->vertex_writes.insert_or_assign(resource.handle, cb_luma_global_settings.FrameIndex);
+#if DEVELOPMENT
+      state->stats.vertex_writes++;
+#endif
+   }
+
    // Motion vectors: a registered vc4 buffer mapped for a whole rewrite, remembered until its Unmap
    template <State* (*get)(reshade::api::device*)>
    void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
@@ -307,6 +361,10 @@ namespace SceneMotionVectors
       if (!state || !state->active || !data || !*data)
          return;
       const PatchedDraws::ObjectConstants::Entry* const registered = state->constants.OnMap(resource.handle, offset, access, *data);
+      if (!registered && access != reshade::api::map_access::read_only)
+      {
+         RecordVertexWrite(device, state, resource);
+      }
 #if DEVELOPMENT
       if (registered && !registered->mapped)
       {
@@ -344,7 +402,49 @@ namespace SceneMotionVectors
          state->stats.updates++;
 #endif
       }
+      else
+      {
+         RecordVertexWrite(device, state, resource);
+      }
       return false;
+   }
+
+   // The previous vertices: an input layout's POSITION, where the vertex buffer holds it (D3D11 can't query a layout's elements)
+   template <State* (*get)(reshade::api::device*)>
+   void OnInitInputLayout(reshade::api::device* device, reshade::api::pipeline_layout, uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects, reshade::api::pipeline pipeline)
+   {
+      for (uint32_t i = 0; i < subobject_count; i++)
+      {
+         if (subobjects[i].type != reshade::api::pipeline_subobject_type::input_layout)
+            continue;
+         State* const state = get(device);
+         if (!state)
+            return;
+         const auto* const elements = static_cast<const reshade::api::input_element*>(subobjects[i].data);
+         for (uint32_t j = 0; j < subobjects[i].count; j++)
+         {
+            const reshade::api::input_element& element = elements[j];
+            const bool float3 = element.format == reshade::api::format::r32g32b32_float;
+            if (element.semantic && _stricmp(element.semantic, "POSITION") == 0 && element.semantic_index == 0 && element.instance_step_rate == 0 && element.offset != D3D11_APPEND_ALIGNED_ELEMENT && (float3 || element.format == reshade::api::format::r32g32b32a32_float))
+            {
+               const std::unique_lock lock(state->mutex);
+               // A destroyed layout's address comes back for a new one (UE3 creates layouts every frame)
+               state->input_positions.insert_or_assign(reinterpret_cast<const void*>(pipeline.handle), InputPosition{.slot = element.buffer_binding, .offset = element.offset, .components = (float3 ? 3u : 4u)});
+               return;
+            }
+         }
+         return;
+      }
+   }
+
+   template <State* (*get)(reshade::api::device*)>
+   void OnDestroyInputLayout(reshade::api::device* device, reshade::api::pipeline pipeline)
+   {
+      State* const state = get(device);
+      if (!state)
+         return;
+      const std::unique_lock lock(state->mutex);
+      state->input_positions.erase(reinterpret_cast<const void*>(pipeline.handle));
    }
 
    template <State* (*get)(reshade::api::device*)>
@@ -374,6 +474,8 @@ namespace SceneMotionVectors
       set.template operator()<reshade::addon_event::map_buffer_region>(OnMapBufferRegion<get>);
       set.template operator()<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion<get>);
       set.template operator()<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion<get>);
+      set.template operator()<reshade::addon_event::init_pipeline>(OnInitInputLayout<get>);
+      set.template operator()<reshade::addon_event::destroy_pipeline>(OnDestroyInputLayout<get>);
    }
 
    // A refused "DrawWithMotionVectors": always false
@@ -417,8 +519,18 @@ namespace SceneMotionVectors
    Math::Matrix44D ReadFrameViewProjection(const std::vector<uint8_t>& constants)
    {
       static_assert(Game::frame_camera.type == CameraType::VIEW_PROJECTION || Game::frame_camera.type == CameraType::VIEW_AND_PROJECTION);
+      static_assert(!Game::frame_camera.row_vectors || Game::frame_camera.type == CameraType::VIEW_PROJECTION);
+      static_assert(std::ranges::all_of(Game::cameras, [](const Camera& camera)
+         { return camera.type == CameraType::VIEW_PROJECTION || (!camera.row_vectors && camera.camera_rows == 4); }));
       if constexpr (Game::frame_camera.type == CameraType::VIEW_PROJECTION)
-         return ReadMatrix(constants, Game::frame_camera.row * 16);
+      {
+         Math::Matrix44D matrix = ReadMatrix(constants, Game::frame_camera.row * 16);
+         if constexpr (Game::frame_camera.row_vectors)
+         {
+            matrix.Transpose();
+         }
+         return matrix;
+      }
       else
          return ReadMatrix(constants, Game::frame_camera.projection_row * 16) * ReadAffineMatrix(constants, Game::frame_camera.row * 16);
    }
@@ -427,7 +539,7 @@ namespace SceneMotionVectors
    // use (null if it can't be, e.g. a vertex shader that doesn't place vertices with a camera). The maps' nodes are never erased.
    template <typename Game, typename T>
    const PatchedShader<T>& GetPatchedShader(State* state, ID3D11Device* native_device, DeviceData& device_data, uint32_t hash, reshade::api::pipeline pipeline,
-      PixelShaderPatch patch = PixelShaderPatch::MOTION_VECTORS)
+      PixelShaderPatch patch = PixelShaderPatch::MOTION_VECTORS, const MotionVectorPatch::PreviousVertices* previous_vertices = nullptr)
    {
       constexpr bool vertex = std::is_same_v<T, ID3D11VertexShader>;
       auto* const shaders = [&]
@@ -443,6 +555,11 @@ namespace SceneMotionVectors
       const auto replacement_key = [&](std::vector<uint8_t>* replacement)
       {
          uint64_t key = hash;
+         // A previous vertices variant by its vertex layout (the low bit set)
+         if (previous_vertices)
+         {
+            key |= (1ull | uint64_t(previous_vertices->stride) << 1 | uint64_t(previous_vertices->offset) << 13 | uint64_t(previous_vertices->components == 4) << 25) << 32;
+         }
          if constexpr (!vertex && requires { Game::PatchesReplacement(hash); })
          {
             if (Game::PatchesReplacement(hash))
@@ -489,7 +606,7 @@ namespace SceneMotionVectors
             const size_t code_size = (sync_patched ? sync_patched->code.size() : desc->code_size);
             if constexpr (vertex)
             {
-               patched = MotionVectorPatch::PatchVertexShader(code, code_size, Game::layout, &error);
+               patched = MotionVectorPatch::PatchVertexShader(code, code_size, Game::layout, &error, nullptr, previous_vertices);
                if (!patched.empty())
                {
                   record.read_size = DXBC::ConstantBufferBytes(code, code_size, object_slot);
@@ -515,7 +632,8 @@ namespace SceneMotionVectors
                      record.camera_type = camera.type;
                      record.camera_offset = camera.row * 16;
                      record.projection_offset = (two_matrices ? camera.projection_row * 16 : 0);
-                     record.camera_end = (std::max)(record.camera_offset, record.projection_offset) + CAMERA_SIZE;
+                     record.camera_size = camera.camera_rows * 16;
+                     record.camera_end = (std::max)(record.camera_offset, record.projection_offset) + record.camera_size;
                      record.frame_camera = camera == Game::frame_camera;
                      break;
                   }
@@ -526,6 +644,7 @@ namespace SceneMotionVectors
                      if (reads(tie_break.row, tie_break.relative))
                      {
                         record.translation_offset = tie_break.row * 16;
+                        record.row_vector_transform = tie_break.row_vectors;
                         break;
                      }
                   }
@@ -579,7 +698,7 @@ namespace SceneMotionVectors
             }
          }
          reshade::log::message(((shader || expected) ? reshade::log::level::info : reshade::log::level::warning),
-            std::format("[{}] {} 0x{:08X} {}", Game::log_tag, (vertex ? "MV VS" : Game::patch_names[size_t(patch)]), hash, status).c_str());
+            std::format("[{}] {} 0x{:08X} {}", Game::log_tag, (vertex ? (previous_vertices ? "MV VS (previous vertices)" : "MV VS") : Game::patch_names[size_t(patch)]), hash, status).c_str());
       }
       record.shader = shader;
       const std::unique_lock lock(state->mutex);
@@ -688,7 +807,9 @@ namespace SceneMotionVectors
    {
       if (entry->latest.size() < vertex_shader.camera_end)
          return nullptr;
-      const size_t min_size = (std::max)(size_t(vertex_shader.camera_end), vertex_shader.translation_offset != 0 ? vertex_shader.translation_offset + sizeof(PatchedDraws::ObjectTransform) : 0);
+      constexpr size_t row_vector_matrix_size = 4 * 16;
+      const size_t transform_size = (vertex_shader.row_vector_transform ? row_vector_matrix_size : sizeof(PatchedDraws::ObjectTransform));
+      const size_t min_size = (std::max)(size_t(vertex_shader.camera_end), vertex_shader.translation_offset != 0 ? vertex_shader.translation_offset + transform_size : 0);
       return state->constants.Snapshot(*entry, vertex_shader.read_size, min_size);
    }
 
@@ -723,7 +844,13 @@ namespace SceneMotionVectors
       }
       if (!state->camera && takes_frame_camera)
       {
-         state->camera = SnapshotConstants(state, &entry, vertex_shader);
+         ConstantsCopy camera = SnapshotConstants(state, &entry, vertex_shader);
+         if constexpr (requires { Game::AcceptFrameCamera(*camera); })
+         {
+            if (!camera || !Game::AcceptFrameCamera(*camera))
+               return result;
+         }
+         state->camera = std::move(camera);
          // Previous clip space from the current: previous * inverse(current), in double (absolute world translation)
          state->reprojection.SetIdentity();
          if (state->previous_camera)
@@ -910,6 +1037,12 @@ namespace SceneMotionVectors
       // None (no CPU copy yet, another camera): the current one (zero motion).
       const std::vector<uint8_t>* upload = nullptr;
       bool object_matched = false;
+      // The previous vertices: the variant reading them, their view, and this draw's vertices copied after it for the next frame
+      const PatchedShader<ID3D11VertexShader>* draw_vertex_shader = &vertex_shader;
+      ID3D11ShaderResourceView* previous_vertices_srv = nullptr;
+      com_ptr<ID3D11Buffer> vertex_copy_source;
+      ID3D11Buffer* vertex_copy_destination = nullptr;
+      D3D11_BOX vertex_copy_box = {};
       if (constants)
       {
          // Draw key: same mesh, same shaders, no instance count. The offsets go with the buffers: queried with them, else tracked
@@ -924,8 +1057,22 @@ namespace SceneMotionVectors
          }
 #endif
          const DrawDispatchData& draw_data = last_draw_dispatch_data;
+         // The previous vertices (see below): an opaque draw from a vertex buffer the CPU wrote this frame or the last (dgVoodoo presents
+         // from another thread, so the frame index can step between a write at the frame's start and its draw). Its key leaves the
+         // buffer out: dgVoodoo gives a D3D9 buffer rewritten with DISCARD another D3D11 one every frame.
+         bool cpu_vertices = false;
+         if constexpr (requires { Game::previous_vertices_slot; })
+         {
+            state->track_vertex_writes = true;
+            if (!blended && vertex_buffer)
+            {
+               const std::shared_lock lock(state->mutex);
+               const auto it = state->vertex_writes.find(reinterpret_cast<uint64_t>(vertex_buffer));
+               cpu_vertices = it != state->vertex_writes.end() && cb_luma_global_settings.FrameIndex - it->second <= 1;
+            }
+         }
          uint64_t key = 0;
-         for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), reinterpret_cast<uint64_t>(vertex_buffer), uint64_t(vertex_offset),
+         for (const uint64_t value : {uint64_t(original_shader_hashes.vertex_shaders[0]), uint64_t(original_shader_hashes.pixel_shaders[0]), (cpu_vertices ? 0 : reinterpret_cast<uint64_t>(vertex_buffer)), uint64_t(vertex_offset),
                  reinterpret_cast<uint64_t>(index_buffer), uint64_t(index_offset), uint64_t(draw_data.index_count), uint64_t(draw_data.first_index), uint64_t(uint32_t(draw_data.vertex_offset)),
                  uint64_t(draw_data.vertex_count), uint64_t(draw_data.first_vertex)})
          {
@@ -938,7 +1085,11 @@ namespace SceneMotionVectors
          // none: their draws keep their own constants with last frame's camera (static).
          PatchedDraws::ObjectTransform transform = {};
          bool untransformed = vertex_shader.translation_offset == 0;
-         if (!untransformed)
+         if (vertex_shader.row_vector_transform)
+         {
+            transform = PatchedDraws::ReadRowVectorTransform(constants->data() + vertex_shader.translation_offset);
+         }
+         else if (!untransformed)
          {
             std::memcpy(transform.data(), constants->data() + vertex_shader.translation_offset, sizeof(transform));
          }
@@ -969,8 +1120,8 @@ namespace SceneMotionVectors
             match = state->objects.FindNearest(key, transform, [&](const auto& candidate)
                { return candidate.constants->size() == constants->size(); });
          }
-         const auto same_rows = [&](UINT offset)
-         { return std::memcmp(constants->data() + offset, state->camera->data() + offset, CAMERA_SIZE) == 0; };
+         const auto same_rows = [&](UINT offset, UINT size = CAMERA_SIZE)
+         { return std::memcmp(constants->data() + offset, state->camera->data() + offset, size) == 0; };
          // Drawn with the frame's camera (a world view projection shader's can't be told)
          bool frame_camera = false;
          if (state->camera)
@@ -978,7 +1129,7 @@ namespace SceneMotionVectors
             switch (vertex_shader.camera_type)
             {
             case CameraType::VIEW_PROJECTION:
-               frame_camera = vertex_shader.frame_camera && same_rows(vertex_shader.camera_offset);
+               frame_camera = vertex_shader.frame_camera && same_rows(vertex_shader.camera_offset, vertex_shader.camera_size);
                break;
             case CameraType::WORLD_VIEW_PROJECTION:
                frame_camera = true;
@@ -1011,7 +1162,7 @@ namespace SceneMotionVectors
             switch (vertex_shader.camera_type)
             {
             case CameraType::VIEW_PROJECTION:
-               std::memcpy(state->camera_only_copy.data() + vertex_shader.camera_offset, state->previous_camera->data() + vertex_shader.camera_offset, CAMERA_SIZE);
+               std::memcpy(state->camera_only_copy.data() + vertex_shader.camera_offset, state->previous_camera->data() + vertex_shader.camera_offset, vertex_shader.camera_size);
                break;
             case CameraType::WORLD_VIEW_PROJECTION:
                WriteMatrix(&state->camera_only_copy, vertex_shader.camera_offset, state->reprojection * ReadMatrix(*constants, vertex_shader.camera_offset));
@@ -1042,9 +1193,103 @@ namespace SceneMotionVectors
             state->stats.other_camera++;
          }
 #endif
+         // The previous vertices (see "MotionVectorPatch::PreviousVertices"): such a draw (Mirror's Edge's paper scraps blown around) reads
+         // the copy of last frame's vertices its matched object made, then copies its own over it after the draw. Alpha blended ones are
+         // particles: reordered as they spawn and die, vertex i isn't last frame's.
+         com_ptr<ID3D11Buffer> vertices;
+         com_ptr<ID3D11ShaderResourceView> vertices_srv;
+         if constexpr (requires { Game::previous_vertices_slot; })
+         {
+            InputPosition position = {};
+            if (com_ptr<ID3D11InputLayout> input_layout; cpu_vertices && !untransformed && (native_device_context->IAGetInputLayout(&input_layout), input_layout))
+            {
+               const std::shared_lock lock(state->mutex);
+               if (const auto it = state->input_positions.find(input_layout.get()); it != state->input_positions.end())
+               {
+                  position = it->second;
+               }
+#if DEVELOPMENT
+               else
+               {
+                  state->stats.no_input_position++;
+               }
+#endif
+            }
+            UINT stride = 0, buffer_offset = 0;
+            com_ptr<ID3D11Buffer> source;
+            if (position.components != 0)
+            {
+               native_device_context->IAGetVertexBuffers(position.slot, 1, &source, &stride, &buffer_offset);
+            }
+            // The positions in the written buffer (the one the key left out)
+            D3D11_BUFFER_DESC source_desc = {};
+#if DEVELOPMENT
+            state->stats.cpu_vertex_draws += cpu_vertices;
+            state->stats.cpu_vertex_matched += cpu_vertices && match;
+#endif
+            if (source && source.get() == vertex_buffer)
+            {
+               source->GetDesc(&source_desc);
+            }
+            // SV_VertexID leaves out the base vertex (and a non indexed draw's first vertex): the copy starts there
+            const int64_t first_vertex = (draw_data.indexed ? int64_t(draw_data.vertex_offset) : int64_t(draw_data.first_vertex));
+            const uint64_t start = uint64_t(buffer_offset) + uint64_t((std::max)(first_vertex, int64_t(0))) * stride;
+            if (source_desc.ByteWidth != 0 && stride != 0 && first_vertex >= 0 && start < source_desc.ByteWidth)
+            {
+               uint64_t size = source_desc.ByteWidth - start;
+               if (!draw_data.indexed)
+               {
+                  size = (std::min)(size, uint64_t(draw_data.vertex_count) * stride);
+               }
+#if DEVELOPMENT
+               state->stats.vertex_copies_clipped += size > PREVIOUS_VERTICES_MAX_BYTES;
+#endif
+               // Whole 32 bit words (a raw view's elements)
+               const UINT copy_size = UINT((std::min)(size, uint64_t(PREVIOUS_VERTICES_MAX_BYTES))) & ~3u;
+               // Last frame's copy, taken over when it's of the same size (the same draw)
+               if (match && state->object_motion && match->vertices)
+               {
+                  D3D11_BUFFER_DESC desc;
+                  match->vertices->GetDesc(&desc);
+                  if (desc.ByteWidth == copy_size)
+                  {
+                     vertices = std::move(match->vertices);
+                     vertices_srv = std::move(match->vertices_srv);
+                     const MotionVectorPatch::PreviousVertices vertex_layout = {.slot = Game::previous_vertices_slot, .stride = stride, .offset = position.offset, .components = position.components};
+                     if (const auto& variant = GetPatchedShader<Game, ID3D11VertexShader>(state, native_device, device_data, original_shader_hashes.vertex_shaders[0], cmd_list_data.pipeline_state_original_vertex_shader,
+                            PixelShaderPatch::MOTION_VECTORS, &vertex_layout);
+                        variant.shader)
+                     {
+                        draw_vertex_shader = &variant;
+                        previous_vertices_srv = vertices_srv.get();
+#if DEVELOPMENT
+                        state->stats.previous_vertices++;
+#endif
+                     }
+                  }
+               }
+               // Only for a draw that was there last frame too: a ring buffer's draws (another offset every frame) never match, nor
+               // would their copies
+               if (!vertices && copy_size != 0 && match)
+               {
+                  const CD3D11_BUFFER_DESC desc(copy_size, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS);
+                  const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_BUFFEREX, DXGI_FORMAT_R32_TYPELESS, 0, copy_size / 4, 0, 0, D3D11_BUFFEREX_SRV_FLAG_RAW); // Flags: the 7th argument
+                  if (SUCCEEDED(native_device->CreateBuffer(&desc, nullptr, &vertices)) && FAILED(native_device->CreateShaderResourceView(vertices.get(), &srv_desc, &vertices_srv)))
+                  {
+                     vertices.reset();
+                  }
+               }
+               if (vertices_srv)
+               {
+                  vertex_copy_source = source;
+                  vertex_copy_destination = vertices.get();
+                  vertex_copy_box = {UINT(start), 0, 0, UINT(start) + copy_size, 1, 1};
+               }
+            }
+         }
          // Kept as drawn for the next frame
          // Untransformed draws are never looked up
-         state->objects.Push(key, {.transform = transform, .constants = std::move(constants)}, !untransformed);
+         state->objects.Push(key, {.transform = transform, .constants = std::move(constants), .vertices = std::move(vertices), .vertices_srv = std::move(vertices_srv)}, !untransformed);
       }
 #if DEVELOPMENT
       else
@@ -1068,7 +1313,7 @@ namespace SceneMotionVectors
          }
       }
       ID3D11Buffer* const previous_current[] = {scene_constants.buffer};
-      state->previous_constants.Bind(native_device, native_device_context, Dg::previous_slots, {&upload, 1}, previous_current, Game::log_tag, {&vertex_shader.read_size, 1});
+      state->previous_constants.Bind(native_device, native_device_context, Dg::previous_slots, {&upload, 1}, previous_current, Game::log_tag, {&draw_vertex_shader->read_size, 1});
       BindJitter(native_device_context, state);
       // Left bound after the draw (set directly, bypassing Core's state tracking): the game's next draws either bind their own targets
       // and shaders, or are motion vector draws too. The game's pixel shaders write o0 only, so the motion vector target keeps its
@@ -1097,10 +1342,33 @@ namespace SceneMotionVectors
             }
          }
       }
-      PatchedDraws::BindPatchedShader(native_device_context, vertex_shader.shader.get(), &state->bound_vertex_shader);
+      PatchedDraws::BindPatchedShader(native_device_context, draw_vertex_shader->shader.get(), &state->bound_vertex_shader);
       PatchedDraws::BindPatchedShader(native_device_context, pixel_shader, &state->bound_pixel_shader);
+      if constexpr (requires { Game::previous_vertices_slot; })
+      {
+         if (previous_vertices_srv)
+         {
+            native_device_context->VSSetShaderResources(Game::previous_vertices_slot, 1, &previous_vertices_srv);
+         }
+      }
 
       draw();
+      if constexpr (requires { Game::previous_vertices_slot; })
+      {
+         // Unbound before it's overwritten with this frame's vertices
+         if (previous_vertices_srv)
+         {
+            ID3D11ShaderResourceView* const no_view = nullptr;
+            native_device_context->VSSetShaderResources(Game::previous_vertices_slot, 1, &no_view);
+         }
+         if (vertex_copy_destination)
+         {
+            native_device_context->CopySubresourceRegion(vertex_copy_destination, 0, 0, 0, 0, vertex_copy_source.get(), 0, &vertex_copy_box);
+#if DEVELOPMENT
+            state->stats.vertex_copies++;
+#endif
+         }
+      }
       if (mask_targets[reactive_slot])
       {
          // No mask bound for the next draws, which don't write it
@@ -1199,7 +1467,10 @@ namespace SceneMotionVectors
       const std::pair<const char*, const uint32_t*> counters[] = {{"draws", &stats.motion_vector_draws}, {"jitter_draws", &stats.jitter_draws}, {"reactive_draws", &stats.reactive_draws}, {"matched", &stats.matched},
          {"camera_only", &stats.camera_only}, {"other_camera", &stats.other_camera}, {"uncopied", &stats.uncopied}, {"maps", &stats.maps}, {"updates", &stats.updates},
          {"other_maps", &stats.other_maps}, {"sr_draws", &stats.sr_draws}, {"tiebreak_collisions", &stats.tiebreak_collisions}, {"untransformed", &stats.untransformed},
-         {"bound_state_mismatches", &stats.bound_state_mismatches}, {"constants_pool", &stats.constants_pool}, {"prepass_drawn", &stats.prepass_drawn}, {"ended_by_hash", &stats.ended_by}};
+         {"bound_state_mismatches", &stats.bound_state_mismatches}, {"constants_pool", &stats.constants_pool}, {"prepass_drawn", &stats.prepass_drawn}, {"previous_vertices", &stats.previous_vertices},
+         {"vertex_copies", &stats.vertex_copies}, {"vertex_copies_clipped", &stats.vertex_copies_clipped}, {"vertex_writes", &stats.vertex_writes},
+         {"no_input_position", &stats.no_input_position}, {"cpu_vertex_draws", &stats.cpu_vertex_draws},
+         {"cpu_vertex_matched", &stats.cpu_vertex_matched}, {"ended_by_hash", &stats.ended_by}};
       for (const auto& [name, value] : counters)
       {
          Mcp::RegisterCounter(prefix + name, value, owner);

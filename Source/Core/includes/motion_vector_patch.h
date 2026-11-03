@@ -90,9 +90,21 @@ namespace MotionVectorPatch
       }
    } // namespace DgVoodoo
 
+   // The previous frame's vertex positions for vertices the CPU rewrites every frame (a fixed world matrix, the motion is in the
+   // vertices): a copy of last frame's vertex buffer as a raw buffer at t<slot>, from the draw's first vertex. The second run reads its
+   // POSITION input there, at SV_VertexID * stride + offset (3 or 4 floats; past the copy's end it keeps the current one). SM5 only.
+   struct PreviousVertices
+   {
+      uint32_t slot;
+      uint32_t stride;
+      uint32_t offset;
+      uint32_t components; // 3 (w = 1, as the input assembler fills it) or 4
+   };
+
    // The vertex shader with the second run, or empty if unpatchable (the draw then keeps the original shaders). "declares_resources":
    // whether it reads resources, which its second run reads at "previous_resources_slot" (the game binds them there).
-   inline std::vector<uint8_t> PatchVertexShader(const uint8_t* code, size_t size, const Layout& layout, std::string* error, bool* declares_resources = nullptr)
+   inline std::vector<uint8_t> PatchVertexShader(const uint8_t* code, size_t size, const Layout& layout, std::string* error, bool* declares_resources = nullptr,
+      const PreviousVertices* previous_vertices = nullptr)
    {
       std::vector<Chunk> chunks;
       if (!ReadChunks(code, size, &chunks))
@@ -148,8 +160,37 @@ namespace MotionVectorPatch
       if (object_index == first_body)
          return (*error = "no object constants", std::vector<uint8_t>());
       const size_t last_output = FindLastDeclaration(instructions, first_body, {D3D10_SB_OPCODE_DCL_OUTPUT, D3D10_SB_OPCODE_DCL_OUTPUT_SIV, D3D10_SB_OPCODE_DCL_OUTPUT_SGV});
+
+      // The previous vertices: the POSITION input's register, a free one for SV_VertexID, and where their declarations go (the raw
+      // buffer after the last buffer or resource, SV_VertexID after the last input)
+      Chunk* input_signature = nullptr;
+      std::vector<SignatureElement> inputs;
+      uint32_t position_input = 0;
+      uint32_t vertex_id_input = 0;
+      size_t last_resource = first_body;
+      size_t last_input = first_body;
+      if (previous_vertices)
+      {
+         input_signature = FindChunk(&chunks, FourCC("ISGN"));
+         if (DECODE_D3D10_SB_TOKENIZED_PROGRAM_MAJOR_VERSION(tokens[0]) < 5 || !input_signature || !ReadSignature(input_signature->data, &inputs))
+            return (*error = "previous vertices: SM5 input signature", std::vector<uint8_t>());
+         const auto position_element = std::ranges::find_if(inputs, [](const SignatureElement& element)
+            { return element.system_value == 0 && element.semantic_index == 0 && _stricmp(element.name.c_str(), "POSITION") == 0; });
+         if (position_element == inputs.end())
+            return (*error = "previous vertices: no POSITION input", std::vector<uint8_t>());
+         position_input = position_element->reg;
+         for (const SignatureElement& element : inputs)
+         {
+            vertex_id_input = (std::max)(vertex_id_input, element.reg + 1);
+         }
+         last_resource = FindLastDeclaration(instructions, first_body, {D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER, D3D10_SB_OPCODE_DCL_SAMPLER, D3D10_SB_OPCODE_DCL_RESOURCE, D3D11_SB_OPCODE_DCL_RESOURCE_RAW, D3D11_SB_OPCODE_DCL_RESOURCE_STRUCTURED});
+         last_input = FindLastDeclaration(instructions, first_body, {D3D10_SB_OPCODE_DCL_INPUT, D3D10_SB_OPCODE_DCL_INPUT_SGV, D3D10_SB_OPCODE_DCL_INPUT_SIV});
+         if (vertex_id_input >= D3D11_VS_INPUT_REGISTER_COUNT || last_resource == first_body || last_input == first_body)
+            return (*error = "previous vertices: declarations", std::vector<uint8_t>());
+      }
+
       uint32_t scratch;
-      std::vector<uint32_t> declarations = CopyDeclarations(tokens, instructions, first_body, 1, &scratch, [&](size_t i)
+      std::vector<uint32_t> declarations = CopyDeclarations(tokens, instructions, first_body, (previous_vertices ? 2 : 1), &scratch, [&](size_t i)
          {
             const Instruction& instruction = instructions[i];
             std::vector<uint32_t> added;
@@ -176,7 +217,16 @@ namespace MotionVectorPatch
                for (const uint32_t reg : {layout.current_position_register, layout.previous_position_register})
                   added.insert(added.end(), {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_OUTPUT) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(3), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL), reg});
             }
+            if (previous_vertices && i == last_resource)
+            {
+               added.insert(added.end(), {Opcode(D3D11_SB_OPCODE_DCL_RESOURCE_RAW, 3), ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_0_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_RESOURCE) | ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(D3D10_SB_OPERAND_INDEX_1D) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32), previous_vertices->slot});
+            }
+            if (previous_vertices && i == last_input)
+            {
+               added.insert(added.end(), {Opcode(D3D10_SB_OPCODE_DCL_INPUT_SGV, 4), Destination(D3D10_SB_OPERAND_TYPE_INPUT, D3D10_SB_OPERAND_4_COMPONENT_MASK_X), vertex_id_input, D3D10_SB_NAME_VERTEX_ID});
+            }
             return added; });
+      const uint32_t previous_position = scratch + 1; // The previous vertices' position (their second temp)
 
       // The two runs. Outputs are only ever destinations in vertex shaders.
       std::vector<uint32_t> body;
@@ -184,6 +234,65 @@ namespace MotionVectorPatch
       for (int run = 0; run < 2; run++)
       {
          const bool previous = run == 1;
+         if (previous && previous_vertices)
+         {
+            // The previous position from the copy, through the scratch temp (dead until the run's first output write): its byte
+            // address at SV_VertexID * stride + offset, the current position past the copy's end
+            constexpr uint32_t immediate = ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_1_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
+            const uint32_t components = previous_vertices->components;
+            body.insert(body.end(), {
+                                       Opcode(D3D11_SB_OPCODE_BUFINFO, 5),
+                                       Destination(D3D10_SB_OPERAND_TYPE_TEMP, D3D10_SB_OPERAND_4_COMPONENT_MASK_X),
+                                       scratch,
+                                       Source(D3D10_SB_OPERAND_TYPE_RESOURCE, 0, 0, 0, 0),
+                                       previous_vertices->slot,
+                                       Opcode(D3D10_SB_OPCODE_IMAD, 9),
+                                       Destination(D3D10_SB_OPERAND_TYPE_TEMP, D3D10_SB_OPERAND_4_COMPONENT_MASK_W),
+                                       previous_position,
+                                       Source(D3D10_SB_OPERAND_TYPE_INPUT, 0, 0, 0, 0),
+                                       vertex_id_input,
+                                       immediate,
+                                       previous_vertices->stride,
+                                       immediate,
+                                       previous_vertices->offset,
+                                       Opcode(D3D10_SB_OPCODE_IADD, 7),
+                                       Destination(D3D10_SB_OPERAND_TYPE_TEMP, D3D10_SB_OPERAND_4_COMPONENT_MASK_Y),
+                                       scratch,
+                                       Source(D3D10_SB_OPERAND_TYPE_TEMP, 3, 3, 3, 3),
+                                       previous_position,
+                                       immediate,
+                                       components * 4,
+                                       Opcode(D3D10_SB_OPCODE_UGE, 7),
+                                       Destination(D3D10_SB_OPERAND_TYPE_TEMP, D3D10_SB_OPERAND_4_COMPONENT_MASK_Y),
+                                       scratch,
+                                       Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 0, 0, 0),
+                                       scratch,
+                                       Source(D3D10_SB_OPERAND_TYPE_TEMP, 1, 1, 1, 1),
+                                       scratch,
+                                       Opcode(D3D11_SB_OPCODE_LD_RAW, 7),
+                                       Destination(D3D10_SB_OPERAND_TYPE_TEMP, (components == 4 ? D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL : D3D10_SB_OPERAND_4_COMPONENT_MASK_X | D3D10_SB_OPERAND_4_COMPONENT_MASK_Y | D3D10_SB_OPERAND_4_COMPONENT_MASK_Z)),
+                                       previous_position,
+                                       Source(D3D10_SB_OPERAND_TYPE_TEMP, 3, 3, 3, 3),
+                                       previous_position,
+                                       Source(D3D10_SB_OPERAND_TYPE_RESOURCE, 0, 1, 2, 3),
+                                       previous_vertices->slot,
+                                    });
+            if (components != 4)
+            {
+               body.insert(body.end(), {Opcode(D3D10_SB_OPCODE_MOV, 5), Destination(D3D10_SB_OPERAND_TYPE_TEMP, D3D10_SB_OPERAND_4_COMPONENT_MASK_W), previous_position, immediate, std::bit_cast<uint32_t>(1.f)});
+            }
+            body.insert(body.end(), {
+                                       Opcode(D3D10_SB_OPCODE_MOVC, 9),
+                                       Destination(D3D10_SB_OPERAND_TYPE_TEMP, D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL),
+                                       previous_position,
+                                       Source(D3D10_SB_OPERAND_TYPE_TEMP, 1, 1, 1, 1),
+                                       scratch,
+                                       Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 2, 3),
+                                       previous_position,
+                                       Source(D3D10_SB_OPERAND_TYPE_INPUT, 0, 1, 2, 3),
+                                       position_input,
+                                    });
+         }
          for (size_t i = first_body; i < instructions.size(); i++)
          {
             const Instruction& instruction = instructions[i];
@@ -217,6 +326,17 @@ namespace MotionVectorPatch
                      {
                         token = (token & ~D3D10_SB_OPERAND_TYPE_MASK) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_TEMP);
                         index = scratch;
+                     }
+                  }
+                  else if (previous && previous_vertices && type == D3D10_SB_OPERAND_TYPE_INPUT)
+                  {
+                     if (index_position == no_index || DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, token) != D3D10_SB_OPERAND_INDEX_IMMEDIATE32)
+                        return supported = false;
+                     // The second run's position input is the previous one (same swizzle)
+                     if (uint32_t& index = body[offset + index_position - instruction.begin]; index == position_input)
+                     {
+                        token = (token & ~D3D10_SB_OPERAND_TYPE_MASK) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_TEMP);
+                        index = previous_position;
                      }
                   }
                   else if (previous && type == D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER && index_position != no_index)
@@ -280,6 +400,11 @@ namespace MotionVectorPatch
       element.reg = layout.previous_position_register;
       outputs.push_back(element);
       output_signature->data = WriteSignature(outputs);
+      if (previous_vertices)
+      {
+         inputs.push_back({"SV_VertexID", 0, D3D_NAME_VERTEX_ID, D3D_REGISTER_COMPONENT_UINT32, vertex_id_input, 0x1, 0x1});
+         input_signature->data = WriteSignature(inputs);
+      }
       return WriteChunks(chunks);
    }
 
