@@ -11,7 +11,7 @@
 //
 // Non-filmic grading is transcribed from 0x2754F750 and filmic grading from 0x222186F8; their register-level
 // swizzles differ, are each internally rotation-consistent, and must be preserved. The body emits linear
-// gradedHDR and native gamma sdrGamma for the shared PsychoV31/output tail.
+// gradedHDR and native gamma sdrGamma for the shared output tail.
 
 // clang-format off
 #include "Includes/Common.hlsl"      // Defines game settings; keep first.
@@ -20,7 +20,8 @@
 #include "Includes/Tonemap_MELE_HDRConfig.hlsli"   // HDR reconstruction constants.
 #include "Includes/Tonemap_MELE_ExpExtended.hlsli" // Continued scene curve and its validated work input.
 #include "Includes/Tonemap_MELE_HDRBridge.hlsli"   // Max-channel grade proxy; needs Reinhard above.
-#include "../Includes/PsychoV31.hlsl" // Display-peak tonemap.
+#include "../Includes/CInfinityRolloff.hlsl" // Display-peak rolloff, for the shared output tail.
+#include "../Includes/MacLeodBoynton.hlsl"   // Highlights Desaturation, for the shared output tail.
 // clang-format on
 
 #if !defined(TM_HAS_MOTIONBLUR) || !defined(TM_HAS_GRAIN) || !defined(TM_HAS_FILMIC)

@@ -80,10 +80,9 @@ float3 MELE_ME3LEAnalytic_GradeChain(float3 c)
 // Included here, not with the headers: MELE_CompositeDOF reads the _Globals fields and DOF textures declared above.
 #include "Includes/Tonemap_MELE_Scene.hlsli"
 
+#include "../Includes/CInfinityRolloff.hlsl" // Display-peak rolloff, for the shared output tail.
+#include "../Includes/MacLeodBoynton.hlsl"   // Highlights Desaturation, for the shared output tail.
 #include "Includes/Tonemap_MELE_HueReference.hlsli"
-// PsychoVDisplayMap, for the shared output tail. After the hue reference, whose "ColorGradingLUT.hlsl" (through
-// "ACES.hlsl") turns back on the X4000 warning PsychoV31 turns off.
-#include "../Includes/PsychoV31.hlsl"
 
 void main(
     float4 v0 : TEXCOORD0,

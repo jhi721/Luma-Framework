@@ -10,6 +10,10 @@
 #ifndef TM_VIGNETTE_TYPE
 #define TM_VIGNETTE_TYPE 0
 #endif
+
+// fxc flags the early return of "MacLeodBoynton::SolvePurity()" as an uninitialized result (X4000). It comes at code
+// generation, so it stays off for the whole shader; here, last, because "ColorGradingLUT.hlsl" turns it back on.
+#pragma warning(disable : 4000)
 #ifndef TM_HAS_GRAIN
 #define TM_HAS_GRAIN 0
 #endif
@@ -19,7 +23,7 @@
 
 float3 sdrLinear = gamma_to_linear(sdrGamma, GCT_MIRROR);
 
-// Native vignette, hoisted ahead of the tonemap and expressed in linear so PsychoV31 absorbs its blue-tinted white
+// Native vignette, hoisted ahead of the tonemap and expressed in linear so the display map absorbs its blue-tinted white
 // point instead of the frame leaving stage 1 above Scene Peak. linear_to_gamma is a signed pure pow, so this is
 // exactly the vanilla multiply in the encoded domain. Grain and dither stay in gamma below, where hoisting would
 // amplify shadow noise.
@@ -59,14 +63,35 @@ float3 vigGamma = 1.0; // The native gamma-domain multiplier, for the exposure m
 float3 postProcessedColor;
 if (LumaSettings.DisplayMode == 1) // HDR
 {
-   // gradedHDR arrives as Game-Paper-White-relative linear HDR. See "PsychoVDisplayMap". Its peak is Scene Peak over
-   // Game Paper White, a unit conversion, not an application of Game Paper White: the two passes that apply that scale
-   // to an outgoing frame are Output_0x0765601C and Video_0x7B5C59DF. Grain, dither, and RCAS can still push the result
-   // ~2% past Scene Peak; accepted.
-   postProcessedColor = PsychoVDisplayMap(gradedHDR * vigLinear,
-                                          LumaSettings.GameSettings.Contrast,
-                                          LumaSettings.GameSettings.Saturation,
-                                          LumaSettings.GameSettings.HighlightDechroma); // Game-Paper-White-relative.
+   // gradedHDR arrives as Game-Paper-White-relative linear BT.709 HDR. Its peak is Scene Peak over Game Paper White, a
+   // unit conversion, not an application of Game Paper White: the two passes that apply that scale to an outgoing frame
+   // are Output_0x0765601C and Video_0x7B5C59DF. Grain, dither, and RCAS can still push the result ~2% past Scene Peak;
+   // accepted.
+   postProcessedColor = gradedHDR * vigLinear;
+   // Highlights Desaturation: only the whitening (MacLeod-Boynton chrominance) of a per-channel Reinhard (ceiling 5, shoulder
+   // 1.5: identity below it), as MGR:R and Mirror's Edge; the hue stays the native grade's. Skipped below the shoulder.
+   const float3 color2020 = BT709_To_BT2020(postProcessedColor);
+   [branch] if (LumaSettings.GameSettings.HighlightDechroma > 0.0 && max3(color2020) > 1.5)
+   {
+      postProcessedColor = BT2020_To_BT709(MacLeodBoynton::HueAndPurityEmulationBT2020(color2020, Reinhard::ReinhardPiecewise(color2020, 5.0, 1.5),
+                                                                                       0.0, LumaSettings.GameSettings.HighlightDechroma));
+   }
+   // Contrast (a power of relative luminance around mid gray) and a chrominance scale around relative luminance: the
+   // rolloff doesn't take them.
+   const float contrast = LumaSettings.GameSettings.Contrast;
+   [branch] if (contrast != 1.0)
+   {
+      postProcessedColor *= pow(max(GetLuminance(postProcessedColor, CS_BT709), FLT_MIN) / MidGray, contrast - 1.0);
+   }
+   const float saturationScale = LumaSettings.GameSettings.Saturation;
+   [branch] if (saturationScale != 1.0)
+   {
+      postProcessedColor = Saturation(postProcessedColor, saturationScale, CS_BT709);
+   }
+   // Max-channel C-infinity rolloff to the peak (MGR:R, Mirror's Edge), which keeps RGB ratios. The peak can't go below
+   // paper white (the rolloff needs it above its 0.18 anchor).
+   const float paperWhite = max(GamePaperWhiteNits, 1.0);
+   postProcessedColor = Tonemap::CInfinityRollOff::MaxChannel(postProcessedColor, max(PeakWhiteNits, paperWhite) / paperWhite, 0.18, 1.0); // Game-Paper-White-relative.
 }
 else // SDR still uses the scRGB swapchain; sdrLinear is the exact native grade.
 {

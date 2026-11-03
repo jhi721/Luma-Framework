@@ -4,7 +4,7 @@
 //
 // ME1LE 0xAAE8755A and ME2LE 0xCC76075F share the decompiled scene preparation and grade; the thin entry points add
 // only ME2LE's post-gamma white point. Preserve register-level swizzles for comparison with the live CSOs. This body
-// produces linear gradedHDR and native gamma sdrGamma; the shared tail applies PsychoV31.
+// produces linear gradedHDR and native gamma sdrGamma; the shared tail applies the display map.
 // ME3LE analytic shader 0x225A8330 has a different cbuffer layout and no exponential curve.
 
 // clang-format off
@@ -14,7 +14,8 @@
 #include "Includes/Tonemap_MELE_HDRConfig.hlsli"   // HDR reconstruction constants.
 #include "Includes/Tonemap_MELE_ExpExtended.hlsli" // Continued scene curve and its validated work input.
 #include "Includes/Tonemap_MELE_HDRBridge.hlsli"   // Native-colour projection; needs Reinhard above.
-#include "../Includes/PsychoV31.hlsl" // PsychoVDisplayMap, for the shared output tail.
+#include "../Includes/CInfinityRolloff.hlsl" // Display-peak rolloff, for the shared output tail.
+#include "../Includes/MacLeodBoynton.hlsl"   // Highlights Desaturation, for the shared output tail.
 // clang-format on
 
 #define cmp -

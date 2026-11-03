@@ -13,9 +13,9 @@ namespace CB
 struct LumaGameSettings
 {
    float Exposure;           // 1 = vanilla. Scene exposure multiplier, scene-referred / pre-grade.
-   float Saturation;         // 1 = vanilla. PsychoV31 saturation (its purity) in the HDR display map.
-   float HighlightDechroma;  // 0 = off (default). PsychoV31 highlights desaturation (its "dechroma") in the HDR display map.
-   float Contrast;           // 1 = vanilla. PsychoV31 contrast (its cone response power) in the HDR display map.
+   float Saturation;         // 1 = vanilla. Chrominance scale around relative luminance before the HDR display map.
+   float HighlightDechroma;  // 0 = off (default). Whitening of highlights above 1.5 toward a per-channel Reinhard, before the HDR display map.
+   float Contrast;           // 1 = vanilla. Power of relative luminance around mid gray before the HDR display map.
    float VignetteIntensity;  // 1 = vanilla. Scales the game's vignette darkening (0 = none; the native white-point tint stays).
    float FilmGrainIntensity; // 1 = vanilla. Scales the game's film grain (0 = off).
    float BloomIntensity;     // Written by C++: Bloom Intensity slider * live native BloomScale (0 = no bloom); 1 while Luma bloom is off.

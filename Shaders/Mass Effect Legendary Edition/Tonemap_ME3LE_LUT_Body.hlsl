@@ -17,7 +17,8 @@
 #include "../Includes/Reinhard.hlsl" // ReinhardRange, used by the grade proxy.
 #include "Includes/Tonemap_MELE_HDRConfig.hlsli"   // HDR reconstruction constants.
 #include "Includes/Tonemap_MELE_HDRBridge.hlsli"   // Max-channel grade proxy; needs Reinhard above.
-#include "../Includes/PsychoV31.hlsl" // Display-peak tonemap.
+#include "../Includes/CInfinityRolloff.hlsl" // Display-peak rolloff, for the shared output tail.
+#include "../Includes/MacLeodBoynton.hlsl"   // Highlights Desaturation, for the shared output tail.
 // clang-format on
 
 #if !defined(TM_HAS_MOTIONBLUR) || !defined(TM_HAS_GRAIN)
