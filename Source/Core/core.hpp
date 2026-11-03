@@ -860,13 +860,9 @@ namespace
          {CompileTimeStringHash("Luma TAA Low CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "0"}}}},
          {CompileTimeStringHash("Luma TAA Medium CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "1"}}}},
          {CompileTimeStringHash("Luma TAA High CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "2"}}}},
-         {CompileTimeStringHash("Luma TAA Ultra CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "3"}}}},
          {CompileTimeStringHash("Luma TAA Low Upscale CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "0"}, {"TAA_UPSCALE", "1"}}}},
          {CompileTimeStringHash("Luma TAA Medium Upscale CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "1"}, {"TAA_UPSCALE", "1"}}}},
          {CompileTimeStringHash("Luma TAA High Upscale CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "2"}, {"TAA_UPSCALE", "1"}}}},
-         {CompileTimeStringHash("Luma TAA Ultra Upscale CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "3"}, {"TAA_UPSCALE", "1"}}}},
-         {CompileTimeStringHash("Luma TAA Shading Change Ultra CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "shading_change_cs", {{"TAA_QUALITY", "3"}}}},
-         {CompileTimeStringHash("Luma TAA Shading Change CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "shading_change_cs", {{"TAA_QUALITY", "1"}}}},
 #endif
 #endif // DX11
    };
@@ -21015,7 +21011,7 @@ namespace
                }
                if (ImGui::IsItemHovered())
                {
-                  ImGui::SetTooltip("Low: the fastest, for weaker GPUs.\nMedium: sharper in motion, for a little more than the cost of Low.\nHigh: sharper textures and steadier in motion, but over twice as heavy as Low and uses more video memory.\nUltra: like High, with less ghosting behind moving objects; slightly heavier than High.");
+                  ImGui::SetTooltip("Low: the fastest, for weaker GPUs.\nMedium: sharper in motion, for a little more than the cost of Low.\nHigh: sharper textures and steadier in motion, but over twice as heavy as Low and uses more video memory.");
                }
             }
 #endif
