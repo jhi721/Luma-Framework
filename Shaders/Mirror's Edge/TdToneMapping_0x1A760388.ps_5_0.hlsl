@@ -3,8 +3,8 @@
 // then encodes with the brightness slider's gamma (c13.w, 0.5 at default) and applies per-channel curves: 16 point
 // sampled (slope, offset) segments, R/G in t1, B in t2, picked at saturate(x * 15/16). Above 1 the saturate keeps the
 // last segment, so the curve continues linearly there. HDR: the same grade with both upper clips as max(0) is the
-// signal, RenoDX's PsychoV31 maps it to the display and the hue emulation then takes the hue of a soft ReinhardPiecewise
-// reference (MacLeod-Boynton, see "DisplayMapTd"). SDR displays keep the vanilla grade.
+// signal, the clip's hue turn comes back from a soft ReinhardPiecewise reference (MacLeod-Boynton) and a max-channel
+// C-infinity rolloff maps it to the display (see "DisplayMapTd"). SDR displays keep the vanilla grade.
 #include "Includes/Common.hlsl"
 #include "Includes/Tonemap.hlsl"
 
@@ -49,7 +49,7 @@ void main(DGV_MAIN_SIGNATURE)
    const float exposure = ApplyDgvMask(ExposureTexture.Sample(ExposureSampler, 0.5), DgvConstants[50], DgvConstants[51]).x * 64.0;
    const float3 scene = ApplyDgvMask(SceneColorTexture.Sample(SceneColorSampler, v5.xy), DgvConstants[44], DgvConstants[45]).xyz * LumaSettings.GameSettings.Exposure;
 
-   // SDR displays keep the vanilla grade (see "PsychoVDisplayMap")
+   // SDR displays keep the vanilla grade (see "DisplayMapTd")
    const bool hdr = TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1;
    float3 displayLinear = gamma_to_linear(GradeTd(scene, exposure, !hdr));
    [branch] if (hdr)

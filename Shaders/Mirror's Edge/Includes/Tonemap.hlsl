@@ -5,7 +5,9 @@
 
 // clang-format off
 #include "../../Includes/Color.hlsl"
-#include "../../Includes/PsychoV31HueReference.hlsl" // PsychoVDisplayMapWithHueReference
+#include "../../Includes/CInfinityRolloff.hlsl" // Tonemap::CInfinityRollOff::MaxChannel (the display map)
+#include "../../Includes/Reinhard.hlsl" // Reinhard::ReinhardPiecewise (hue reference)
+#include "../../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueAndPurityEmulationBT2020
 #include "../../Includes/DgVoodoo.hlsl"
 // clang-format on
 
@@ -31,15 +33,36 @@ float3 PowTd(float3 base, float3 exponent)
    return exp2(exponent * float3(DgVoodooLog2(b.x), DgVoodooLog2(b.y), DgVoodooLog2(b.z)));
 }
 
-// The extended (unclipped) grade, linear, to the display, with the hue lean of the original's per-channel clip (fire to yellow)
-// at the user's strength (see "PsychoVDisplayMapWithHueReference").
-float3 DisplayMapTd(float3 extendedLinear)
+// The display map's rolloff strength (MGR:R's and Vanquish's: the paper white stays within 1%)
+static const float kDisplayMapStrength = 1.0;
+
+// The extended (unclipped) grade, linear BT.709 (1 = paper white), to the display: a max-channel C-infinity rolloff to the peak (MGR:R,
+// Vanquish), which keeps the unclipped hue. The original clipped per channel, turning bright highlights toward the primaries (fire to
+// yellow): that hue turn comes back from a per-channel Reinhard (ceiling 5, shoulder 1.5: identity below it) in full, its whitening at
+// "Highlights Desaturation" (MacLeod-Boynton). Skipped below the shoulder, where the reference is the color itself.
+float3 DisplayMapTd(float3 linearBT709)
 {
-   return PsychoVDisplayMapWithHueReference(extendedLinear,
-                                            LumaSettings.GameSettings.Contrast,
-                                            LumaSettings.GameSettings.Saturation,
-                                            LumaSettings.GameSettings.HighlightsDesaturation,
-                                            LumaSettings.GameSettings.HueEmulation);
+   const float3 color2020 = BT709_To_BT2020(linearBT709);
+   [branch] if (max3(color2020) > 1.5)
+   {
+      linearBT709 = BT2020_To_BT709(MacLeodBoynton::HueAndPurityEmulationBT2020(color2020, Reinhard::ReinhardPiecewise(color2020, 5.0, 1.5),
+                                                                                1.0, LumaSettings.GameSettings.HighlightsDesaturation));
+   }
+   // Contrast (a power of relative luminance around mid gray) and a chrominance scale around relative luminance
+   // ("Saturation()": lerp(Y, rgb, s)): the rolloff doesn't take them
+   const float contrast = LumaSettings.GameSettings.Contrast;
+   [branch] if (contrast != 1.0)
+   {
+      linearBT709 *= pow(max(GetLuminance(linearBT709, CS_BT709), FLT_MIN) / MidGray, contrast - 1.0);
+   }
+   const float saturationScale = LumaSettings.GameSettings.Saturation;
+   [branch] if (saturationScale != 1.0)
+   {
+      linearBT709 = Saturation(linearBT709, saturationScale, CS_BT709);
+   }
+   // The peak can't go below paper white (the rolloff needs it above its 0.18 anchor)
+   const float paperWhite = max(GamePaperWhiteNits, 1.0);
+   return Tonemap::CInfinityRollOff::MaxChannel(linearBT709, max(PeakWhiteNits, paperWhite) / paperWhite, 0.18, kDisplayMapStrength);
 }
 
 // A linear frame as the canvas holds it: gamma space (POST_PROCESS_SPACE_TYPE 0), so the HUD blends onto it like vanilla.

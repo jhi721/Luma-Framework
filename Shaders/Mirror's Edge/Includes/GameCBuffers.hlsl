@@ -14,14 +14,13 @@ namespace CB
 struct LumaGameSettings
 {
    float Exposure;               // 1 = vanilla. Multiplier on the scene, before the grade.
-   float Contrast;               // 1 = vanilla. PsychoV31 contrast (its cone response power) in the HDR display map.
-   float Saturation;             // 1 = vanilla. PsychoV31 saturation (its purity) in the HDR display map.
-   float HighlightsDesaturation; // 0 = off. PsychoV31 highlights desaturation (its "dechroma") in the HDR display map.
+   float Contrast;               // 1 = vanilla. Power around mid gray on BT.709 relative luminance, before the HDR display map (Tonemap.hlsl).
+   float Saturation;             // 1 = vanilla. Chrominance scale around BT.709 relative luminance ("Saturation()": lerp(Y, rgb, s)), before the HDR display map (Tonemap.hlsl).
+   float HighlightsDesaturation; // 0 = off. MacLeod-Boynton purity weight of the hue reference's whitening (Tonemap.hlsl).
    float ColorGradingIntensity;  // 1 = vanilla, 0 = neutral. Strength of the per-channel color curves.
    float Dithering;              // 0/1. Output dither against banding (8 bit SDR, 10 bit PQ HDR).
    float VideoAutoHDREnable;     // 0/1. PumboAutoHDR on the Bink passes (Video_0xE41621CF.ps_5_0.hlsl).
    float VideoAutoHDRBoost;      // 0..1. Video peak = lerp(SDR white, 250 nits, boost).
-   float HueEmulation;           // 0..1, 1 = the clip's hue lean. Weight of the reference hue after the HDR display map (Tonemap.hlsl).
 };
 
 struct LumaGameData
