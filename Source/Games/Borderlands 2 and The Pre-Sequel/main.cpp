@@ -154,7 +154,6 @@ constexpr PerfTestMode perf_test_modes[] = {
    {.name = "DLSS Without Motion Vector Draws", .set_aa = true, .sr_type = SR::Type::DLSS, .motion_vector_draws = 0},
    {.name = "FSR 3", .set_aa = true, .sr_type = SR::Type::FSR},
    {.name = "Luma TAA High", .set_aa = true, .sr_type = SR::Type::LumaTAA, .luma_taa_quality = 2},
-   {.name = "Luma TAA Ultra", .set_aa = true, .sr_type = SR::Type::LumaTAA, .luma_taa_quality = 3},
    {.name = "SMAA", .set_aa = true, .smaa = true},
    {.name = "No AA", .set_aa = true},
    {.name = "Without vc4 Filter", .vc4_filter_off = true},
@@ -166,10 +165,10 @@ constexpr PerfTestMode perf_test_modes[] = {
 // without motion vectors the hooks return early), against "Current Settings".
 constexpr int perf_sweep_modes[] = {2, 3, 4, 5,
 #if ENABLE_LUMA_TAA
-   6, 7,
+   6,
 #endif
-   8, 9};
-constexpr int perf_cpu_sweep_modes[] = {10, 11, 12, 1};
+   7, 8};
+constexpr int perf_cpu_sweep_modes[] = {9, 10, 11, 1};
 static_assert(std::string_view(perf_test_modes[perf_sweep_modes[std::size(perf_sweep_modes) - 1]].name) == "No AA");
 static_assert(std::string_view(perf_test_modes[perf_cpu_sweep_modes[std::size(perf_cpu_sweep_modes) - 1]].name) == "Current Settings");
 constexpr Perf::SweepDef perf_sweeps[] = {{"Sweep", perf_sweep_modes}, {"CPU Sweep", perf_cpu_sweep_modes}};
