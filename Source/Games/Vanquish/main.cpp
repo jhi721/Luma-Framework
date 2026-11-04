@@ -24,30 +24,31 @@
 // Vanquish (PC, Steam, exe link time 2017-07-31) is x86 D3D9: it runs through dgVoodoo (D3D9 -> D3D11), so every hash below is a
 // dgVoodoo 2.87.6 translation (ps_5_0) from the offline map of data000.cpk's shader.dat/shader2.dat and of the exe's embedded shaders
 // dgVoodoo translates each pixel shader once per alpha test function in use: the lists hold all three.
+// Each list then holds the dgVoodoo 2.81.3 twins (ps_4_0, the Linux package's build), paired offline by alpha test and opcodes.
 // Frame (live): the scene in 8-bit targets, FilterShaderGather (grade + bloom) into a scene sized
 // target, the game's FXAA or edge AA (the exe's own shaders; a dgVoodoo copy with the game's AA off) into dgVoodoo's D3D9 back buffer
 // (the canvas), the UI on it, then dgVoodoo's present. FilterShaderGather's replacement does the HDR display map.
-const ShaderHashesList shader_hashes_Gather = {.pixel_shaders = {0xBC9B20C2, 0xE004F806, 0x021D5E4D}};
+const ShaderHashesList shader_hashes_Gather = {.pixel_shaders = {0xBC9B20C2, 0xE004F806, 0x021D5E4D, 0x48FFD7B4, 0xEB2A1BAE, 0xB3C88B24}};
 // What writes the canvas after the gather pass: the game's FXAA (exe_007) or edge AA 2x / 4x / 8x (exe_004 / 005 / 006, the game's
 // "MSAA" option), a plain copy in their place once SMAA ran on their input, else dgVoodoo's copy with the game's AA off
-const ShaderHashesList shader_hashes_GameAA = {.pixel_shaders = {0x15857C80, 0xB39B8ED0, 0xEB476A79, 0x32A44A9C, 0x3341D6E4, 0x491F4CBE, 0xC674EE68, 0x4434D070, 0xAE5DF7AE, 0x85CECC90, 0x75FCCD11, 0xDF16B483}};
+const ShaderHashesList shader_hashes_GameAA = {.pixel_shaders = {0x15857C80, 0xB39B8ED0, 0xEB476A79, 0x32A44A9C, 0x3341D6E4, 0x491F4CBE, 0xC674EE68, 0x4434D070, 0xAE5DF7AE, 0x85CECC90, 0x75FCCD11, 0xDF16B483, 0x7C74E55F, 0x315CE602, 0x5F4256CE, 0xB2602160, 0x49BC8BE9, 0xAC49314B, 0x9440733F, 0x3B8132DA, 0x2A9954D3, 0xC8AAB307, 0x11B65982, 0xB3D9035C}};
 const ShaderHashesList shader_hashes_AAOffCopy = {.pixel_shaders = {0xE9A53CDA}};
 // The depth prepass (zmapscr / zmapscrnki, seen in game): linear view depth into a scene sized R32F target that SSAO, DoF and the soft
 // particles read. SMAA's predication source.
-const ShaderHashesList shader_hashes_DepthPrepass = {.pixel_shaders = {0x5F3E9D55, 0xBA502672}};
+const ShaderHashesList shader_hashes_DepthPrepass = {.pixel_shaders = {0x5F3E9D55, 0xBA502672, 0x6C46DB88, 0x64549F7E}};
 // dgVoodoo's present blit of the canvas into the swapchain (MGR:R's and Bayonetta's hash), drawn once the swapchain is upgraded
 const ShaderHashesList shader_hashes_DgVoodooPresent = {.pixel_shaders = {0x880A17D3}};
 // The movies: Sofdec decodes on the CPU, dgVoodoo unpacks the uploaded frame (its R32 UINT texture) into an R8G8B8A8 target, then the
 // game's "filtershadercopytex" draws that into the final target. The copy also runs in the bloom chain and after the gather pass, so a
 // movie is the copy that reads the unpack's output.
 const ShaderHashesList shader_hashes_VideoUnpack = {.pixel_shaders = {0x471059BE}};
-const ShaderHashesList shader_hashes_Copy = {.pixel_shaders = {0x91A6C437}};
+const ShaderHashesList shader_hashes_Copy = {.pixel_shaders = {0x91A6C437, 0x7584B641}};
 // The bloom chain, all into the fixed size 320x176 bloom target (seen in game at 4K), each draw followed by a dgVoodoo copy of the
 // written region into a texture of its size that the next pass samples: filter05 (the scene into level 0, then each level into the
 // next: 160x80, 80x48, 48x32, 32x16), filter02 / filter01 (each level's V / H blur), then the copy shader drawing the levels into
 // level 0 (the first opaque, the 80x48, 48x32 and 32x16 ones SRC_ALPHA / ONE), which the gather pass reads as t1.
-const ShaderHashesList shader_hashes_BloomSource = {.pixel_shaders = {0x8B6A8D61, 0x9C312037, 0xAD095D6B}};
-const ShaderHashesList shader_hashes_BloomBlur = {.pixel_shaders = {0x3B0C76B0, 0xCC2E3748, 0x8D9CA7F2, 0x55E02134, 0xCCB5D7CF, 0x383F18C2}};
+const ShaderHashesList shader_hashes_BloomSource = {.pixel_shaders = {0x8B6A8D61, 0x9C312037, 0xAD095D6B, 0x29FE50C2, 0x2F68CC26, 0x2A79AB5C}};
+const ShaderHashesList shader_hashes_BloomBlur = {.pixel_shaders = {0x3B0C76B0, 0xCC2E3748, 0x8D9CA7F2, 0x55E02134, 0xCCB5D7CF, 0x383F18C2, 0x918D9D54, 0x36CCFFDC, 0x3901D0F8, 0xE4C43DF5, 0x92DAACE5, 0xC51AC86F}};
 // Every list above "OnDrawOrDispatch" tests: a draw in none of them (most of the scene) skips their lookups
 const ShaderHashesList shader_hashes_Listed = []
 {
@@ -63,7 +64,8 @@ const ShaderHashesList shader_hashes_Listed = []
 // (modelshaderdownsampling, only seen on the velocity). Clamped as it stored it now that the scene sized and shaped targets are fp16.
 const std::unordered_set<uint32_t> velocity_pixel_shaders = {
    0x38A99388, 0x25928798, 0x9A548B81, 0x004FC83F, 0x6A31B7CC, 0xD7A426D5, 0x33EC7BFF, 0x92C62DC9, 0xFBEBED66, 0x168CA31F, 0x84DD0B27, 0xB7198BCC,
-   0x853E8BF8, 0x423D2F0D, 0x97F3C1F4, 0x5EE654CA, 0x5EAF888B, 0xD00F7593};
+   0x853E8BF8, 0x423D2F0D, 0x97F3C1F4, 0x5EE654CA, 0x5EAF888B, 0xD00F7593, 0xF4393B3B, 0x250BB857, 0x3166B668, 0x77858A85, 0x73C8073C, 0x80E0122D,
+   0x4FF9C639, 0xB3D64BF4, 0xD6B4AD11, 0xFEF7E743, 0xAD422EAD, 0xD19830D7, 0xBECA1D05, 0xD95F9759, 0x178EC9F2, 0xF696E494, 0x42338E8B, 0xD8EE9774};
 // FSR's and Luma TAA's masks, written by the scene's alpha blended draws past dgVoodoo's targets (their pixel shaders patched with
 // "PatchPixelShaderReactive", the slot max blended in every blend state: "PatchedDraws::OnCreateBlendState")
 constexpr UINT REACTIVE_SLOT = MotionVectorPatches::reactive_slot;
