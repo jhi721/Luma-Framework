@@ -199,6 +199,12 @@ struct MetalGearRisingRevengeanceGameDeviceData final : public GameDeviceData
       smaa_depth.reset();
    }
 
+   // The last T2x frame is the previous one: the resolve has a history, and the scene jitters
+   bool HasT2xHistory(uint32_t frame_index) const
+   {
+      return t2x_frames[0] && t2x_frame + 1 == frame_index;
+   }
+
    void ReleaseT2xFrames()
    {
       for (int i = 0; i < 2; i++)
@@ -304,7 +310,7 @@ class MetalGearRisingRevengeance final : public Game
       t2x = t2x && t2x_weight_ps && t2x_blend_ps && t2x_resolve_ps;
       const uint32_t frame_index = cb_luma_global_settings.FrameIndex;
       const int t2x_current = int(frame_index & 1);
-      bool t2x_history = gd.t2x_frames[0] && gd.t2x_frame + 1 == frame_index;
+      bool t2x_history = gd.HasT2xHistory(frame_index);
       if (t2x && GetViewTextureSize(gd.t2x_frame_srvs[0].get()) != size)
       {
          t2x_history = false;
@@ -467,7 +473,7 @@ class MetalGearRisingRevengeance final : public Game
    // the fill, rolls the last frame's camera and objects over and makes the masks' targets. Once per present (the later passes never
    // reopen it). The motion vector draws' jitter is zero: the scene jitters through its viewports ("JitterSceneViewport") and the
    // patched vertex shaders add the jitter buffer to the same positions, so a jitter there would shift them twice.
-   static void OpenScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, bool reactive, ID3D11DepthStencilView* dsv)
+   static void OpenScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, ID3D11DepthStencilView* dsv)
    {
       auto& gd = GetGameDeviceData(device_data);
       com_ptr<ID3D11Resource> depth;
@@ -496,13 +502,14 @@ class MetalGearRisingRevengeance final : public Game
       // SMAA T2x: the sample offsets (0.25, 0.25) then (-0.25, -0.25) in y down pixels, for "SMAA.hlsl"'s T2x subsample indices 1 and 2
       // (Bayonetta's phases, in the upscalers' jitter convention, which the viewport applies). That is its table read with y up, which
       // measured better (docs/SMAA-Lab.md).
-      if (gd.t2x_active && gd.t2x_frames[0] && gd.t2x_frame + 1 == cb_luma_global_settings.FrameIndex)
+      if (gd.t2x_active && gd.HasT2xHistory(cb_luma_global_settings.FrameIndex))
       {
          const float shift = ((cb_luma_global_settings.FrameIndex & 1) == 0 ? -0.25f : 0.25f);
          gd.jitter = {shift, shift};
       }
 
       // The masks at the scene's size; what the alpha blended draws write starts from zero every frame
+      const bool reactive = IsReactiveMaskUsed(device_data);
       if (reactive && GetViewTextureSize(gd.mv.reactive_target_srv.get()) != depth_size)
       {
          gd.mv.ReleaseReactiveMasks();
@@ -748,15 +755,12 @@ class MetalGearRisingRevengeance final : public Game
    // The fill reads the scene's depth, which dgVoodoo creates typeless (R24G8) without one either.
    static bool OnCreateResource(reshade::api::device* device, reshade::api::resource_desc& desc, reshade::api::subresource_data* initial_data, reshade::api::resource_usage initial_state)
    {
-      if (desc.type == reshade::api::resource_type::texture_2d && desc.texture.samples == 1 && desc.texture.format == reshade::api::format::r24_g8_typeless && (desc.usage & reshade::api::resource_usage::depth_stencil) != 0 &&
-          (desc.usage & reshade::api::resource_usage::shader_resource) == 0)
-      {
-         desc.usage |= reshade::api::resource_usage::shader_resource;
-         return true;
-      }
-      if (desc.type != reshade::api::resource_type::texture_2d || desc.texture.samples <= 1 || (desc.usage & reshade::api::resource_usage::render_target) == 0 || (desc.usage & reshade::api::resource_usage::shader_resource) != 0)
+      if (desc.type != reshade::api::resource_type::texture_2d || (desc.usage & reshade::api::resource_usage::shader_resource) != 0)
          return false;
-      if (desc.texture.format != reshade::api::format::r8g8b8a8_typeless && desc.texture.format != reshade::api::format::r8g8b8a8_unorm)
+      const bool is_scene_depth = desc.texture.samples == 1 && desc.texture.format == reshade::api::format::r24_g8_typeless && (desc.usage & reshade::api::resource_usage::depth_stencil) != 0;
+      const bool is_msaa_target = desc.texture.samples > 1 && (desc.usage & reshade::api::resource_usage::render_target) != 0 &&
+                                  (desc.texture.format == reshade::api::format::r8g8b8a8_typeless || desc.texture.format == reshade::api::format::r8g8b8a8_unorm);
+      if (!is_scene_depth && !is_msaa_target)
          return false;
       desc.usage |= reshade::api::resource_usage::shader_resource;
       return true;
@@ -1136,8 +1140,9 @@ public:
       auto& game_device_data = GetGameDeviceData(device_data);
       const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
       const bool can_draw = is_immediate && original_draw_dispatch_func && *original_draw_dispatch_func;
+      const bool is_depth_prepass = original_shader_hashes.Contains(shader_hashes_DepthPrepass);
       // The first prepass draw of the frame names its target (not returned: the coverage below takes the alpha tested one too)
-      if (g_smaa_enable && is_immediate && !game_device_data.depth_prepass && original_shader_hashes.Contains(shader_hashes_DepthPrepass))
+      if (g_smaa_enable && is_immediate && !game_device_data.depth_prepass && is_depth_prepass)
       {
          ComPtr<ID3D11RenderTargetView> rtv;
          native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
@@ -1156,13 +1161,13 @@ public:
       // gather pass
       if (game_device_data.mv.active && is_immediate && !game_device_data.has_drawn_gather)
       {
-         if (!game_device_data.mv.scene_open && !game_device_data.mv.scene_done && original_shader_hashes.Contains(shader_hashes_DepthPrepass))
+         if (!game_device_data.mv.scene_open && !game_device_data.mv.scene_done && is_depth_prepass)
          {
             com_ptr<ID3D11DepthStencilView> dsv;
             native_device_context->OMGetRenderTargets(0, nullptr, &dsv);
             if (dsv && dsv.get() != game_device_data.open_refused_dsv)
             {
-               OpenScene(native_device, native_device_context, device_data, IsReactiveMaskUsed(device_data), dsv.get());
+               OpenScene(native_device, native_device_context, device_data, dsv.get());
             }
          }
          if (game_device_data.mv.scene_open)
@@ -1508,24 +1513,24 @@ public:
 #if DEVELOPMENT
       // "MV Debug View": Core's debug draw of the target, absolute values in pixels. No lock: the motion vector draw creates the target
       // on the immediate context, which presents too
+      ID3D11Texture2D* debug_texture = nullptr;
       if (g_mv_debug_view && game_device_data.mv.texture)
       {
-         D3D11_TEXTURE2D_DESC desc;
-         game_device_data.mv.texture->GetDesc(&desc);
-         debug_draw_auto_clear_texture = false;
+         debug_texture = game_device_data.mv.texture.get();
          debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::Abs | (uint32_t)DebugDrawTextureOptionsMask::UVToPixelSpace;
-         device_data.debug_draw_texture = game_device_data.mv.texture.get();
-         device_data.debug_draw_texture_format = desc.Format;
-         device_data.debug_draw_texture_size = {desc.Width, desc.Height, 1, 1};
       }
       else if (g_sr_reactive_debug_view && game_device_data.mv.reactive)
       {
-         D3D11_TEXTURE2D_DESC desc;
-         game_device_data.mv.reactive->GetDesc(&desc);
-         debug_draw_auto_clear_texture = false;
+         debug_texture = game_device_data.mv.reactive.get();
          debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::RedOnly;
          debug_draw_options &= ~((uint32_t)DebugDrawTextureOptionsMask::Abs | (uint32_t)DebugDrawTextureOptionsMask::UVToPixelSpace);
-         device_data.debug_draw_texture = game_device_data.mv.reactive.get();
+      }
+      if (debug_texture)
+      {
+         D3D11_TEXTURE2D_DESC desc;
+         debug_texture->GetDesc(&desc);
+         debug_draw_auto_clear_texture = false;
+         device_data.debug_draw_texture = debug_texture;
          device_data.debug_draw_texture_format = desc.Format;
          device_data.debug_draw_texture_size = {desc.Width, desc.Height, 1, 1};
       }
