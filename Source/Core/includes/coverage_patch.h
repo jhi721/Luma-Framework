@@ -41,10 +41,11 @@ namespace CoveragePatch
          *error = "unreadable";
          return {};
       }
-      // sampleinfo and oMask are SM 4.1 (dgVoodoo 2.81.3's ps_4_0 has neither)
-      if (DECODE_D3D10_SB_TOKENIZED_PROGRAM_MAJOR_VERSION(tokens[0]) * 10 + DECODE_D3D10_SB_TOKENIZED_PROGRAM_MINOR_VERSION(tokens[0]) < 41)
+      // sampleinfo and oMask are SM 4.1: a ps_4_0 (dgVoodoo 2.81.3's) is raised to ps_4_1 below, a superset its FL 11_0 device runs
+      const uint32_t version = DECODE_D3D10_SB_TOKENIZED_PROGRAM_MAJOR_VERSION(tokens[0]) * 10 + DECODE_D3D10_SB_TOKENIZED_PROGRAM_MINOR_VERSION(tokens[0]);
+      if (version < 40)
       {
-         *error = "no clip (below SM 4.1)";
+         *error = "no clip (below SM 4.0)";
          return {};
       }
 
@@ -330,6 +331,10 @@ namespace CoveragePatch
       uint32_t temp = 0;
       std::vector<uint32_t> patched = DXBC::CopyDeclarations(tokens, instructions, first_body, 1, &temp, [&](size_t i)
          { return i == last_output ? std::vector<uint32_t>{DXBC::Opcode(D3D10_SB_OPCODE_DCL_OUTPUT, 2), omask} : std::vector<uint32_t>{}; });
+      if (version == 40)
+      {
+         patched[0] = ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(D3D10_SB_PIXEL_SHADER, 4, 1);
+      }
       constexpr uint32_t immediate_1 = ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_1_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
       constexpr uint32_t x_dst = DXBC::Destination(D3D10_SB_OPERAND_TYPE_TEMP, D3D10_SB_OPERAND_4_COMPONENT_MASK_X);
       constexpr uint32_t y_dst = DXBC::Destination(D3D10_SB_OPERAND_TYPE_TEMP, D3D10_SB_OPERAND_4_COMPONENT_MASK_Y);
