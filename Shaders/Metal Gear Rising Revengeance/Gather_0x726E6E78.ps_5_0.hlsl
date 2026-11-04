@@ -8,7 +8,7 @@
 
 // MGR:R final pass "FilterShaderGather" (shader2.dat, D3D9 ps_3_0, dgVoodoo 2.87.5 -> ps_5_0 0x726E6E78 without alpha test;
 // Gather_0x562F84D7 / Gather_0xDD1B4599 are its GREATEREQUAL / GREATER alpha test translations). Render layer 0x62
-// (FUN_00a3ab10), after FXAA, into the back buffer (the canvas) before the UI. Transcribed from the translated disassembly. Every
+// (FUN_00a3ab10), after FXAA's layer (which never draws), into the back buffer (the canvas) before the UI. Transcribed from the translated disassembly. Every
 // value is gamma encoded (R'G'B', 1 = SDR white) as the game's 8-bit targets hold it: the 256x1 ColorTableTexture (t2, the spline
 // the CPU writes every frame, one grey curve in R, G and B: FUN_00eac880) read per channel with the channel as U, saturation
 // g_Saido (c186 = cb4[194]) around Y' of the curved colour, the g_MulColor gain (c184 = cb4[192], with the light pre-scale's

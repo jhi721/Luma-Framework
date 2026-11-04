@@ -22,16 +22,16 @@
 #include "..\..\Core\includes\coverage_patch.h"
 #include "..\..\Core\includes\patched_draws.h"
 
-// Metal Gear Rising: Revengeance (PC, Steam, exe link time 2014-01-28) is x86 D3D9: it runs through dgVoodoo (D3D9 -> D3D11), so every
-// hash below is a dgVoodoo translation from the offline map of GameData/shader*.dat (_tools/mgrr/NOTES.md): 2.87.5 / 2.87.6 (ps_5_0, the
-// main zip) first, then the same shaders under 2.81.3 (ps_4_0, the Linux zip) in the same order; the 2.81.3 replacements are forwarders
-// to the 2.87.5 bodies (same signature and rows). dgVoodoo translates each pixel shader once per alpha test function in use: each list
-// holds every variant a shader has (none, GREATEREQUAL, GREATER) and is matched as a set, in the offline map's order.
-// FilterShaderGather (shader2.dat): the final pass (render layer 0x62), the grade's curve, saturation and gradient plus the bloom and
-// the brightness option. Its replacement does the HDR display map. FilterShaderGatherNoise, the same pass times a noise texture, drawn
-// in its place (seen in game), follows. In game (title screen, MSAA 4x) it writes the render resolution scene target (MSAA),
-// the movie and the UI draw on that target, it is resolved, then the game's copy (filtershadercopytex) scales it into dgVoodoo's D3D9
-// back buffer (the canvas, the output resolution), which is resolved and presented by dgVoodoo's blit.
+// Metal Gear Rising: Revengeance (PC, Steam, exe link time 2014-01-28) is x86 D3D9 and runs through dgVoodoo (D3D9 -> D3D11). Every
+// hash below is a dgVoodoo translation from the offline map of GameData/shader*.dat (_tools/mgrr/NOTES.md): first 2.87.5 / 2.87.6
+// (ps_5_0, the main zip), then the same shaders under 2.81.3 (ps_4_0, the Linux zip) in the same order. The 2.81.3 replacements forward
+// to the 2.87.5 bodies, which have the same signature and rows. dgVoodoo translates a pixel shader once per alpha test function in use,
+// so each list holds every variant a shader has (none, GREATEREQUAL, GREATER) and is matched as a set.
+// FilterShaderGather (shader2.dat) is the final pass (render layer 0x62): the grade's curve, saturation and gradient, plus the bloom and
+// the brightness option. Its replacement does the HDR display map. FilterShaderGatherNoise is the same pass times a noise texture, drawn
+// in its place (seen in game). At the title screen with MSAA 4x, it writes the scene target at the render resolution, the movie and the
+// UI draw on it, it is resolved, then filtershadercopytex scales it into dgVoodoo's D3D9 back buffer (the canvas, at the output
+// resolution), which dgVoodoo's blit resolves and presents.
 const ShaderHashesList shader_hashes_Gather = {.pixel_shaders = {0x726E6E78, 0x562F84D7, 0xDD1B4599, 0xCE6E1597, 0x970F67BD, 0xF263AE82, 0xC9453909, 0x0CDD2BDB, 0x252B2AE7, 0xD7D5CA35, 0xB3BB0D35, 0xFF4AFD3B,
                                                   0x27337F04, 0xB9449F1B, 0x38B31283, 0x07C2BDDE, 0x27F82C3D, 0x81DF6FB5, 0x89AA8AB6, 0x1771F599, 0xB57E19F1, 0xD959F596, 0xC68E6BA9, 0x5979509E}};
 // filtershadercopytex, the copy into the canvas
@@ -147,9 +147,9 @@ struct MetalGearRisingRevengeanceGameDeviceData final : public GameDeviceData
    std::atomic<bool> msaa_resolved = false;
    std::atomic<bool> msaa_active = false;
 
-   // DLAA, FSR Native AA, XeSS or Luma TAA (Core's SR bridge: the game is 32-bit) on the motion vectors of Core's "SceneMotionVectors"
-   // (vc4 layout in "MotionVectorPatches"), before the gather pass
-   // An upscaler is picked, hasn't failed and the game's MSAA is off, latched at present for the whole frame
+   // DLAA, FSR Native AA, XeSS (through Core's SR bridge, the game is 32-bit) or Luma TAA on the motion vectors of Core's
+   // "SceneMotionVectors" (vc4 layout in "MotionVectorPatches"), before the gather pass. "sr_active" means an upscaler is picked, hasn't
+   // failed and the game's MSAA is off, latched at present for the whole frame.
    bool sr_active = false;
    // The motion vector targets, camera, objects and vc4 copies; "mv.active": the motion vector draws this frame (set at present)
    SceneMotionVectors::State mv;
@@ -785,12 +785,12 @@ class MetalGearRisingRevengeance final : public Game
       static constexpr bool second_scene_color = true;
       static constexpr PixelShaderPatch blended_mask_patch = PixelShaderPatch::GAME_0;
 
-      // The carrier of the opaque meshes' motion vectors: the depth prepass' R32F target (it is no shader resource of the upscaler, the
-      // gather pass' input is), and the second one, the gather pass' scene (its fp16 mirror) the alpha blended draws go to (picked by the caller,
-      // see "scene_color_hint"). The G-buffer's draws are refused (several targets). Single sample both.
+      // The carriers of the motion vectors, both single sample: the depth prepass' R32F target for the opaque meshes (the upscaler reads
+      // the gather pass' input, not this), and the gather pass' scene for the alpha blended draws (picked by the caller, see
+      // "scene_color_hints"). The scene is its fp16 mirror, or the game's R8G8B8A8 target where it isn't upgraded. The G-buffer's draws
+      // are refused, they have several targets.
       static bool AcceptSceneColor(const D3D11_RENDER_TARGET_VIEW_DESC& rtv_desc, const D3D11_TEXTURE2D_DESC& color_desc)
       {
-         // The scene's fp16 mirror (bound in place of the game's R8G8B8A8 target) and the depth prepass' R32F
          return color_desc.SampleDesc.Count == 1 && (rtv_desc.Format == DXGI_FORMAT_R32_FLOAT || rtv_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || rtv_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || rtv_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
       }
 
@@ -1585,7 +1585,7 @@ public:
       {
          ImGui::TextColored(ImVec4(1.f, 0.8f, 0.f, 1.f), "MSAA is on: DLAA, FSR, XeSS and Luma TAA need Anti-Aliasing off in the game's options.");
       }
-      // Both act only with the game's MSAA on
+      // The resolve and the alpha to coverage act only with the game's MSAA on
       ImGui::BeginDisabled(!msaa_active);
       DrawSettingCheckbox("Luma MSAA Enable", "MSAAResolveEnable", &g_msaa_resolve_enable, true, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, sky, grass, foliage and fences; requires Anti-Aliasing enabled in the game's options; not used with DLSS/FSR/XeSS or Luma TAA).", !msaa_active);
       ImGui::EndDisabled();
@@ -1753,12 +1753,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       samplers_upgrade_mode = 3;
       force_upgrade_linear_samplers = true;
 
-      // Every target is A8R8G8B8 (FUN_00a21920, offline), the G-buffer too. The scene and post targets become fp16 mirrors at creation
-      // (the swapchain sized and shaped ones: the bloom pyramid, the exposure readback and the shadow maps stay 8-bit), as Bayonetta's:
-      // the engine scales its lights down to fit the 8-bit targets and the grade's g_MulColor scales them back, so the scene's highlights
-      // carry values above 1. Indirect, as TW2 and Bayonetta (changing dgVoodoo's own creation formats breaks its bookkeeping); their
-      // resolves follow by chain. The gather target and the canvas copy also upgrade by their writers: dgVoodoo creates its D3D9 back
-      // buffer before it sizes the swapchain, so the size filters miss it at creation.
+      // Every colour target but the depth prepass' R32F is A8R8G8B8 (FUN_00a21920, offline), the G-buffer too. The swapchain sized and
+      // shaped ones, the scene and post targets, become fp16 mirrors at creation, as Bayonetta's. The bloom pyramid, the exposure
+      // readback and the shadow maps stay 8-bit. The engine scales its lights down to fit the 8-bit targets and the grade's g_MulColor
+      // scales them back, so the scene's highlights carry values above 1. The upgrade is indirect, as TW2's and Bayonetta's, because
+      // changing dgVoodoo's own creation formats breaks its bookkeeping. Their resolves follow by chain. The gather target and the canvas
+      // copy also upgrade by their writers: dgVoodoo creates its D3D9 back buffer before it sizes the swapchain, so the size filters miss
+      // it at creation.
       texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
       enable_indirect_texture_format_upgrades = true;
       enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::DirectDependencies;

@@ -7,8 +7,8 @@
 // GREATER translations and "hwshaderpftyuva", which adds an alpha plane, forward here): BT.601 limited range Y'CbCr -> R'G'B' (dgVoodoo
 // reads the planes from .w) times g_MatrialColor (c62 = cb4[70], the fade). Transcribed from the translated disassembly. In game the
 // cutscenes draw it into the canvas, the title screen's movie into the scene target before the UI (the alpha plane variant).
-// Then the vanilla clamp (the 8-bit targets gave it: below 0 the conversion's undershoot, the fp16 mirrors kept it) and, in HDR, a
-// light PumboAutoHDR. The targets are gamma encoded with 1 = UI paper white (UI_DRAW_TYPE 2: the composition scales the canvas by it).
+// Then the vanilla clamp: the 8-bit targets clipped the conversion's undershoot below 0, which the fp16 mirrors keep. In HDR, a light
+// PumboAutoHDR ("VideoAutoHDR") follows. The targets are gamma encoded with 1 = UI paper white (UI_DRAW_TYPE 2: the composition scales the canvas by it).
 
 cbuffer cb3 : register(b3)
 {
