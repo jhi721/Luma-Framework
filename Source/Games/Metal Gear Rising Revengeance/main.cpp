@@ -23,37 +23,44 @@
 #include "..\..\Core\includes\patched_draws.h"
 
 // Metal Gear Rising: Revengeance (PC, Steam, exe link time 2014-01-28) is x86 D3D9: it runs through dgVoodoo (D3D9 -> D3D11), so every
-// hash below is a dgVoodoo 2.87.5 translation (ps_5_0) from the offline map of GameData/shader*.dat (_tools/mgrr/NOTES.md). dgVoodoo
-// translates each pixel shader once per alpha test function in use: the lists hold the plain one first, then GREATEREQUAL, GREATER.
+// hash below is a dgVoodoo translation from the offline map of GameData/shader*.dat (_tools/mgrr/NOTES.md): 2.87.5 / 2.87.6 (ps_5_0, the
+// main zip) first, then the same shaders under 2.81.3 (ps_4_0, the Linux zip) in the same order; the 2.81.3 replacements are forwarders
+// to the 2.87.5 bodies (same signature and rows). dgVoodoo translates each pixel shader once per alpha test function in use: the lists
+// hold the plain one first, then GREATEREQUAL, GREATER.
 // FilterShaderGather (shader2.dat): the final pass (render layer 0x62), the grade's curve, saturation and gradient plus the bloom and
 // the brightness option. Its replacement does the HDR display map. FilterShaderGatherNoise, the same pass times a noise texture, drawn
 // in its place (seen in game), follows. In game (title screen, MSAA 4x) it writes the render resolution scene target (MSAA),
 // the movie and the UI draw on that target, it is resolved, then the game's copy (filtershadercopytex) scales it into dgVoodoo's D3D9
 // back buffer (the canvas, the output resolution), which is resolved and presented by dgVoodoo's blit.
-const ShaderHashesList shader_hashes_Gather = {.pixel_shaders = {0x726E6E78, 0x562F84D7, 0xDD1B4599, 0xCE6E1597, 0x970F67BD, 0xF263AE82, 0xC9453909, 0x0CDD2BDB, 0x252B2AE7, 0xD7D5CA35, 0xB3BB0D35, 0xFF4AFD3B}};
+const ShaderHashesList shader_hashes_Gather = {.pixel_shaders = {0x726E6E78, 0x562F84D7, 0xDD1B4599, 0xCE6E1597, 0x970F67BD, 0xF263AE82, 0xC9453909, 0x0CDD2BDB, 0x252B2AE7, 0xD7D5CA35, 0xB3BB0D35, 0xFF4AFD3B,
+                                                  0x27337F04, 0xB9449F1B, 0x38B31283, 0x07C2BDDE, 0x27F82C3D, 0x81DF6FB5, 0x89AA8AB6, 0x1771F599, 0xB57E19F1, 0xD959F596, 0xC68E6BA9, 0x5979509E}};
 // filtershadercopytex, the copy into the canvas
-const ShaderHashesList shader_hashes_Copy = {.pixel_shaders = {0x91A6C437}};
-// dgVoodoo's present blit of the canvas into the swapchain (Bayonetta's hash)
+const ShaderHashesList shader_hashes_Copy = {.pixel_shaders = {0x91A6C437, 0x7584B641}};
+// dgVoodoo's present blit of the canvas into the swapchain (Bayonetta's hash, the same on both builds)
 const ShaderHashesList shader_hashes_DgVoodooPresent = {.pixel_shaders = {0x880A17D3}};
 // The movies' Y'CbCr -> R'G'B' (hwshaderpftyuv / hwshaderpftyuva and their alpha test twins, Video_0x43A3099D.ps_5_0.hlsl)
-const ShaderHashesList shader_hashes_Video = {.pixel_shaders = {0x43A3099D, 0x0CFBCBEF, 0xC1C26B88, 0x71B4A727, 0x6CF5789C, 0x52502A77}};
+const ShaderHashesList shader_hashes_Video = {.pixel_shaders = {0x43A3099D, 0x0CFBCBEF, 0xC1C26B88, 0x71B4A727, 0x6CF5789C, 0x52502A77, 0xCB8F6735, 0xD4EC8EAC, 0xD2DA2E53, 0x5ECDABD2, 0xCB0CA537, 0x3BC2AB1A}};
 // The bloom chain, all into the fixed size 320x176 bloom target (seen in game at 4K): filter05 (the scene into level 0, then each
 // level into the next: 80x48, 48x32), filter02 / filter01 (each level's V / H blur), then filter08 (the levels' copies added into level
 // 0), which the gather pass reads as t1
-const ShaderHashesList shader_hashes_BloomSource = {.pixel_shaders = {0x0A08457E, 0x1F727666, 0xCE7D760B}};
-const ShaderHashesList shader_hashes_BloomChain = {.pixel_shaders = {0x4B19F442, 0xE454B49F, 0x0B206431, 0x07C81AB1, 0x9F72067C, 0xBBDF2A11, 0x2A5D2B3A, 0x76B8D0F9, 0x9A10CDCF}};
+const ShaderHashesList shader_hashes_BloomSource = {.pixel_shaders = {0x0A08457E, 0x1F727666, 0xCE7D760B, 0x8915F667, 0xD5C1B20D, 0xDCFE44B4}};
+const ShaderHashesList shader_hashes_BloomChain = {.pixel_shaders = {0x4B19F442, 0xE454B49F, 0x0B206431, 0x07C81AB1, 0x9F72067C, 0xBBDF2A11, 0x2A5D2B3A, 0x76B8D0F9, 0x9A10CDCF,
+                                                      0xB922709D, 0xD6B18092, 0x5330A3DF, 0x696374C5, 0xC382D5B7, 0xF3000FB7, 0x27E48165, 0x921E9D13, 0xA6A1F5AA}};
 // The motion blur's velocity map (modelshadervelocitymap, mappl, mappl_ps3, mapscrnki, weight, fixed, directionvelocitymap) and its dilation
 // (modelshaderblurpass2..5): (ndc - previous ndc) * scale + 0.5 in o0.xy, which the 8-bit target clamped and quantized. Clamped as it
 // stored it now that the scene sized targets are fp16.
 const std::unordered_set<uint32_t> velocity_pixel_shaders = {
    0xD6459C7A, 0xBF53671F, 0xD70457EA, 0x25928798, 0x9A548B81, 0x38A99388, 0x9BF3EB98, 0xBE302C8A, 0x0AF5AAD0, 0x5940BF0B, 0xF727984C,
    0xFDA6E45C, 0x5FB1861B, 0xA2AC97CD, 0x9B28456F, 0xADA34A43, 0xF70D9E33, 0x91E4602E, 0x54B4AD50, 0x670A6C0E, 0xDB974526, 0x133DFF5C,
-   0x2243A7CF, 0x8D2C9DE2, 0x94845320, 0x9F29B50B, 0xA0C5CD2B, 0x8A3332B1, 0xEE3C798B, 0x5804E7AC, 0x13C80FDF, 0x73C2030B, 0xAF5C87AB};
+   0x2243A7CF, 0x8D2C9DE2, 0x94845320, 0x9F29B50B, 0xA0C5CD2B, 0x8A3332B1, 0xEE3C798B, 0x5804E7AC, 0x13C80FDF, 0x73C2030B, 0xAF5C87AB,
+   0x8F21E210, 0xE586005A, 0xE4BF3664, 0x250BB857, 0x3166B668, 0xF4393B3B, 0x186E2C72, 0xB4B659A5, 0xD7556B51, 0x9B69BC77, 0x39DAD5B1,
+   0x3733DB62, 0x52BBCF9A, 0xC373C6D8, 0xECBA8440, 0xBDCCFA42, 0x96CCADDF, 0x0E712679, 0x6A5A78CE, 0x57A6D15B, 0xF668F5DA, 0xE7A72CE9,
+   0x2D2C7F36, 0xD9E3EAC3, 0xBD3AAFDB, 0x0EB7F47D, 0xA23C212E, 0x00B73AC3, 0x366BB841, 0xAD541C73, 0x20080312, 0xFD6D74AD, 0xFCDEBB6F};
 // The depth prepass (modelshaderzmapscr and zmapscrnki, plain and with their alpha test twins, seen in game): linear view depth into a
 // scene sized R32F target (MSAA with the game's MSAA on, then resolved), which the deferred passes and the soft particles read. SMAA's
 // predication source. Its single R32F target is the carrier of the scene's motion vectors: the G-buffer draws have several targets,
 // which Core's "SceneMotionVectors" refuses, and the velocity pass only exists with the game's Motion Blur on.
-const ShaderHashesList shader_hashes_DepthPrepass = {.pixel_shaders = {0x522D69B1, 0x36772BFA, 0xAC6B358B, 0xCF1201CF, 0x3E5410CC, 0xE5B37BFF}};
+const ShaderHashesList shader_hashes_DepthPrepass = {.pixel_shaders = {0x522D69B1, 0x36772BFA, 0xAC6B358B, 0xCF1201CF, 0x3E5410CC, 0xE5B37BFF, 0x1C4D3B5D, 0xE14225A9, 0x01D5AFC2, 0x040226F4, 0x9A092F08, 0x8E38BBB3}};
 // FSR's and Luma TAA's masks, written by the scene's alpha blended draws past dgVoodoo's targets (their pixel shaders patched with
 // "PatchPixelShaderReactive", the slot max blended in every blend state: "PatchedDraws::OnCreateBlendState")
 constexpr UINT REACTIVE_SLOT = MotionVectorPatches::reactive_slot;
