@@ -213,8 +213,8 @@ namespace UnscaledTurns
    constexpr std::array<uint8_t, 9> PROLOGUE = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x8B, 0x4D, 0x0C};
    // The return addresses of the per-frame calls with constant arguments: em0092 ground alignment (FUN_007e99e0, FUN_0080ef80,
    // ~0x80f3b0; 0.2, 5 degrees), em0130 ground alignment (FUN_00872bb0; 0.3, 10), em00f1 (FUN_0094e030; 0.8, 10), object 0x3000c
-   // turning to the player (FUN_00578980; 0.3, 30), em0090-92 self-righting (FUN_007ae730; 0.1, pi), the camera's collision up-axis turn (FUN_00605210, "TtV_CHAR_COLLISION"; 0.3, 10).
-   // Not FUN_005e9410's call (0x5E965A), whose caller is not proven to run every frame.
+   // turning to the player (FUN_00578980; 0.3, 30), em0090-92 self-righting (FUN_007ae730; 0.1, pi), the character collision up axis (FUN_005e9410 from FUN_00605210,
+   // "TtV_CHAR_COLLISION"; 0.3, 10).
    constexpr std::array<uintptr_t, 8> UNSCALED_RETURNS = {0x7E9C4A, 0x80F35E, 0x80FB3E, 0x872CAE, 0x94EBE8, 0x578E7D, 0x7AE81E, 0x5E965F};
 
    static MinHook::HookedFunction<Rotate> hooked;
@@ -668,7 +668,7 @@ namespace VectorApproaches
    constexpr std::array<uint8_t, 12> PROLOGUE = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x83, 0xEC, 0x30, 0x8B, 0x4D, 0x0C};
    // Rate 0.1 to 0.5, snap 0.01 to 0.1, max step 0.5 or the projectile's +0x8
    constexpr std::array<uintptr_t, 6> UNSCALED_RETURNS = {0x4C7237, 0x4DEFFB, 0x4E03EF, 0x4E0BCB, 0x4E1B45, 0x6B039E};
-   // Player states: rate step * 0.6, snap step * 0.05, max step step * 0.15, the object in ecx
+   // Player states: rate step * 0.6, snap step * 0.05, max step step * 0.15
    constexpr std::array<uintptr_t, 6> LINEAR_RETURNS = {0x4DF4D2, 0x4DF7E8, 0x4E0F42, 0x4E1258, 0x4E1EBF, 0x4E21D5};
 
    static MinHook::HookedFunction<Approach> hooked;
@@ -687,10 +687,10 @@ namespace VectorApproaches
       }
       else if (std::ranges::find(LINEAR_RETURNS, return_address) != LINEAR_RETURNS.end())
       {
-         const float step = *reinterpret_cast<const float*>(static_cast<uint8_t*>(ecx) + TIME_SCALE) * frame_time;
-         if (step > 0.f && step < 1.f)
+         // rate / frame time = the console per frame rate (rate * time scale), as in "SnapApproaches"' linear callers
+         if (frame_time < 1.f)
          {
-            rate = PerConsoleFrame((std::min)(rate / step, 1.f), step);
+            rate = PerConsoleFrame((std::min)(rate / frame_time, 1.f), frame_time);
          }
       }
       return hooked.original(ecx, edx, out, current, target, rate, snap, max_step);
