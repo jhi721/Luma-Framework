@@ -152,6 +152,8 @@ struct VanquishGameDeviceData final : public GameDeviceData
    uint32_t t2x_frame = 0;
    // T2x's resolve writes RGB only: the gather target's alpha stays. Made at its first use.
    com_ptr<ID3D11BlendState> rgb_blend_state;
+   // max(target, 0) with a black draw, made at its first use (see "subtracts")
+   com_ptr<ID3D11BlendState> max_blend_state;
 
    // DLAA, FSR Native AA, XeSS or Luma TAA (Core's SR bridge: the game is 32-bit) on the motion vectors of Core's "SceneMotionVectors"
    // (vc4 layout in "MotionVectorPatches"), before the gather pass
@@ -1046,6 +1048,8 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("Vanquish SMAA T2x Resolve PS"),
          ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_resolve_ps", {{"SMAA_T2X", "1"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("Vanquish Motion Vector Fill CS"), ShaderDefinition("Luma_Vanquish_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
+      // Max blended after a subtractive UI draw (see "subtracts")
+      native_shaders_definitions.emplace(CompileTimeStringHash("Vanquish Draw Black PS"), ShaderDefinition{"Luma_DrawColor_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"COLOR", "float4(0.0, 0.0, 0.0, 0.0)"}}});
 
       sr_game_tooltip = "Needs Anti-Aliasing off in the game's options. DLSS, FSR and XeSS require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
 
@@ -1421,6 +1425,45 @@ public:
          ID3D11ShaderResourceView* const null_srv = nullptr;
          native_device_context->PSSetShaderResources(1, 1, &null_srv);
          return DrawOrDispatchOverrideType::Replaced;
+      }
+      // The 8-bit UNORM targets floored a subtractive blend at 0, their fp16 mirrors don't: the pause menu's tint (uibaseshader 0CD3C0A6,
+      // "SRC_ALPHA REV_SUBTRACT ONE") left negative red on the canvas. The game's draw, then max(target, 0) (P5S' way). Not only after
+      // the gather pass: the pause menu's frames have none (a copy of the last scene).
+      if (can_draw && original_shader_hashes.pixel_shaders[0] != SHADER_HASH_NONE)
+      {
+         com_ptr<ID3D11BlendState> blend_state;
+         native_device_context->OMGetBlendState(&blend_state, nullptr, nullptr);
+         D3D11_BLEND_DESC blend_desc = {};
+         if (blend_state)
+         {
+            blend_state->GetDesc(&blend_desc);
+         }
+         const D3D11_RENDER_TARGET_BLEND_DESC& rt_blend = blend_desc.RenderTarget[0];
+         const auto subtracts = [](D3D11_BLEND_OP op)
+         { return op == D3D11_BLEND_OP_SUBTRACT || op == D3D11_BLEND_OP_REV_SUBTRACT; };
+         if (rt_blend.BlendEnable && (subtracts(rt_blend.BlendOp) || subtracts(rt_blend.BlendOpAlpha)))
+         {
+            if (!game_device_data.max_blend_state)
+            {
+               D3D11_BLEND_DESC max_blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
+               max_blend_desc.RenderTarget[0] = {.BlendEnable = TRUE, .SrcBlend = D3D11_BLEND_ONE, .DestBlend = D3D11_BLEND_ONE, .BlendOp = D3D11_BLEND_OP_MAX, .SrcBlendAlpha = D3D11_BLEND_ONE, .DestBlendAlpha = D3D11_BLEND_ONE, .BlendOpAlpha = D3D11_BLEND_OP_MAX, .RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL};
+               native_device->CreateBlendState(&max_blend_desc, &game_device_data.max_blend_state);
+            }
+            auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
+            auto* const black_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Vanquish Draw Black PS"));
+            ComPtr<ID3D11RenderTargetView> target_rtv;
+            native_device_context->OMGetRenderTargets(1, target_rtv.put(), nullptr);
+            if (game_device_data.max_blend_state && copy_vs && black_ps && target_rtv)
+            {
+               (*original_draw_dispatch_func)();
+               const uint2 size = GetViewTextureSize(target_rtv.get());
+               DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
+               draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
+               DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), game_device_data.max_blend_state.get(), nullptr, copy_vs, black_ps, nullptr, target_rtv.get(), size.x, size.y);
+               draw_state_stack.Restore(native_device_context);
+               return DrawOrDispatchOverrideType::Replaced;
+            }
+         }
       }
       return DrawOrDispatchOverrideType::None;
    }
