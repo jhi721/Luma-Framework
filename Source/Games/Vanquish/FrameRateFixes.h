@@ -3,11 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <format>
 #include <ranges>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 
 #include "..\..\Core\includes\minhook.h"
@@ -25,6 +28,49 @@ namespace FrameRateFixes
       constexpr DWORD STEAM_TIME_DATE_STAMP = 0x596642C6;
       const auto* const image = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
       return reinterpret_cast<const IMAGE_NT_HEADERS*>(image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew)->FileHeader.TimeDateStamp == STEAM_TIME_DATE_STAMP;
+   }
+
+   // How often each fix changed the game's values, logged every 2 s of game time ("LogStats"); counted in DEVELOPMENT only
+   enum class Stat
+   {
+      HOMING_PRESCALED,
+      HOMING_RICOCHET,
+      HOMING_DEFLECTION,
+      UNSCALED_TURN,
+      COUNTER_TICK,
+      COUNTER_HOLD,
+      DAMAGE_LANDED,
+      DAMAGE_DROPPED,
+      APPROACH_UNSCALED,
+      APPROACH_LINEAR,
+      APPROACH_STEP_SCALED,
+      ENEMY_TURN,
+      SNAP_UNSCALED,
+      SNAP_LINEAR,
+      SNAP_POW,
+      VECTOR_UNSCALED,
+      VECTOR_LINEAR,
+      STUCK_HELD,
+      DRAG_XZ, // The "BlockCalls" blocks, in their order
+      DRAG_Y,
+      EASE_ACTIVE,
+      EASE_EXPIRED,
+      LEAN,
+      DUST_TIMER,
+      COUNT,
+   };
+   constexpr std::array<const char*, size_t(Stat::COUNT)> STAT_NAMES = {"homing_prescaled", "homing_ricochet", "homing_deflection", "unscaled_turn", "counter_tick", "counter_hold",
+      "damage_landed", "damage_dropped", "approach_unscaled", "approach_linear", "approach_step_scaled", "enemy_turn", "snap_unscaled", "snap_linear", "snap_pow",
+      "vector_unscaled", "vector_linear", "stuck_held", "drag_xz", "drag_y", "ease_active", "ease_expired", "lean", "dust_timer"};
+#if DEVELOPMENT
+   static std::array<std::atomic<uint32_t>, size_t(Stat::COUNT)> stats = {};
+#endif
+
+   static void Count(Stat stat)
+   {
+#if DEVELOPMENT
+      stats[size_t(stat)].fetch_add(1, std::memory_order_relaxed);
+#endif
    }
 
    // DAT_00f0318c: the frame time in 1/30 s
@@ -109,6 +155,7 @@ namespace FrameRateFixes
          }
          if (std::ranges::find(PRESCALED_MAX_STEP_RETURNS, caller) != PRESCALED_MAX_STEP_RETURNS.end())
          {
+            Count(Stat::HOMING_PRESCALED);
             max_step /= frame_time;
             if (caller == PRESCALED_RATE_RETURN)
             {
@@ -117,11 +164,13 @@ namespace FrameRateFixes
          }
          else if (caller == RICOCHET_RETURN)
          {
+            Count(Stat::HOMING_RICOCHET);
             rate /= frame_time;
             max_step /= frame_time;
          }
          else if (caller == DEFLECTION_RETURN)
          {
+            Count(Stat::HOMING_DEFLECTION);
             // The branch decided by the time scale, not the frame step
             const bool slow_motion = FRAME_STEP(projectile) < SLOW_MOTION_SCALE * frame_time;
             rate = slow_motion ? 1.f : (DEFLECTION_RATE / frame_time);
@@ -162,6 +211,7 @@ namespace FrameRateFixes
          if (enabled && frame_time > 0.f && rate < 1.f &&
              std::ranges::find(UNSCALED_RETURNS, reinterpret_cast<uintptr_t>(_ReturnAddress())) != UNSCALED_RETURNS.end())
          {
+            Count(Stat::UNSCALED_TURN);
             rate = PerConsoleFrame(rate, frame_time);
             max_angle *= frame_time;
          }
@@ -217,9 +267,14 @@ namespace FrameRateFixes
       {
          if (!enabled || is_tick_frame)
          {
+            if (enabled)
+            {
+               Count(Stat::COUNTER_TICK);
+            }
             hooked.original(player, edx);
             return;
          }
+         Count(Stat::COUNTER_HOLD);
          auto* const no_death_frames = reinterpret_cast<uint16_t*>(player + NO_DEATH_FRAMES);
          auto* const type_8f_hit_cooldown = reinterpret_cast<int32_t*>(player + TYPE_8F_HIT_COOLDOWN);
          auto* const hit_cooldown = reinterpret_cast<int32_t*>(player + HIT_COOLDOWN);
@@ -298,10 +353,14 @@ namespace FrameRateFixes
          if (!is_new && hits.frame != receivers.frame)
          {
             if (receivers.time + frame_time * 0.5 < hits.next_time)
+            {
+               Count(Stat::DAMAGE_DROPPED);
                return 0;
+            }
             hits.next_time = (receivers.time - hits.next_time < 1.0) ? (hits.next_time + 1.0) : (receivers.time + 1.0);
             hits.frame = receivers.frame;
          }
+         Count(Stat::DAMAGE_LANDED);
          return (std::max)(damage, 1);
       }
 
@@ -413,6 +472,7 @@ namespace FrameRateFixes
          const auto return_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
          if (std::ranges::find(UNSCALED_RETURNS, return_address) != UNSCALED_RETURNS.end())
          {
+            Count(Stat::APPROACH_UNSCALED);
             if (rate < 1.f)
             {
                rate = PerConsoleFrame(rate, frame_time);
@@ -421,10 +481,12 @@ namespace FrameRateFixes
          }
          else if (frame_time < 1.f && std::ranges::find(LINEAR_RETURNS, return_address) != LINEAR_RETURNS.end())
          {
+            Count(Stat::APPROACH_LINEAR);
             rate = PerConsoleFrame((std::min)(rate / frame_time, 1.f), frame_time);
          }
          else if (frame_time < 1.f && std::ranges::find(STEP_SCALED_RETURNS, return_address) != STEP_SCALED_RETURNS.end())
          {
+            Count(Stat::APPROACH_STEP_SCALED);
             const float time_scale = *reinterpret_cast<const float*>(caller_edi + TIME_SCALE);
             if (time_scale > 0.f)
             {
@@ -476,6 +538,7 @@ namespace FrameRateFixes
             return;
          }
          const float time_scale = *reinterpret_cast<const float*>(enemy + TIME_SCALE);
+         Count(Stat::ENEMY_TURN);
          const float console_rate = (std::min)(rate * time_scale, 1.f);
          auto* const yaw = reinterpret_cast<float*>(enemy + YAW);
          *yaw = UnscaledApproaches::hooked.original(*yaw, *reinterpret_cast<const float*>(enemy + TARGET_YAW), PerConsoleFrame(console_rate, frame_time),
@@ -530,6 +593,7 @@ namespace FrameRateFixes
          const auto return_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
          if (std::ranges::binary_search(UNSCALED_RETURNS, return_address))
          {
+            Count(Stat::SNAP_UNSCALED);
             if (rate < 1.f)
             {
                rate = PerConsoleFrame(rate, frame_time);
@@ -539,6 +603,7 @@ namespace FrameRateFixes
          }
          else if (frame_time < 1.f && std::ranges::binary_search(LINEAR_RETURNS, return_address))
          {
+            Count(Stat::SNAP_LINEAR);
             rate = PerConsoleFrame((std::min)(rate / frame_time, 1.f), frame_time);
             snap *= frame_time;
             max_step *= frame_time;
@@ -552,6 +617,7 @@ namespace FrameRateFixes
                const float step = *reinterpret_cast<const float*>(static_cast<uint8_t*>(ecx) + TIME_SCALE) * frame_time;
                if (step > 0.f && rate > 0.f)
                {
+                  Count(Stat::SNAP_POW);
                   const float k = std::pow(rate, 1.f / step);
                   rate = PerConsoleFrame(k, step);
                   const float extent_scale = squared ? (1.f / step) : step;
@@ -594,6 +660,7 @@ namespace FrameRateFixes
          const auto return_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
          if (std::ranges::find(UNSCALED_RETURNS, return_address) != UNSCALED_RETURNS.end())
          {
+            Count(Stat::VECTOR_UNSCALED);
             rate = PerConsoleFrame(rate, frame_time);
             snap *= frame_time;
             max_step *= frame_time;
@@ -603,6 +670,7 @@ namespace FrameRateFixes
             // rate / frame time = the console per frame rate (rate * time scale), as in "SnapApproaches"' linear callers
             if (frame_time < 1.f)
             {
+               Count(Stat::VECTOR_LINEAR);
                rate = PerConsoleFrame((std::min)(rate / frame_time, 1.f), frame_time);
             }
          }
@@ -913,6 +981,10 @@ namespace FrameRateFixes
          {
             ++*stuck_frames;
          }
+         else
+         {
+            Count(Stat::STUCK_HELD);
+         }
          return *stuck_frames > MAX_STUCK_FRAMES;
       }
 
@@ -1071,11 +1143,12 @@ namespace FrameRateFixes
       // return_address: Entry's, right after the patched block's call
       static void __stdcall Run(uint8_t* object, uintptr_t return_address)
       {
-         for (const Block& block : BLOCKS)
+         for (size_t i = 0; i < BLOCKS.size(); i++)
          {
-            if (return_address == uintptr_t(block.start + CALL_SIZE))
+            if (return_address == uintptr_t(BLOCKS[i].start + CALL_SIZE))
             {
-               block.handler(object);
+               Count(Stat(size_t(Stat::DRAG_XZ) + i));
+               BLOCKS[i].handler(object);
                return;
             }
          }
@@ -1207,9 +1280,42 @@ namespace FrameRateFixes
 
       static MinHook::HookedFunction<Update> hooked;
 
+#if DEVELOPMENT
+      // Every 2 s of game time: the frame time range, the per-frame values and each fix's counts since the last line
+      static void LogStats()
+      {
+         static double elapsed = 0.0; // In 1/30 s
+         static uint32_t frames = 0;
+         static float min_frame_time = FLT_MAX;
+         static float max_frame_time = 0.f;
+         const float frame_time = *FRAME_TIME;
+         elapsed += frame_time;
+         frames++;
+         min_frame_time = (std::min)(min_frame_time, frame_time);
+         max_frame_time = (std::max)(max_frame_time, frame_time);
+         if (elapsed < 60.0)
+            return;
+         std::string line = std::format("[Vanquish] Frame rate fixes {}: {} frames, frame time {:.3f}-{:.3f}, slowdown gate {}, console frame time {:.3f}, frame constant 0 {:.3f} |",
+            enabled ? "on" : "off", frames, min_frame_time, max_frame_time, ConsoleSlowdown::patched ? "patched" : "original", ConsoleFrameTime::value,
+            FrameConstants::values[0]);
+         for (size_t i = 0; i < stats.size(); i++)
+         {
+            line += std::format(" {}={}", STAT_NAMES[i], stats[i].exchange(0, std::memory_order_relaxed));
+         }
+         reshade::log::message(reshade::log::level::info, line.c_str());
+         elapsed = 0.0;
+         frames = 0;
+         min_frame_time = FLT_MAX;
+         max_frame_time = 0.f;
+      }
+#endif
+
       static int __cdecl Detour()
       {
          const int result = hooked.original();
+#if DEVELOPMENT
+         LogStats();
+#endif
          for (const Fix& fix : FIXES)
          {
             if (fix.on_frame)
