@@ -6,7 +6,7 @@
 
 cbuffer RenderShareStretch : register(b0)
 {
-   float2 render_share; // Render size / output size
+   float2 render_share; // Render size / view size (the output size, or less in a letterboxed cinematic)
 };
 
 Texture2D<float4> source : register(t0);

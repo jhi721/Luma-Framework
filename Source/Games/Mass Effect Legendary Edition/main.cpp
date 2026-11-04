@@ -1070,6 +1070,9 @@ struct MassEffectGameDeviceData final : public GameDeviceData
    std::array<float, 2> mv_jitter_ndc = {}; // The same offset in NDC (y up), as the jitter buffer holds it
    // The scene's viewport (the top-left share of the output sized targets under the engine's render scale), taken when it opens
    std::array<uint32_t, 2> render_size = {};
+   // The engine's view at native scale, also top-left: the upscaler's output and the post passes' area. Smaller than the targets
+   // when the engine letterboxes a cinematic at a display aspect ratio other than its own (16:9 in a 16:10 or 4:3 conversation)
+   std::array<uint32_t, 2> view_size = {};
    com_ptr<ID3D11Buffer> mv_jitter_buffer;
    // Per-draw lookups kept for the next draw (reset when the scene opens, views and states can be recreated between scenes): the
    // jitter path's last depth view and whether it's the scene depth, the last depth stencil state's depth test and write (null = the
@@ -1871,11 +1874,36 @@ class MassEffectLE final : public Game
       UINT viewport_count = 1;
       native_device_context->RSGetViewports(&viewport_count, &viewport);
       const bool viewport_valid = viewport_count != 0 && viewport.Width >= 1.f && viewport.Height >= 1.f && viewport.Width <= device_data.output_resolution.x && viewport.Height <= device_data.output_resolution.y;
-      game_device_data.render_size = (viewport_valid ? std::array<uint32_t, 2>{uint32_t(viewport.Width), uint32_t(viewport.Height)} : std::array<uint32_t, 2>{uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y)});
+      const uint32_t target_width = uint32_t(device_data.output_resolution.x), target_height = uint32_t(device_data.output_resolution.y);
+      const auto& render_size = game_device_data.render_size = (viewport_valid ? std::array<uint32_t, 2>{uint32_t(viewport.Width), uint32_t(viewport.Height)} : std::array<uint32_t, 2>{target_width, target_height});
+      // Without our render scale the scene is the whole view. Under it the view is the render share's aspect ratio fitted to the
+      // targets, the targets themselves within 1% (the scaled size is rounded).
+      // ponytail: a letterboxed view under the render scale can be 1 px off its real size; read the view's unscaled size from the
+      // engine (FViewInfo, see "RenderPostProcessDetour") if that ever shows
+      if (EngineScale::enabled_by_us)
+      {
+         const double render_aspect = double(render_size[0]) / double(render_size[1]), target_aspect = double(target_width) / double(target_height);
+         if (std::abs(render_aspect / target_aspect - 1.0) <= 0.01)
+         {
+            game_device_data.view_size = {target_width, target_height};
+         }
+         else if (render_aspect > target_aspect)
+         {
+            game_device_data.view_size = {target_width, (std::min)(uint32_t(std::lround(target_width / render_aspect)), target_height)};
+         }
+         else
+         {
+            game_device_data.view_size = {(std::min)(uint32_t(std::lround(target_height * render_aspect)), target_width), target_height};
+         }
+      }
+      else
+      {
+         game_device_data.view_size = render_size;
+      }
       // The upscaler's mip bias for this frame's own render size (a render scale change takes effect on the frame after the slider's
       // release), -1 at native resolution (0 with XeSS). The scene opens inside its first draw: Core rebinds the bound samplers right away. Without
       // an upscaler it's reset at present.
-      SetTextureMipLodBias(native_device_context, device_data, (sr_instance_data ? SR::GetMipLODBias(device_data.sr_type, float(game_device_data.render_size[1]), device_data.output_resolution.y) : 0.f), &cmd_list_data);
+      SetTextureMipLodBias(native_device_context, device_data, (sr_instance_data ? SR::GetMipLODBias(device_data.sr_type, float(render_size[1]), float(game_device_data.view_size[1])) : 0.f), &cmd_list_data);
       game_device_data.mv_jitter_ndc = {game_device_data.mv_jitter[0] * 2.f / float(game_device_data.render_size[0]), game_device_data.mv_jitter[1] * -2.f / float(game_device_data.render_size[1])};
       const float ndc_jitter[4] = {game_device_data.mv_jitter_ndc[0], game_device_data.mv_jitter_ndc[1], 0.f, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
@@ -2471,12 +2499,14 @@ class MassEffectLE final : public Game
          game_device_data.sr_vert_fov = float(camera.vert_fov);
       }
 
-      // The scene's top-left share under the engine's render scale
+      // The scene's top-left share under the engine's render scale, upscaled to the view's top-left (the post passes' area)
       const uint32_t render_width = (std::min)(game_device_data.render_size[0] != 0 ? game_device_data.render_size[0] : scene_desc.Width, scene_desc.Width);
       const uint32_t render_height = (std::min)(game_device_data.render_size[1] != 0 ? game_device_data.render_size[1] : scene_desc.Height, scene_desc.Height);
+      const uint32_t view_width = std::clamp(game_device_data.view_size[0] != 0 ? game_device_data.view_size[0] : scene_desc.Width, render_width, scene_desc.Width);
+      const uint32_t view_height = std::clamp(game_device_data.view_size[1] != 0 ? game_device_data.view_size[1] : scene_desc.Height, render_height, scene_desc.Height);
       const SR::SettingsData settings_data = {
-         .output_width = scene_desc.Width,
-         .output_height = scene_desc.Height,
+         .output_width = view_width,
+         .output_height = view_height,
          .render_width = render_width,
          .render_height = render_height,
          .dynamic_resolution = false,
@@ -2714,7 +2744,8 @@ class MassEffectLE final : public Game
       graphics_state.Restore(native_device_context);
    }
 
-   // Whether the engine's render scale draws the scene into the top-left share of its output sized targets this frame
+   // Whether the scene fills only the top-left share of its output sized targets this frame (the engine's render scale, or a
+   // letterboxed view): what the AO passes cover. The post passes cover the view instead (see "RebindUpscaledScene").
    static bool IsRenderShare(const DeviceData& device_data, const MassEffectGameDeviceData& gd)
    {
       return gd.render_size[0] != 0 && gd.render_size[1] != 0 && (gd.render_size[0] < device_data.output_resolution.x || gd.render_size[1] < device_data.output_resolution.y);
@@ -2725,7 +2756,8 @@ class MassEffectLE final : public Game
    // they read (the scene's depth and velocity, written in the render share) is read stretched ("StretchRenderShare").
    static void RebindUpscaledScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, MassEffectGameDeviceData* gd, bool compute)
    {
-      const bool render_share = IsRenderShare(device_data, *gd);
+      // Only under the render scale: a letterboxed view at native scale runs its post passes over the scene as drawn
+      const bool render_share = gd->render_size[0] != 0 && gd->render_size[1] != 0 && (gd->render_size[0] < gd->view_size[0] || gd->render_size[1] < gd->view_size[1]);
       if (!gd->sr_input && !render_share)
          return;
       com_ptr<ID3D11ShaderResourceView> srvs[16]; // t0-t15
@@ -2831,7 +2863,7 @@ class MassEffectLE final : public Game
       }
       if (stretch.frame != cb_luma_global_settings.FrameIndex)
       {
-         const float render_share[4] = {float(gd->render_size[0]) / float(desc.Width), float(gd->render_size[1]) / float(desc.Height), 0.f, 0.f};
+         const float render_share[4] = {float(gd->render_size[0]) / float(gd->view_size[0]), float(gd->render_size[1]) / float(gd->view_size[1]), 0.f, 0.f};
          if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->render_share_stretch_buffer), render_share, sizeof(render_share)))
             return nullptr;
          DrawStateStack<DrawStateStackType::Compute> compute_state;
@@ -3987,6 +4019,7 @@ public:
          float uv_scale[2] = {1.f, 1.f};
          if ((gd.gtao_active_this_frame || gd.hbao_stretched_this_frame) && IsRenderShare(device_data, gd))
          {
+            // The scene UV is over the whole targets (not the view): onto the render share
             uv_scale[0] = device_data.output_resolution.x / float(gd.render_size[0]);
             uv_scale[1] = device_data.output_resolution.y / float(gd.render_size[1]);
          }
@@ -4037,6 +4070,7 @@ public:
          // No scene opens to rewrite it, and the engine's render scale is off from the next frame (see "EngineScale::Apply"): a share
          // left from the scaled frames would keep XeGTAO's depth loads and the AO apply's UV scale on it (see "IsRenderShare")
          gd.render_size = {};
+         gd.view_size = {};
       }
       // None picked: Core freed its upscaler resources and output, ours go too (recreated when an upscaler is picked again). The DEV
       // "MV Enable" still draws motion vectors without an upscaler: their resources stay then.
