@@ -33,6 +33,7 @@ const ShaderHashesList shader_hashes_Gather = {.pixel_shaders = {0xBC9B20C2, 0xE
 // What writes the canvas after the gather pass: the game's FXAA (exe_007) or edge AA 2x / 4x / 8x (exe_004 / 005 / 006, the game's
 // "MSAA" option), a plain copy in their place once SMAA ran on their input, else dgVoodoo's copy with the game's AA off
 const ShaderHashesList shader_hashes_GameAA = {.pixel_shaders = {0x15857C80, 0xB39B8ED0, 0xEB476A79, 0x32A44A9C, 0x3341D6E4, 0x491F4CBE, 0xC674EE68, 0x4434D070, 0xAE5DF7AE, 0x85CECC90, 0x75FCCD11, 0xDF16B483, 0x7C74E55F, 0x315CE602, 0x5F4256CE, 0xB2602160, 0x49BC8BE9, 0xAC49314B, 0x9440733F, 0x3B8132DA, 0x2A9954D3, 0xC8AAB307, 0x11B65982, 0xB3D9035C}};
+// dgVoodoo 2.81.3 has no twin: with the game's AA off its gather pass draws straight into the canvas (seen in game)
 const ShaderHashesList shader_hashes_AAOffCopy = {.pixel_shaders = {0xE9A53CDA}};
 // The depth prepass (zmapscr / zmapscrnki, seen in game): linear view depth into a scene sized R32F target that SSAO, DoF and the soft
 // particles read. SMAA's predication source.
