@@ -28,8 +28,8 @@ RWTexture2D<float> previous_additive : register(u4); // The additive and alpha b
    {
       // The additive draws write y = 0, so x > y is theirs (sparks, glows), scaled and capped at 0.9 without a threshold, else they
       // smear, and kept from the previous frame (a blinking one that went out is still lit in the upscaler's history); the alpha
-      // blended ones (x = y = a: smoke, haze) only over the threshold, as a continuous mask over them shakes the whole sprite
-      // (Bayonetta's TAA lab), and only where their alpha changed since the previous frame by more than
+      // blended ones (x = y = a: smoke, haze) only over the threshold, as a continuous mask over them shakes the whole sprite,
+      // and only where their alpha changed since the previous frame by more than
       // "alpha_change_threshold": the game also draws static glass panes and corridor end caps as large alpha blended particle
       // quads (037EC99A), whose history the mask threw away, so the aliasing behind them shimmered under Luma TAA and FSR
       const float alpha_change_threshold = 0.1;

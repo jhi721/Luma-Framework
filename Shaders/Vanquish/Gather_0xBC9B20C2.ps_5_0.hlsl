@@ -134,7 +134,7 @@ void main(DGV_MAIN_SIGNATURE)
    float3 color = IsNaN_Strict(o0.rgb) ? 0.0 : max(o0.rgb, 0.0);
    // Vanilla clipped per channel in 8-bit, turning bright highlights toward the primaries; the max-channel curve and map keep the
    // unclipped hue. Restore only that hue turn, from a per-channel Reinhard (ceiling 5, shoulder 1.5: identity below it), as MGR:R.
-   // "Highlights Desaturation" is the chrominance strength (0 = none, vanilla's whitening at 1). Skipped below the shoulder, where the
+   // "Highlights Desaturation" is the MacLeod-Boynton purity strength toward it (0 = none, vanilla's whitening at 1). Skipped below the shoulder, where the
    // reference is the colour itself.
    color = gamma_to_linear(color, GCT_MIRROR);
    const float3 color2020 = BT709_To_BT2020(color);
