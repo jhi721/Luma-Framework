@@ -22,7 +22,7 @@ namespace FrameRateFixes
 {
    static bool enabled = true;
 
-   // The Steam executable (patch 1.05), whose fixed addresses the gameplay hooks below use (no relocations: fixed base)
+   // The Steam executable (patch 1.05). The hooks below use its fixed addresses, as it has no relocations.
    static bool IsSteamExecutable()
    {
       constexpr DWORD STEAM_TIME_DATE_STAMP = 0x596642C6;
@@ -556,8 +556,9 @@ namespace FrameRateFixes
    // angle, max step; 132 callers) snaps within the snap angle, else moves by FUN_00b9b680 but at least by the snap angle. Per call, so
    // per frame: the rate, the snap angle and the max step become per 1/30 s as in "UnscaledApproaches", by return address. The linear
    // callers multiplied only the rate by the frame step (rate / frame time = rate per console frame); they keep the game's from 1 up.
-   // The callers passing rate k^step get 1 - (1 - k)^step. Not here: the snaps (rate 1, max step pi) and step scaled arguments. The player auto-turn (FUN_004de2f0, 3 degrees per
-   // call while its 10 frame timer +0xE9F4 counts down) is in only with that timer in "FrameConstants".
+   // The callers passing rate k^step get 1 - (1 - k)^step. Not here: the snaps (rate 1, max step pi) and step scaled arguments.
+   // The player auto-turn (FUN_004de2f0, 3 degrees per call while its 10 frame timer +0xE9F4 counts down) is only fixed together
+   // with that timer in "FrameConstants".
    namespace SnapApproaches
    {
       using Approach = int(__fastcall*)(void* ecx, void* edx, float* out, float current, float target, float rate, float snap, float max_step);

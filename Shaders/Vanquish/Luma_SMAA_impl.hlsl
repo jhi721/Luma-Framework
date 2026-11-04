@@ -1,8 +1,8 @@
 // Reference: https://github.com/iryoku/smaa
 
-// SMAA ULTRA + colour edge detection, 1x or T2x (below). Run by main.cpp on the gather pass' snapshot (display
-// mapped, gamma encoded), written back into the gather target before the game's AA slot and the UI. Edges are detected on the gamma
-// snapshot, the neighborhood blend filters it in linear light and re-encodes. The predication mask comes from Luma_Vanquish_DepthEdges.
+// SMAA ULTRA with colour edge detection, 1x or T2x (below). main.cpp runs it on the gather pass' snapshot (display mapped, gamma
+// encoded) and writes it back into the gather target before the game's AA slot and the UI. Edges are detected on the gamma snapshot,
+// while the neighborhood blend filters it in linear light and re-encodes. The predication mask comes from "Luma_Vanquish_DepthEdges.hlsl".
 
 // "SMAA_T2X" 1 is SMAA T2x (main.cpp's "Vanquish SMAA T2x" passes, Bayonetta's): the scene jitters by a quarter pixel diagonally in
 // two phases, the blending weights take the phase's area texture subsamples, the neighborhood blend stays in linear light with the
@@ -30,14 +30,14 @@ cbuffer SmaaMetricsCB : register(b1)
 #define SMAA_PRESET_ULTRA
 #define SMAA_PREDICATION       1
 #define SMAA_PREDICATION_SCALE smaa_metrics.predication.x
-// Predication is live (CS mask, SCALE 2.0), so both values below are load-bearing: flat = SCALE * SMAA_THRESHOLD =
-// 0.10, silhouette = flat * (1 - STRENGTH) = 0.05 (ULTRA base). SMAA_PREDICATION_THRESHOLD 0.5 is scale-free; tune the CS.
+// Predication is live (the depth edges mask, scale 2.0), so both values below matter: flat = SCALE * SMAA_THRESHOLD = 0.10 and
+// silhouette = flat * (1 - STRENGTH) = 0.05 (the ULTRA base). "SMAA_PREDICATION_THRESHOLD" 0.5 is scale-free, so tune the mask itself.
 #define SMAA_PREDICATION_STRENGTH  0.5
 #define SMAA_PREDICATION_THRESHOLD 0.5
 #define SMAAGather(tex, coord)     tex.Gather(LinearSampler, coord, 0)
 
-// The predication signal above is a one-sided edge-ness; morphological edge suppression in place of the local contrast
-// adaptation (both in SMAA_Passes.hlsl / SMAA.hlsl). main.cpp also sets SMAA_SMOOTH_U_SHAPES 0.
+// The predication signal above is a one-sided edge-ness, so we use morphological edge suppression in place of the local contrast
+// adaptation (both in "SMAA_Passes.hlsl" and "SMAA.hlsl"). main.cpp also sets "SMAA_SMOOTH_U_SHAPES" 0.
 #define SMAA_PREDICATION_EDGENESS           1
 #define SMAA_MORPHOLOGICAL_EDGE_SUPPRESSION 1
 

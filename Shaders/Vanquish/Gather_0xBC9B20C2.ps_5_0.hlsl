@@ -8,15 +8,17 @@
 
 // Vanquish final grade "FilterShaderGather" (shader2.dat, D3D9 ps_3_0, dgVoodoo 2.87.6 -> ps_5_0 0xBC9B20C2 without alpha test, the
 // one drawn in game; Gather_0xE004F806 / Gather_0x021D5E4D are its GREATEREQUAL / GREATER alpha test translations). Transcribed from
-// the translated disassembly. MGR:R's pass (its Gather_0x726E6E78) except the bloom: here bloom * g_BloomColor is weighted by its own
-// alpha. Every value is gamma encoded (R'G'B', 1 = SDR white) as the game's 8-bit targets hold it: the scene (t0, 1080p), the 320x176
-// bloom (t1) and the 256x1 ColorTableTexture (t2, written by the CPU every frame, its R read per channel with the channel as U through
-// a point sampler); saturation g_Saido (c186 = cb4[194]) around Y' of the curved colour, the g_MulColor gain (c184 = cb4[192]), the
-// vertical g_AddColor gradient (c185 = cb4[193]), the bloom times g_BloomColor (c187 = cb4[195]) and g_Brightness (c188 = cb4[196]).
-// It writes the scene sized target the game's FXAA or edge AA (exe blobs) reads, then the UI draws on their output (dgVoodoo's D3D9
-// back buffer). HDR: the curve continued by its tangent above a pivot (PlatinumToneCurve), vanilla exact below it, then the vanilla
-// clip's hue turn (MacLeod-Boynton, hue only), the display map (a max-channel C-infinity rolloff to the peak) and the UI paper white
-// pre-scale (UI_DRAW_TYPE 2), encoded back for the Core composition.
+// the translated disassembly. This is MGR:R's pass (its Gather_0x726E6E78) except for the bloom, which here is weighted by its own
+// alpha after g_BloomColor.
+// Every value is gamma encoded (R'G'B', 1 = SDR white) as the game's 8-bit targets hold it. The inputs are the scene (t0, 1080p), the
+// 320x176 bloom (t1) and the 256x1 ColorTableTexture (t2). The CPU rewrites t2 every frame, and its R is read per channel with the
+// channel as U through a point sampler. The grade is the saturation g_Saido (c186 = cb4[194]) around the Y' of the curved colour, the
+// g_MulColor gain (c184 = cb4[192]), the vertical g_AddColor gradient (c185 = cb4[193]), then the bloom times g_BloomColor
+// (c187 = cb4[195]) and g_Brightness (c188 = cb4[196]).
+// It writes the scene sized target that the game's FXAA or edge AA (exe blobs) reads, then the UI draws on their output (dgVoodoo's
+// D3D9 back buffer). In HDR the curve is continued by its tangent above a pivot ("PlatinumToneCurve") and stays vanilla exact below
+// it. After that come the vanilla clip's hue turn (MacLeod-Boynton, hue only), the display map (a max-channel C-infinity rolloff to
+// the peak) and the UI paper white pre-scale (UI_DRAW_TYPE 2), then the result is encoded back for the Core composition.
 
 cbuffer cb3 : register(b3)
 {
@@ -84,7 +86,7 @@ void main(DGV_MAIN_SIGNATURE)
    [branch] if (TONEMAP_TYPE >= 1 && LumaSettings.DisplayMode == 1)
    {
       ungraded = IsNaN_Strict(scene.rgb) ? 0.0 : max(scene.rgb, 0.0);
-      // Every pivot is at least a window up, so the fit is skipped where no channel can pass it
+      // Every pivot is at least a window up, so the fit is skipped where no channel can pass it.
       // "curved" is already the curve of these values: "PlatinumToneCurve::Sample" saturates its input
       [branch] if (max3(ungraded) > PlatinumToneCurve::kWindow)
       {
@@ -134,8 +136,8 @@ void main(DGV_MAIN_SIGNATURE)
    float3 color = IsNaN_Strict(o0.rgb) ? 0.0 : max(o0.rgb, 0.0);
    // Vanilla clipped per channel in 8-bit, turning bright highlights toward the primaries; the max-channel curve and map keep the
    // unclipped hue. Restore only that hue turn, from a per-channel Reinhard (ceiling 5, shoulder 1.5: identity below it), as MGR:R.
-   // "Highlights Desaturation" is the MacLeod-Boynton purity strength toward it (0 = none, vanilla's whitening at 1). Skipped below the shoulder, where the
-   // reference is the colour itself.
+   // "Highlights Desaturation" is the MacLeod-Boynton purity strength toward it (0 = none, vanilla's whitening at 1). Skipped below
+   // the shoulder, where the reference is the colour itself.
    color = gamma_to_linear(color, GCT_MIRROR);
    const float3 color2020 = BT709_To_BT2020(color);
    [branch] if (max3(color2020) > 1.5)

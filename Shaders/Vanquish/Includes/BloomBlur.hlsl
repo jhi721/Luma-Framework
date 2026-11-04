@@ -2,14 +2,14 @@
 #define VANQUISH_BLOOM_BLUR_HLSL
 
 // Vanquish bloom blurs "filter02" (V, BlurV_0xCC2E3748) and "filter01" (H, BlurH_0x55E02134) (shader.dat, dgVoodoo 2.87.6 -> ps_5_0),
-// transcribed from the translated disassembly: 5 bilinear taps along one axis at 0, +-1.5 and +-3.5 texels of the whole 320x176
-// bloom target, as constant UV offsets, weights 1 / 0.8 / 0.45 (sum 3.5); out rgb = mean.rgb * mean.a * c184.rgb, alpha c184.w
-// (c184 = cb4[192]). Centred on a texel, the taps between texels split their weight: per texel 1 at 0, 0.4 at +-1 and +-2, 0.225 at
-// +-3 and +-4.
-// In Luma Bloom's chain (main.cpp "DrawBloomPass", LumaData.CustomData3 = its scale k) the source is k times finer: the same taps
-// land on a comb of fine texels. That per texel kernel is applied over the fine texels instead, each game texel k of them wide. A
-// tent per tap (MGR:R's and Bayonetta's) overlaps its neighbours unevenly: the kernel rises again 1.5 game texels out, a stripe of
-// that period across the bloom (measured in game at k 3).
+// transcribed from the translated disassembly. They take 5 bilinear taps along one axis at 0, +-1.5 and +-3.5 texels of the whole
+// 320x176 bloom target, as constant UV offsets with weights 1 / 0.8 / 0.45 (sum 3.5). The output is rgb = mean.rgb * mean.a *
+// c184.rgb and alpha = c184.w (c184 = cb4[192]). Centred on a texel, the taps that fall between texels split their weight, which
+// gives a per texel kernel of 1 at 0, 0.4 at +-1 and +-2, and 0.225 at +-3 and +-4.
+// In Luma Bloom's chain (main.cpp "DrawBloomPass", LumaData.CustomData3 = its scale k) the source is k times finer, so the same taps
+// would land on a comb of fine texels. We apply that per texel kernel over the fine texels instead, each game texel being k of them
+// wide. A tent per tap (MGR:R's and Bayonetta's) overlaps its neighbours unevenly: the kernel rises again 1.5 game texels out, which
+// shows as a stripe of that period across the bloom (measured in game at k 3).
 
 cbuffer cb3 : register(b3)
 {

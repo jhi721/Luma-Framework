@@ -22,13 +22,13 @@
 #include "FrameRateFixes.h"
 #include "..\..\Core\includes\patched_draws.h"
 
-// Vanquish (PC, Steam, exe link time 2017-07-31) is x86 D3D9: it runs through dgVoodoo (D3D9 -> D3D11), so every hash below is a
-// dgVoodoo 2.87.6 translation (ps_5_0) from the offline map of data000.cpk's shader.dat/shader2.dat and of the exe's embedded shaders
-// dgVoodoo translates each pixel shader once per alpha test function in use: the lists hold all three.
-// Each list then holds the dgVoodoo 2.81.3 twins (ps_4_0, the Linux package's build), paired offline by alpha test and opcodes.
-// Frame (live): the scene in 8-bit targets, FilterShaderGather (grade + bloom) into a scene sized
-// target, the game's FXAA or edge AA (the exe's own shaders; a dgVoodoo copy with the game's AA off) into dgVoodoo's D3D9 back buffer
-// (the canvas), the UI on it, then dgVoodoo's present. FilterShaderGather's replacement does the HDR display map.
+// Vanquish (PC, Steam, exe link time 2017-07-31) is x86 D3D9 and runs through dgVoodoo (D3D9 -> D3D11), so every hash below is a
+// dgVoodoo 2.87.6 translation (ps_5_0) from the offline map of data000.cpk's shader.dat/shader2.dat and of the exe's embedded shaders.
+// dgVoodoo translates each pixel shader once per alpha test function in use, so the lists hold all three. They also hold the
+// dgVoodoo 2.81.3 twins (ps_4_0, the Linux package's build), paired offline by alpha test and opcodes.
+// The frame, as seen in game: the scene in 8-bit targets, FilterShaderGather (grade + bloom) into a scene sized target, the game's
+// FXAA or edge AA (the exe's own shaders, or a dgVoodoo copy with the game's AA off) into dgVoodoo's D3D9 back buffer (the canvas),
+// the UI on it, then dgVoodoo's present. The replacement of FilterShaderGather does the HDR display map.
 const ShaderHashesList shader_hashes_Gather = {.pixel_shaders = {0xBC9B20C2, 0xE004F806, 0x021D5E4D, 0x48FFD7B4, 0xEB2A1BAE, 0xB3C88B24}};
 // What writes the canvas after the gather pass: the game's FXAA (exe_007) or edge AA 2x / 4x / 8x (exe_004 / 005 / 006, the game's
 // "MSAA" option), a plain copy in their place once SMAA ran on their input, else dgVoodoo's copy with the game's AA off
@@ -36,7 +36,7 @@ const ShaderHashesList shader_hashes_GameAA = {.pixel_shaders = {0x15857C80, 0xB
 // dgVoodoo 2.81.3 has no twin: with the game's AA off its gather pass draws straight into the canvas (seen in game)
 const ShaderHashesList shader_hashes_AAOffCopy = {.pixel_shaders = {0xE9A53CDA}};
 // The depth prepass (zmapscr / zmapscrnki, seen in game): linear view depth into a scene sized R32F target that SSAO, DoF and the soft
-// particles read. SMAA's predication source.
+// particles read. It is also SMAA's predication source.
 const ShaderHashesList shader_hashes_DepthPrepass = {.pixel_shaders = {0x5F3E9D55, 0xBA502672, 0x6C46DB88, 0x64549F7E}};
 // dgVoodoo's present blit of the canvas into the swapchain (MGR:R's and Bayonetta's hash), drawn once the swapchain is upgraded
 const ShaderHashesList shader_hashes_DgVoodooPresent = {.pixel_shaders = {0x880A17D3}};
@@ -171,7 +171,7 @@ struct VanquishGameDeviceData final : public GameDeviceData
    // The size of the last gather pass' scene: the depth prepass' target of this size opens the scene (the shadow maps draw R32F targets
    // too)
    uint2 scene_size_hint = {};
-   // The last two gather passes' scenes (two if the game alternates them): the translucents' target
+   // The last two gather passes' scenes (two if the game alternates them), which are the translucents' target
    // ("MotionVectorGame::second_scene_color")
    com_ptr<ID3D11Resource> scene_color_hints[2];
    ID3D11DepthStencilView* open_refused_dsv = nullptr; // The last depth view "OpenScene" refused (reset at present)
@@ -781,9 +781,9 @@ class Vanquish final : public Game
       static constexpr bool second_scene_color = true;
       static constexpr PixelShaderPatch blended_mask_patch = PixelShaderPatch::GAME_0;
 
-      // The carrier of the opaque meshes' motion vectors: the depth prepass' R32F target (it is no shader resource of the upscaler, the
-      // gather pass' input is), and the second one, the gather pass' scene (its fp16 mirror) the alpha blended draws go to (picked by the caller,
-      // see "scene_color_hint"). The G-buffer's draws are refused (several targets). Single sample both.
+      // The opaque meshes' motion vectors are carried by the depth prepass' R32F target (not the upscaler's shader resource, the gather
+      // pass' input is). The alpha blended draws go to the second target, the gather pass' scene (its fp16 mirror), which the caller
+      // picks (see "scene_color_hints"). The G-buffer's draws are refused (several targets). Both are single sample.
       static bool AcceptSceneColor(const D3D11_RENDER_TARGET_VIEW_DESC& rtv_desc, const D3D11_TEXTURE2D_DESC& color_desc)
       {
          // The scene's fp16 mirror (bound in place of the game's R8G8B8A8 target) and the depth prepass' R32F

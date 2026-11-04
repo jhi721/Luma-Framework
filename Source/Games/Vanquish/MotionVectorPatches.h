@@ -6,9 +6,9 @@
 #include "..\..\Core\includes\motion_vector_patch.h"
 #include "..\..\Core\includes\scene_motion_vectors.h"
 
-// The game's slots and rows for Core's DXBC motion vector patch (see "motion_vector_patch.h"; dgVoodoo's registers are in
-// "MotionVectorPatch::DgVoodoo"). The second vertex shader run reads the previous frame's per-draw constants (vc4) from another slot.
-// Bayonetta's layout (the same engine), plus MGR:R's view and projection kinds.
+// The game's rows for Core's DXBC motion vector patch (see "motion_vector_patch.h"). dgVoodoo's registers are in
+// "MotionVectorPatch::DgVoodoo". The second vertex shader run reads the previous frame's per-draw constants (vc4) from another slot.
+// This is Bayonetta's layout, as it is the same engine, plus MGR:R's view and projection kinds.
 namespace MotionVectorPatches
 {
    using MotionVectorPatch::DgVoodoo::object_row_offset;
@@ -16,8 +16,8 @@ namespace MotionVectorPatches
    using SceneMotionVectors::target_slot;
 
    // vc4 rows (c<N> at row N + 20; CTAB census of the 501 vertex shaders of shader.dat and shader2.dat).
-   // Column vector math, one row per clip space component; the per-object matrices are 3x4, translation in .w. No vertex shader reads
-   // both c8 and c24.
+   // The shaders use column vector math with one row per clip space component, and the per-object matrices are 3x4 with the
+   // translation in .w. No vertex shader reads both c8 and c24.
    // g_ViewProjection / g_ViewProjMatrix / g_ViewProj c8: materials (47 skinned by g_WorldArray, 100 static in world space, 9 with a
    // world matrix c16)
    constexpr uint32_t view_projection_row = object_row_offset + 8;
@@ -38,10 +38,10 @@ namespace MotionVectorPatches
    // No camera row filter (the camera sits in three rows); shadow and screen passes are told apart by their bound targets
    constexpr MotionVectorPatch::Layout layout = MotionVectorPatch::DgVoodoo::MakeLayout();
 
-   // Core's "SceneMotionVectors" config. The camera kinds in order (the first one a vertex shader reads wins): the two matrix kinds need
-   // all 4 rows of both, the view projection ones only their first (Bayonetta's). The tie-break rows in order, and the kind that sets
-   // the frame's camera: the depth prepass' (MGR:R's), the only opaque draws accepted (the G-buffer's c8 draws have several targets).
-   // Its world view shaders take the camera too, from the same rows.
+   // Core's "SceneMotionVectors" config. The camera kinds are in priority order, the first one a vertex shader reads wins. The two
+   // matrix kinds need all 4 rows of both, the view projection ones (Bayonetta's) only their first. The tie-break rows are in order too.
+   // "frame_camera" is the kind that sets the frame's camera: the depth prepass' (MGR:R's), the only opaque draws accepted, as the
+   // G-buffer's c8 draws have several targets. Its world view shaders take the camera too, from the same rows.
    constexpr std::array<SceneMotionVectors::Camera, 4> cameras = {{
       {.type = SceneMotionVectors::CameraType::WORLD_VIEW_AND_PROJECTION, .row = world_view_row, .projection_row = projection_row},
       {.type = SceneMotionVectors::CameraType::VIEW_AND_PROJECTION, .row = view_row, .projection_row = projection_row},
