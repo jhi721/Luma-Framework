@@ -126,6 +126,20 @@ static bool AttachVerified(MinHook::HookedFunction<Function>* hooked, uint8_t* t
    return std::memcmp(target, prologue.data(), N) == 0 && MinHook::Attach(hooked, target, detour);
 }
 
+// The fix table's uninstall for a MinHook detour
+template <auto* hooked>
+static void Detach()
+{
+   MinHook::Detach(hooked);
+}
+
+// A call or jump at code[offset - 1] to target, its rel32 written into patched (a copy of the bytes at code)
+static void WriteRel32(uint8_t* patched, const uint8_t* code, size_t offset, uintptr_t target)
+{
+   const int32_t rel32 = int32_t(intptr_t(target) - reinterpret_cast<intptr_t>(code + offset + sizeof(int32_t)));
+   std::memcpy(patched + offset, &rel32, sizeof(rel32));
+}
+
 // Homing projectiles turned slower the higher the frame rate (half as fast at 60 fps as at 30).
 // FUN_004a3030 (this = projectile, target, direction, rate, max step, scale) turns the projectile by
 // min(angle * rate, max step) (FUN_00b9dec0); with "scale" set it multiplies both by the projectile's frame step (its time scale
@@ -193,12 +207,7 @@ namespace HomingSteering
 
    static bool Install()
    {
-      return IsSteamExecutable() && AttachVerified(&hooked, STEER, PROLOGUE, &Detour);
-   }
-
-   static void Uninstall()
-   {
-      MinHook::Detach(&hooked);
+      return AttachVerified(&hooked, STEER, PROLOGUE, &Detour);
    }
 } // namespace HomingSteering
 
@@ -235,12 +244,7 @@ namespace UnscaledTurns
 
    static bool Install()
    {
-      return IsSteamExecutable() && AttachVerified(&hooked, ROTATE, PROLOGUE, &Detour);
-   }
-
-   static void Uninstall()
-   {
-      MinHook::Detach(&hooked);
+      return AttachVerified(&hooked, ROTATE, PROLOGUE, &Detour);
    }
 } // namespace UnscaledTurns
 
@@ -319,12 +323,7 @@ namespace PlayerFrameCounters
 
    static bool Install()
    {
-      return IsSteamExecutable() && AttachVerified(&hooked, UPDATE, PROLOGUE, &Detour);
-   }
-
-   static void Uninstall()
-   {
-      MinHook::Detach(&hooked);
+      return AttachVerified(&hooked, UPDATE, PROLOGUE, &Detour);
    }
 } // namespace PlayerFrameCounters
 
@@ -396,7 +395,7 @@ namespace ContinuousDamage
 
    static bool Install()
    {
-      if (!IsSteamExecutable() || std::memcmp(SCALE_BLOCK, ORIGINAL.data(), ORIGINAL.size()) != 0)
+      if (std::memcmp(SCALE_BLOCK, ORIGINAL.data(), ORIGINAL.size()) != 0)
          return false;
       // push ecx; push [esp+60h]; call TakeDamage; test eax, eax; jz drop
       // mov [esp+0C0h], eax; jmp 0x608852 (append the record)
@@ -404,8 +403,7 @@ namespace ContinuousDamage
       std::array<uint8_t, ORIGINAL.size()> patched = {0x51, 0xFF, 0x74, 0x24, 0x60, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x09, 0x89, 0x84, 0x24,
          0xC0, 0x00, 0x00, 0x00, 0xEB, 0x1C, 0x8B, 0x7C, 0x24, 0x1C, 0x8B, 0x74, 0x24, 0x24, 0xEB, 0x3E};
       std::fill(patched.begin() + 33, patched.end(), uint8_t(0x90));
-      const int32_t call = int32_t(reinterpret_cast<intptr_t>(&TakeDamage) - reinterpret_cast<intptr_t>(SCALE_BLOCK + CALL_OFFSET + sizeof(int32_t)));
-      std::memcpy(patched.data() + CALL_OFFSET, &call, sizeof(call));
+      WriteRel32(patched.data(), SCALE_BLOCK, CALL_OFFSET, reinterpret_cast<uintptr_t>(&TakeDamage));
       installed = System::PatchMemory(SCALE_BLOCK, patched.data(), patched.size(), System::PatchMemoryType::Code);
       return installed;
    }
@@ -436,7 +434,7 @@ namespace ConsoleSlowdown
 
    static bool Install()
    {
-      patchable = IsSteamExecutable() && std::memcmp(GATE, ORIGINAL.data(), ORIGINAL.size()) == 0 && std::memcmp(GATE + ORIGINAL.size(), JUMP.data(), JUMP.size()) == 0;
+      patchable = std::memcmp(GATE, ORIGINAL.data(), ORIGINAL.size()) == 0 && std::memcmp(GATE + ORIGINAL.size(), JUMP.data(), JUMP.size()) == 0;
       return patchable;
    }
 
@@ -520,12 +518,7 @@ namespace UnscaledApproaches
 
    static bool Install()
    {
-      return IsSteamExecutable() && AttachVerified(&hooked, APPROACH, PROLOGUE, reinterpret_cast<Approach>(&Entry));
-   }
-
-   static void Uninstall()
-   {
-      MinHook::Detach(&hooked);
+      return AttachVerified(&hooked, APPROACH, PROLOGUE, reinterpret_cast<Approach>(&Entry));
    }
 } // namespace UnscaledApproaches
 
@@ -565,11 +558,6 @@ namespace LinearTurnRate
    {
       // Calls FUN_00b9b680 through its trampoline
       return UnscaledApproaches::hooked.target && AttachVerified(&hooked, TURN, PROLOGUE, &Detour);
-   }
-
-   static void Uninstall()
-   {
-      MinHook::Detach(&hooked);
    }
 } // namespace LinearTurnRate
 
@@ -649,12 +637,7 @@ namespace SnapApproaches
 
    static bool Install()
    {
-      return IsSteamExecutable() && AttachVerified(&hooked, APPROACH, PROLOGUE, &Detour);
-   }
-
-   static void Uninstall()
-   {
-      MinHook::Detach(&hooked);
+      return AttachVerified(&hooked, APPROACH, PROLOGUE, &Detour);
    }
 } // namespace SnapApproaches
 
@@ -700,12 +683,7 @@ namespace VectorApproaches
 
    static bool Install()
    {
-      return IsSteamExecutable() && AttachVerified(&hooked, APPROACH, PROLOGUE, &Detour);
-   }
-
-   static void Uninstall()
-   {
-      MinHook::Detach(&hooked);
+      return AttachVerified(&hooked, APPROACH, PROLOGUE, &Detour);
    }
 } // namespace VectorApproaches
 
@@ -841,7 +819,6 @@ namespace FrameConstants
    constexpr size_t ADDRESS_OFFSET = 4;
 
    static std::array<uint32_t, SITES.size()> constant_addresses = {};
-   static std::array<double, SITES.size()> constants = {};
    static std::array<double, SITES.size()> values = {}; // Read by the game in place of the constants
    static bool installed = false;
 
@@ -862,7 +839,7 @@ namespace FrameConstants
       const bool fix = g_fix_frame_rate_bugs && frame_time > 0.0;
       for (size_t i = 0; i < SITES.size(); i++)
       {
-         const double constant = constants[i];
+         const double constant = *reinterpret_cast<const double*>(uintptr_t(constant_addresses[i]));
          if (!fix)
          {
             values[i] = constant;
@@ -893,16 +870,13 @@ namespace FrameConstants
 
    static bool Install()
    {
-      if (!IsSteamExecutable())
-         return false;
       for (size_t i = 0; i < SITES.size(); i++)
       {
          const auto* const code = reinterpret_cast<const uint8_t*>(SITES[i].instruction);
          if (code[0] != 0xF2 || code[1] != 0x0F || std::ranges::find(OPCODES, code[OPCODE_OFFSET]) == OPCODES.end() || (code[MODRM_OFFSET] & 0xC7) != 0x05)
             return false;
          std::memcpy(&constant_addresses[i], code + ADDRESS_OFFSET, sizeof(uint32_t));
-         constants[i] = *reinterpret_cast<const double*>(uintptr_t(constant_addresses[i]));
-         values[i] = constants[i];
+         values[i] = *reinterpret_cast<const double*>(uintptr_t(constant_addresses[i]));
       }
       installed = true;
       for (size_t i = 0; i < SITES.size() && installed; i++)
@@ -959,8 +933,6 @@ namespace ConsoleFrameTime
 
    static bool Install()
    {
-      if (!IsSteamExecutable())
-         return false;
       for (size_t i = 0; i < SITES.size(); i++)
       {
          if (std::memcmp(reinterpret_cast<const void*>(SITES[i]), ORIGINALS[i].data(), ORIGINALS[i].size()) != 0)
@@ -1018,14 +990,12 @@ namespace StuckRecovery
 
    static bool Install()
    {
-      if (!IsSteamExecutable() || std::memcmp(COUNT, ORIGINAL.data(), ORIGINAL.size()) != 0)
+      if (std::memcmp(COUNT, ORIGINAL.data(), ORIGINAL.size()) != 0)
          return false;
       // push esi; call IsStuck; test eax, eax; jz NOT_STUCK; nop padding
       std::array<uint8_t, ORIGINAL.size()> patched = {0x56, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x0F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90};
-      const int32_t call = int32_t(reinterpret_cast<intptr_t>(&IsStuck) - reinterpret_cast<intptr_t>(COUNT + CALL_OFFSET + sizeof(int32_t)));
-      const int32_t jump = int32_t(intptr_t(NOT_STUCK) - reinterpret_cast<intptr_t>(COUNT + JUMP_OFFSET + sizeof(int32_t)));
-      std::memcpy(patched.data() + CALL_OFFSET, &call, sizeof(call));
-      std::memcpy(patched.data() + JUMP_OFFSET, &jump, sizeof(jump));
+      WriteRel32(patched.data(), COUNT, CALL_OFFSET, reinterpret_cast<uintptr_t>(&IsStuck));
+      WriteRel32(patched.data(), COUNT, JUMP_OFFSET, NOT_STUCK);
       installed = System::PatchMemory(COUNT, patched.data(), patched.size(), System::PatchMemoryType::Code);
       return installed;
    }
@@ -1233,8 +1203,6 @@ namespace BlockCalls
 
    static bool Install()
    {
-      if (!IsSteamExecutable())
-         return false;
       for (const Block& block : BLOCKS)
       {
          const auto* const code = reinterpret_cast<const uint8_t*>(block.check_instruction);
@@ -1248,16 +1216,14 @@ namespace BlockCalls
          const size_t size = PatchSize(block);
          std::memcpy(originals[i].data(), block.start, size);
          std::array<uint8_t, CALL_SIZE + MAX_TAIL_SIZE + JUMP_SIZE> patched = {0xE8};
-         const int32_t call = int32_t(reinterpret_cast<intptr_t>(&Entry) - reinterpret_cast<intptr_t>(block.start + CALL_SIZE));
-         std::memcpy(patched.data() + 1, &call, sizeof(call));
+         WriteRel32(patched.data(), block.start, 1, reinterpret_cast<uintptr_t>(&Entry));
          // The replayed instructions only use absolute addresses (no rel32), so they run anywhere
          // A tail inside the block is copied from the saved original, not the live bytes
          const bool tail_in_block = block.tail >= uintptr_t(block.start) && block.tail < uintptr_t(block.start) + size;
          const void* const tail = tail_in_block ? originals[i].data() + (block.tail - uintptr_t(block.start)) : reinterpret_cast<const void*>(block.tail);
          std::memcpy(patched.data() + CALL_SIZE, tail, block.tail_size);
          patched[CALL_SIZE + block.tail_size] = 0xE9;
-         const int32_t jump = int32_t(intptr_t(block.end) - reinterpret_cast<intptr_t>(block.start + size));
-         std::memcpy(patched.data() + CALL_SIZE + block.tail_size + 1, &jump, sizeof(jump));
+         WriteRel32(patched.data(), block.start, CALL_SIZE + block.tail_size + 1, block.end);
          installed = System::PatchMemory(block.start, patched.data(), size, System::PatchMemoryType::Code);
          if (!installed)
          {
@@ -1285,17 +1251,17 @@ struct Fix
    void (*on_present)() = nullptr;
 };
 constexpr auto FIXES = std::to_array<Fix>({
-   {HomingSteering::Install, HomingSteering::Uninstall},
+   {HomingSteering::Install, Detach<&HomingSteering::hooked>},
    {ContinuousDamage::Install, ContinuousDamage::Uninstall, ContinuousDamage::OnPresent},
-   {UnscaledTurns::Install, UnscaledTurns::Uninstall},
-   {PlayerFrameCounters::Install, PlayerFrameCounters::Uninstall, PlayerFrameCounters::OnPresent},
+   {UnscaledTurns::Install, Detach<&UnscaledTurns::hooked>},
+   {PlayerFrameCounters::Install, Detach<&PlayerFrameCounters::hooked>, PlayerFrameCounters::OnPresent},
    {ConsoleSlowdown::Install, []
       { ConsoleSlowdown::Apply(false); }, []
       { ConsoleSlowdown::Apply(g_fix_frame_rate_bugs); }},
-   {UnscaledApproaches::Install, UnscaledApproaches::Uninstall},
-   {LinearTurnRate::Install, LinearTurnRate::Uninstall},
-   {SnapApproaches::Install, SnapApproaches::Uninstall},
-   {VectorApproaches::Install, VectorApproaches::Uninstall},
+   {UnscaledApproaches::Install, Detach<&UnscaledApproaches::hooked>},
+   {LinearTurnRate::Install, Detach<&LinearTurnRate::hooked>},
+   {SnapApproaches::Install, Detach<&SnapApproaches::hooked>},
+   {VectorApproaches::Install, Detach<&VectorApproaches::hooked>},
    {FrameConstants::Install, FrameConstants::Uninstall, FrameConstants::OnPresent},
    {ConsoleFrameTime::Install, ConsoleFrameTime::Uninstall, ConsoleFrameTime::OnPresent},
    {StuckRecovery::Install, StuckRecovery::Uninstall},
@@ -1418,6 +1384,12 @@ struct VanquishGameDeviceData final : public GameDeviceData
          t2x_frame_srvs[i].reset();
       }
    }
+
+   // The other T2x frame holds the previous frame's resolve: the jitter (OpenScene) and the resolve (DrawSMAAOnScene) agree on it
+   bool HasT2xHistory(uint32_t frame_index) const
+   {
+      return t2x_frames[0] && t2x_frame + 1 == frame_index;
+   }
 };
 
 class Vanquish final : public Game
@@ -1513,7 +1485,7 @@ class Vanquish final : public Game
       }
       const uint32_t frame_index = cb_luma_global_settings.FrameIndex;
       const int t2x_current = int(frame_index & 1);
-      bool t2x_history = gd.t2x_frames[0] && gd.t2x_frame + 1 == frame_index;
+      bool t2x_history = gd.HasT2xHistory(frame_index);
       if (t2x && GetViewTextureSize(gd.t2x_frame_srvs[0].get()) != size)
       {
          t2x_history = false;
@@ -1701,7 +1673,7 @@ class Vanquish final : public Game
       // SMAA T2x: the sample offsets (0.25, 0.25) then (-0.25, -0.25) in y down pixels, for "SMAA.hlsl"'s T2x subsample indices 1 and 2
       // (Bayonetta's phases, in the upscalers' jitter convention, which the viewport applies). That is its table read with y up, which
       // measured better.
-      if (gd.t2x_active && gd.t2x_frames[0] && gd.t2x_frame + 1 == cb_luma_global_settings.FrameIndex)
+      if (gd.t2x_active && gd.HasT2xHistory(cb_luma_global_settings.FrameIndex))
       {
          const float shift = ((cb_luma_global_settings.FrameIndex & 1) == 0 ? -0.25f : 0.25f);
          gd.jitter = {shift, shift};
@@ -2278,9 +2250,13 @@ public:
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
       SetEvents(true);
-      for (const Fix& fix : FIXES)
+      // Only the Steam executable's fixed addresses are known
+      if (IsSteamExecutable())
       {
-         g_fixes_installed |= fix.install();
+         for (const Fix& fix : FIXES)
+         {
+            g_fixes_installed |= fix.install();
+         }
       }
    }
 
@@ -2355,21 +2331,16 @@ public:
       // DLAA/FSR/XeSS/Luma TAA: the scene opens at the depth prepass' first draw and its mesh draws take motion vectors (see
       // "DrawWithMotionVectors"), else the viewport jitter and the alpha blended ones their masks; the fill and the upscaler run at the
       // gather pass
-      if (game_device_data.mv.active && is_immediate && !game_device_data.has_drawn_gather)
+      if (game_device_data.mv.active && is_immediate && !game_device_data.has_drawn_gather && (game_device_data.mv.scene_open || (!game_device_data.mv.scene_done && is_depth_prepass)))
       {
-         if (!game_device_data.mv.scene_open && !game_device_data.mv.scene_done && is_depth_prepass)
+         com_ptr<ID3D11DepthStencilView> dsv;
+         native_device_context->OMGetRenderTargets(0, nullptr, &dsv);
+         if (!game_device_data.mv.scene_open && dsv && dsv.get() != game_device_data.open_refused_dsv)
          {
-            com_ptr<ID3D11DepthStencilView> dsv;
-            native_device_context->OMGetRenderTargets(0, nullptr, &dsv);
-            if (dsv && dsv.get() != game_device_data.open_refused_dsv)
-            {
-               OpenScene(native_device, native_device_context, device_data, IsReactiveMaskUsed(device_data), dsv.get());
-            }
+            OpenScene(native_device, native_device_context, device_data, IsReactiveMaskUsed(device_data), dsv.get());
          }
          if (game_device_data.mv.scene_open)
          {
-            com_ptr<ID3D11DepthStencilView> dsv;
-            native_device_context->OMGetRenderTargets(0, nullptr, &dsv);
             const bool scene_draw = IsSceneDepthTested(native_device_context, &game_device_data, dsv);
             if (game_device_data.jitter != std::array<float, 2>{} || game_device_data.viewport_jittered)
             {

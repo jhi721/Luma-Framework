@@ -27,7 +27,6 @@ float dp3_f32(float3 a, float3 b)
     return mad(a.z, b.z, mad(a.y, b.y, _87));
 }
 
-// TODO: there's probably more of these that are still missing
 void main(
   float4 v0 : SV_POSITION0,
   float4 v1 : TEXCOORD8,

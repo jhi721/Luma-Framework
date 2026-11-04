@@ -12,11 +12,11 @@ void main(float4 v0 : SV_POSITION0, float2 v1 : TEXCOORD0, out float4 o0 : SV_TA
 {
    const int2 pixel = int2(v1);
    o0 = t0.Load(int3(pixel, 0));
+   uint2 canvas_size;
+   t0.GetDimensions(canvas_size.x, canvas_size.y);
    if (LumaData.CustomData1 == 1)
    {
-      uint2 canvas_size;
       uint2 scene_size;
-      t0.GetDimensions(canvas_size.x, canvas_size.y);
       t1.GetDimensions(scene_size.x, scene_size.y);
       o0.rgb = clamp(o0.rgb, 0.0, max(t1.Load(int3(uint2(pixel) * scene_size / canvas_size, 0)).rgb, 1.0));
       o0.a = saturate(o0.a);
@@ -25,8 +25,6 @@ void main(float4 v0 : SV_POSITION0, float2 v1 : TEXCOORD0, out float4 o0 : SV_TA
    // composition scales the canvas by (UI_DRAW_TYPE 2), as MGR:R's
    [branch] if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      uint2 size;
-      t0.GetDimensions(size.x, size.y);
-      ApplyOutputDithering(o0.rgb, v0.xy / size, true, LumaSettings.DisplayMode == 1, UIPaperWhiteNits);
+      ApplyOutputDithering(o0.rgb, v0.xy / canvas_size, true, LumaSettings.DisplayMode == 1, UIPaperWhiteNits);
    }
 }
