@@ -38,8 +38,7 @@ RWTexture2D<float> previous_additive : register(u4); // The additive draws' mask
       reactive[id.xy] = max(additive, alpha_blended);
       transparency[id.xy] = mask.y;
    }
-   // saturate() also drops a NaN
-   const float z = saturate(depth.Load(int3(id.xy, 0)));
+   const float z = depth.Load(int3(id.xy, 0));
    device_depth[id.xy] = z;
    if (motion_vectors[id.xy].x < MOTION_VECTOR_MARKER)
       return;

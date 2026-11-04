@@ -25,8 +25,8 @@
 // Metal Gear Rising: Revengeance (PC, Steam, exe link time 2014-01-28) is x86 D3D9: it runs through dgVoodoo (D3D9 -> D3D11), so every
 // hash below is a dgVoodoo translation from the offline map of GameData/shader*.dat (_tools/mgrr/NOTES.md): 2.87.5 / 2.87.6 (ps_5_0, the
 // main zip) first, then the same shaders under 2.81.3 (ps_4_0, the Linux zip) in the same order; the 2.81.3 replacements are forwarders
-// to the 2.87.5 bodies (same signature and rows). dgVoodoo translates each pixel shader once per alpha test function in use: the lists
-// hold the plain one first, then GREATEREQUAL, GREATER.
+// to the 2.87.5 bodies (same signature and rows). dgVoodoo translates each pixel shader once per alpha test function in use: each list
+// holds every variant a shader has (none, GREATEREQUAL, GREATER) and is matched as a set, in the offline map's order.
 // FilterShaderGather (shader2.dat): the final pass (render layer 0x62), the grade's curve, saturation and gradient plus the bloom and
 // the brightness option. Its replacement does the HDR display map. FilterShaderGatherNoise, the same pass times a noise texture, drawn
 // in its place (seen in game), follows. In game (title screen, MSAA 4x) it writes the render resolution scene target (MSAA),
@@ -877,7 +877,7 @@ class MetalGearRisingRevengeance final : public Game
       const D3D11_BOX box = (source_box ? D3D11_BOX{.left = source_box->left * scale, .top = source_box->top * scale, .front = 0, .right = source_box->right * scale, .bottom = source_box->bottom * scale, .back = 1}
                                         : D3D11_BOX{.left = 0, .top = 0, .front = 0, .right = dest_desc.Width * scale, .bottom = dest_desc.Height * scale, .back = 1});
       auto* const native_device_context = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
-      native_device_context->CopySubresourceRegion(shadow->texture.get(), 0, dest_box ? dest_box->left * scale : 0, dest_box ? dest_box->top * scale : 0, 0, gd.bloom_texture.get(), 0, &box);
+      native_device_context->CopySubresourceRegion(shadow->texture.get(), 0, (dest_box ? (dest_box->left * scale) : 0), (dest_box ? (dest_box->top * scale) : 0), 0, gd.bloom_texture.get(), 0, &box);
    }
 
    static bool OnCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest)
@@ -1777,40 +1777,77 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       texture_format_upgrades_2d_size_filters = (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px;
 
 #if DEVELOPMENT
-      // Offline map of the post shaders (dgVoodoo 2.87.5), for traces and the DevKit
-      for (const auto& [hash, name] : std::initializer_list<std::pair<const char*, const char*>>{
-              {"726E6E78", "Gather (grade + bloom)"},
-              {"562F84D7", "Gather (grade + bloom)"},
-              {"DD1B4599", "Gather (grade + bloom)"},
-              {"CE6E1597", "Gather Noise (grade + bloom)"},
-              {"970F67BD", "Gather Noise (grade + bloom)"},
-              {"F263AE82", "Gather Noise (grade + bloom)"},
-              {"C9453909", "Gather Noise, PC Fix noise off (grade + bloom)"},
-              {"0CDD2BDB", "Gather Noise, PC Fix noise off (grade + bloom)"},
-              {"252B2AE7", "Gather Noise, PC Fix noise off (grade + bloom)"},
-              {"D7D5CA35", "Gather Noise, no noise texture (grade + bloom)"},
-              {"B3BB0D35", "Gather Noise, no noise texture (grade + bloom)"},
-              {"FF4AFD3B", "Gather Noise, no noise texture (grade + bloom)"},
-              {"52502A77", "Video Y'CbCr + A (hwshaderpftyuva)"},
-              {"C1C26B88", "Video Y'CbCr (hwshaderpftyuv)"},
-              {"14F88B41", "FXAA (filter09)"},
-              {"5F6FD3B9", "FXAA (filter09)"},
-              {"DEFECE82", "FXAA (filter09)"},
-              {"6C8D7CF4", "FXAA Luma (filter09_Sub2)"},
-              {"A170EC3C", "FXAA Edge Mask (filter09_Sub)"},
-              {"07C81AB1", "Glare (filter01)"},
-              {"4B19F442", "Bloom (filter02)"},
-              {"0A08457E", "Bloom Source (filter05)"},
-              {"7CF9D199", "Deferred Composition"},
-              {"EA408DAB", "DoF"},
-              {"753F6B3B", "HDAO"},
-              {"3E6B3A19", "SSAO"},
-              {"5FB1861B", "Skinned Velocity (VelocityWeight)"},
-              {"91A6C437", "Copy"},
-              {"EEA9CD70", "Movie"},
+      // Offline map of the post shaders (both dgVoodoo builds), for traces and the DevKit
+      for (const auto& [hash, name] : std::initializer_list<std::pair<uint32_t, const char*>>{
+              {0x726E6E78, "Gather (grade + bloom)"},
+              {0x27337F04, "Gather (grade + bloom)"},
+              {0x562F84D7, "Gather (grade + bloom)"},
+              {0xB9449F1B, "Gather (grade + bloom)"},
+              {0xDD1B4599, "Gather (grade + bloom)"},
+              {0x38B31283, "Gather (grade + bloom)"},
+              {0xCE6E1597, "Gather Noise (grade + bloom)"},
+              {0x07C2BDDE, "Gather Noise (grade + bloom)"},
+              {0x970F67BD, "Gather Noise (grade + bloom)"},
+              {0x27F82C3D, "Gather Noise (grade + bloom)"},
+              {0xF263AE82, "Gather Noise (grade + bloom)"},
+              {0x81DF6FB5, "Gather Noise (grade + bloom)"},
+              {0xC9453909, "Gather Noise, PC Fix noise off (grade + bloom)"},
+              {0x89AA8AB6, "Gather Noise, PC Fix noise off (grade + bloom)"},
+              {0x0CDD2BDB, "Gather Noise, PC Fix noise off (grade + bloom)"},
+              {0x1771F599, "Gather Noise, PC Fix noise off (grade + bloom)"},
+              {0x252B2AE7, "Gather Noise, PC Fix noise off (grade + bloom)"},
+              {0xB57E19F1, "Gather Noise, PC Fix noise off (grade + bloom)"},
+              {0xD7D5CA35, "Gather Noise, no noise texture (grade + bloom)"},
+              {0xD959F596, "Gather Noise, no noise texture (grade + bloom)"},
+              {0xB3BB0D35, "Gather Noise, no noise texture (grade + bloom)"},
+              {0xC68E6BA9, "Gather Noise, no noise texture (grade + bloom)"},
+              {0xFF4AFD3B, "Gather Noise, no noise texture (grade + bloom)"},
+              {0x5979509E, "Gather Noise, no noise texture (grade + bloom)"},
+              {0x52502A77, "Video Y'CbCr + A (hwshaderpftyuva)"},
+              {0x3BC2AB1A, "Video Y'CbCr + A (hwshaderpftyuva)"},
+              {0xC1C26B88, "Video Y'CbCr (hwshaderpftyuv)"},
+              {0xD2DA2E53, "Video Y'CbCr (hwshaderpftyuv)"},
+              {0x14F88B41, "FXAA (filter09)"},
+              {0x82277D95, "FXAA (filter09)"},
+              {0x5F6FD3B9, "FXAA (filter09)"},
+              {0x0F8D8664, "FXAA (filter09)"},
+              {0xDEFECE82, "FXAA (filter09)"},
+              {0xAF3E152C, "FXAA (filter09)"},
+              {0x6C8D7CF4, "FXAA Luma (filter09_Sub2)"},
+              {0xDF509983, "FXAA Luma (filter09_Sub2)"},
+              {0xA170EC3C, "FXAA Edge Mask (filter09_Sub)"},
+              {0xCD908EC9, "FXAA Edge Mask (filter09_Sub)"},
+              {0x07C81AB1, "Blur H (filter01)"},
+              {0x696374C5, "Blur H (filter01)"},
+              {0x9F72067C, "Blur H (filter01)"},
+              {0xC382D5B7, "Blur H (filter01)"},
+              {0xBBDF2A11, "Blur H (filter01)"},
+              {0xF3000FB7, "Blur H (filter01)"},
+              {0x4B19F442, "Blur V (filter02)"},
+              {0xB922709D, "Blur V (filter02)"},
+              {0xE454B49F, "Blur V (filter02)"},
+              {0xD6B18092, "Blur V (filter02)"},
+              {0x0B206431, "Blur V (filter02)"},
+              {0x5330A3DF, "Blur V (filter02)"},
+              {0x0A08457E, "Bloom Source (filter05)"},
+              {0x8915F667, "Bloom Source (filter05)"},
+              {0x7CF9D199, "Deferred Composition"},
+              {0x65E2A65A, "Deferred Composition"},
+              {0xEA408DAB, "DoF"},
+              {0x9C607DBA, "DoF"},
+              {0x753F6B3B, "HDAO"},
+              {0xDD8B799C, "HDAO"},
+              {0x3E6B3A19, "SSAO"},
+              {0x69272E85, "SSAO"},
+              {0x5FB1861B, "Skinned Velocity (VelocityWeight)"},
+              {0x52BBCF9A, "Skinned Velocity (VelocityWeight)"},
+              {0x91A6C437, "Copy"},
+              {0x7584B641, "Copy"},
+              {0xEEA9CD70, "Movie"},
+              {0xF7B9517A, "Movie"},
            })
       {
-         forced_shader_names.emplace(std::stoul(hash, nullptr, 16), name);
+         forced_shader_names.emplace(hash, name);
       }
 #endif
 
