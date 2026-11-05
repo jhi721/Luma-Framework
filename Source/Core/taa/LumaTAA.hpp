@@ -301,6 +301,10 @@ namespace LumaTAA
          // The games call this from their own passes: leave their compute state as it was
          DrawStateStack<DrawStateStackType::Compute> compute_state;
          compute_state.Cache(command_list, taa_data->device_data->uav_max_count);
+         // D3D11 binds a resource still bound as an output as a null SRV: a game's scene left as a render target would read as black
+         DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
+         graphics_state.Cache(command_list, taa_data->device_data->uav_max_count);
+         command_list->OMSetRenderTargets(0, nullptr, nullptr);
 
          // The resolve runs per output pixel when upscaling, per render pixel otherwise
          const UINT resolve_groups_x = (settings_data.output_width + 7) / 8, resolve_groups_y = (settings_data.output_height + 7) / 8;
@@ -321,6 +325,7 @@ namespace LumaTAA
          command_list->CSSetUnorderedAccessViews(0, UINT(std::size(null_uavs)), null_uavs, nullptr);
 
          compute_state.Restore(command_list);
+         graphics_state.Restore(command_list);
          taa_data->history_index = write_index ^ 1;
          taa_data->history_valid = true;
          return true;
