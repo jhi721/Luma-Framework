@@ -725,16 +725,16 @@ class SaintsRowIV final : public Game
          if (!game_device_data.mv_constants.MayBeRegistered(resource.handle))
             return;
          const std::lock_guard lock(game_device_data.mv_constants_mutex);
-         game_device_data.mv_constants.OnMap(resource.handle, offset, access, *data);
+         game_device_data.mv_constants.OnMap(resource.handle, offset, access, data);
       }
    }
 
-   // Before a registered buffer's Unmap (the game has written it): the render scale's vc4 rewrite, and the motion vectors' CPU copy
-   // of the buffer, read back from the mapped memory.
+   // Before a registered buffer's Unmap (the game has written it to the entry's "latest"): the render scale's vc4 rewrite, and the
+   // write to the buffer. Not gated on "mv_active": the present that turns it off can fall between the Map and its Unmap.
    static void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
    {
       DeviceData* const device_data = device->get_private_data<DeviceData>();
-      if (device_data && device_data->game && GetGameDeviceData(*device_data).mv_active)
+      if (device_data && device_data->game)
       {
          auto& game_device_data = GetGameDeviceData(*device_data);
 #if DEVELOPMENT
@@ -743,11 +743,11 @@ class SaintsRowIV final : public Game
          if (!game_device_data.mv_constants.MayBeRegistered(resource.handle))
             return;
          const std::lock_guard lock(game_device_data.mv_constants_mutex);
-         const PatchedDraws::ObjectConstants::Entry* const registered = game_device_data.mv_constants.Find(resource.handle);
+         PatchedDraws::ObjectConstants::Entry* const registered = game_device_data.mv_constants.Find(resource.handle);
          if (!registered || !registered->mapped)
             return;
          const UINT buffer_size = registered->size;
-         auto* const mapped_data = static_cast<uint8_t*>(registered->mapped);
+         uint8_t* const upload = registered->latest.data();
          // Render scale: the material pass maps its screen texel to UV as ((ndc + 1) / 2 * c9.zw + 0.5) * c9.xy (y flipped), so
          // zw = the render size puts it in the sub-rect, xy stays 1 / the full texture size. Only the output sized steps (reflections
          // have their own). The G-buffer's stipple (LOD fades, translucents) samples its pattern at the viewport UV times
@@ -756,22 +756,22 @@ class SaintsRowIV final : public Game
          if (const float scale = GetSubRectScale(*device_data); scale < 1.f && buffer_size >= 10 * 16 && game_device_data.sub_rect_vc4_buffers.contains(resource.handle))
          {
             float pixel_steps[4];
-            std::memcpy(pixel_steps, mapped_data + 9 * 16, sizeof(pixel_steps));
+            std::memcpy(pixel_steps, upload + 9 * 16, sizeof(pixel_steps));
             if (pixel_steps[2] == device_data->output_resolution.x && pixel_steps[3] == device_data->output_resolution.y)
             {
                pixel_steps[2] = std::round(pixel_steps[2] * scale);
                pixel_steps[3] = std::round(pixel_steps[3] * scale);
-               std::memcpy(mapped_data + 9 * 16, pixel_steps, sizeof(pixel_steps));
+               std::memcpy(upload + 9 * 16, pixel_steps, sizeof(pixel_steps));
 #if DEVELOPMENT
                g_pixel_steps_overrides_this_frame++;
 #endif
                if (buffer_size >= 13 * 16)
                {
                   float stipple_repeat[2];
-                  std::memcpy(stipple_repeat, mapped_data + 12 * 16, sizeof(stipple_repeat));
+                  std::memcpy(stipple_repeat, upload + 12 * 16, sizeof(stipple_repeat));
                   stipple_repeat[0] *= pixel_steps[2] / device_data->output_resolution.x;
                   stipple_repeat[1] *= pixel_steps[3] / device_data->output_resolution.y;
-                  std::memcpy(mapped_data + 12 * 16, stipple_repeat, sizeof(stipple_repeat));
+                  std::memcpy(upload + 12 * 16, stipple_repeat, sizeof(stipple_repeat));
                }
             }
          }

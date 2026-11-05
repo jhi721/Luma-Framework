@@ -167,7 +167,14 @@ struct TheWitcherGameDeviceData final : public GameDeviceData
    using ConstantsCopy = std::shared_ptr<const std::vector<uint8_t>>;
    std::mutex mv_constants_mutex;
    std::unordered_map<uint64_t, ConstantsCopy> mv_constants_copies;
-   std::unordered_map<uint64_t, void*> mv_mapped_constants; // Registered buffers mapped now, until their Unmap
+   // Registered buffers mapped now, until their Unmap: the game writes to "written", so nothing reads the mapped memory back (write
+   // combined on AMD: 28 us per draw)
+   struct MappedConstants
+   {
+      void* mapped = nullptr;
+      std::vector<uint8_t> written;
+   };
+   std::unordered_map<uint64_t, MappedConstants> mv_mapped_constants;
    // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
    PatchedDraws::PreviousConstants mv_previous_constants;
    // Motion vector draws by draw key (shaders, buffers, arguments), with a tie-break translation and vc4. A draw takes the previous
@@ -301,29 +308,34 @@ class TheWitcherGame final : public Game
       if (!gd.mv_constants_copies.contains(resource.handle))
          return;
       if (access == reshade::api::map_access::write_discard && offset == 0)
-         gd.mv_mapped_constants[resource.handle] = *data;
+      {
+         D3D11_BUFFER_DESC desc;
+         reinterpret_cast<ID3D11Buffer*>(resource.handle)->GetDesc(&desc);
+         auto& mapped = gd.mv_mapped_constants[resource.handle];
+         mapped.written.resize(desc.ByteWidth);
+         mapped.mapped = std::exchange(*data, mapped.written.data());
+      }
 #if DEVELOPMENT
       else
          gd.mv_stats.other_maps++; // A partial or appending write: the copies would miss it
 #endif
    }
 
-   // Motion vectors: the CPU copy of a vc4 buffer, before its Unmap (the game has written it). Reads the mapped memory back.
+   // Motion vectors: a redirected Map of a vc4 buffer reaches the buffer and its CPU copy, before its Unmap. Not gated on "mv_active":
+   // the present that turns it off can fall between the two.
    static void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
    {
       DeviceData* const device_data = device->get_private_data<DeviceData>();
-      if (!device_data || !device_data->game || !GetGameDeviceData(*device_data).mv_active)
+      if (!device_data || !device_data->game)
          return;
       auto& gd = GetGameDeviceData(*device_data);
       const std::lock_guard lock(gd.mv_constants_mutex);
       const auto mapped = gd.mv_mapped_constants.find(resource.handle);
-      if (mapped == gd.mv_mapped_constants.end())
+      if (mapped == gd.mv_mapped_constants.end() || !mapped->second.mapped)
          return;
-      D3D11_BUFFER_DESC desc;
-      reinterpret_cast<ID3D11Buffer*>(resource.handle)->GetDesc(&desc);
-      const auto* const bytes = static_cast<const uint8_t*>(mapped->second);
-      gd.mv_constants_copies[resource.handle] = std::make_shared<std::vector<uint8_t>>(bytes, bytes + desc.ByteWidth);
-      gd.mv_mapped_constants.erase(mapped);
+      const std::vector<uint8_t>& written = mapped->second.written;
+      std::memcpy(std::exchange(mapped->second.mapped, nullptr), written.data(), written.size());
+      gd.mv_constants_copies[resource.handle] = std::make_shared<std::vector<uint8_t>>(written);
 #if DEVELOPMENT
       gd.mv_stats.maps++;
 #endif

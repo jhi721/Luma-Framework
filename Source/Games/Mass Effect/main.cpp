@@ -1079,20 +1079,20 @@ class MassEffect final : public Game
       if (!gd.mv_constants.MayBeRegistered(resource.handle))
          return;
       const std::lock_guard lock(gd.mv_constants_mutex);
-      const PatchedDraws::ObjectConstants::Entry* const registered = gd.mv_constants.OnMap(resource.handle, offset, access, *data);
+      const PatchedDraws::ObjectConstants::Entry* const registered = gd.mv_constants.OnMap(resource.handle, offset, access, data);
 #if DEVELOPMENT
       if (registered && !registered->mapped)
          gd.mv_stats.other_maps++; // A partial or appending write: the copies would miss it
 #endif
    }
 
-   // Motion vectors: the CPU copy of a vc4 buffer, before its Unmap (the game has written it). Reads the mapped memory back.
+   // Motion vectors: a redirected Map of a vc4 buffer writes its data to the buffer, before its Unmap. Not gated on "mv_active": the
+   // present that turns it off can fall between the two.
    static void OnUnmapBufferRegion(reshade::api::device* device,
       reshade::api::resource resource)
    {
       DeviceData* const device_data = device->get_private_data<DeviceData>();
-      if (!device_data || !device_data->game ||
-          !GetGameDeviceData(*device_data).mv_active)
+      if (!device_data || !device_data->game)
          return;
       auto& gd = GetGameDeviceData(*device_data);
 #if DEVELOPMENT

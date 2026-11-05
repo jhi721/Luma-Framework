@@ -360,7 +360,7 @@ namespace SceneMotionVectors
       State* const state = get(device);
       if (!state || !state->active || !data || !*data)
          return;
-      const PatchedDraws::ObjectConstants::Entry* const registered = state->constants.OnMap(resource.handle, offset, access, *data);
+      const PatchedDraws::ObjectConstants::Entry* const registered = state->constants.OnMap(resource.handle, offset, access, data);
       if (!registered && access != reshade::api::map_access::read_only)
       {
          RecordVertexWrite(device, state, resource);
@@ -373,12 +373,13 @@ namespace SceneMotionVectors
 #endif
    }
 
-   // Motion vectors: the CPU copy of a vc4 buffer, before its Unmap (the game has written it). Reads the mapped memory back.
+   // Motion vectors: a redirected Map of a vc4 buffer writes its data to the buffer, before its Unmap. Not gated on "State::active":
+   // dgVoodoo presents from another thread, which can turn it off between the two.
    template <State* (*get)(reshade::api::device*)>
    void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
    {
       State* const state = get(device);
-      if (!state || !state->active)
+      if (!state)
          return;
       if (state->constants.OnUnmap(resource.handle))
       {

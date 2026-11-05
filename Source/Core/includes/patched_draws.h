@@ -216,7 +216,7 @@ namespace PatchedDraws
          // The last upload, rewritten in place: dgVoodoo maps a vc4 buffer for most draws, patched ones or not
          std::vector<uint8_t> latest;
          Copy copy;               // "latest" whole, for the draws since that upload reading all of it (skinned: shared; made by the first)
-         void* mapped = nullptr;  // Mapped now, until its Unmap
+         void* mapped = nullptr;  // The real pointer of a Map redirected to "latest", until its Unmap
          UINT size = 0;           // The buffer's
          uint32_t generation = 0; // "generation" at the upload: an older one predates a pause of the hooks
       };
@@ -224,6 +224,7 @@ namespace PatchedDraws
       // Raised when the hooks restart ("Restart"): the uploads they missed make every older "latest" stale. A counter rather than
       // emptying the entries, which the frame's thread owns (dgVoodoo may present from another thread).
       std::atomic<uint32_t> generation = 1;
+      uint32_t open_maps = 0; // Maps redirected to "latest" and not unmapped yet: most Unmaps skip the lookup
       // The first registered buffers and their entries (a node's address stays while the map grows), so a buffer hook finds them
       // without a lookup. With more registered, or "filter" off, every buffer takes the map lookup. The handles are read lock free
       // ("MayBeRegistered"); an unregistered buffer's slot holds "free_slot" until the next registration takes it.
@@ -362,27 +363,36 @@ namespace PatchedDraws
          return entry.copy;
       }
 
-      // The "map_buffer_region" event: a registered buffer mapped for a whole rewrite is remembered until its Unmap; a partial or
-      // appending write (the copies would miss it) leaves the entry's "mapped" null. Null if the buffer isn't registered.
-      Entry* OnMap(uint64_t handle, uint64_t offset, reshade::api::map_access access, void* data)
+      // The "map_buffer_region" event: a registered buffer mapped for a whole rewrite is written to its "latest" instead of "*data"
+      // until its Unmap. A mapped pointer must not be read back: AMD's is write-combined, a 4 KB copy took 28 us per draw there. A
+      // partial or appending write (the copies would miss it) leaves the entry's "mapped" null. Null if the buffer isn't registered.
+      Entry* OnMap(uint64_t handle, uint64_t offset, reshade::api::map_access access, void** data)
       {
          Entry* const entry = Find(handle);
-         if (entry)
+         if (!entry)
+            return nullptr;
+         entry->mapped = nullptr;
+         if (access == reshade::api::map_access::write_discard && offset == 0)
          {
-            // Overwritten at every Map, so a pointer from before a pause of the hooks never reaches an Unmap
-            entry->mapped = ((access == reshade::api::map_access::write_discard && offset == 0) ? data : nullptr);
+            // Resized, not cleared: whatever the game leaves unwritten keeps the last upload
+            entry->latest.resize(entry->size);
+            entry->mapped = std::exchange(*data, entry->latest.data());
+            open_maps++;
          }
          return entry;
       }
 
-      // The "unmap_buffer_region" event: a remembered Map's copy, before its Unmap (the game has written it). True if copied.
+      // The "unmap_buffer_region" event, before the Unmap: a redirected Map's write reaches the buffer. True if there was one. Must run
+      // even with motion vectors just turned off (the game wrote only to "latest"), so hooks don't gate it on that.
       bool OnUnmap(uint64_t handle)
       {
+         if (open_maps == 0)
+            return false;
          Entry* const entry = Find(handle);
          if (!entry || !entry->mapped)
             return false;
-         const uint8_t* const mapped = static_cast<const uint8_t*>(std::exchange(entry->mapped, nullptr));
-         entry->latest.assign(mapped, mapped + entry->size);
+         std::memcpy(std::exchange(entry->mapped, nullptr), entry->latest.data(), entry->size);
+         open_maps--;
          entry->copy.reset();
          entry->generation = generation;
          return true;

@@ -267,12 +267,11 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::atomic<ID3D11Resource*> mv_scene_depth_id = nullptr;     // "mv_scene_depth", for other contexts to compare
    std::atomic<ID3D11DeviceContext*> mv_scene_context = nullptr; // Only compared
 
-   // The $Globals buffers patched draws bind (mapped with discard before nearly every draw; some draws reuse the last contents): each
-   // Map's pointer, and at Unmap a CPU snapshot of it that the draws (and the object history) share
+   // The $Globals buffers patched draws bind (mapped with discard before nearly every draw; some draws reuse the last contents): at
+   // Unmap, a CPU snapshot of what the game wrote that the draws (and the object history) share
    using GlobalsCopy = std::shared_ptr<const std::vector<uint8_t>>;
    struct GlobalsBuffer
    {
-      void* mapped = nullptr; // Between a Map and its Unmap
       UINT size = 0;
       GlobalsCopy copy; // Null until the first Unmap after the buffer's registration
    };
@@ -565,7 +564,17 @@ class Persona5Strikers final : public Game
       return game_device_data.mv_filtered_globals_rebuilds.load(std::memory_order_relaxed) != rebuilds;
    }
 
-   // Motion vectors: the mapped pointer of a $Globals buffer a patched draw binds, copied at Unmap
+   // A $Globals Map redirected to "written" until its Unmap. A mapped pointer must not be read back: AMD's is write-combined, a 4 KB
+   // copy took 28 us. Per thread, as contexts record on several threads and can map one buffer at once.
+   struct MappedGlobals
+   {
+      uint64_t handle = 0; // 0 = free
+      void* mapped = nullptr;
+      std::vector<uint8_t> written;
+   };
+   static inline thread_local std::vector<MappedGlobals> mapped_globals;
+
+   // Motion vectors: a Map of a $Globals buffer a patched draw binds writes to "mapped_globals", its Unmap takes the snapshot
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
       DeviceData* const device_data = GetDeviceData(device);
@@ -577,10 +586,25 @@ class Persona5Strikers final : public Game
 #endif
       if (access == reshade::api::map_access::write_discard && data && *data && MayBeGlobalsBuffer(game_device_data, resource.handle))
       {
-         const std::lock_guard lock(game_device_data.mv_globals_mutex);
-         if (const auto buffer = game_device_data.mv_globals_buffers.find(resource.handle); buffer != game_device_data.mv_globals_buffers.end())
+         UINT buffer_size = 0;
          {
-            buffer->second.mapped = *data;
+            const std::shared_lock lock(game_device_data.mv_globals_mutex);
+            if (const auto buffer = game_device_data.mv_globals_buffers.find(resource.handle); buffer != game_device_data.mv_globals_buffers.end())
+            {
+               buffer_size = buffer->second.size;
+            }
+         }
+         if (buffer_size != 0)
+         {
+            auto free_map = std::ranges::find(mapped_globals, uint64_t(0), &MappedGlobals::handle);
+            if (free_map == mapped_globals.end())
+            {
+               free_map = mapped_globals.emplace(mapped_globals.end());
+            }
+            free_map->handle = resource.handle;
+            // Resized, not cleared: whatever the game leaves unwritten keeps this thread's last upload
+            free_map->written.resize(buffer_size);
+            free_map->mapped = std::exchange(*data, free_map->written.data());
          }
       }
       // A deferred context's first map of a dynamic buffer in a command list must discard, so the split discards these (see
@@ -630,24 +654,28 @@ class Persona5Strikers final : public Game
       }
    }
 
-   // Motion vectors: snapshots a written $Globals buffer's mapped memory at Unmap
+   // Motion vectors: a redirected $Globals Map reaches its buffer and the snapshot. Not gated on "IsSRActive": it can change between a
+   // Map and its Unmap, and the buffer would keep no data.
    static void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
    {
+      const auto mapped = std::ranges::find(mapped_globals, resource.handle, &MappedGlobals::handle);
+      if (mapped == mapped_globals.end())
+         return;
+      std::memcpy(mapped->mapped, mapped->written.data(), mapped->written.size());
+      mapped->handle = 0;
       DeviceData* const device_data = GetDeviceData(device);
-      if (!device_data || !IsSRActive(*device_data))
+      if (!device_data)
          return;
       auto& game_device_data = GetGameDeviceData(*device_data);
 #if DEVELOPMENT
       const Perf::HookTimer timer{&game_device_data.perf_window.hook_ns};
 #endif
-      if (!MayBeGlobalsBuffer(game_device_data, resource.handle))
-         return;
+      auto copy = std::make_shared<const std::vector<uint8_t>>(mapped->written);
       const std::lock_guard lock(game_device_data.mv_globals_mutex);
-      const auto buffer = game_device_data.mv_globals_buffers.find(resource.handle);
-      if (buffer == game_device_data.mv_globals_buffers.end() || !buffer->second.mapped)
-         return;
-      const auto* const mapped = static_cast<const uint8_t*>(std::exchange(buffer->second.mapped, nullptr));
-      buffer->second.copy = std::make_shared<const std::vector<uint8_t>>(mapped, mapped + buffer->second.size);
+      if (const auto buffer = game_device_data.mv_globals_buffers.find(resource.handle); buffer != game_device_data.mv_globals_buffers.end())
+      {
+         buffer->second.copy = std::move(copy);
+      }
    }
 
    // The bound shader's motion vector version, patched from Core's bytecode copy on first use (null if it can't be)

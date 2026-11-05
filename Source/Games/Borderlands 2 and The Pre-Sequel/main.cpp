@@ -279,6 +279,7 @@ static constexpr const char* kMotionVectorRejectNames[REJECT_COUNT] = {"extra_ta
 // The buffer hooks (map/unmap/update_buffer_region: copies of vc4's uploads) are registered, only while motion vectors need them
 // and the proxy's vertex constant mirror can't replace them (see "OnPresent")
 static bool g_buffer_hooks_registered = false;
+static bool g_unmap_hook_registered = false;
 
 struct Borderlands2GameDeviceData final : public GameDeviceData
 {
@@ -1079,7 +1080,7 @@ class Borderlands2 final : public Game
 #if DEVELOPMENT
       const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
-      const PatchedDraws::ObjectConstants::Entry* const registered = gd.mv_constants.OnMap(resource.handle, offset, access, *data);
+      const PatchedDraws::ObjectConstants::Entry* const registered = gd.mv_constants.OnMap(resource.handle, offset, access, data);
 #if DEVELOPMENT
       if (registered)
       {
@@ -1092,11 +1093,12 @@ class Borderlands2 final : public Game
 #endif
    }
 
-   // Motion vectors: the CPU copy of a vc4 buffer, before its Unmap (the game has written it). Reads the mapped memory back.
+   // Motion vectors: a redirected Map of a vc4 buffer writes its data to the buffer, before its Unmap. Not gated on "mv_active": the
+   // present that turns it off can fall between the two.
    static void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
    {
       DeviceData* const device_data = device->get_private_data<DeviceData>();
-      if (!device_data || !device_data->game || !GetGameDeviceData(*device_data).mv_active)
+      if (!device_data || !device_data->game)
          return;
       auto& gd = GetGameDeviceData(*device_data);
 #if DEVELOPMENT
@@ -3343,13 +3345,16 @@ public:
                // The uploads missed while unregistered make every earlier copy stale: the draws are uncopied (zero motion) until the next
                gd.mv_constants.Restart();
                reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
-               reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
+               if (!std::exchange(g_unmap_hook_registered, true))
+               {
+                  reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
+               }
                reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
             }
             else
             {
+               // The Unmap hook stays: a Map taken before this may still have to reach its buffer
                reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
-               reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
                reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
             }
          }

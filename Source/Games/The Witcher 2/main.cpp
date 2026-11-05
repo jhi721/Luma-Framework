@@ -997,7 +997,7 @@ class TheWitcher2Game final : public Game
 #if DEVELOPMENT
       const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns};
 #endif
-      const PatchedDraws::ObjectConstants::Entry* const registered = gd.mv_constants.OnMap(resource.handle, offset, access, *data);
+      const PatchedDraws::ObjectConstants::Entry* const registered = gd.mv_constants.OnMap(resource.handle, offset, access, data);
 #if DEVELOPMENT
       if (registered)
       {
@@ -1010,7 +1010,8 @@ class TheWitcher2Game final : public Game
 #endif
    }
 
-   // Motion vectors: the CPU copy of a vc4 buffer, before its Unmap (the game has written it). Reads the mapped memory back.
+   // Motion vectors: a redirected Map of a vc4 buffer writes its data to the buffer, before its Unmap. The gate is safe here: "mv_active"
+   // only changes on the thread of these events.
    static void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
    {
       DeviceData* const device_data = device->get_private_data<DeviceData>();
