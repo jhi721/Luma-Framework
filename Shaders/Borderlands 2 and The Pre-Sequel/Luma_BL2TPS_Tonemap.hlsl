@@ -1,15 +1,21 @@
 // clang-format off
 // ORDER MATTERS — do NOT let clang-format sort these. The game-local Common.hlsl MUST come first: it defines
-// LumaGameSettings (via GameCBuffers.hlsl) BEFORE the shared Settings.hlsl declares the LumaSettings cbuffer, and
-// PsychoV31.hlsl reads LumaSettings, so it goes after. Sorted otherwise, GameSettings becomes the empty fallback struct
-// and every LumaSettings.GameSettings.* reference fails to compile (invalid subscript).
+// LumaGameSettings (via GameCBuffers.hlsl) BEFORE the shared Settings.hlsl declares the LumaSettings cbuffer. Sorted
+// otherwise, GameSettings becomes the empty fallback struct and every LumaSettings.GameSettings.* reference fails to
+// compile (invalid subscript).
 #include "Includes/Common.hlsl" // game-local: LumaGameSettings (grade sliders) + shared Common (Color/Math/Settings) — keep FIRST
-#include "../Includes/PsychoV31.hlsl"
+#include "../Includes/CInfinityRolloff.hlsl" // Tonemap::CInfinityRollOff::MaxChannel (the display map)
+#include "../Includes/Reinhard.hlsl" // Reinhard::ReinhardPiecewise (highlight whitening reference)
+#include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueAndPurityEmulationBT2020
 #include "../Includes/DgVoodoo.hlsl" // DGV_MAIN_SIGNATURE
 // clang-format on
 
+// fxc flags the early return of "MacLeodBoynton::SolvePurity()" as an uninitialized result (X4000). It comes at code generation, so
+// it stays off for the whole shader.
+#pragma warning(disable : 4000)
+
 // Borderlands 2 + The Pre-Sequel — uber post-process / tonemap SHARED IMPLEMENTATION (UE3, via dgVoodoo D3D9->11).
-// Holds the grade body as RunTonemap() and the main() over the full UE3 interpolator set; the per-hash wrapper files
+// Holds the main() with the grade body, over the full UE3 interpolator set; the per-hash wrapper files
 // (Tonemap_0x<HASH>.ps_5_0.hlsl, one per game × dgVoodoo version) set the slot map and include it. No hash in this
 // filename -> not matched/replaced directly.
 //
@@ -21,16 +27,16 @@
 // exact native ImageAdjustments + ColorGradingLUT result is the COMPLETE colour reference, including the game's
 // per-channel hue, saturation, tint and its own highlight whitening. A separate unbounded continuation of the
 // measured K=0 response (W*c in linear light) passes through a reversible bounded copy of the real LUT to obtain
-// HDR luminance, and ONLY that luminance is projected onto the native graded RGB ratios. PsychoV31 performs the only
-// final display rolloff. SDR executes none of the reconstruction (its scene still gets the user Exposure, Bloom
-// and Vignette controls, and Luma's pyramidal bloom is on by default).
+// HDR luminance, and ONLY that luminance is projected onto the native graded RGB ratios. A max-channel C-infinity
+// rolloff performs the only final display mapping, and keeps those ratios. SDR executes none of the reconstruction
+// (its scene still gets the user Exposure, Bloom and Vignette controls, and Luma's pyramidal bloom is on by default).
 //
 // This is NOT inverse tonemapping, NOT hue restoration from the raw scene, and NOT MELE family 05's hard-clip
 // treatment: no path anywhere takes the working value's channel ratios.
 // The per-channel ImageAdjustments curve below MUST keep the original's swizzles (r0.zzxy / r3.z,w,xy) — a
 // "cleaner" rewrite swaps channels and casts the whole image green.
 
-// HDR / vanilla. 1 = the reconstruction + PsychoV31 display map above (default). 0 = the vanilla SDR grade on every
+// HDR / vanilla. 1 = the reconstruction + C-infinity rolloff above (default). 0 = the vanilla SDR grade on every
 // display mode, without the dither.
 #ifndef TONEMAP_TYPE
 #define TONEMAP_TYPE 1
@@ -72,10 +78,6 @@ SamplerState s2_s : register(TM_S_VIGNETTE); // BL2 s2 / TPS s3
 SamplerState s3_s : register(TM_S_LUT);      // BL2 s3 / TPS s4
 SamplerState s4_s : register(TM_S_DOF);      // BL2 s4 / TPS s5
 
-cbuffer cb3 : register(b3)
-{
-   float4 cb3[77];
-}
 cbuffer cb4 : register(b4)
 {
    float4 cb4[236];
@@ -90,7 +92,7 @@ cbuffer cb4 : register(b4)
 #define VignetteColor                    cb4[22] // c14
 
 // ====================== HDR luminance reconstruction ======================
-// The native branch in RunTonemap owns the colour; everything here owns the range. See the file
+// The native branch in main owns the colour; everything here owns the range. See the file
 // header for the contract - only Y crosses from the working value to the output.
 
 #define BL2TPS_HDR_BRIDGE_SHOULDER        0.75
@@ -114,25 +116,8 @@ bool BL2TPS_IsFiniteNonNegative(float3 v)
    return all(v >= 0.0) && all(v <= FLT_MAX);
 }
 
-// The shoulder the max-channel proxy rides: identity at and below k, C1 across the seam, asymptotic
-// to 1. This is Reinhard::ReinhardRange specialized to the only arguments this shader ever passed it
-// - In_Peak = -1, Out_Peak = 1, ClampOutput = false - and to its only caller, which has already
-// established peak > k. Under those the generic body loses its dead In_Peak > 0 range restore, its
-// trailing (Color <= k) select, and ReinhardSimple's abs(), which is the identity on a positive
-// argument. What survives is the same float32 operation sequence, so it returns the same bits:
-// checked against the generic helper over 2.6M values, including 20k ULP above the seam.
-//
-// Do NOT fold this to (peak - 0.5625) / (peak - 0.5). It is algebraically equal and reorders the
-// rounding, which is exactly what this pass is not allowed to do.
-float BL2TPS_CompressWorkingPeak(float peak)
-{
-   const float k = BL2TPS_HDR_BRIDGE_SHOULDER;
-   const float x = peak - k;
-   return k + x / (x / (1.0 - k) + 1.0);
-}
-
 // The native 16-slice trilinear LUT read, reproduced for the working branch. NOT a generic LUT
-// sampler: it is the block in RunTonemap transcribed against its own compiled listing, and two of
+// sampler: it is the block in main transcribed against its own compiled listing, and two of
 // its constants are traps.
 //
 // Routing, decoded from the ImageAdjustments output (it reaches the native block as (B, B, R, G),
@@ -171,7 +156,7 @@ float3 BL2TPS_SampleColorGradeGamma(float3 gammaRGB)
 // exactly W*c - a pure gain, not an approximation of one. Continuing THAT branch over the whole
 // positive range gives E(c) = W*c: the response the game itself applies to everything below mid-gray,
 // with the Reinhard shoulder and the clip at scene >= 14 simply absent. No asymptote, no invented
-// curve, no second tonemapper - PsychoV31 alone owns the display mapping.
+// curve, no second tonemapper - the rolloff alone owns the display mapping.
 //
 // Valid only for K == 0, which is every constant set captured so far. A non-zero K mixes the toe in
 // and W*c stops being the native response, so this declines and the caller keeps the exact native
@@ -221,7 +206,7 @@ bool BL2TPS_TryBuildWorkingLuminance(float3 curveInput, out float targetLuminanc
    float q = 1.0;
    if (m > k)
    {
-      q = BL2TPS_CompressWorkingPeak(m) / m;
+      q = Reinhard::ReinhardRange(m, k).x / m;
    }
 
    // Every check runs BEFORE the pow, the division and the LUT read it protects. An invalid working
@@ -320,10 +305,9 @@ float3 BL2TPS_NativeColorAtLuminance(float3 nativeReferenceLinear, float targetL
 }
 
 // The tonemap grade. v5 = TEXCOORD0 (DOF radial/kernel coords in .zw), v6 = TEXCOORD1 (scene UV .xy, half-res DOF
-// UV .zw) — the only interpolators the body uses. Returns the final gamma-space color (o0.a is always 0).
-float4 RunTonemap(float4 v5, float4 v6)
+// UV .zw): the only interpolators the body uses.
+void main(DGV_MAIN_SIGNATURE)
 {
-   float4 o;
    float4 r0, r1, r2, r3;
 
    // --- DOF composite (verbatim) ---
@@ -386,7 +370,6 @@ float4 RunTonemap(float4 v5, float4 v6)
    r0.xyz = hdrColor;
 
    // --- vignette (verbatim) ---
-   float3 vignetteColor = r0.rgb;
    r1.xyz = r0.xyz * VignetteColor.xyz;
    r2.xyz = r0.xyz * -VignetteColor.xyz + r0.xyz;
    r1.xyz = v6.y * r2.xyz + r1.xyz;
@@ -400,28 +383,27 @@ float4 RunTonemap(float4 v5, float4 v6)
    r0.w = r2.y + -VignetteSettings.x;
    r0.xyz = (r0.w >= 0) ? r0.xyz : r1.xyz;
    // User Vignette Intensity: lerp between the pre-vignette color and the vignetted result (1 = vanilla, 0 = none).
-   r0.xyz = lerp(vignetteColor, r0.xyz, LumaSettings.GameSettings.VignetteIntensity);
+   r0.xyz = lerp(hdrColor, r0.xyz, LumaSettings.GameSettings.VignetteIntensity);
 
    // The curve's own input: post-vignette, pre-curve and UNCLIPPED - the physical colour before the native
    // per-channel curve compresses it. The HDR reconstruction continues the curve from here, and the native
    // branch below runs on this same value, unchanged.
    const float3 curveInput = r0.xyz;
 
-   // --- ImageAdjustments per-channel curve (verbatim; keep swizzles exactly) ---
+   // --- ImageAdjustments per-channel curve (vanilla's operations, dgVoodoo's guards through DgVoodoo.hlsl; keep swizzles exactly) ---
    r1 = r0.zzxy + -ImageAdjustments2.z;
    r1 = saturate(r1 * 10000);
    r2.xyz = r0.xyz + ImageAdjustments2.x;
    // Native guards: a zero divisor becomes 1e37 instead of inf, and log runs on |x| with -inf pinned to -1e37, so a
    // negative or zero channel still yields a finite value rather than NaN.
-   r3.z = (abs(r2.x) > 0.0) ? 1 / abs(r2.x) : 1e37;
-   r3.w = (abs(r2.y) > 0.0) ? 1 / abs(r2.y) : 1e37;
-   r3.xy = (abs(r2.z) > 0.0) ? 1 / abs(r2.z) : 1e37;
+   r3.z = DgVoodooRcp(abs(r2.x));
+   r3.w = DgVoodooRcp(abs(r2.y));
+   r3.xy = DgVoodooRcp(abs(r2.z));
    r2 = r0.zzxy * r3;
    r0.xyz = r0.xyz * ImageAdjustments2.w;
-   r3.x = log2(abs(r0.x));
-   r3.y = log2(abs(r0.y));
-   r3.z = log2(abs(r0.z));
-   r3.xyz = (asuint(r3.xyz) == 0xff800000u) ? -1e37 : r3.xyz;
+   r3.x = DgVoodooLog2(r0.x);
+   r3.y = DgVoodooLog2(r0.y);
+   r3.z = DgVoodooLog2(r0.z);
    r0.xyz = r3.xyz * 0.454545468;
    r3.z = exp2(r0.x);
    r3.w = exp2(r0.y);
@@ -442,13 +424,12 @@ float4 RunTonemap(float4 v5, float4 v6)
    r2 = t3.Sample(s3_s, r1.zw);
    r1 = t3.Sample(s3_s, r1.xy);
    r0.yzw = (-r1.xxyz + r2.xxyz).yzw;
-   o.xyz = r0.x * r0.yzw + r1.xyz;
+   o0.xyz = r0.x * r0.yzw + r1.xyz;
 
    // ====================== Luma HDR output ======================
-   // o.rgb is the native graded look in gamma space and the COMPLETE colour reference (see the file header): HDR
+   // o0.rgb is the native graded look in gamma space and the COMPLETE colour reference (see the file header): HDR
    // replaces its luminance and nothing else, SDR presents it untouched.
-   float3 gradedSdrGamma = o.rgb;
-   float3 sdrLinear = gamma_to_linear(gradedSdrGamma, GCT_MIRROR);
+   float3 sdrLinear = gamma_to_linear(o0.rgb, GCT_MIRROR);
 
    float3 postProcessedColor;
 
@@ -466,11 +447,35 @@ float4 RunTonemap(float4 v5, float4 v6)
          recovered = BL2TPS_NativeColorAtLuminance(sdrLinear, workLuminance);
       }
 
-      // See "PsychoVDisplayMap".
-      postProcessedColor = PsychoVDisplayMap(recovered,
-                                             LumaSettings.GameSettings.Contrast,
-                                             LumaSettings.GameSettings.Saturation,
-                                             LumaSettings.GameSettings.HighlightDechroma);
+      // Highlights Desaturation, off by default: the purity of a per-channel ReinhardPiecewise(5, 1.5) of the colour in BT.2020,
+      // as in The Witcher 2 and Borderlands GOTY, but no hue from it (they pass 1.0): the native grade's LUT already turned the hue
+      // toward yellow white, a second turn would stack on it (see the file header).
+      // Skipped below the shoulder, where the reference is the colour itself.
+      const float highlightDechroma = LumaSettings.GameSettings.HighlightDechroma;
+      [branch] if (highlightDechroma != 0.0)
+      {
+         const float3 color2020 = BT709_To_BT2020(recovered);
+         [branch] if (max3(color2020) > 1.5)
+         {
+            recovered = BT2020_To_BT709(MacLeodBoynton::HueAndPurityEmulationBT2020(color2020, Reinhard::ReinhardPiecewise(color2020, 5.0, 1.5),
+                                                                                    0.0, highlightDechroma));
+         }
+      }
+      // Contrast (a power of relative luminance around mid gray) and a scale of the RGB distance from relative luminance: the
+      // rolloff doesn't take them
+      const float contrast = LumaSettings.GameSettings.Contrast;
+      [branch] if (contrast != 1.0)
+      {
+         recovered *= pow(max(GetLuminance(recovered, CS_BT709), FLT_MIN) / MidGray, contrast - 1.0);
+      }
+      const float saturationScale = LumaSettings.GameSettings.Saturation;
+      [branch] if (saturationScale != 1.0)
+      {
+         recovered = Saturation(recovered, saturationScale, CS_BT709);
+      }
+      // The rolloff (linear BT.709, 1.0 = paper white). The peak can't go below paper white (it needs to be above the mid gray anchor).
+      const float paperWhite = max(LumaSettings.GamePaperWhiteNits, 1.0);
+      postProcessedColor = Tonemap::CInfinityRollOff::MaxChannel(recovered, max(LumaSettings.PeakWhiteNits, paperWhite) / paperWhite, MidGray, 1.0);
    }
    else // SDR (still presented through the scRGB swapchain) — sdrLinear is the vanilla grade, untouched
 #endif
@@ -499,10 +504,5 @@ float4 RunTonemap(float4 v5, float4 v6)
    }
 #endif
 
-   return float4(postProcessedColor, 0.0); // vanilla wrote o0.w = 0
-}
-
-void main(DGV_MAIN_SIGNATURE)
-{
-   o0 = RunTonemap(v5, v6);
+   o0 = float4(postProcessedColor, 0.0); // vanilla wrote o0.w = 0
 }

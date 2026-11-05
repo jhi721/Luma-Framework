@@ -2,7 +2,7 @@
 // Movies decode to 3 Y'CbCr planes (Y' = t0, the color difference planes t1 and t2) and a fullscreen quad converts them
 // straight onto the swapchain, bypassing the tonemap; on the fp16 scRGB swapchain that SDR output sits flat at paper white. Body verbatim from the
 // dgVoodoo ps_5_0 disasm (DX9 0x33244F80: tor/tog/tob/consts c0..c3 -> cb4[8..11]); the cb3 and/or pairs are
-// dgVoodoo's texture-format bit emulation, kept via asuint/asfloat. dgVoodoo dropped the SM3 saturate(o) (the UNORM
+// dgVoodoo's texture-format bit emulation, through ApplyDgvMask. dgVoodoo dropped the SM3 saturate(o) (the UNORM
 // backbuffer clamped for free), so it is re-added before the AutoHDR - kills the matrix's overshoot and negatives.
 
 // clang-format off
@@ -38,14 +38,14 @@ void main(DGV_MAIN_SIGNATURE)
 {
    float4 r0, r1;
 
-   // --- Y'CbCr plane fetch + dgVoodoo format-emulation mask (verbatim) ---
+   // --- Y'CbCr plane fetch + dgVoodoo format-emulation mask ---
    r0 = t0.Sample(s0_s, v5.xy);
-   r0 = asfloat((asuint(r0) & asuint(cb3[44])) | asuint(cb3[45]));
+   r0 = ApplyDgvMask(r0, cb3[44], cb3[45]);
    r1 = t1.Sample(s1_s, v5.xy);
-   r1 = asfloat((asuint(r1) & asuint(cb3[46])) | asuint(cb3[47]));
+   r1 = ApplyDgvMask(r1, cb3[46], cb3[47]);
    r0.y = r1.x;
    r1 = t2.Sample(s2_s, v5.xy);
-   r1 = asfloat((asuint(r1) & asuint(cb3[48])) | asuint(cb3[49]));
+   r1 = ApplyDgvMask(r1, cb3[48], cb3[49]);
    r0.z = r1.x;
    r0.w = cb4[11].x;
 

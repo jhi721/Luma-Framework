@@ -6,7 +6,7 @@
 // saturate((max3(source * BloomScale) - BloomThreshold) * 0.5), BloomScale a constant 4 that only undoes the pass's
 // pre-divided-by-4 source; applying it here too opens the knee 4x too low (~10x the native energy).
 // C++ keeps GameSettings.BloomThreshold live off that pass (measured 0.50 to 1.32) and binds LumaSettings here.
-// Karis firefly weighting runs before this (DrawKarisAverage); no TAA to hide sparkle.
+// Karis firefly weighting runs before this (DrawKarisAverage): SMAA and no AA have no temporal filter to hide sparkle.
 
 // clang-format off
 #include "Includes/Common.hlsl" // game-local: LumaGameSettings - keep FIRST (see the tonemap's include note).

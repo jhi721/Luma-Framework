@@ -81,28 +81,28 @@ static constexpr uint32_t kScaleformDigitGlyphHash = 0x79CDF7BA;
 // directional/spot light types, TFilterPixelShader, TDOFGatherPixelShader0; the bright pass's known twin reproduced as the control).
 // TPS's cache shares these byte for byte except its tonemap and light shaft downsamples, and only its directional downsample still
 // hashes apart after dgVoodoo.
-static constexpr uint32_t kScenePostHashes[] = {
-   0xEB2678CD, // light shafts downsample
-   0x13098E07, // light shafts downsample, dgVoodoo 2.81.3
-   0xFE261570, // light shafts downsample, directional light
-   0xBFD04077, // light shafts downsample, directional light, dgVoodoo 2.81.3
-   0xA33D1DF9, // light shafts downsample, directional light, TPS
-   0x944209BA, // light shafts downsample, directional light, TPS, dgVoodoo 2.81.3
-   0xC3B44D30, // light shafts downsample, spot light (BL2 and TPS)
-   0x93DD55D8, // light shafts downsample, spot light (BL2 and TPS), dgVoodoo 2.81.3
-   0x070EAE70, // depth of field low resolution scene
-   0x6DF81571, // depth of field low resolution scene, dgVoodoo 2.81.3
-   0xC710CF7C, // bloom downsample
-   0x77A6E651, // bloom downsample, dgVoodoo 2.81.3
-   kBloomBrightPassHash,
-   kBloomBrightPassHash_v281,
-   kFXAAResolveHash,
-   kFXAAResolveHash_v281,
-   kTonemapHash,
-   kTonemapHash_v281,
-   kTonemapHashTPS,
-   kTonemapHashTPS_v281,
-};
+static const ShaderHashesList kScenePostHashes = {.pixel_shaders = {
+                                                     0xEB2678CD, // light shafts downsample
+                                                     0x13098E07, // light shafts downsample, dgVoodoo 2.81.3
+                                                     0xFE261570, // light shafts downsample, directional light
+                                                     0xBFD04077, // light shafts downsample, directional light, dgVoodoo 2.81.3
+                                                     0xA33D1DF9, // light shafts downsample, directional light, TPS
+                                                     0x944209BA, // light shafts downsample, directional light, TPS, dgVoodoo 2.81.3
+                                                     0xC3B44D30, // light shafts downsample, spot light (BL2 and TPS)
+                                                     0x93DD55D8, // light shafts downsample, spot light (BL2 and TPS), dgVoodoo 2.81.3
+                                                     0x070EAE70, // depth of field low resolution scene
+                                                     0x6DF81571, // depth of field low resolution scene, dgVoodoo 2.81.3
+                                                     0xC710CF7C, // bloom downsample
+                                                     0x77A6E651, // bloom downsample, dgVoodoo 2.81.3
+                                                     kBloomBrightPassHash,
+                                                     kBloomBrightPassHash_v281,
+                                                     kFXAAResolveHash,
+                                                     kFXAAResolveHash_v281,
+                                                     kTonemapHash,
+                                                     kTonemapHash_v281,
+                                                     kTonemapHashTPS,
+                                                     kTonemapHashTPS_v281,
+                                                  }};
 
 #if DEVELOPMENT
 static bool g_mv_enable = false;       // Motion vectors without an upscaler
@@ -112,10 +112,9 @@ static bool g_mv_match_objects = true; // Off: every motion vector draw takes th
 // One frame capture (Luma MCP "luma_trace_list") at the first upscaled frame with a near plane under 1 (the loading screen's spinning
 // weapon; the game camera's is 10); re-armed through MCP
 static bool g_mv_trace_loading = true;
-// A/B of the CPU savings (see "PatchedDraws::ObjectConstants", synced at present, and "FixImpossiblePerRTBlend")
+// A/B of the CPU savings (see "PatchedDraws::ObjectConstants", synced at present)
 static bool g_mv_buffer_filter = true;
 static bool g_mv_constants_pool = true;
-static bool g_blend_memo = true;
 static bool g_bound_state_tracking = true; // See "PatchedDraws::BoundStates"
 static bool g_vc4_mirror = true;           // vc4 from the D3D9 proxy's constant mirror when it runs (see "vertex_constants")
 static bool g_vc4_mirror_check = false;    // The mirror against the copies of vc4's uploads ("vc4 mirror mismatches" in the "[BL2 MV]" log)
@@ -144,7 +143,6 @@ struct PerfTestMode
    // One CPU saving off, the others as the user set them
    bool vc4_filter_off = false;
    bool vc4_pool_off = false;
-   bool blend_memo_off = false;
 };
 constexpr PerfTestMode perf_test_modes[] = {
    {.name = "Off"},
@@ -158,7 +156,6 @@ constexpr PerfTestMode perf_test_modes[] = {
    {.name = "No AA", .set_aa = true},
    {.name = "Without vc4 Filter", .vc4_filter_off = true},
    {.name = "Without vc4 Pool", .vc4_pool_off = true},
-   {.name = "Without Blend Memo", .blend_memo_off = true},
 };
 // "Sweep": these modes in turn, a log window each, over several rounds (interleaved, so the scene's drift averages out), then a
 // median per mode against the last one. "CPU Sweep": the CPU savings each off in turn under the current anti-aliasing (an upscaler:
@@ -168,8 +165,10 @@ constexpr int perf_sweep_modes[] = {2, 3, 4, 5,
    6,
 #endif
    7, 8};
-constexpr int perf_cpu_sweep_modes[] = {9, 10, 11, 1};
+constexpr int perf_cpu_sweep_modes[] = {9, 10, 1};
 static_assert(std::string_view(perf_test_modes[perf_sweep_modes[std::size(perf_sweep_modes) - 1]].name) == "No AA");
+static_assert(std::string_view(perf_test_modes[perf_cpu_sweep_modes[0]].name) == "Without vc4 Filter");
+static_assert(std::string_view(perf_test_modes[perf_cpu_sweep_modes[1]].name) == "Without vc4 Pool");
 static_assert(std::string_view(perf_test_modes[perf_cpu_sweep_modes[std::size(perf_cpu_sweep_modes) - 1]].name) == "Current Settings");
 constexpr Perf::SweepDef perf_sweeps[] = {{"Sweep", perf_sweep_modes}, {"CPU Sweep", perf_cpu_sweep_modes}};
 // Per mode, each window's GPU frame, scene, end, hook and CPU frame times, and the end's parts. A log window (120 frames) per mode and
@@ -214,7 +213,6 @@ static constexpr bool g_mv_force_jitter = false;
 static constexpr bool g_mv_match_objects = true;
 static constexpr bool g_mv_buffer_filter = true;
 static constexpr bool g_mv_constants_pool = true;
-static constexpr bool g_blend_memo = true;
 static constexpr bool g_bound_state_tracking = true;
 static constexpr bool g_vc4_mirror = true;
 static constexpr bool g_vc4_mirror_check = false;
@@ -283,17 +281,6 @@ static bool g_unmap_hook_registered = false;
 
 struct Borderlands2GameDeviceData final : public GameDeviceData
 {
-   // Repaired blend states, keyed by the ORIGINAL desc. Keying by desc rather than by the
-   // source state's pointer means a released state can't leave a stale key that a later allocation reuses.
-   struct BlendDescCompare
-   {
-      bool operator()(const D3D11_BLEND_DESC& a, const D3D11_BLEND_DESC& b) const
-      {
-         return memcmp(&a, &b, sizeof(D3D11_BLEND_DESC)) < 0;
-      }
-   };
-   std::map<D3D11_BLEND_DESC, ComPtr<ID3D11BlendState>, BlendDescCompare> fixed_blend_states;
-
    // One staging copy per captured pass, read a frame late (see CaptureConstantRows). One buffer each, not a
    // ring: the reader may skip a frame, so a DO_NOT_WAIT map of LAST frame's copy is enough and never blocks.
    struct ConstantCapture
@@ -354,7 +341,6 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    ComPtr<ID3D11Texture2D> tex_smaa_out;
    ComPtr<ID3D11RenderTargetView> tex_smaa_out_rtv;
    ComPtr<ID3D11ShaderResourceView> tex_smaa_out_srv;
-   uint32_t smaa_out_w = 0, smaa_out_h = 0;
 
    // SMAA T2x (see "RunPostTonemapSMAA"), set at present for the whole frame like "sr_active". The scene jitters only after a frame
    // the resolve ran, as with "mv_jitter_allowed". The phase is chosen when the scene opens, -1 if it didn't jitter.
@@ -378,9 +364,7 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    ComPtr<ID3D11Texture2D> tex_pred;
    ComPtr<ID3D11UnorderedAccessView> uav_pred;
    ComPtr<ID3D11ShaderResourceView> srv_pred;
-   uint32_t pred_w = 0, pred_h = 0;
-   ComPtr<ID3D11Buffer> cb_pred;
-   float pred_tolerance = -1.f;
+   com_ptr<ID3D11Buffer> cb_pred;
 
    // Luma HDR pyramidal bloom output (linear fp16), generated at the tonemap from the scene SRV, bound to PS t5 (BL2) / t8 (TPS).
    ComPtr<ID3D11ShaderResourceView> srv_luma_bloom;
@@ -533,18 +517,17 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    struct MotionVectorStats
    {
       uint32_t motion_vector_draws = 0, jitter_draws = 0, matched = 0, camera_only = 0, other_camera = 0, uncopied = 0, maps = 0, updates = 0, other_maps = 0, sr_draws = 0;
-      uint32_t tiebreak_collisions = 0;                                                              // Objects sharing a key and a transform with other constants ("PatchedDraws::CountTieBreakCollisions")
-      uint32_t vc4_mirror_mismatches = 0;                                                            // "g_vc4_mirror_check": motion vector draws whose mirror rows weren't the copied upload
-      uint32_t vc4_mirror_used_mismatches = 0;                                                       // Of them, the ones in the rows read here (camera, LocalToWorld)
-      uint32_t vc4_mirror_mismatch_row = 0, vc4_mirror_mismatch_vs = 0;                              // The first row and the shader of the last one
-      uint32_t vc4_mirror_unknown = 0;                                                               // Motion vector draws with rows the mirror doesn't know (after a Reset or a state block's Apply)
-      uint32_t bound_state_mismatches = 0;                                                           // "g_bound_state_check": tracked states that weren't the bound ones
-      uint32_t reactive_draws = 0;                                                                   // Alpha blended draws that wrote FSR's masks
-      uint32_t ended_by = 0;                                                                         // The ending pass's PS hash
-      int ended_by_scene_slot = -1;                                                                  // The PS slot it reads the scene's copy from, -1 if none
-      float near_plane = 0.f, far_plane = 0.f;                                                       // The upscaler's, from the camera's projection (0: none found)
-      uint32_t rejected[REJECT_COUNT] = {};                                                          // "DrawWithMotionVectors" refusals by reason ("MotionVectorReject")
-      uint32_t rejected_format = 0, rejected_dimension = 0, rejected_width = 0, rejected_height = 0; // The last target refused by format or size
+      uint32_t tiebreak_collisions = 0;                                 // Objects sharing a key and a transform with other constants ("PatchedDraws::CountTieBreakCollisions")
+      uint32_t vc4_mirror_mismatches = 0;                               // "g_vc4_mirror_check": motion vector draws whose mirror rows weren't the copied upload
+      uint32_t vc4_mirror_used_mismatches = 0;                          // Of them, the ones in the rows read here (camera, LocalToWorld)
+      uint32_t vc4_mirror_mismatch_row = 0, vc4_mirror_mismatch_vs = 0; // The first row and the shader of the last one
+      uint32_t vc4_mirror_unknown = 0;                                  // Motion vector draws with rows the mirror doesn't know (after a Reset or a state block's Apply)
+      uint32_t bound_state_mismatches = 0;                              // "g_bound_state_check": tracked states that weren't the bound ones
+      uint32_t reactive_draws = 0;                                      // Alpha blended draws that wrote FSR's masks
+      uint32_t ended_by = 0;                                            // The ending pass's PS hash
+      int ended_by_scene_slot = -1;                                     // The PS slot it reads the scene's copy from, -1 if none
+      float near_plane = 0.f, far_plane = 0.f;                          // The upscaler's, from the camera's projection (0: none found)
+      uint32_t rejected[REJECT_COUNT] = {};                             // "DrawWithMotionVectors" refusals by reason ("MotionVectorReject")
    };
    MotionVectorStats mv_stats, mv_last_stats;
    int mv_draw_reject = -1; // The current draw's "MotionVectorReject" reason (-1 for none), for the MCP trace note
@@ -572,7 +555,6 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
    bool perf_user_smaa = false;
    bool perf_user_vc4_filter = true;
    bool perf_user_vc4_pool = true;
-   bool perf_user_blend_memo = true;
 #endif
 
    // SMAA's own resources (predication, output temp), apart from Core's ("ReleaseSMAAIntermediates"); recreated at their next use
@@ -581,7 +563,6 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
       tex_pred.reset();
       uav_pred.reset();
       srv_pred.reset();
-      pred_w = pred_h = 0;
       ReleaseSMAAOutput();
    }
 
@@ -590,7 +571,6 @@ struct Borderlands2GameDeviceData final : public GameDeviceData
       tex_smaa_out.reset();
       tex_smaa_out_rtv.reset();
       tex_smaa_out_srv.reset();
-      smaa_out_w = smaa_out_h = 0;
    }
 
    void ReleaseT2xFrames()
@@ -664,14 +644,6 @@ class Borderlands2 final : public Game
       return ContainsPixelShader(hashes, kFXAAResolveHash, kFXAAResolveHash_v281);
    }
 
-   static bool CreateImmutableCB(ID3D11Device* device, const void* data, UINT size, ComPtr<ID3D11Buffer>* out)
-   {
-      out->reset();
-      const CD3D11_BUFFER_DESC bd(size, D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_IMMUTABLE);
-      const D3D11_SUBRESOURCE_DATA initial_data = {.pSysMem = data};
-      return SUCCEEDED(device->CreateBuffer(&bd, &initial_data, out->put()));
-   }
-
    // Default-pool 2D texture. LDR-shaped temps take the live LDR format, since CopyResource requires identical formats.
    static bool CreateDefaultTex(ID3D11Device* device, uint32_t w, uint32_t h, UINT bind_flags, ComPtr<ID3D11Texture2D>* out, DXGI_FORMAT format)
    {
@@ -737,11 +709,8 @@ class Borderlands2 final : public Game
 
       // Shader-readiness gate (async loader / dev live-reload): skip SMAA this frame if any pass is missing, the chain is
       // all-or-nothing rather than partially configured.
-      const bool smaa_ready = HasSMAAShaders(device_data);
-      if (!smaa_ready)
-      {
+      if (!HasSMAAShaders(device_data))
          return;
-      }
 
       gd->smaa_frame = cb_luma_global_settings.FrameIndex;
       gd->snapshot_frame = cb_luma_global_settings.FrameIndex;
@@ -761,15 +730,9 @@ class Borderlands2 final : public Game
       }
       if (pred_ok)
       {
-         if (!gd->cb_pred || gd->pred_tolerance != g_smaa_pred_tolerance)
-         {
-            const float p[4] = {g_smaa_pred_tolerance, 0.f, 0.f, 0.f};
-            if (CreateImmutableCB(native_device, p, sizeof(p), std::addressof(gd->cb_pred)))
-            {
-               gd->pred_tolerance = g_smaa_pred_tolerance;
-            }
-         }
-         if (!gd->tex_pred || gd->pred_w != w || gd->pred_h != h)
+         const float pred_constants[4] = {g_smaa_pred_tolerance, 0.f, 0.f, 0.f};
+         const bool pred_constants_written = PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->cb_pred), pred_constants, sizeof(pred_constants));
+         if (!gd->srv_pred || GetViewTextureSize(gd->srv_pred.get()) != uint2{w, h})
          {
             gd->uav_pred.reset();
             gd->srv_pred.reset();
@@ -778,25 +741,21 @@ class Borderlands2 final : public Game
             {
                native_device->CreateUnorderedAccessView(gd->tex_pred.get(), nullptr, gd->uav_pred.put());
                native_device->CreateShaderResourceView(gd->tex_pred.get(), nullptr, gd->srv_pred.put());
-               gd->pred_w = w;
-               gd->pred_h = h;
             }
          }
-         pred_ok = gd->cb_pred && gd->uav_pred && gd->srv_pred;
+         pred_ok = pred_constants_written && gd->uav_pred && gd->srv_pred;
       }
 
       if (do_sharpen)
       {
          gd->smaa_out_frame = cb_luma_global_settings.FrameIndex;
-         if (!gd->tex_smaa_out || gd->smaa_out_w != w || gd->smaa_out_h != h)
+         if (!gd->tex_smaa_out_srv || GetViewTextureSize(gd->tex_smaa_out_srv.get()) != uint2{w, h})
          {
             gd->ReleaseSMAAOutput();
             if (CreateDefaultTex(native_device, w, h, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, std::addressof(gd->tex_smaa_out), ldr_format))
             {
                native_device->CreateRenderTargetView(gd->tex_smaa_out.get(), nullptr, gd->tex_smaa_out_rtv.put());
                native_device->CreateShaderResourceView(gd->tex_smaa_out.get(), nullptr, gd->tex_smaa_out_srv.put());
-               gd->smaa_out_w = w;
-               gd->smaa_out_h = h;
             }
          }
          if (!gd->tex_smaa_out_rtv || !gd->tex_smaa_out_srv)
@@ -815,12 +774,12 @@ class Borderlands2 final : public Game
       {
          DrawStateStack<DrawStateStackType::Compute> cs_state;
          cs_state.Cache(native_device_context, device_data.uav_max_count);
-         ID3D11ShaderResourceView* ps_srv = gd->srv_scene_depth.get();
-         ID3D11UnorderedAccessView* ps_uav = gd->uav_pred.get();
-         ID3D11Buffer* ps_cb = gd->cb_pred.get();
-         native_device_context->CSSetUnorderedAccessViews(0, 1, &ps_uav, nullptr);
-         native_device_context->CSSetShaderResources(0, 1, &ps_srv);
-         native_device_context->CSSetConstantBuffers(0, 1, &ps_cb);
+         ID3D11ShaderResourceView* depth_srv = gd->srv_scene_depth.get();
+         ID3D11UnorderedAccessView* pred_uav = gd->uav_pred.get();
+         ID3D11Buffer* pred_cb = gd->cb_pred.get();
+         native_device_context->CSSetUnorderedAccessViews(0, 1, &pred_uav, nullptr);
+         native_device_context->CSSetShaderResources(0, 1, &depth_srv);
+         native_device_context->CSSetConstantBuffers(0, 1, &pred_cb);
          native_device_context->CSSetShader(pred_cs, nullptr, 0);
          native_device_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
          cs_state.Restore(native_device_context);
@@ -841,8 +800,7 @@ class Borderlands2 final : public Game
          if (copy_vs != nullptr && copy_ps != nullptr)
          {
             // The mask is single-channel, so the core copy lands it in RED - unmistakably a debug view. It
-            // REPLACES the antialiased frame rather than blending over it, hence the early return (which also
-            // skips the metrics CB swap below, so there is nothing left to restore).
+            // REPLACES the antialiased frame rather than blending over it, hence the early return.
             DrawStateStack<DrawStateStackType::FullGraphics> debug_state;
             debug_state.Cache(native_device_context, device_data.uav_max_count);
             DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
@@ -901,7 +859,7 @@ class Borderlands2 final : public Game
       if (t2x)
       {
          // The resolve: t0 this frame, t1 the previous one or this one again without a history, t2 the motion vectors, s0 linear and
-         // s1 point
+         // s1 point, b1 the metrics (DrawSMAA restored the game's)
          DrawStateStack<DrawStateStackType::FullGraphics> resolve_state;
          resolve_state.Cache(native_device_context, device_data.uav_max_count);
          // The patched draws may leave the motion vector target bound, and its view would then read as null
@@ -910,6 +868,8 @@ class Borderlands2 final : public Game
          native_device_context->PSSetShaderResources(1, 2, resolve_srvs);
          ID3D11SamplerState* const resolve_samplers[2] = {device_data.sampler_state_linear.get(), device_data.sampler_state_point.get()};
          native_device_context->PSSetSamplers(0, 2, resolve_samplers);
+         ID3D11Buffer* const metrics_cb = gd->cb_smaa_metrics.get();
+         native_device_context->PSSetConstantBuffers(1, 1, &metrics_cb);
          DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr,
             copy_vs, t2x_resolve_ps, gd->t2x_frame_srvs[t2x_current].get(), output_rtv, w, h, false);
          resolve_state.Restore(native_device_context);
@@ -1001,18 +961,16 @@ class Borderlands2 final : public Game
          g_smaa_enable = (mode.set_aa ? mode.smaa : gd.perf_user_smaa);
       }
       const auto sets_cpu = [](const PerfTestMode& test_mode)
-      { return test_mode.vc4_filter_off || test_mode.vc4_pool_off || test_mode.blend_memo_off; };
+      { return test_mode.vc4_filter_off || test_mode.vc4_pool_off; };
       if (!sets_cpu(previous_mode) && sets_cpu(mode))
       {
          gd.perf_user_vc4_filter = g_mv_buffer_filter;
          gd.perf_user_vc4_pool = g_mv_constants_pool;
-         gd.perf_user_blend_memo = g_blend_memo;
       }
       if (sets_cpu(mode) || sets_cpu(previous_mode))
       {
          g_mv_buffer_filter = gd.perf_user_vc4_filter && !mode.vc4_filter_off;
          g_mv_constants_pool = gd.perf_user_vc4_pool && !mode.vc4_pool_off;
-         g_blend_memo = gd.perf_user_blend_memo && !mode.blend_memo_off;
       }
       // A helper started from now on writes its profile (one already running doesn't: its rows come once it restarts, at the next
       // upscaler change)
@@ -1034,19 +992,19 @@ class Borderlands2 final : public Game
 
    // The helper's evaluation in ms (GPU timestamps after its wait for the game's "in" and after the upscaler), the median of the
    // profile rows written since the last call; NaN without rows
-   static double ReadHelperEvaluateMs(Borderlands2GameDeviceData& gd)
+   static double ReadHelperEvaluateMs(Borderlands2GameDeviceData* gd)
    {
-      FILE* csv = _wfsopen(gd.perf_helper_profile_path.c_str(), L"rb", _SH_DENYNO);
+      FILE* csv = _wfsopen(gd->perf_helper_profile_path.c_str(), L"rb", _SH_DENYNO);
       if (!csv)
          return std::numeric_limits<double>::quiet_NaN();
       _fseeki64(csv, 0, SEEK_END);
       const int64_t size = _ftelli64(csv);
-      if (size < gd.perf_helper_profile_read)
+      if (size < gd->perf_helper_profile_read)
       {
-         gd.perf_helper_profile_read = 0; // A new helper rewrote it
+         gd->perf_helper_profile_read = 0; // A new helper rewrote it
       }
-      std::string text(size_t(size - gd.perf_helper_profile_read), '\0');
-      _fseeki64(csv, gd.perf_helper_profile_read, SEEK_SET);
+      std::string text(size_t(size - gd->perf_helper_profile_read), '\0');
+      _fseeki64(csv, gd->perf_helper_profile_read, SEEK_SET);
       text.resize(fread(text.data(), 1, text.size(), csv));
       fclose(csv);
       std::vector<double> values;
@@ -1064,7 +1022,7 @@ class Borderlands2 final : public Game
             values.push_back(double(evaluated - waited) * 1000.0 / double(frequency));
          }
       }
-      gd.perf_helper_profile_read += int64_t(start);
+      gd->perf_helper_profile_read += int64_t(start);
       return values.empty() ? std::numeric_limits<double>::quiet_NaN() : Perf::Median(std::move(values));
    }
 
@@ -1188,7 +1146,9 @@ class Borderlands2 final : public Game
       {
          HRESULT hr;
          if constexpr (vertex)
+         {
             hr = native_device->CreateVertexShader(patched.data(), patched.size(), nullptr, &shader);
+         }
          else
          {
             hr = native_device->CreatePixelShader(patched.data(), patched.size(), nullptr, &shader);
@@ -1303,7 +1263,7 @@ class Borderlands2 final : public Game
       }
       const D3D11_RENDER_TARGET_BLEND_DESC& rt0 = blend_desc.RenderTarget[0];
       gd->mv_blend_opaque = rt0.RenderTargetWriteMask != 0 && (!rt0.BlendEnable || (rt0.SrcBlend == D3D11_BLEND_ONE && rt0.DestBlend == D3D11_BLEND_ZERO && rt0.BlendOp == D3D11_BLEND_OP_ADD));
-      gd->mv_reactive_blend = (!rt0.BlendEnable || rt0.SrcBlend != D3D11_BLEND_SRC_ALPHA) ? 0 : (rt0.DestBlend == D3D11_BLEND_ONE ? 2 : 1);
+      gd->mv_reactive_blend = ((!rt0.BlendEnable || rt0.SrcBlend != D3D11_BLEND_SRC_ALPHA) ? 0 : (rt0.DestBlend == D3D11_BLEND_ONE ? 2 : 1));
       gd->mv_blend_state = blend_state;
    }
 
@@ -1397,12 +1357,6 @@ class Borderlands2 final : public Game
          {
             color_texture->GetDesc(&color_desc);
          }
-#if DEVELOPMENT
-         gd.mv_stats.rejected_format = rtv_desc.Format;
-         gd.mv_stats.rejected_dimension = rtv_desc.ViewDimension;
-         gd.mv_stats.rejected_width = color_desc.Width;
-         gd.mv_stats.rejected_height = color_desc.Height;
-#endif
          // The fill reads the scene: it needs a shader resource view. Filtered by the resource, not the view (dgVoodoo binds single-slice
          // array views).
          if (rtv_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || color_desc.ArraySize != 1 || color_desc.SampleDesc.Count != 1 || (color_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0)
@@ -1955,7 +1909,6 @@ class Borderlands2 final : public Game
       graphics_state.Cache(native_device_context, device_data.uav_max_count);
       compute_state.Cache(native_device_context, device_data.uav_max_count);
       auto* const fill_shader = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("BL2TPS Motion Vector Fill CS"));
-      bool filled = false;
       if (gd.mv_scene_srv)
       {
          com_ptr<ID3D11Resource> srv_resource;
@@ -2041,7 +1994,6 @@ class Borderlands2 final : public Game
             ID3D11ShaderResourceView* const null_srvs[std::size(srvs)] = {};
             native_device_context->CSSetUnorderedAccessViews(0, UINT(std::size(null_uavs)), null_uavs, nullptr);
             native_device_context->CSSetShaderResources(0, UINT(std::size(null_srvs)), null_srvs);
-            filled = true;
             gd.mv_filled = true;
             if (write_reactive)
             {
@@ -2054,8 +2006,6 @@ class Borderlands2 final : public Game
                native_device_context->ClearUnorderedAccessViewFloat(gd.mv_reactive_uav.get(), zero);
                native_device_context->ClearUnorderedAccessViewFloat(gd.mv_transparency_uav.get(), zero);
             }
-#endif
-#if DEVELOPMENT
             if (perf_queries && perf_queries->Marked(PERF_SCENE_END) && !perf_queries->Marked(PERF_SCENE_TAIL_END))
             {
                perf_queries->Mark(native_device_context, PERF_FILL_END);
@@ -2064,7 +2014,7 @@ class Borderlands2 final : public Game
          }
       }
       // The upscaler's depth comes from the fill
-      if (IsSRActive(device_data) && filled)
+      if (IsSRActive(device_data) && gd.mv_filled)
       {
          [[maybe_unused]] const bool drawn = DrawUpscaler(native_device, native_device_context, device_data, write_reactive);
 #if DEVELOPMENT
@@ -2087,7 +2037,7 @@ public:
       reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
-      reshade::unregister_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot>);
+      reshade::unregister_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot, true>);
       reshade::unregister_event<reshade::addon_event::bind_pipeline>(PatchedDraws::OnBindPipeline<GetBoundStates>);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(PatchedDraws::OnPushConstantBuffers<GetBoundStates>);
       reshade::unregister_event<reshade::addon_event::bind_vertex_buffers>(PatchedDraws::OnBindVertexBuffers<GetBoundStates>);
@@ -2101,7 +2051,7 @@ public:
       Mcp::RegisterToggles({{"smaa_enable", &g_smaa_enable}, {"smaa_t2x", &g_smaa_t2x}, {"smaa_predication", &g_smaa_predication}, {"smaa_pred_debug", &g_smaa_pred_debug}, {"smaa_pred_measure", &g_smaa_pred_measure},
          { "hide_ui",
             &g_hide_ui }});
-      Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_match_objects", &g_mv_match_objects}, {"mv_buffer_filter", &g_mv_buffer_filter}, {"mv_constants_pool", &g_mv_constants_pool}, {"blend_memo", &g_blend_memo}, {"bound_state_tracking", &g_bound_state_tracking}, {"bound_state_check", &g_bound_state_check}, {"vc4_mirror", &g_vc4_mirror}, {"vc4_mirror_check", &g_vc4_mirror_check}, {"mv_trace_loading", &g_mv_trace_loading}, { "perf_hook_timers",
+      Mcp::RegisterToggles({{"mv_enable", &g_mv_enable}, {"mv_debug_view", &g_mv_debug_view}, {"mv_force_jitter", &g_mv_force_jitter}, {"mv_match_objects", &g_mv_match_objects}, {"mv_buffer_filter", &g_mv_buffer_filter}, {"mv_constants_pool", &g_mv_constants_pool}, {"bound_state_tracking", &g_bound_state_tracking}, {"bound_state_check", &g_bound_state_check}, {"vc4_mirror", &g_vc4_mirror}, {"vc4_mirror_check", &g_vc4_mirror_check}, {"mv_trace_loading", &g_mv_trace_loading}, { "perf_hook_timers",
                                &Perf::g_hook_timers }});
       // As the "Performance Test" combo: a mode cancels a running sweep; "perf_sweep" 1 starts the GPU "Sweep", 2 the "CPU Sweep", 0 stops it
       Mcp::RegisterInts({{"perf_test", &Perf::g_test, 0, int(std::size(perf_test_modes)) - 1, [](DeviceData& device_data, double value)
@@ -2142,7 +2092,7 @@ public:
 #endif
       // Game-specific toggle consumed by the tonemap replacement (Luma_BL2TPS_Tonemap.hlsl).
       std::vector<ShaderDefineData> game_shader_defines_data = {
-         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla grade (reference)\n1 - HDR: native grade + reconstructed luminance + PsychoV31 display map", 1},
+         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla grade (reference)\n1 - HDR: native grade + reconstructed luminance + C-infinity rolloff", 1},
       };
       shader_defines_data.append_range(game_shader_defines_data);
       assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
@@ -2179,7 +2129,7 @@ public:
          ShaderDefinition("Luma_BL2TPS_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
       native_shaders_definitions.emplace(CompileTimeStringHash("BL2TPS Copy Back PS"),
          ShaderDefinition("Luma_BL2TPS_CopyBack", reshade::api::pipeline_subobject_type::pixel_shader));
-      reshade::register_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot>);
+      reshade::register_event<reshade::addon_event::create_pipeline>(PatchedDraws::OnCreateBlendState<MotionVectorPatches::target_slot, MotionVectorPatches::reactive_slot, true>);
       reshade::register_event<reshade::addon_event::bind_pipeline>(PatchedDraws::OnBindPipeline<GetBoundStates>);
       reshade::register_event<reshade::addon_event::push_descriptors>(PatchedDraws::OnPushConstantBuffers<GetBoundStates>);
       reshade::register_event<reshade::addon_event::bind_vertex_buffers>(PatchedDraws::OnBindVertexBuffers<GetBoundStates>);
@@ -2193,9 +2143,9 @@ public:
       // User settings mirrored into LumaSettings.GameSettings; GameCBuffers.hlsl says which act in SDR too.
       default_luma_global_game_settings.Exposure = 1.f;           // scene multiplier (1x)
       default_luma_global_game_settings.Saturation = 1.f;         // BT.709-luminance lerp (Color.hlsl Saturation)
-      default_luma_global_game_settings.HighlightDechroma = 0.f;  // off; only PsychoV31's gamut compression desaturates
+      default_luma_global_game_settings.HighlightDechroma = 0.f;  // off; the native grade keeps its own highlight whitening
       default_luma_global_game_settings.BloomIntensity = 1.f;     // seed only; OnDrawOrDispatch owns the effective value
-      default_luma_global_game_settings.Contrast = 1.f;           // PsychoV31's contrast (its cone response power)
+      default_luma_global_game_settings.Contrast = 1.f;           // power of relative luminance around mid gray
       default_luma_global_game_settings.VignetteIntensity = 1.f;  // game vignette darkening scale
       default_luma_global_game_settings.LumaBloomEnable = 1.f;    // 1 = Luma HDR pyramidal bloom, 0 = vanilla game bloom
       default_luma_global_game_settings.Dithering = 1.f;          // animated triangular dither at output (HDR and SDR), anti-banding on
@@ -2231,166 +2181,8 @@ public:
       Game::OnDestroyDeviceData(device_data);
    }
 
-   // dgVoodoo sometimes leaves blending ENABLED on a secondary RT while RT0 has it off; D3D9 has one global blend
-   // state, so the game never asked for it and that target is corrupted (diagnosed in TW2, water PS 0xDA16C815). No
-   // symptom known here: preventive, and the DEVELOPMENT log reports whether it occurs. Repair = copy RT0's blend
-   // fields onto the offenders, write masks kept. Not gated on is_immediate: blend state records fine into a deferred
-   // list. Returns true iff it ran the original draw itself.
-   bool FixImpossiblePerRTBlend(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, bool is_immediate, Borderlands2GameDeviceData* gd, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, std::function<void()>* original_draw_dispatch_func)
-   {
-      // Our own injected passes set their blend state deliberately. Re-issuing the draw is the only way to
-      // apply a different state, so without that callback there is nothing to do.
-      if (is_custom_pass || (stages & reshade::api::shader_stage::pixel) == 0 || original_draw_dispatch_func == nullptr)
-         return false;
-
-      // Tracked on the immediate context (see "bound_states")
-      com_ptr<ID3D11BlendState> queried_blend_state;
-      ID3D11BlendState* blend_state = nullptr;
-      if (is_immediate)
-      {
-         blend_state = gd->bound_states.BlendState(native_device_context);
-      }
-      else
-      {
-         native_device_context->OMGetBlendState(&queried_blend_state, nullptr, nullptr);
-         blend_state = queried_blend_state.get();
-      }
-      if (!blend_state)
-         return false; // no state object = default (blending off everywhere)
-
-      // Only BOUND targets count: the wrapper leaves stale BlendEnable in unused descriptor slots, which alone
-      // matches nearly every draw and would take over passes other hooks own; Luma's own slots (from
-      // "MotionVectorPatches::target_slot") differ by design (see "OnCreateBlendState"). Free descriptor scan first.
-      constexpr UINT game_targets = MotionVectorPatches::target_slot;
-      // "g_blend_memo": the checks on the state alone, remembered for it (a GetDesc and a loop on every draw of the frame: every
-      // blending state has independent blend, see "OnCreateBlendState"). Per thread (this runs on every context) and per frame (a
-      // released state's pointer can come back as another's).
-      struct BlendMemo
-      {
-         ID3D11BlendState* state = nullptr;
-         uint32_t frame = UINT32_MAX;
-         bool candidate = false;
-         D3D11_BLEND_DESC desc;
-      };
-      thread_local BlendMemo memo;
-      const bool memoized = g_blend_memo && memo.state == blend_state && memo.frame == cb_luma_global_settings.FrameIndex;
-      if (memoized && !memo.candidate)
-         return false;
-      D3D11_BLEND_DESC queried;
-      if (!memoized)
-      {
-         blend_state->GetDesc(&queried);
-         // One state for all targets is already D3D9-shaped
-         bool candidate = queried.IndependentBlendEnable;
-#if !DEVELOPMENT
-         // Only the "RT0 off, RTn on" shape is ever repaired, so outside DEVELOPMENT (where the inverse shape is logged) a blending
-         // RT0 has nothing to do here: skip the descriptor scan and the render-target query both.
-         candidate &= !queried.RenderTarget[0].BlendEnable;
-#endif
-         bool disagreement = false;
-         for (UINT i = 1; i < game_targets && !disagreement; i++)
-         {
-            disagreement = queried.RenderTarget[i].BlendEnable != queried.RenderTarget[0].BlendEnable;
-         }
-         candidate &= disagreement;
-         if (g_blend_memo)
-         {
-            memo.state = blend_state;
-            memo.frame = cb_luma_global_settings.FrameIndex;
-            memo.candidate = candidate;
-            if (candidate)
-            {
-               memo.desc = queried;
-            }
-         }
-         if (!candidate)
-            return false;
-      }
-      const D3D11_BLEND_DESC& bd = (memoized ? memo.desc : queried);
-      const bool rt0_blending = bd.RenderTarget[0].BlendEnable != FALSE;
-
-      ID3D11RenderTargetView* rtvs[game_targets] = {};
-      native_device_context->OMGetRenderTargets(game_targets, rtvs, nullptr);
-      bool bound[game_targets] = {};
-      for (UINT i = 0; i < game_targets; i++)
-      {
-         bound[i] = rtvs[i] != nullptr;
-         if (rtvs[i])
-         {
-            rtvs[i]->Release(); // OMGetRenderTargets hands back references; only the bound/not-bound answer is kept
-         }
-      }
-
-      bool needs_fix = false;
-      [[maybe_unused]] bool inverse_shape = false;
-      for (UINT i = 1; i < game_targets; i++)
-      {
-         if (!bound[i] || bd.RenderTarget[i].BlendEnable == bd.RenderTarget[0].BlendEnable)
-            continue;
-         if (bd.RenderTarget[0].BlendEnable == FALSE)
-         {
-            needs_fix = true;
-         }
-         else
-         {
-            inverse_shape = true;
-         }
-      }
-
-#if DEVELOPMENT
-      // One line per distinct shader, so a play session reports every pass that carries this.
-      if (needs_fix || inverse_shape)
-      {
-         // Locked: this function deliberately runs on every context (see its header), so two can reach the set.
-         static std::mutex logged_shaders_mutex;
-         static std::unordered_set<uint64_t> logged_shaders;
-         const uint64_t pixel_shader_hash = original_shader_hashes.pixel_shaders[0];
-         const std::scoped_lock logged_shaders_lock(logged_shaders_mutex);
-         if (logged_shaders.emplace(pixel_shader_hash).second)
-         {
-            reshade::log::message(reshade::log::level::warning,
-               std::format("[BL-BlendFix] impossible per-RT blend state (dgVoodoo artefact) on pixel shader 0x{:X} - {}", pixel_shader_hash, needs_fix ? "repaired" : "inverse shape, left alone").c_str());
-         }
-      }
-#endif
-
-      if (!needs_fix)
-         return false;
-
-      ComPtr<ID3D11BlendState> fixed_state;
-      if (const auto it = gd->fixed_blend_states.find(bd); it != gd->fixed_blend_states.end())
-      {
-         fixed_state = it->second;
-      }
-      else
-      {
-         D3D11_BLEND_DESC fixed_desc = bd;
-         for (UINT i = 1; i < game_targets; i++)
-         {
-            if (fixed_desc.RenderTarget[i].BlendEnable == bd.RenderTarget[0].BlendEnable)
-               continue;
-            const UINT8 write_mask = fixed_desc.RenderTarget[i].RenderTargetWriteMask; // legal per-RT in D3D9, keep it
-            fixed_desc.RenderTarget[i] = bd.RenderTarget[0];
-            fixed_desc.RenderTarget[i].RenderTargetWriteMask = write_mask;
-         }
-         if (FAILED(native_device->CreateBlendState(&fixed_desc, fixed_state.put())) || !fixed_state)
-            return false; // leave the draw untouched rather than run it half-applied
-         gd->fixed_blend_states[bd] = fixed_state;
-      }
-
-      FLOAT blend_factor[4];
-      UINT sample_mask = 0;
-      com_ptr<ID3D11BlendState> bound_blend_state;
-      native_device_context->OMGetBlendState(&bound_blend_state, blend_factor, &sample_mask);
-      native_device_context->OMSetBlendState(fixed_state.get(), blend_factor, sample_mask);
-      (*original_draw_dispatch_func)();
-      native_device_context->OMSetBlendState(blend_state, blend_factor, sample_mask); // hand the game back its own state
-      return true;
-   }
-
    // Re-applies the stencil test dgVoodoo drops on the item card's rolling price digits. Returns true iff it ran
    // the original draw itself (caller returns Replaced).
-
    bool RepairScaleformStencilMask(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, Borderlands2GameDeviceData* gd, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool is_immediate, std::function<void()>* original_draw_dispatch_func)
    {
       if (!is_immediate || is_custom_pass)
@@ -2403,9 +2195,7 @@ public:
       const auto is_mask_submit = [&]
       {
          ComPtr<ID3D11BlendState> blend_state;
-         FLOAT blend_factor[4];
-         UINT sample_mask = 0;
-         native_device_context->OMGetBlendState(blend_state.put(), blend_factor, &sample_mask);
+         native_device_context->OMGetBlendState(blend_state.put(), nullptr, nullptr);
          if (!blend_state)
             return false;
          D3D11_BLEND_DESC bd;
@@ -2413,8 +2203,7 @@ public:
          if (bd.RenderTarget[0].RenderTargetWriteMask != 0)
             return false;
          ComPtr<ID3D11DepthStencilState> ds_state;
-         UINT stencil_ref = 0;
-         native_device_context->OMGetDepthStencilState(ds_state.put(), &stencil_ref);
+         native_device_context->OMGetDepthStencilState(ds_state.put(), nullptr);
          if (!ds_state)
             return false;
          D3D11_DEPTH_STENCIL_DESC dsd;
@@ -2473,8 +2262,6 @@ public:
             // Write 1 everywhere the mask draws, depth off
             CD3D11_DEPTH_STENCIL_DESC write_desc(D3D11_DEFAULT);
             write_desc.DepthEnable = FALSE;
-            write_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
-            write_desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
             write_desc.StencilEnable = TRUE;
             write_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
             write_desc.BackFace = write_desc.FrontFace;
@@ -2530,8 +2317,6 @@ public:
             // Test-only: pass exactly where the duplicated mask wrote 1, never write, depth off.
             CD3D11_DEPTH_STENCIL_DESC test_desc(D3D11_DEFAULT);
             test_desc.DepthEnable = FALSE;
-            test_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
-            test_desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
             test_desc.StencilEnable = TRUE;
             test_desc.StencilWriteMask = 0;
             test_desc.FrontFace.StencilFunc = D3D11_COMPARISON_EQUAL;
@@ -2946,13 +2731,13 @@ public:
 #if DEVELOPMENT
          const Perf::HookTimer perf_timer{&gd.perf_window.hook_ns}; // The draws' own submission included
 #endif
-         if (!gd.mv_scene_done && std::ranges::any_of(kScenePostHashes, [&](uint32_t hash)
-                                     { return original_shader_hashes.Contains(hash, reshade::api::shader_stage::pixel); }))
+         const uint32_t pixel_shader_hash = uint32_t(original_shader_hashes.pixel_shaders[0]);
+         if (!gd.mv_scene_done && kScenePostHashes.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
          {
             if (gd.mv_scene_open)
             {
 #if DEVELOPMENT
-               gd.mv_stats.ended_by = uint32_t(original_shader_hashes.pixel_shaders[0]);
+               gd.mv_stats.ended_by = pixel_shader_hash;
 #endif
                // A copy of the scene (same description, CopyResource compatible) among the pass's textures
                gd.mv_scene_copy.reset();
@@ -2987,16 +2772,8 @@ public:
             {
                OpenScene(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0], dsv.get());
             }
-            // The draw with dgVoodoo's per-target blend repaired, as every other draw (see "FixImpossiblePerRTBlend")
-            const std::function<void()> draw = [&]
-            {
-               if (!FixImpossiblePerRTBlend(native_device, native_device_context, true, &gd, stages, original_shader_hashes, is_custom_pass, original_draw_dispatch_func))
-               {
-                  (*original_draw_dispatch_func)();
-               }
-            };
-            const bool motion_vectors = DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, draw, rtvs, dsv.get());
-            const bool jitter = !motion_vectors && DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, draw, rtvs, dsv.get());
+            const bool motion_vectors = DrawWithMotionVectors(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv.get());
+            const bool jitter = !motion_vectors && DrawWithJitter(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv.get());
 #if DEVELOPMENT
             Mcp::Annotate(cmd_list_data, motion_vectors ? "mv" : (jitter ? "jitter" : "unpatched"));
             if (const int reject = std::exchange(gd.mv_draw_reject, -1); reject >= 0)
@@ -3009,7 +2786,7 @@ public:
 #if DEVELOPMENT
             // A pass reading the scene (or a copy of it) into another target before the end. Off while a "Performance Test" runs
             // (CPU on every draw that Publishing doesn't pay), as the audit below and the stats log.
-            if (Perf::g_test == 0 && gd.mv_scene_open && gd.mv_scene_color && !gd.mv_reads_before_end.contains(uint32_t(original_shader_hashes.pixel_shaders[0])))
+            if (Perf::g_test == 0 && gd.mv_scene_open && gd.mv_scene_color && !gd.mv_reads_before_end.contains(pixel_shader_hash))
             {
                com_ptr<ID3D11Resource> target;
                if (rtvs[0])
@@ -3033,9 +2810,9 @@ public:
                   {
                      GetResourceInfo(target.get(), size, format);
                   }
-                  gd.mv_reads_before_end.insert(uint32_t(original_shader_hashes.pixel_shaders[0]));
+                  gd.mv_reads_before_end.insert(pixel_shader_hash);
                   reshade::log::message(reshade::log::level::info, std::format("[BL2 MV] frame {}: PS 0x{:08X} reads the scene before its end, into {} {}x{} (depth {})", cb_luma_global_settings.FrameIndex,
-                                                                      uint32_t(original_shader_hashes.pixel_shaders[0]), target ? GetFormatNameSafe(format) : "none", size.x, size.y, dsv ? "bound" : "none")
+                                                                      pixel_shader_hash, target ? GetFormatNameSafe(format) : "none", size.x, size.y, dsv ? "bound" : "none")
                                                                       .c_str());
                   break;
                }
@@ -3044,7 +2821,7 @@ public:
          }
 #if DEVELOPMENT
          // A draw into the scene and its depth after the end
-         else if (Perf::g_test == 0 && gd.mv_scene_done && gd.mv_scene_color && gd.mv_depth && !is_custom_pass && !gd.mv_draws_after_end.contains(uint32_t(original_shader_hashes.pixel_shaders[0])))
+         else if (Perf::g_test == 0 && gd.mv_scene_done && gd.mv_scene_color && gd.mv_depth && !is_custom_pass && !gd.mv_draws_after_end.contains(pixel_shader_hash))
          {
             com_ptr<ID3D11RenderTargetView> rtv;
             com_ptr<ID3D11DepthStencilView> dsv;
@@ -3060,9 +2837,9 @@ public:
             }
             if (color == gd.mv_scene_color && depth == gd.mv_depth)
             {
-               gd.mv_draws_after_end.insert(uint32_t(original_shader_hashes.pixel_shaders[0]));
+               gd.mv_draws_after_end.insert(pixel_shader_hash);
                reshade::log::message(reshade::log::level::warning, std::format("[BL2 MV] frame {}: PS 0x{:08X} (VS 0x{:08X}) draws into the scene after its end (ended by 0x{:08X})", cb_luma_global_settings.FrameIndex,
-                                                                      uint32_t(original_shader_hashes.pixel_shaders[0]), uint32_t(original_shader_hashes.vertex_shaders[0]), gd.mv_stats.ended_by)
+                                                                      pixel_shader_hash, uint32_t(original_shader_hashes.vertex_shaders[0]), gd.mv_stats.ended_by)
                                                                       .c_str());
             }
          }
@@ -3075,13 +2852,10 @@ public:
          PatchedDraws::RestoreGameShader(native_device_context, &gd.mv_bound_pixel_shader);
       }
 
-      if (is_immediate && !is_custom_pass && (stages & reshade::api::shader_stage::pixel) != 0)
+      // Track this area's authored bloom threshold off the native bright pass; the Luma prefilter needs it.
+      if (is_immediate && !is_custom_pass && (stages & reshade::api::shader_stage::pixel) != 0 && ContainsPixelShader(original_shader_hashes, kBloomBrightPassHash, kBloomBrightPassHash_v281))
       {
-         // Track this area's authored bloom threshold off the native bright pass; the Luma prefilter needs it.
-         if (ContainsPixelShader(original_shader_hashes, kBloomBrightPassHash, kBloomBrightPassHash_v281))
-         {
-            CaptureBloomConstants(native_device, native_device_context, &gd);
-         }
+         CaptureBloomConstants(native_device, native_device_context, &gd);
       }
 
       // Scaleform item-card price-digit stencil repair: returns Replaced when it re-runs the draw itself.
@@ -3162,11 +2936,7 @@ public:
             bloom_state.Cache(native_device_context, device_data.uav_max_count);
 
             // DrawBloom binds only b11, so the prefilter would not see LumaSettings without this (donor: MELE).
-            if (luma_settings_cbuffer_index < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
-            {
-               ID3D11Buffer* settings_cb = device_data.luma_global_settings.get();
-               native_device_context->PSSetConstantBuffers(luma_settings_cbuffer_index, 1, &settings_cb);
-            }
+            SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
 
             ComPtr<ID3D11ShaderResourceView> srv_karis;
             DrawKarisAverage(native_device, native_device_context, device_data, scene_srv.get(), srv_karis.put());
@@ -3263,9 +3033,7 @@ public:
       if (g_hide_ui && is_immediate && !is_custom_pass && gd.tonemap_fired_this_frame && !IsAnyTonemap(original_shader_hashes) && !IsFXAA(original_shader_hashes))
       {
          ComPtr<ID3D11BlendState> blend_state;
-         FLOAT blend_factor[4];
-         UINT sample_mask = 0;
-         native_device_context->OMGetBlendState(blend_state.put(), blend_factor, &sample_mask);
+         native_device_context->OMGetBlendState(blend_state.put(), nullptr, nullptr);
          bool alpha_blended = false;
          if (blend_state)
          {
@@ -3288,16 +3056,8 @@ public:
          }
 
          if (alpha_blended || on_ldr_buffer)
-         {
-            if (g_hide_ui)
-               return DrawOrDispatchOverrideType::Skip;
-         }
+            return DrawOrDispatchOverrideType::Skip;
       }
-
-      // LAST on purpose: this one re-issues the draw itself, so it must yield to every hook above, or it runs
-      // vanilla a pass another hook meant to take over.
-      if (FixImpossiblePerRTBlend(native_device, native_device_context, is_immediate, &gd, stages, original_shader_hashes, is_custom_pass, original_draw_dispatch_func))
-         return DrawOrDispatchOverrideType::Replaced;
 
       return DrawOrDispatchOverrideType::None;
    }
@@ -3441,8 +3201,8 @@ public:
       {
          auto& window = gd.perf_window;
          const char* const aa = (IsSRActive(device_data) ? SR::GetTypeName(device_data.sr_type) : (g_mv_enable ? "MV only" : (g_smaa_enable ? "SMAA" : "none")));
-         const std::string settings = std::format("mode=\"{}\" hook_timers={} aa={} vc4_filter={} vc4_pool={} blend_memo={} output={}x{}", perf_test_modes[Perf::g_test].name, Perf::g_hook_timers, aa,
-            g_mv_buffer_filter, g_mv_constants_pool, g_blend_memo, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
+         const std::string settings = std::format("mode=\"{}\" hook_timers={} aa={} vc4_filter={} vc4_pool={} output={}x{}", perf_test_modes[Perf::g_test].name, Perf::g_hook_timers, aa,
+            g_mv_buffer_filter, g_mv_constants_pool, uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y));
          // Also until the upscaler draws (the SR bridge's helper takes seconds to start, passing the color through meanwhile), and
          // longer after leaving it
          const bool sr_exit = std::exchange(gd.perf_sr_active, IsSRActive(device_data)) && !IsSRActive(device_data);
@@ -3471,7 +3231,7 @@ public:
             const double fill = stats.end_parts[0].Average(), upscaler = stats.end_parts[1].Average(), copy_back = stats.end_parts[2].Average(), scene_copy = stats.end_parts[3].Average();
             const double hooks = window.HookMs();
             // Read every window (a helper still exiting after the upscaler was left keeps writing), kept only where the upscaler ran
-            const double helper_rows = ReadHelperEvaluateMs(gd);
+            const double helper_rows = ReadHelperEvaluateMs(&gd);
             const double helper_evaluate = (stats.end_parts[1].samples != 0 ? helper_rows : std::numeric_limits<double>::quiet_NaN());
             reshade::log::message(reshade::log::level::info, std::format("[BL2 Perf] {} gpu frame avg/max={:.3f}/{:.3f} ms scene avg/max={:.3f}/{:.3f} ms ({}) end avg/max={:.3f}/{:.3f} ms ({}) = fill {:.3f} + upscaler {:.3f} (helper evaluate {:.3f}) + copy back {:.3f} + scene copy {:.3f} ms ({}) cpu frame avg={:.3f} ms cpu hooks={:.3f} ms/frame samples={}/{} disjoint={}",
                                                                 settings, stats.frame.Average(), stats.frame.max_ms, stats.scene.Average(), stats.scene.max_ms, stats.scene.samples, stats.end.Average(), stats.end.max_ms, stats.end.samples, fill, upscaler, helper_evaluate, copy_back, scene_copy, stats.end_parts[0].samples, window.CpuFrameMs(), hooks, stats.frame.samples, window.frames, window.disjoint)
@@ -3504,7 +3264,12 @@ public:
       // The DEV panel's counts in ReShade.log every 300 frames while motion vectors run
       if (const auto& stats = gd.mv_last_stats; gd.mv_active && Perf::g_test == 0 && cb_luma_global_settings.FrameIndex % 300 == 0)
       {
-         reshade::log::message(reshade::log::level::info, std::format("[BL2 MV] frame {}: {} mv ({} matched, {} camera only, {} other camera, {} uncopied), {} jitter, {} maps, {} updates, {} other maps, sr {} ({}), near {:.3f} far {:.0f}, ended by 0x{:08X} (scene slot {}, copy {}), refused {}/{}/{}/{}/{}/{}/{}/{}/{}, bound state mismatches {}, vc4 mirror {} (mismatches {}, in used rows {}, last at row {} of VS 0x{:08X}, unknown {})", cb_luma_global_settings.FrameIndex, stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws, stats.maps, stats.updates, stats.other_maps, stats.sr_draws, int(device_data.sr_type), stats.near_plane, stats.far_plane, stats.ended_by, stats.ended_by_scene_slot, gd.mv_scene_copy != nullptr, stats.rejected[0], stats.rejected[1], stats.rejected[2], stats.rejected[3], stats.rejected[4], stats.rejected[5], stats.rejected[6], stats.rejected[7], stats.rejected[8], stats.bound_state_mismatches, gd.vertex_constants ? "on" : "off", stats.vc4_mirror_mismatches, stats.vc4_mirror_used_mismatches, stats.vc4_mirror_mismatch_row, stats.vc4_mirror_mismatch_vs, stats.vc4_mirror_unknown).c_str());
+         std::string refused;
+         for (size_t i = 0; i < REJECT_COUNT; i++)
+         {
+            refused += std::format("{}{}", i == 0 ? "" : "/", stats.rejected[i]);
+         }
+         reshade::log::message(reshade::log::level::info, std::format("[BL2 MV] frame {}: {} mv ({} matched, {} camera only, {} other camera, {} uncopied), {} jitter, {} maps, {} updates, {} other maps, sr {} ({}), near {:.3f} far {:.0f}, ended by 0x{:08X} (scene slot {}, copy {}), refused {}, bound state mismatches {}, vc4 mirror {} (mismatches {}, in used rows {}, last at row {} of VS 0x{:08X}, unknown {})", cb_luma_global_settings.FrameIndex, stats.motion_vector_draws, stats.matched, stats.camera_only, stats.other_camera, stats.uncopied, stats.jitter_draws, stats.maps, stats.updates, stats.other_maps, stats.sr_draws, int(device_data.sr_type), stats.near_plane, stats.far_plane, stats.ended_by, stats.ended_by_scene_slot, gd.mv_scene_copy != nullptr, refused, stats.bound_state_mismatches, gd.vertex_constants ? "on" : "off", stats.vc4_mirror_mismatches, stats.vc4_mirror_used_mismatches, stats.vc4_mirror_mismatch_row, stats.vc4_mirror_mismatch_vs, stats.vc4_mirror_unknown).c_str());
       }
       // "MV Debug View": Core's debug draw of the target, absolute values in pixels
       {
@@ -3556,7 +3321,7 @@ public:
       reshade::get_config_value(nullptr, NAME, "VignetteIntensity", gs.VignetteIntensity);
 
       reshade::get_config_value(nullptr, NAME, "LumaBloomEnable", g_luma_bloom_enable);
-      gs.LumaBloomEnable = g_luma_bloom_enable ? 1.f : 0.f; // mirror to the shader composite switch
+      gs.LumaBloomEnable = (g_luma_bloom_enable ? 1.f : 0.f); // mirror to the shader composite switch
 
       reshade::get_config_value(nullptr, NAME, "Dithering", gs.Dithering);
 
@@ -3665,7 +3430,7 @@ public:
       // Mirrored to the shader composite switch
       if (DrawSettingCheckbox("Luma Bloom Enable", "LumaBloomEnable", &g_luma_bloom_enable, true, "Replaces the game's bloom with a wider, softer HDR bloom."))
       {
-         gs.LumaBloomEnable = g_luma_bloom_enable ? 1.f : 0.f;
+         gs.LumaBloomEnable = (g_luma_bloom_enable ? 1.f : 0.f);
       }
 
       // Scales the injected Luma bloom only. With the pyramid off the game's own bloom runs at the strength its

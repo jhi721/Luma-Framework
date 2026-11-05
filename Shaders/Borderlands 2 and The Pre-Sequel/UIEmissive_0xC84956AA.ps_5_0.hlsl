@@ -2,7 +2,7 @@
 // o0 = min(color, 4) * vertexColor.w + vertexColor.xyz can exceed 1.0; vanilla's 8-bit UNORM backbuffer clamped that
 // for free, Luma's fp16 LDR does not, and since it draws POST-tonemap the overshoot bypasses the display map and the paper-white
 // scale blows the icon to ~10000 nits. Fix: re-add the saturate. Body verbatim from the dgVoodoo ps_5_0 disasm; the
-// cb3 and/or pairs are dgVoodoo's texture-format bit emulation (mask+set), kept exactly via asuint/asfloat.
+// cb3 and/or pairs are dgVoodoo's texture-format bit emulation (mask+set), through ApplyDgvMask.
 
 #include "../Includes/DgVoodoo.hlsl" // DGV_MAIN_SIGNATURE
 
@@ -33,12 +33,12 @@ void main(DGV_MAIN_SIGNATURE)
 
    r0.xy = v5.xy + cb4[18].xy;
    r0.xyzw = t3.Sample(s3_s, r0.xy).xyzw;
-   r0.xyzw = asfloat((asuint(r0.xyzw) & asuint(cb3[50].xyzw)) | asuint(cb3[51].xyzw));
+   r0.xyzw = ApplyDgvMask(r0, cb3[50], cb3[51]);
    r0.yz = v5.xy + cb4[17].xy;
    r1.xyzw = t3.Sample(s3_s, r0.yz).xyzw;
-   r1.xyzw = asfloat((asuint(r1.xyzw) & asuint(cb3[50].xyzw)) | asuint(cb3[51].xyzw));
+   r1.xyzw = ApplyDgvMask(r1, cb3[50], cb3[51]);
    r2.xyzw = t2.Sample(s2_s, r0.yz).xyzw;
-   r2.xyzw = asfloat((asuint(r2.xyzw) & asuint(cb3[48].xyzw)) | asuint(cb3[49].xyzw));
+   r2.xyzw = ApplyDgvMask(r2, cb3[48], cb3[49]);
    r0.yzw = float3(1, 1, 1) + -r2.xyz;
    r0.x = r1.x * r0.x;
    r0.x = 10 * r0.x;
@@ -49,19 +49,19 @@ void main(DGV_MAIN_SIGNATURE)
    r1.x = exp2(r3.x);
    r0.x = -9.99999997e-007 + abs(r0.x);
    r2.xyzw = t0.Sample(s0_s, v5.xy).xyzw;
-   r2.xyzw = asfloat((asuint(r2.xyzw) & asuint(cb3[44].xyzw)) | asuint(cb3[45].xyzw));
+   r2.xyzw = ApplyDgvMask(r2, cb3[44], cb3[45]);
    r1.yzw = float3(1, 1.39999998, 3) * r2.yzx;
    r1.x = r1.x * r1.w;
    r1.x = cb4[19].w * r1.x;
    r3.w = cmp(r0.x >= 0);
    o0.w = r3.w ? r1.x : 0;
    r2.xyzw = t1.Sample(s1_s, v5.xy).xyzw;
-   r2.xyzw = asfloat((asuint(r2.xyzw) & asuint(cb3[46].xyzw)) | asuint(cb3[47].xyzw));
+   r2.xyzw = ApplyDgvMask(r2, cb3[46], cb3[47]);
    r1.yz = r2.yz * r1.yz;
    r1.x = 0;
    r1.xyz = float3(6, 6, 6) * r1.xyz;
    r2.xyzw = t2.Sample(s2_s, v5.xy).xyzw;
-   r2.xyzw = asfloat((asuint(r2.xyzw) & asuint(cb3[48].xyzw)) | asuint(cb3[49].xyzw));
+   r2.xyzw = ApplyDgvMask(r2, cb3[48], cb3[49]);
    r0.x = 1 + -r2.y;
    r0.xyz = r0.xxx * r0.yzw;
    r2.xyz = r0.xyz * float3(0, 10, 12) + -r1.xyz;
