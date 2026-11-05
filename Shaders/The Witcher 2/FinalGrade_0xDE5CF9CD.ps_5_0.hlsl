@@ -3,14 +3,16 @@
 #include "Includes/Common.hlsl" // game-local: LumaGameSettings — keep FIRST
 #include "../Includes/Color.hlsl"
 #include "Includes/GameBindings.hlsl"   // b3/b4, the dgVoodoo masks, ApplyDgvMask, DgVoodooRcp, DgVoodooLog2
-#include "../Includes/PsychoV31HueReference.hlsl" // PsychoVDisplayMapWithHueReference
+#include "../Includes/CInfinityRolloff.hlsl" // Tonemap::CInfinityRollOff::MaxChannel (the display map)
+#include "../Includes/Reinhard.hlsl" // Reinhard::ReinhardPiecewise (hue reference)
+#include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueAndPurityEmulationBT2020
 // clang-format on
 
 // The Witcher 2 FINAL GRADE pass (dgVoodoo -> ps_5_0, hash 0xDE5CF9CD), the engine's
 // CEnvFinalColorBalanceParameters: FXAA + shadow offset, midtone power and highlight gain + luma-keyed split
 // toning + vignette, on the full-res fp16 canvas right before the UI draws.
 // Vanilla body transcribed VERBATIM (register-level, constants cb4[N] = DX9 c(N-8)). This is also where the
-// Luma HDR output block lives (highlight hue + PsychoV31 + UI paper-white pre-scale): the highlight split tone lerps
+// Luma HDR output block lives (highlight hue + C-infinity rolloff + UI paper-white pre-scale): the highlight split tone lerps
 // toward a SATURATED luma target and soft-clips everything above 1.0, so the HDR range dies here unless it is
 // rebuilt after it. The tonemap replacements stay vanilla-only.
 //
@@ -240,20 +242,34 @@ void main(DGV_MAIN_SIGNATURE)
       float3 postProcessedColor;
       if (LumaSettings.DisplayMode == 1) // HDR
       {
-         // Highlight hue: the colour stage of the other hard-clip ports (Borderlands GOTY, Medal of Honor Airborne,
-         // Mass Effect 2007) and of RenoDX's BL1 template. Vanilla clipped per channel twice, in the glow blend
-         // before this grade and in the 8-bit present blit after it, which bends a bright saturated source toward
-         // yellow-white; Luma removes both clips. After the display map the hue is bent the same way, partway and
-         // without the whitening: a per-channel ReinhardPiecewise(5, 1.5) of the colour in BT.2020 supplies a hue
-         // DIRECTION, and MacLeod-Boynton puts it on the mapped colour's purity and T = L + M, replacing PsychoV31's own
-         // highlight lean. Full hue strength and no purity transfer (the RenoDX ports' Hue Shift 100% and Blowout 0),
-         // fixed rather than exposed. The clip colour itself is no reference: a fully clipped one is achromatic, with no
-         // MacLeod-Boynton direction at all.
-         // See "PsychoVDisplayMapWithHueReference".
-         postProcessedColor = PsychoVDisplayMapWithHueReference(lin,
-                                                                LumaSettings.GameSettings.Contrast,
-                                                                LumaSettings.GameSettings.Saturation,
-                                                                LumaSettings.GameSettings.HighlightDechroma);
+         // Highlight hue, as in Mirror's Edge: vanilla clipped per channel twice, in the glow blend before this grade and
+         // in the 8-bit present blit after it, which bends a bright saturated source toward yellow-white; Luma removes
+         // both clips. That hue turn comes back from a per-channel ReinhardPiecewise(5, 1.5) of the colour in BT.2020 in
+         // full, its whitening at "Highlights Desaturation" (MacLeod-Boynton). Skipped below the shoulder, where the
+         // reference is the colour itself. The clip colour itself is no reference: a fully clipped one is achromatic,
+         // with no MacLeod-Boynton direction at all.
+         const float3 color2020 = BT709_To_BT2020(lin);
+         [branch] if (max3(color2020) > 1.5)
+         {
+            lin = BT2020_To_BT709(MacLeodBoynton::HueAndPurityEmulationBT2020(color2020, Reinhard::ReinhardPiecewise(color2020, 5.0, 1.5),
+                                                                              1.0, LumaSettings.GameSettings.HighlightDechroma));
+         }
+         // Contrast (a power of relative luminance around mid gray) and a chrominance scale around relative luminance
+         // ("Saturation()": lerp(Y, rgb, s)): the rolloff doesn't take them
+         const float contrast = LumaSettings.GameSettings.Contrast;
+         [branch] if (contrast != 1.0)
+         {
+            lin *= pow(max(GetLuminance(lin, CS_BT709), FLT_MIN) / MidGray, contrast - 1.0);
+         }
+         const float saturationScale = LumaSettings.GameSettings.Saturation;
+         [branch] if (saturationScale != 1.0)
+         {
+            lin = Saturation(lin, saturationScale, CS_BT709);
+         }
+         // Max-channel rolloff (strength 1 as MGR:R, Vanquish and Mirror's Edge: paper white stays within 1%), which keeps the
+         // hue. The peak can't go below paper white (the rolloff needs it above its 0.18 anchor).
+         const float paperWhite = max(LumaSettings.GamePaperWhiteNits, 1.0);
+         postProcessedColor = Tonemap::CInfinityRollOff::MaxChannel(lin, max(LumaSettings.PeakWhiteNits, paperWhite) / paperWhite, 0.18, 1.0);
       }
       else // SDR (still presented through the scRGB swapchain)
       {
