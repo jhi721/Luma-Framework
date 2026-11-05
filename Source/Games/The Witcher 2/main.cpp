@@ -2392,8 +2392,8 @@ class TheWitcher2Game final : public Game
          // The rendered area of the full size depth, one working pixel per scene pixel (work_share in working pixels per AO target pixel,
          // for the radius cap)
          const auto [depth_w, depth_h] = GetViewTextureSize(gd->mv_linear_depth_srv.get());
-         work_w = std::clamp(RenderArea::render_size[0], 1u, depth_w);
-         work_h = std::clamp(RenderArea::render_size[1], 1u, depth_h);
+         work_w = (RenderArea::render_size[0] != 0 ? (std::min)(RenderArea::render_size[0], depth_w) : depth_w);
+         work_h = (RenderArea::render_size[1] != 0 ? (std::min)(RenderArea::render_size[1], depth_h) : depth_h);
          work_share = {float(work_w) / float(w), float(work_h) / float(h)};
          depth_load_scale = {1.f, 1.f};
          depth = gd->mv_linear_depth_srv.get();
