@@ -29,6 +29,9 @@ namespace MotionVectorPatches
    constexpr uint32_t previous_position_register = 31;
    // Past the game's targets (almost every pixel shader writes o0, the uber post o1; only the unused HBAO+ pixel shader writes o0-o7)
    constexpr uint32_t target_slot = 4;
+   // FSR's and Luma TAA's masks (x reactive, y transparency & composition), written by the scene's alpha blended draws (their pixel
+   // shaders patched with Core's "PatchPixelShaderReactive")
+   constexpr uint32_t reactive_slot = 5;
 
    // For Core's patches ("motion_vector_patch.h")
    constexpr MotionVectorPatch::Layout layout = {object_slot, previous_slots, jitter_slot, resource_slots, previous_resources_slot,

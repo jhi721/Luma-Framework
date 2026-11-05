@@ -11,8 +11,10 @@
 // - Normals: the game's ViewNormalTex (coarse AO 0xF534EB09 t0), r11g11b10_float, the full view-space xyz packed v * 0.5 + 0.5 (no
 //   z reconstruction).
 // - Noise: frozen at 0 without an upscaler (the game has no TAA: a frame index would make the pattern boil), and denoise runs twice.
-//   With DLSS/FSR (they accumulate the lit scene the AO multiplies into) it cycles frame % 64 and denoise runs once, as Intel's
-//   XeGTAO.h advises with TAA (NoiseIndexRT, set by main.cpp). The quality default is Very High.
+//   With DLSS/FSR (they accumulate the lit scene the AO multiplies into) it cycles frame % 64, an AO history runs between the main
+//   pass and the denoise ("temporal_pass_cs", main.cpp) and denoise runs once, as Intel's XeGTAO.h advises with TAA (NoiseIndexRT,
+//   set by main.cpp). The quality default is Very High.
+// - GT-VBAO ("gtvbao_main_pass_cs", "GT-VBAO Enable") replaces the main pass only. It keeps both denoise passes.
 // - View z is in UE3 units (near plane ~10), a huge range: DepthScaleRT (default 50, to ~metres) brings it into the range Intel's
 //   constants expect (the R32F pyramid loses no precision at large z). EFFECT_RADIUS is anchored at that scale.
 
@@ -74,13 +76,6 @@ cbuffer LumaGTAO : register(b11)
 #define SAMPLE_DISTRIBUTION_POWER 1.5 // Default 2.0
 #endif
 
-// BL packs the full xyz view-space normal (v*0.5+0.5) — decoded directly, no reconstruction. NORMAL_Z_SIGN
-// flips only the decoded z if the view-space handedness needs it (verify via DebugViewRT=2: smooth
-// per-surface shading = correct; flip to -1.0 if the shading looks inverted).
-#ifndef NORMAL_Z_SIGN
-#define NORMAL_Z_SIGN (1.0)
-#endif
-
 #define VIEWPORT_PIXEL_SIZE InvFullResolution
 
 // GFSDK ProjInfo is exactly the NDC->view mul/add pair (live FOV, dialogue zoom included).
@@ -107,11 +102,23 @@ float3 XeGTAO_LoadViewspaceNormal(uint2 pixCoord)
 {
    // tex1 = the game's ViewNormalTex (r11g11b10_float, captured at the coarse-AO dispatch)
 
-   // Decode the game's packed view-space normals: xyz in [0,1] -> [-1,1], all three channels (see NORMAL_Z_SIGN).
-   float3 n = tex1.Load(int3(pixCoord, 0)).xyz * 2.0 - 1.0;
-   n.z *= NORMAL_Z_SIGN;
-   return normalize(n);
+   // Decode the game's packed view-space normals: xyz in [0,1] -> [-1,1], all three channels, no reconstruction.
+   return normalize(tex1.Load(int3(pixCoord, 0)).xyz * 2.0 - 1.0);
 }
 
-// tex0 = the game's full-res scene depth (r24_g8, viewed r24_unorm_x8), captured at the deinterleave dispatch
-#include "../Includes/XeGTAO.hlsl"
+// MELE's GT-VBAO settings (the same engine, also one AO pixel per scene pixel), not measured against this game's HBAO+: 2 slices, 1 under
+// the history ("temporal_pass_cs", main.cpp defines it) with Core's FAST noise, 8 steps, a 0.2 radius back face.
+#ifndef GTVBAO_SLICE_COUNT
+#define GTVBAO_SLICE_COUNT 2.0
+#endif
+#ifndef GTVBAO_STEP_COUNT
+#define GTVBAO_STEP_COUNT 8.0
+#endif
+#define GTVBAO_THICKNESS(effectRadius) (0.2 * (effectRadius))
+// Core's "FAST Noise" (Shaders/Global/Textures/FAST: 64 layers of 128x128 RGBA, filter adapted spatio-temporal noise), a layer per frame
+#if GTVBAO_FAST_NOISE
+Texture2DArray<float4> fast_noise : register(t4);
+#define GTVBAO_NOISE(pixCoord) fast_noise.Load(int4((pixCoord) & 127u, uint(NoiseIndexRT) & 63u, 0)).xyz
+#endif
+#include "../Includes/GTVBAO.hlsl"
+#include "../Includes/XeGTAOTemporal.hlsl"

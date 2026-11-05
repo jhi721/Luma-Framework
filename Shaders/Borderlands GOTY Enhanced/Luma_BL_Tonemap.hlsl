@@ -4,12 +4,11 @@
 //   1. Rebuild the game's scene + bloom mix exactly (untonemapped).
 //   2. Run the exact vanilla clamped grade: the SDR reference (TONEMAP_TYPE 0) and the FXAA luma source.
 //   3. HDR: the same analytic UE3 grade as an extended function (SDR clamps and floors removed, nothing else changed). It supplies
-//      range, luminance and purity (extendedLinear).
-//   4. RenoDX's PsychoV31 maps it to the user's peak and paper white, with the user's contrast, saturation and highlights
-//      desaturation.
-//   5. MacLeod–Boynton hue emulation: the hue of the RenoDX BL1 donor, the extended grade through a per-channel
-//      ReinhardPiecewise(5, 1.5) in BT.2020 that bends the way the vanilla clip bent without its whitening, replaces the mapped hue
-//      (see "PsychoVDisplayMapWithHueReference").
+//      range, luminance and purity.
+//   4. MacLeod–Boynton hue emulation: the hue of the RenoDX BL1 donor, the extended grade through a per-channel
+//      ReinhardPiecewise(5, 1.5) in BT.2020 that bends the way the vanilla clip bent, in full, with its whitening at the user's
+//      highlights desaturation.
+//   5. The user's contrast and saturation, then a max-channel C-infinity rolloff to the user's peak, which keeps RGB ratios.
 // SDR displays (and TONEMAP_TYPE 0) get the vanilla clamped grade.
 //
 // Output is stored gamma-encoded (POST_PROCESS_SPACE_TYPE 0, 1.0 = paper white) so the game's gamma SDR HUD blends on top as in
@@ -21,10 +20,16 @@
 // Settings.hlsl's empty dummy wins -> "invalid subscript 'BloomIntensity'".
 #include "Includes/Common.hlsl"             // LumaGameSettings (the grade sliders)
 #include "../Includes/Color.hlsl"
-#include "../Includes/PsychoV31HueReference.hlsl" // PsychoVDisplayMapWithHueReference
+#include "../Includes/CInfinityRolloff.hlsl" // Tonemap::CInfinityRollOff::MaxChannel (the display map)
+#include "../Includes/Reinhard.hlsl" // Reinhard::ReinhardPiecewise (hue reference)
+#include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueAndPurityEmulationBT2020
 // clang-format on
 
-// HDR / vanilla. 1 = extended UE3 grade + PsychoV31 display map (default). 0 = vanilla clamped SDR reference.
+// fxc flags the early return of "MacLeodBoynton::SolvePurity()" as an uninitialized result (X4000). It comes at code generation, so
+// it stays off for the whole shader.
+#pragma warning(disable : 4000)
+
+// HDR / vanilla. 1 = extended UE3 grade + C-infinity display map (default). 0 = vanilla clamped SDR reference.
 #ifndef TONEMAP_TYPE
 #define TONEMAP_TYPE 1
 #endif
@@ -109,19 +114,37 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    [branch] if (LumaSettings.DisplayMode == 1)
    {
       // 3. The extended HDR grade (clampSDR false), computed once: the hue reference and the display map both start from it.
-      const float3 extendedLinear = gamma_to_linear(GradeUE3_FromPostMidtones(GradeUE3_PostMidtones(untonemapped, false), false));
+      outColor = gamma_to_linear(GradeUE3_FromPostMidtones(GradeUE3_PostMidtones(untonemapped, false), false));
 
-      // 4-5. The display map, then the RenoDX BL1 hue (common.hlsli, ApplyCustomGrading: its reference is the only hue source):
-      // see "PsychoVDisplayMapWithHueReference". The output is linear BT.709, 1.0 = paper white.
-      outColor = PsychoVDisplayMapWithHueReference(extendedLinear,
-                                                   LumaSettings.GameSettings.Contrast,
-                                                   LumaSettings.GameSettings.Saturation,
-                                                   LumaSettings.GameSettings.HighlightDechroma);
+      // 4. The RenoDX BL1 hue (common.hlsli, ApplyCustomGrading), as in Mirror's Edge and The Witcher 2. Skipped below the
+      // shoulder, where the reference is the color itself. The clip color itself is no reference: a fully clipped one is
+      // achromatic, with no MacLeod-Boynton direction at all.
+      const float3 color2020 = BT709_To_BT2020(outColor);
+      [branch] if (max3(color2020) > 1.5)
+      {
+         outColor = BT2020_To_BT709(MacLeodBoynton::HueAndPurityEmulationBT2020(color2020, Reinhard::ReinhardPiecewise(color2020, 5.0, 1.5),
+                                                                                1.0, LumaSettings.GameSettings.HighlightDechroma));
+      }
+      // 5. Contrast (a power of relative luminance around mid gray) and a scale of the RGB distance from relative luminance: the rolloff
+      // doesn't take them
+      const float contrast = LumaSettings.GameSettings.Contrast;
+      [branch] if (contrast != 1.0)
+      {
+         outColor *= pow(max(GetLuminance(outColor, CS_BT709), FLT_MIN) / MidGray, contrast - 1.0);
+      }
+      const float saturationScale = LumaSettings.GameSettings.Saturation;
+      [branch] if (saturationScale != 1.0)
+      {
+         outColor = Saturation(outColor, saturationScale, CS_BT709);
+      }
+      // The rolloff (linear BT.709, 1.0 = paper white). The peak can't go below paper white (it needs to be above the 0.18 anchor).
+      const float paperWhite = max(LumaSettings.GamePaperWhiteNits, 1.0);
+      outColor = Tonemap::CInfinityRollOff::MaxChannel(outColor, max(LumaSettings.PeakWhiteNits, paperWhite) / paperWhite, 0.18, 1.0);
    }
    else
 #endif
    {
-      // Vanilla reference (and SDR displays, see "PsychoVDisplayMap"): the exact clamped SDR grade (gamma-encoded), linearized.
+      // Vanilla reference (and SDR displays): the exact clamped SDR grade (gamma-encoded), linearized.
       outColor = gamma_to_linear(saturate(GradeUE3_FromPostMidtones(postMidtones, true)));
    }
 
@@ -129,8 +152,7 @@ void RunBLTonemap(float4 v0, float2 v1, out float3 outColor, out float outLuma)
    outColor *= GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, false);
    // The extended grade and the MacLeod-Boynton hue emulation can emit NaN or negatives (the scene carries small negative/WCG values):
    // none may reach the swapchain.
-   outColor = (outColor == outColor) ? outColor : 0.0; // NaN -> 0 (NaN != NaN)
-   outColor = max(0.0, outColor);
+   outColor = IsNaN_Strict(outColor) ? 0.0 : max(0.0, outColor);
 #if POST_PROCESS_SPACE_TYPE == 0
    // Anti-banding dither, one step of the output quantizer: in HDR the 10-bit BT.2020 PQ code, from linear before the gamma encode
    // below; in SDR the 8-bit code, after it.

@@ -4,6 +4,13 @@
 
 #include "../Includes/Common.hlsl"
 
+// "SMAA_T2X" 1 is SMAA T2x (main.cpp's "BL SMAA T2x" passes). The scene jitters by a quarter pixel diagonally in two phases. The
+// blending weights take the phase's area texture subsamples, the neighborhood blend stays in linear light with the velocity length in
+// alpha, and the resolve blends it with the previous frame reprojected by the motion vectors. The output hook below runs at the resolve.
+#ifndef SMAA_T2X
+#define SMAA_T2X 0
+#endif
+
 // Written by main.cpp's FXAA resolve replacement. SmaaRtMetrics: (1/W, 1/H, W, H) at output resolution.
 cbuffer SmaaMetricsCB : register(b1)
 {
@@ -12,9 +19,19 @@ cbuffer SmaaMetricsCB : register(b1)
    // on geometry edges); 1 when it is missing or mismatched, which with the null predication texture is the plain ULTRA threshold
    // (0.05) rather than a frame-wide doubled 0.10 that under-detects edges. yzw unused.
    float4 SmaaPredication;
+#if SMAA_T2X
+   float4 SmaaSubsampleIndices; // The jitter phase's "SMAA.hlsl" @SUBSAMPLE_INDICES, 0 when the scene didn't jitter
+#endif
 }
 
 #define SMAA_RT_METRICS SmaaRtMetrics
+#if SMAA_T2X
+#define SMAA_SUBSAMPLE_INDICES SmaaSubsampleIndices
+#define SMAA_REPROJECTION      1
+// The motion vector target ("mv_texture" in main.cpp) holds the UV delta from the current to the previous position. SMAA's velocity is
+// the opposite.
+#define SMAA_DECODE_VELOCITY(sample) (-(sample).rg)
+#endif
 #define SMAA_PRESET_ULTRA
 #define SMAA_PREDICATION       1
 #define SMAA_PREDICATION_SCALE SmaaPredication.x
@@ -38,8 +55,9 @@ cbuffer SmaaMetricsCB : register(b1)
 // tex1 = predicationTex (plane-deviation edge mask)
 
 // SMAANeighborhoodBlending
-// tex0 = colorTex (the same snapshot, filtered in linear light), tex1 = blendTex. Re-encode to the canvas' gamma.
+// tex0 = colorTex (the same snapshot, filtered in linear light), tex1 = blendTex. Re-encode to the canvas' gamma, alpha 0 as the tonemap
+// wrote it, never T2x's velocity length.
 #define SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR         1
-#define SMAA_NEIGHBORHOOD_OUTPUT(color, position) color.rgb = linear_to_gamma(color.rgb, GCT_MIRROR);
+#define SMAA_NEIGHBORHOOD_OUTPUT(color, position) color = float4(linear_to_gamma(color.rgb, GCT_MIRROR), 0.0);
 
 #include "../Includes/SMAA_Passes.hlsl"
