@@ -988,8 +988,10 @@ int main(int argc, char** argv)
    SetUnhandledExceptionFilter(&CrashReport);
    StartWatchdog(8000);
    if (argc < 2)
-      return printf("usage: d3d9_csmt_test <d3d9.dll> [frames=N] [reset] [redevice] [thread] [thread_sleep=MS] [ex] [nomanaged] [bench=N] [work=MS]\n"), 2;
+      return printf("usage: d3d9_csmt_test <d3d9.dll> [frames=N] [reset] [redevice] [thread] [thread_sleep=MS] [ex] [nomanaged] [bench=N] [work=MS] [readback=AGE]\n"), 2;
    UINT frames = 6, bench_draws = 0, thread_sleep_ms = 0;
+   constexpr UINT NO_READBACK_TEST = ~0u;
+   UINT readback_age = NO_READBACK_TEST;
    double work_ms = 0;
    bool reset = false, redevice = false, thread = false, constants = false, ex = false;
    for (int i = 2; i < argc; i++)
@@ -998,6 +1000,7 @@ int main(int argc, char** argv)
       sscanf_s(argv[i], "frames=%u", &frames);
       sscanf_s(argv[i], "bench=%u", &bench_draws);
       sscanf_s(argv[i], "work=%lf", &work_ms);
+      sscanf_s(argv[i], "readback=%u", &readback_age);        // the oldest pixels a read may get; 0 wants every read exact
       sscanf_s(argv[i], "thread_sleep=%u", &thread_sleep_ms); // a rare second thread: the main one keeps most of the device lock
       reset |= !strcmp(argv[i], "reset");
       redevice |= !strcmp(argv[i], "redevice");
@@ -1090,6 +1093,75 @@ int main(int argc, char** argv)
                   }
                }
             });
+      }
+
+      if (readback_age != NO_READBACK_TEST)
+      {
+         // Frames that read a target back each see their own value in it, or one at most readback_age old; after a
+         // pause, or a Reset in the second round, a read is exact again.
+         for (UINT test_round = 0; test_round < 2; test_round++)
+         {
+            if (test_round == 1)
+            {
+               scene.defaults.Release();
+               hr = device->Reset(&pp);
+               if (FAILED(hr))
+               {
+                  g_failures++;
+                  printf("FAIL readback: reset 0x%08lX\n", hr);
+               }
+               scene.defaults.Create(device);
+            }
+            IDirect3DSurface9* back_buffer = nullptr;
+            IDirect3DSurface9* target = nullptr;
+            IDirect3DSurface9* copy = nullptr;
+            CHECK_HR(device->GetRenderTarget(0, &back_buffer));
+            CHECK_HR(device->CreateRenderTarget(64, 64, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &target, nullptr));
+            CHECK_HR(device->CreateOffscreenPlainSurface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &copy, nullptr));
+            auto read = [&](UINT value)
+            {
+               CHECK_HR(device->SetRenderTarget(0, target));
+               CHECK_HR(device->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, value >> 8, value & 255), 1.0f, 0));
+               CHECK_HR(device->SetRenderTarget(0, back_buffer));
+               CHECK_HR(device->GetRenderTargetData(target, copy));
+               D3DLOCKED_RECT locked = {};
+               CHECK_HR(copy->LockRect(&locked, nullptr, D3DLOCK_READONLY));
+               const UINT seen = (locked.pBits ? (((uint32_t*)locked.pBits)[64 * 32] & 0xFFFF) : 0);
+               copy->UnlockRect();
+               return seen;
+            };
+            UINT old_reads = 0;
+            for (UINT value = 1; value <= 40; value++)
+            {
+               const UINT seen = read(value);
+               old_reads += seen != value;
+               if (seen > value || value - seen > readback_age)
+               {
+                  g_failures++;
+                  printf("FAIL readback: value %u read as %u\n", value, seen);
+               }
+               CHECK_HR(device->Present(nullptr, nullptr, nullptr, nullptr));
+            }
+            if ((old_reads != 0) != (readback_age != 0))
+            {
+               g_failures++;
+               printf("FAIL readback: %u old reads of 40 (oldest allowed %u)\n", old_reads, readback_age);
+            }
+            for (int present = 0; present < 3; present++)
+            {
+               CHECK_HR(device->Present(nullptr, nullptr, nullptr, nullptr));
+            }
+            if (const UINT seen = read(1000); seen != 1000)
+            {
+               g_failures++;
+               printf("FAIL readback: after a pause 1000 read as %u\n", seen);
+            }
+            printf("readback: round %u, %u old reads of 40\n", test_round, old_reads);
+            CHECK_HR(device->Present(nullptr, nullptr, nullptr, nullptr));
+            copy->Release();
+            target->Release();
+            back_buffer->Release();
+         }
       }
 
       LARGE_INTEGER frequency, begin, end;

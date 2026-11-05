@@ -135,6 +135,18 @@ foreach ($test in $started) {
     }
 }
 }
+# d3d9_csmt_async_readback.on: reads of a target read every frame are a few frames old at most, exact after a pause or
+# a Reset; without the flag CSMT stays exact.
+if ($runtimes.Name -contains "dgvoodoo") {
+    foreach ($case in @(@{ Name = "exact"; Flags = @(); Age = 0 }, @{ Name = "async"; Flags = @("d3d9_csmt_async_readback.on"); Age = 8 })) {
+        $dir = New-Folder "dgvoodoo_readback_$($case.Name)" $dgvDll $true $true $case.Flags
+        $result = Invoke-Test $dir @("frames=1", "readback=$($case.Age)")
+        $ok = ($result.Exit -eq 0) -and ($result.Output | Select-String "readback: round 1")
+        "=== dgvoodoo / readback $($case.Name): $(if ($ok) { 'ok' } else { 'FAILED' })"
+        $result.Output | Where-Object { $_ -match "^readback|FAIL" } | Select-Object -First 8 | ForEach-Object { "  $_" }
+        if ($ok) { Remove-Item $dir -Recurse -Force } else { $failed++ }
+    }
+}
 if ($Bench) {
     foreach ($runtime in $runtimes) {
         $off = New-Folder "$($runtime.Name)_bench_off" $runtime.Chain $false $runtime.VaFix

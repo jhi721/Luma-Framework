@@ -31,6 +31,8 @@
 // the report adds the layer's per-frame counters. Test-only: d3d9_csmt_native.on
 // also allows it on a runtime that isn't dgVoodoo, d3d9_csmt_keepmt.on keeps
 // D3DCREATE_MULTITHREADED under it (docs/DX9-Support-Plan.md, Phase 0 item 5).
+// d3d9_csmt_async_readback.on: render targets read back every frame answer with
+// a copy a frame or two old instead of waiting for the GPU (Csmt::AsyncReadback).
 //
 // d3d9_fastlock.on next to this dll: dgVoodoo 2.87.6's device lock becomes a
 // cheaper recursive lock (see "DeviceLock").
@@ -3537,6 +3539,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void*)
       g_csmt_native = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
       swprintf_s(flag_path, L"%sd3d9_csmt_keepmt.on", g_dir);
       g_csmt_keep_multithreaded = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
+      swprintf_s(flag_path, L"%sd3d9_csmt_async_readback.on", g_dir);
+      Csmt::g_async_readback = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
       swprintf_s(flag_path, L"%sd3d9_fastlock.on", g_dir);
       g_fast_lock_requested = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
       swprintf_s(flag_path, L"%sd3d9_dgvfix.off", g_dir);

@@ -12,6 +12,9 @@
 // - everything else is synchronous: the worker runs it after the queued calls while the caller waits.
 // Calls the worker makes (dgVoodoo calling its own objects through the vtable) go straight down.
 //
+// d3d9_csmt_async_readback.on (for a game that tolerates old pixels, see AsyncReadback): GetRenderTargetData of a target
+// read in the frame before answers with the last copy that finished, so the game doesn't wait for the GPU.
+//
 // The worker is the only thread that ever calls the layer below, so the device is created without
 // D3DCREATE_MULTITHREADED (dgVoodoo misrendered now and then when calls came from several threads, one at a time).
 // Producers (game threads) are serialized by one lock. The game may run at most MAX_QUEUED_FRAMES frames ahead of
@@ -59,6 +62,7 @@ namespace Csmt
    constexpr uint32_t MAX_QUEUED_FRAMES = 1;
    constexpr size_t QUEUE_BYTES = 32 << 20;
    constexpr DWORD MAX_QUERY_RESULT_BYTES = 16; // larger results (pipeline statistics) are always synchronous
+   constexpr uint32_t MAX_READBACK_GAP = 1;     // presents between two reads of a target that keep it asynchronous
 
    // ---- vtables -------------------------------------------------------------------------------------------------
 
@@ -237,6 +241,18 @@ namespace Csmt
       }
    };
 
+   // A render target the game reads back every frame.
+   struct Readback
+   {
+      IDirect3DSurface9* surface = nullptr; // system memory: the copy on its way
+      IDirect3DQuery9* done = nullptr;      // signaled once `surface` holds it
+      D3DSURFACE_DESC desc = {};
+      std::vector<char> pixels; // the last copy that finished
+      UINT pitch = 0;
+      uint32_t last_read = 0; // in presents
+      bool in_flight = false;
+   };
+
    struct Shared
    {
       SpinLock producer; // game threads
@@ -260,6 +276,7 @@ namespace Csmt
       StateShadow state;                                       // producer
       std::unordered_map<void*, QueryState*> queries;          // producer
       std::vector<QueryState*> polled_queries;                 // worker
+      std::unordered_map<void*, Readback> readbacks;           // worker, by render target
       Stats stats;                                             // producer
       std::atomic<uint64_t> worker_polls{0};
       LARGE_INTEGER last_poll = {}; // worker
@@ -273,6 +290,7 @@ namespace Csmt
    // caller once the worker drained the queue (the device keeps D3DCREATE_MULTITHREADED there, so the worker's query
    // polling can't race them). Set before Start.
    inline bool g_reset_on_caller = false;
+   inline bool g_async_readback = false; // d3d9_csmt_async_readback.on, set before Start
 
    // "VertexConstantMirror" (exported for Luma), written by the thread that calls the layer below, after each call: the worker,
    // or the game thread while the layer passes calls through
@@ -964,6 +982,127 @@ namespace Csmt
       }
    }
 
+   inline void ReleaseReadback(Readback* readback)
+   {
+      if (readback->surface)
+      {
+         readback->surface->Release();
+         readback->done->Release();
+      }
+      *readback = {};
+   }
+
+   // Their objects hold the device: gone before Reset and every device Release. Worker only.
+   inline void DropReadbacks()
+   {
+      for (auto& [target, readback] : g.readbacks)
+      {
+         ReleaseReadback(&readback);
+      }
+      g.readbacks.clear();
+   }
+
+   // Keeps the copies that finished and forgets the targets the game stopped reading. Worker only.
+   inline void PollReadbacks()
+   {
+      const uint32_t frame = g.presents_done.load(std::memory_order_relaxed);
+      for (auto it = g.readbacks.begin(); it != g.readbacks.end();)
+      {
+         Readback& readback = it->second;
+         if (readback.in_flight)
+         {
+            BOOL finished = FALSE;
+            const HRESULT hr = readback.done->GetData(&finished, sizeof(finished), D3DGETDATA_FLUSH);
+            if (hr == S_FALSE)
+            {
+               ++it;
+               continue;
+            }
+            readback.in_flight = false;
+            D3DLOCKED_RECT locked;
+            if (hr == S_OK && SUCCEEDED(readback.surface->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
+            {
+               const char* bits = (const char*)locked.pBits;
+               readback.pixels.assign(bits, bits + size_t(locked.Pitch) * readback.desc.Height);
+               readback.pitch = locked.Pitch;
+               readback.surface->UnlockRect();
+            }
+         }
+         if (frame - readback.last_read > MAX_READBACK_GAP)
+         {
+            ReleaseReadback(&readback);
+            it = g.readbacks.erase(it);
+         }
+         else
+         {
+            ++it;
+         }
+      }
+   }
+
+   // Reading a target back makes the game wait for all the GPU work queued before it, which stops the game and the GPU
+   // from overlapping: two 256x256 reads cost Borderlands 2's menus a 4 ms longer frame at 4K. A target read in the
+   // frame before instead gets the last copy that finished, a frame or two old, while the worker copies it again and
+   // locks that copy only once an event query says the GPU is through. The first read after a pause is exact.
+   // ponytail: keyed by address, a new target of the same size at a dead one's address inside the gap gets its old pixels.
+   inline HRESULT STDMETHODCALLTYPE AsyncReadback(IDirect3DDevice9Ex* self, IDirect3DSurface9* target, IDirect3DSurface9* destination)
+   {
+      CSMT_ORIGINAL(DEVICE, GetRenderTargetData);
+      if (PassThrough())
+         return original(self, target, destination);
+      return OnWorker(DEVICE, CSMT_SLOT_DEVICE_GetRenderTargetData, [&]() -> HRESULT
+         {
+            PollReadbacks();
+            const auto [it, first_read] = g.readbacks.try_emplace(target);
+            Readback& readback = it->second;
+            const uint32_t frame = g.presents_done.load(std::memory_order_relaxed);
+            readback.last_read = frame;
+            if (first_read)
+               return original(self, target, destination);
+            D3DSURFACE_DESC desc;
+            if (FAILED(destination->GetDesc(&desc)))
+               return original(self, target, destination);
+            if (readback.surface && (desc.Width != readback.desc.Width || desc.Height != readback.desc.Height || desc.Format != readback.desc.Format))
+            {
+               ReleaseReadback(&readback);
+               readback.last_read = frame;
+            }
+            if (!readback.surface)
+            {
+               IDirect3DQuery9* done = nullptr;
+               if (FAILED(self->CreateQuery(D3DQUERYTYPE_EVENT, &done)))
+                  return original(self, target, destination);
+               if (FAILED(self->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &readback.surface, nullptr)))
+               {
+                  done->Release();
+                  return original(self, target, destination);
+               }
+               readback.done = done;
+               readback.desc = desc;
+            }
+            HRESULT hr = D3D_OK;
+            D3DLOCKED_RECT locked;
+            if (!readback.pixels.empty() && SUCCEEDED(destination->LockRect(&locked, nullptr, 0)))
+            {
+               const UINT row_bytes = (std::min<UINT>)(readback.pitch, locked.Pitch);
+               for (UINT y = 0; y < desc.Height; y++)
+               {
+                  memcpy((char*)locked.pBits + y * locked.Pitch, readback.pixels.data() + y * readback.pitch, row_bytes);
+               }
+               destination->UnlockRect();
+            }
+            else
+            {
+               hr = original(self, target, destination);
+            }
+            if (SUCCEEDED(hr) && !readback.in_flight && SUCCEEDED(original(self, target, readback.surface)))
+            {
+               readback.done->Issue(D3DISSUE_END);
+               readback.in_flight = true;
+            }
+            return hr; });
+   }
+
    inline HRESULT STDMETHODCALLTYPE Present(IDirect3DDevice9Ex* self, const RECT* source_rect, const RECT* destination_rect,
       HWND window, const RGNDATA* dirty_region)
    {
@@ -978,6 +1117,7 @@ namespace Csmt
          {
             g.last_present.store(original(self, from.Get(), to.Get(), window, nullptr), std::memory_order_relaxed);
             PollQueries(D3DGETDATA_FLUSH);
+            PollReadbacks();
             g.presents_done.fetch_add(1, std::memory_order_release); });
       g.presents_pushed++;
       g.stats.presents++;
@@ -1003,7 +1143,9 @@ namespace Csmt
       if (PassThrough())
          return original(self);
       const ULONG refs = OnWorker(DEVICE, CSMT_SLOT_DEVICE_Release, [&]
-         { return original(self); });
+         {
+            DropReadbacks();
+            return original(self); });
       if (refs == 0 && self == g.device)
       {
          Stop();
@@ -1552,6 +1694,8 @@ namespace Csmt
       }
       if constexpr (K == DEVICE && (SLOT == CSMT_SLOT_DEVICE_Reset || SLOT == CSMT_SLOT_DEVICE_ResetEx))
       {
+         OnWorker(K, SLOT, []
+            { DropReadbacks(); });
          if (g_reset_on_caller)
          {
             ProducerScope scope;
@@ -1665,6 +1809,10 @@ namespace Csmt
       CSMT_SET(DEVICE, CSMT_SLOT_DEVICE_DrawPrimitiveUP, &DrawPrimitiveUP);
       CSMT_SET(DEVICE, CSMT_SLOT_DEVICE_DrawIndexedPrimitiveUP, &DrawIndexedPrimitiveUP);
       CSMT_SET(DEVICE, CSMT_SLOT_DEVICE_StretchRect, &StretchRect);
+      if (g_async_readback)
+      {
+         CSMT_SET(DEVICE, CSMT_SLOT_DEVICE_GetRenderTargetData, &AsyncReadback);
+      }
       CSMT_SET(DEVICE, CSMT_SLOT_DEVICE_ColorFill, &ColorFill);
       CSMT_SET(DEVICE, CSMT_SLOT_DEVICE_UpdateSurface, &UpdateSurface);
       CSMT_SET(DEVICE, CSMT_SLOT_DEVICE_Present, &Present);
