@@ -15,8 +15,9 @@
 // The worker is the only thread that ever calls the layer below, so the device is created without
 // D3DCREATE_MULTITHREADED (dgVoodoo misrendered now and then when calls came from several threads, one at a time).
 // Producers (game threads) are serialized by one lock. The game may run at most MAX_QUEUED_FRAMES frames ahead of
-// the worker. Only for dgVoodoo: NVIDIA's native D3D9 driver hangs on work recorded by one thread and waited for by
-// another (d3d9_memlog.cpp refuses it).
+// the worker. Only for dgVoodoo by default (d3d9_memlog.cpp): on Windows d3d9 NVIDIA's driver hangs in CreateTexture on
+// the worker unless the device keeps D3DCREATE_MULTITHREADED, and the VA fix's MANAGED emulation renders differently
+// there (docs/DX9-Support-Plan.md, Phase 0 item 5).
 #pragma once
 #include "csmt_methods.h"
 #include "csmt_queue.h"
@@ -166,11 +167,14 @@ namespace Csmt
       bool stream_frequency_known[16];
       bool indices_known;
       bool declaration_known;
-      bool recording; // between BeginStateBlock and EndStateBlock
+      bool recording;               // between BeginStateBlock and EndStateBlock
+      uint32_t constants_epoch = 1; // SetConstants' values from another epoch are unknown, so Forget stays cheap
 
       void Forget()
       {
+         const uint32_t next_epoch = constants_epoch + 1;
          *this = {};
+         constants_epoch = next_epoch;
       }
 
       // Pixel samplers 0-15, D3DDMAPSAMPLER (256) and D3DVERTEXTEXTURESAMPLER0-3 (257-260); -1 otherwise.
@@ -195,6 +199,8 @@ namespace Csmt
       uint64_t query_hits = 0;
       uint64_t query_misses = 0;
       uint64_t redundant = 0;
+      uint64_t constant_registers = 0;
+      uint64_t constant_repeats = 0;
       uint32_t syncs[KIND_COUNT][MAX_SLOTS] = {};
    };
 
@@ -263,6 +269,10 @@ namespace Csmt
    inline Shared g;
    inline thread_local int t_producer_depth = 0;
    inline thread_local bool t_worker = false;
+   // Windows d3d9 fails Reset/ResetEx called on another thread than the one that created the device: they run on the
+   // caller once the worker drained the queue (the device keeps D3DCREATE_MULTITHREADED there, so the worker's query
+   // polling can't race them). Set before Start.
+   inline bool g_reset_on_caller = false;
 
    // "VertexConstantMirror" (exported for Luma), written by the thread that calls the layer below, after each call: the worker,
    // or the game thread while the layer passes calls through
@@ -580,22 +590,53 @@ namespace Csmt
          }
       }
       void** vtable = *(void***)object;
-      if (FindVtable(vtable))
+      // Windows d3d9 keeps a device's vtable inside the device and copies its static IDirect3DDevice9 table over it
+      // again in BeginStateBlock (a D3D9Ex device's extra slots keep our hooks), and a later device can reuse a dead
+      // one's memory: a patched table whose leading slots hold none of our hooks is such a copy, and the methods it
+      // holds become the originals.
+      const auto is_copy = [vtable](const PatchedVtable& patched)
+      {
+         const int copied = (patched.kind == DEVICE ? (std::min)(patched.slots, int(CSMT_SLOT_DEVICE_SetConvolutionMonoKernel))
+                                                    : patched.slots);
+         for (int i = 0; i < copied; i++)
+         {
+            if (vtable[i] == g_hooks[patched.kind][i])
+               return false;
+         }
+         return true;
+      };
+      if (const PatchedVtable* patched = FindVtable(vtable); patched && !is_copy(*patched))
          return;
-      const int slots = SlotCount(object, kind);
       std::lock_guard lock(g_patch_mutex);
-      const int count = g_vtable_count.load(std::memory_order_relaxed);
-      if (FindVtable(vtable) || count == int(std::size(g_vtables)))
-         return;
-      PatchedVtable& patched = g_vtables[count];
-      patched.vtable = vtable;
-      patched.kind = kind;
-      patched.slots = slots;
-      std::copy_n(vtable, slots, patched.originals);
-      g_vtable_count.store(count + 1, std::memory_order_release);
+      PatchedVtable* patched = FindVtable(vtable);
+      if (patched)
+      {
+         if (!is_copy(*patched))
+            return;
+         for (int i = 0; i < patched->slots; i++)
+         {
+            if (vtable[i] != g_hooks[patched->kind][i])
+            {
+               patched->originals[i] = vtable[i];
+            }
+         }
+      }
+      else
+      {
+         const int count = g_vtable_count.load(std::memory_order_relaxed);
+         if (count == int(std::size(g_vtables)))
+            return;
+         patched = &g_vtables[count];
+         patched->vtable = vtable;
+         patched->kind = kind;
+         patched->slots = SlotCount(object, kind);
+         std::copy_n(vtable, patched->slots, patched->originals);
+         g_vtable_count.store(count + 1, std::memory_order_release);
+      }
+      const int slots = patched->slots;
       DWORD old_protect;
       VirtualProtect(vtable, slots * sizeof(void*), PAGE_EXECUTE_READWRITE, &old_protect);
-      std::copy_n(g_hooks[kind], slots, vtable);
+      std::copy_n(g_hooks[patched->kind], slots, vtable);
       VirtualProtect(vtable, slots * sizeof(void*), old_protect, &old_protect);
       FlushInstructionCache(GetCurrentProcess(), vtable, slots * sizeof(void*));
    }
@@ -723,30 +764,61 @@ namespace Csmt
       return D3D_OK;
    }
 
-   // Set{Vertex,Pixel}ShaderConstant{F,I,B}: `count` registers of `register_bytes`.
+   // Set{Vertex,Pixel}ShaderConstant{F,I,B}: `count` registers of `register_bytes`. UE3 sets most registers again with the
+   // value they hold (66% in a Borderlands 2 level), so only the range from the first to the last changed one is queued.
    template <int SLOT, typename T, size_t REGISTER_BYTES>
    HRESULT STDMETHODCALLTYPE SetConstants(IDirect3DDevice9Ex* self, UINT start, const T* data, UINT count)
    {
       using Fn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9Ex*, UINT, const T*, UINT);
       const auto original = (Fn)OriginalFor(self, SLOT);
-      const size_t bytes = size_t(count) * REGISTER_BYTES;
-      const auto call = [=](const T* values)
+      const auto call = [=](UINT first, const T* values, UINT registers)
       {
-         const HRESULT hr = original(self, start, values, count);
+         const HRESULT hr = original(self, first, values, registers);
          if (SUCCEEDED(hr) && values)
          {
-            MirrorConstants<SLOT>(start, values, count);
+            MirrorConstants<SLOT>(first, values, registers);
          }
          return hr;
       };
       if (PassThrough() || !data)
-         return call(data);
+         return call(start, data, count);
+      ProducerScope scope;
+      // The shader model 3 limits: a call past them fails below, so it must not reach the shadow.
+      constexpr bool is_float = SLOT == CSMT_SLOT_DEVICE_SetVertexShaderConstantF || SLOT == CSMT_SLOT_DEVICE_SetPixelShaderConstantF;
+      constexpr UINT SHADOW_REGISTERS = (SLOT == CSMT_SLOT_DEVICE_SetVertexShaderConstantF ? 256 : (is_float ? 224 : 16));
+      UINT changed_first = 0, changed_count = count;
+      if (!g.state.recording && count <= SHADOW_REGISTERS && start <= SHADOW_REGISTERS - count)
+      {
+         static BYTE values[SHADOW_REGISTERS * REGISTER_BYTES];
+         static uint32_t epochs[SHADOW_REGISTERS];
+         const uint32_t epoch = g.state.constants_epoch;
+         UINT last_changed = 0;
+         changed_first = count;
+         for (UINT i = 0; i < count; i++)
+         {
+            BYTE* known = values + (start + i) * REGISTER_BYTES;
+            const BYTE* value = (const BYTE*)data + i * REGISTER_BYTES;
+            if (epochs[start + i] == epoch && memcmp(known, value, REGISTER_BYTES) == 0)
+               continue;
+            memcpy(known, value, REGISTER_BYTES);
+            epochs[start + i] = epoch;
+            changed_first = (std::min)(changed_first, i);
+            last_changed = i;
+         }
+         changed_count = (changed_first == count ? 0 : last_changed - changed_first + 1);
+      }
+      g.stats.constant_registers += count;
+      g.stats.constant_repeats += count - changed_count;
+      if (changed_count == 0)
+         return D3D_OK;
+      const UINT first = start + changed_first;
+      const T* values = data + size_t(changed_first) * (REGISTER_BYTES / sizeof(T));
+      const size_t bytes = size_t(changed_count) * REGISTER_BYTES;
       if (bytes > g.queue->MaxPayload())
          return OnWorker(DEVICE, SLOT, [&]
-            { return call(data); });
-      ProducerScope scope;
+            { return call(first, values, changed_count); });
       Push([=](char* payload)
-         { call((const T*)payload); }, data, bytes);
+         { call(first, (const T*)payload, changed_count); }, values, bytes);
       return D3D_OK;
    }
 
@@ -1463,6 +1535,7 @@ namespace Csmt
          if constexpr (K == DEVICE && SLOT == CSMT_SLOT_DEVICE_BeginStateBlock)
          {
             g_vertex_constants_recording = SUCCEEDED(hr);
+            PatchObject(self, DEVICE); // Windows d3d9 copied its table over ours
          }
          else
          {
@@ -1476,6 +1549,18 @@ namespace Csmt
       if constexpr (K == DEVICE && SLOT == CSMT_SLOT_DEVICE_BeginStateBlock)
       {
          g.state.recording = true;
+      }
+      if constexpr (K == DEVICE && (SLOT == CSMT_SLOT_DEVICE_Reset || SLOT == CSMT_SLOT_DEVICE_ResetEx))
+      {
+         if (g_reset_on_caller)
+         {
+            ProducerScope scope;
+            OnWorker(K, SLOT, [] {});
+            t_worker = true; // the runtime's own calls during Reset pass through, as on the worker
+            const HRESULT hr = call();
+            t_worker = false;
+            return hr;
+         }
       }
       return OnWorker(K, SLOT, call);
    }
@@ -1509,6 +1594,7 @@ namespace Csmt
          {
             g_vertex_constants_recording = false;
             const HRESULT hr = original(self, block);
+            PatchObject(self, DEVICE); // Windows d3d9 copied its table over ours
             if (SUCCEEDED(hr) && block && *block)
             {
                PatchObject(*block, STATE_BLOCK);
@@ -1807,10 +1893,11 @@ namespace Csmt
       const double frames = (std::max<double>)(double(stats.presents), 1.0);
       fprintf(log,
          "    CSMT | %.0f fps | per frame: commands %.0f, payload %.1f KB, syncs %.1f, locks deferred %.1f sync %.1f, "
-         "query hits %.1f misses %.1f, present wait %.2f ms, repeats dropped %.0f | worker polls %llu | syncs:",
+         "query hits %.1f misses %.1f, present wait %.2f ms, repeats dropped %.0f, constant registers %.0f repeated %.0f | worker polls %llu | syncs:",
          stats.presents / seconds, stats.commands / frames, stats.payload_bytes / frames / 1024, total_syncs / frames,
          stats.deferred_locks / frames, stats.sync_locks / frames, stats.query_hits / frames, stats.query_misses / frames,
-         stats.present_wait_ms / frames, stats.redundant / frames, (unsigned long long)g.worker_polls.exchange(0));
+         stats.present_wait_ms / frames, stats.redundant / frames, stats.constant_registers / frames, stats.constant_repeats / frames,
+         (unsigned long long)g.worker_polls.exchange(0));
       for (size_t i = 0; i < (std::min<size_t>)(syncs.size(), 12); i++)
       {
          fprintf(log, " %s::%s %.1f", g_kind_names[syncs[i].kind], g_names[syncs[i].kind][syncs[i].slot],

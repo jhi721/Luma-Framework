@@ -28,7 +28,9 @@
 //
 // d3d9_csmt.on next to this dll: D3D9 calls run on a worker thread (csmt.h),
 // which also makes dropping D3DCREATE_MULTITHREADED safe. With d3d9_memlog.on
-// the report adds the layer's per-frame counters.
+// the report adds the layer's per-frame counters. Test-only: d3d9_csmt_native.on
+// also allows it on a runtime that isn't dgVoodoo, d3d9_csmt_keepmt.on keeps
+// D3DCREATE_MULTITHREADED under it (docs/DX9-Support-Plan.md, Phase 0 item 5).
 //
 // d3d9_fastlock.on next to this dll: dgVoodoo 2.87.6's device lock becomes a
 // cheaper recursive lock (see "DeviceLock").
@@ -50,6 +52,7 @@
 #include <psapi.h>
 #include <shared_mutex>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 #include <windows.h>
@@ -105,14 +108,16 @@ namespace
    constexpr int SLOT_UPDATE_TEXTURE = 31;
 
    wchar_t g_dir[MAX_PATH] = {};
-   FILE* g_log = nullptr;              // "NUL" without d3d9_memlog.on
-   bool g_log_enabled = false;         // d3d9_memlog.on present
-   bool g_fix_requested = false;       // d3d9_vafix.on present
-   bool g_strip_multithreaded = false; // d3d9_nomt.on present
-   bool g_csmt_requested = false;      // d3d9_csmt.on present
-   bool g_fast_lock_requested = false; // d3d9_fastlock.on present
-   bool g_fix_active = false;          // the device really is D3D9Ex (one device assumed)
-   bool g_user_memory = false;         // the runtime takes user-memory SYSTEMMEM textures
+   FILE* g_log = nullptr;                  // "NUL" without d3d9_memlog.on
+   bool g_log_enabled = false;             // d3d9_memlog.on present
+   bool g_fix_requested = false;           // d3d9_vafix.on present
+   bool g_strip_multithreaded = false;     // d3d9_nomt.on present
+   bool g_csmt_requested = false;          // d3d9_csmt.on present
+   bool g_csmt_native = false;             // d3d9_csmt_native.on present (test-only)
+   bool g_csmt_keep_multithreaded = false; // d3d9_csmt_keepmt.on present (test-only)
+   bool g_fast_lock_requested = false;     // d3d9_fastlock.on present
+   bool g_fix_active = false;              // the device really is D3D9Ex (one device assumed)
+   bool g_user_memory = false;             // the runtime takes user-memory SYSTEMMEM textures
    UINT g_available_texture_mb =
       0; // what the runtime reports (dgVoodoo: its VRAM cap)
 
@@ -1397,6 +1402,77 @@ namespace
       return hr;
    }
 
+   using HookedGetLevelDesc = HRESULT(STDMETHODCALLTYPE*)(void*, UINT, D3DSURFACE_DESC*); // 2D and cube, same slot
+
+   // dgVoodoo stores A2R10G10B10 as DXGI R10G10B10A2 (DXGI has no BGR 10-bit format) and hands those bytes to CPU locks,
+   // so uploads and read-backs swap red and blue. The game locks a copy in D3D9 order; dgVoodoo's own bytes stay in its
+   // order, which keeps its GPU copies and sampling right. Not covered: volumes. Nothing runs before a game uses the format.
+   struct SwappedLock
+   {
+      BYTE* bits = nullptr;
+      INT pitch = 0;
+      UINT width = 0, height = 0;
+      bool write_back = false;
+      std::vector<uint32_t> texels;
+   };
+   struct SwappedLocks
+   {
+      std::shared_mutex mutex;
+      std::map<std::tuple<void*, UINT, UINT>, SwappedLock> locks; // resource, face, level
+   };
+   SwappedLocks g_swapped_locks;
+   std::atomic<bool> g_dgv_10_bit_used{false};
+
+   void CopySwappingRedBlue(const BYTE* from, INT from_pitch, BYTE* to, INT to_pitch, UINT width, UINT height)
+   {
+      for (UINT y = 0; y < height; y++)
+      {
+         const auto* source = (const uint32_t*)(from + y * from_pitch);
+         auto* destination = (uint32_t*)(to + y * to_pitch);
+         for (UINT x = 0; x < width; x++)
+         {
+            const uint32_t texel = source[x];
+            destination[x] = (texel & 0xc00ffc00) | ((texel & 0x3ff) << 20) | ((texel >> 20) & 0x3ff);
+         }
+      }
+   }
+
+   void BeginSwappedLock(void* resource, UINT face, UINT level, const D3DSURFACE_DESC& desc, D3DLOCKED_RECT* locked, const RECT* rect, DWORD flags)
+   {
+      if (desc.Format != D3DFMT_A2R10G10B10)
+         return;
+      SwappedLock lock = {
+         .bits = (BYTE*)locked->pBits,
+         .pitch = locked->Pitch,
+         .width = rect ? UINT(rect->right - rect->left) : desc.Width,
+         .height = rect ? UINT(rect->bottom - rect->top) : desc.Height,
+         .write_back = !(flags & D3DLOCK_READONLY),
+      };
+      lock.texels.resize(size_t(lock.width) * lock.height);
+      const INT pitch = INT(lock.width * sizeof(uint32_t));
+      CopySwappingRedBlue(lock.bits, lock.pitch, (BYTE*)lock.texels.data(), pitch, lock.width, lock.height);
+      locked->pBits = lock.texels.data();
+      locked->Pitch = pitch;
+      std::unique_lock guard(g_swapped_locks.mutex);
+      g_swapped_locks.locks.insert_or_assign({resource, face, level}, std::move(lock));
+   }
+
+   void EndSwappedLock(void* resource, UINT face, UINT level)
+   {
+      if (!g_dgv_10_bit_used.load(std::memory_order_relaxed))
+         return;
+      std::unique_lock guard(g_swapped_locks.mutex);
+      const auto it = g_swapped_locks.locks.find({resource, face, level});
+      if (it == g_swapped_locks.locks.end())
+         return;
+      const SwappedLock& lock = it->second;
+      if (lock.write_back)
+      {
+         CopySwappingRedBlue((const BYTE*)lock.texels.data(), INT(lock.width * sizeof(uint32_t)), lock.bits, lock.pitch, lock.width, lock.height);
+      }
+      g_swapped_locks.locks.erase(it);
+   }
+
    HRESULT STDMETHODCALLTYPE HookSurfaceLockRect(IDirect3DSurface9* self,
       D3DLOCKED_RECT* locked,
       const RECT* rect, DWORD flags)
@@ -1417,11 +1493,21 @@ namespace
             Count(SURFACE_READONLY);
          }
       }
-      if (!ref)
-         return original(self, locked, rect, flags);
-      Count(SURFACE_SERVED);
-      return LockSubresource(ref->texture, ref->face, ref->level, locked, rect,
-         flags, false);
+      HRESULT hr;
+      if (ref)
+      {
+         Count(SURFACE_SERVED);
+         hr = LockSubresource(ref->texture, ref->face, ref->level, locked, rect, flags, false);
+      }
+      else
+      {
+         hr = original(self, locked, rect, flags);
+      }
+      if (D3DSURFACE_DESC desc; SUCCEEDED(hr) && g_dgv_10_bit_used.load(std::memory_order_relaxed) && SUCCEEDED(Original<decltype(&HookSurfaceGetDesc)>(self, SLOT_SURFACE_GET_DESC)(self, &desc)))
+      {
+         BeginSwappedLock(self, 0, 0, desc, locked, rect, flags);
+      }
+      return hr;
    }
 
    HRESULT STDMETHODCALLTYPE HookSurfaceUnlockRect(IDirect3DSurface9* self)
@@ -1430,6 +1516,7 @@ namespace
          self, SLOT_SURFACE_UNLOCK_RECT);
       if (t_in_texture_call)
          return original(self);
+      EndSwappedLock(self, 0, 0);
       if (std::optional<SurfaceRef> ref = ReplacedSurface(self))
          return UnlockSubresource((IDirect3DBaseTexture9*)ref->texture, ref->face,
             ref->level);
@@ -1441,18 +1528,23 @@ namespace
       D3DLOCKED_RECT* locked,
       const RECT* rect, DWORD flags)
    {
-      if (const HRESULT hr =
-             LockSubresource(self, 0, level, locked, rect, flags, true);
-         hr != S_FALSE)
-         return hr;
-      TextureCallScope scope;
-      return Original<decltype(&HookTextureLockRect)>(self, SLOT_LOCK)(
-         self, level, locked, rect, flags);
+      HRESULT hr = LockSubresource(self, 0, level, locked, rect, flags, true);
+      if (hr == S_FALSE)
+      {
+         TextureCallScope scope;
+         hr = Original<decltype(&HookTextureLockRect)>(self, SLOT_LOCK)(self, level, locked, rect, flags);
+      }
+      if (D3DSURFACE_DESC desc; SUCCEEDED(hr) && g_dgv_10_bit_used.load(std::memory_order_relaxed) && SUCCEEDED(Original<HookedGetLevelDesc>(self, SLOT_GET_LEVEL_DESC)(self, level, &desc)))
+      {
+         BeginSwappedLock(self, 0, level, desc, locked, rect, flags);
+      }
+      return hr;
    }
 
    HRESULT STDMETHODCALLTYPE HookTextureUnlockRect(IDirect3DTexture9* self,
       UINT level)
    {
+      EndSwappedLock(self, 0, level);
       if (const HRESULT hr = UnlockSubresource(self, 0, level); hr != S_FALSE)
          return hr;
       TextureCallScope scope;
@@ -1465,19 +1557,24 @@ namespace
       D3DLOCKED_RECT* locked,
       const RECT* rect, DWORD flags)
    {
-      if (const HRESULT hr =
-             LockSubresource(self, UINT(face), level, locked, rect, flags, true);
-         hr != S_FALSE)
-         return hr;
-      TextureCallScope scope;
-      return Original<decltype(&HookCubeLockRect)>(self, SLOT_LOCK)(
-         self, face, level, locked, rect, flags);
+      HRESULT hr = LockSubresource(self, UINT(face), level, locked, rect, flags, true);
+      if (hr == S_FALSE)
+      {
+         TextureCallScope scope;
+         hr = Original<decltype(&HookCubeLockRect)>(self, SLOT_LOCK)(self, face, level, locked, rect, flags);
+      }
+      if (D3DSURFACE_DESC desc; SUCCEEDED(hr) && g_dgv_10_bit_used.load(std::memory_order_relaxed) && SUCCEEDED(Original<HookedGetLevelDesc>(self, SLOT_GET_LEVEL_DESC)(self, level, &desc)))
+      {
+         BeginSwappedLock(self, UINT(face), level, desc, locked, rect, flags);
+      }
+      return hr;
    }
 
    HRESULT STDMETHODCALLTYPE HookCubeUnlockRect(IDirect3DCubeTexture9* self,
       D3DCUBEMAP_FACES face,
       UINT level)
    {
+      EndSwappedLock(self, UINT(face), level);
       if (const HRESULT hr = UnlockSubresource(self, UINT(face), level);
          hr != S_FALSE)
          return hr;
@@ -1557,6 +1654,9 @@ namespace
    constexpr int SLOT_GET_GAMMA_RAMP = 22;
    constexpr int SLOT_SET_RENDER_TARGET = 37;
    constexpr int SLOT_SET_RENDER_STATE = 57;
+   constexpr int SLOT_CREATE_RENDER_TARGET = 28;
+   constexpr int SLOT_COLOR_FILL = 35;
+   constexpr int SLOT_CREATE_OFFSCREEN_PLAIN_SURFACE = 36;
    constexpr int SLOT_CREATE_STATE_BLOCK = 59;
    constexpr int SLOT_BEGIN_STATE_BLOCK = 60;
    constexpr int SLOT_END_STATE_BLOCK = 61;
@@ -1580,6 +1680,8 @@ namespace
 
    bool g_dgv_fixes_disabled = false; // d3d9_dgvfix.off present
    bool g_dgv_fixes = false;          // on for this device (chain is dgVoodoo)
+   bool g_dgv_mips_patched = false;   // UpdateTexture's small-mip bug fixed in dgVoodoo's code
+   bool g_dgv_dot3_patched = false;   // DOTPRODUCT3's write mask fixed in dgVoodoo's code
 
    // dgVoodoo's own device methods, taken before the CSMT layer patches the vtable.
    struct DgvMethods
@@ -1647,7 +1749,7 @@ namespace
          return int(PIXEL_SAMPLERS + sampler - D3DVERTEXTEXTURESAMPLER0);
       return -1;
    }
-   std::atomic<bool> g_dgv_premultiplied_blend_set{false}; // a stage op was ever set to BLENDTEXTUREALPHAPM
+   std::atomic<bool> g_dgv_stage_op_replaced{false}; // a stage op was ever set to one ReplaceStageOps handles
 
    void ResetVertexSamplers()
    {
@@ -1847,9 +1949,12 @@ namespace
       return D3D_OK;
    }
 
+   // Stage ops dgVoodoo gets wrong, swapped for the draw only, so getters and state blocks keep seeing the game's states.
    // BLENDTEXTUREALPHAPM computes arg1 + arg2 * (1 + Ta) instead of arg1 + arg2 * (1 - Ta). MULTIPLYADD
-   // arg0 + arg1 * arg2 with arg2 = inverted texture alpha gives the documented result (verify_ff). Swapped in for the
-   // draw only, so getters and state blocks keep seeing the game's states.
+   // arg0 + arg1 * arg2 with arg2 = inverted texture alpha gives the documented result (verify_ff).
+   // COLOROP DOTPRODUCT3 replicates the dot into alpha whatever ALPHAOP says (D3DTOP_DOTPRODUCT3 docs; NVIDIA and Wine's
+   // dp3 alpha test agree), so the alpha pass takes the same op and arguments. ALPHAOP DOTPRODUCT3 under another colour op
+   // doesn't yield the dot on NVIDIA; the alpha passes through.
    struct StageOp
    {
       D3DTEXTURESTAGESTATETYPE op, arg0, arg1, arg2;
@@ -1858,15 +1963,16 @@ namespace
       {D3DTSS_ALPHAOP, D3DTSS_ALPHAARG0, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2}};
    constexpr DWORD TEXTURE_STAGES = 8;
 
-   struct ReplacedBlend
+   struct ReplacedStageOp
    {
       DWORD stage = 0;
       const StageOp* op = nullptr;
+      DWORD value = 0;    // the game's op
       DWORD args[3] = {}; // the game's arg0..arg2
    };
 
    // Returns how many entries of "replaced" (TEXTURE_STAGES * 2) it filled.
-   int ReplacePremultipliedBlends(IDirect3DDevice9* device, ReplacedBlend* replaced)
+   int ReplaceStageOps(IDirect3DDevice9* device, ReplacedStageOp* replaced)
    {
       auto get = g_dgv.methods.get_texture_stage_state;
       auto set = g_dgv.methods.set_texture_stage_state;
@@ -1877,17 +1983,41 @@ namespace
          get(device, stage, D3DTSS_COLOROP, &color_op);
          if (color_op == D3DTOP_DISABLE)
             break;
+         auto save = [&](const StageOp& op, DWORD value) -> ReplacedStageOp&
+         {
+            ReplacedStageOp& entry = replaced[count++];
+            entry = {.stage = stage, .op = &op, .value = value};
+            get(device, stage, op.arg0, &entry.args[0]);
+            get(device, stage, op.arg1, &entry.args[1]);
+            get(device, stage, op.arg2, &entry.args[2]);
+            return entry;
+         };
+         if (DWORD alpha_op = D3DTOP_DISABLE; g_dgv_dot3_patched && SUCCEEDED(get(device, stage, D3DTSS_ALPHAOP, &alpha_op)))
+         {
+            if (color_op == D3DTOP_DOTPRODUCT3)
+            {
+               save(STAGE_OPS[1], alpha_op);
+               DWORD color_arg = 0;
+               set(device, stage, D3DTSS_ALPHAOP, D3DTOP_DOTPRODUCT3);
+               get(device, stage, D3DTSS_COLORARG1, &color_arg);
+               set(device, stage, D3DTSS_ALPHAARG1, color_arg);
+               get(device, stage, D3DTSS_COLORARG2, &color_arg);
+               set(device, stage, D3DTSS_ALPHAARG2, color_arg);
+            }
+            else if (alpha_op == D3DTOP_DOTPRODUCT3)
+            {
+               save(STAGE_OPS[1], alpha_op);
+               set(device, stage, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+               set(device, stage, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
+            }
+         }
          for (const StageOp& op : STAGE_OPS)
          {
             DWORD value = D3DTOP_DISABLE;
             get(device, stage, op.op, &value);
             if (value != D3DTOP_BLENDTEXTUREALPHAPM)
                continue;
-            ReplacedBlend& entry = replaced[count++];
-            entry = {.stage = stage, .op = &op};
-            get(device, stage, op.arg0, &entry.args[0]);
-            get(device, stage, op.arg1, &entry.args[1]);
-            get(device, stage, op.arg2, &entry.args[2]);
+            const ReplacedStageOp& entry = save(op, value);
             set(device, stage, op.op, D3DTOP_MULTIPLYADD);
             set(device, stage, op.arg0, entry.args[1]);
             set(device, stage, op.arg1, entry.args[2]);
@@ -1899,9 +2029,9 @@ namespace
 
    HRESULT STDMETHODCALLTYPE HookSetTextureStageState(IDirect3DDevice9* self, DWORD stage, D3DTEXTURESTAGESTATETYPE type, DWORD value)
    {
-      if (value == D3DTOP_BLENDTEXTUREALPHAPM && (type == D3DTSS_COLOROP || type == D3DTSS_ALPHAOP))
+      if ((value == D3DTOP_BLENDTEXTUREALPHAPM || value == D3DTOP_DOTPRODUCT3) && (type == D3DTSS_COLOROP || type == D3DTSS_ALPHAOP))
       {
-         g_dgv_premultiplied_blend_set.store(true, std::memory_order_relaxed);
+         g_dgv_stage_op_replaced.store(true, std::memory_order_relaxed);
       }
       return Original<decltype(&HookSetTextureStageState)>(self, SLOT_SET_TEXTURE_STAGE_STATE)(self, stage, type, value);
    }
@@ -2026,8 +2156,9 @@ namespace
    template <int slot, typename... Args>
    HRESULT STDMETHODCALLTYPE HookDraw(IDirect3DDevice9* self, Args... args)
    {
-      ReplacedBlend replaced[TEXTURE_STAGES * 2];
-      const int replaced_count = g_dgv_premultiplied_blend_set.load(std::memory_order_relaxed) ? ReplacePremultipliedBlends(self, replaced) : 0;
+      ReplacedStageOp replaced[TEXTURE_STAGES * 2];
+      // A swap during BeginStateBlock would land in the block the game is recording.
+      const int replaced_count = (g_dgv_stage_op_replaced.load(std::memory_order_relaxed) && !g_dgv_recording.load(std::memory_order_relaxed)) ? ReplaceStageOps(self, replaced) : 0;
       if (const uint32_t stages = g_dgv_texture_lod_set.load(std::memory_order_relaxed) ? g_dgv_max_mip_level_stages.exchange(0, std::memory_order_relaxed) : 0)
       {
          ApplyMaxMipLevels(self, stages, false);
@@ -2035,9 +2166,9 @@ namespace
       const HRESULT hr = Original<HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, Args...)>(self, slot)(self, args...);
       for (int i = 0; i < replaced_count; i++)
       {
-         const ReplacedBlend& entry = replaced[i];
+         const ReplacedStageOp& entry = replaced[i];
          auto set = g_dgv.methods.set_texture_stage_state;
-         set(self, entry.stage, entry.op->op, D3DTOP_BLENDTEXTUREALPHAPM);
+         set(self, entry.stage, entry.op->op, entry.value);
          set(self, entry.stage, entry.op->arg0, entry.args[0]);
          set(self, entry.stage, entry.op->arg1, entry.args[1]);
          set(self, entry.stage, entry.op->arg2, entry.args[2]);
@@ -2216,6 +2347,50 @@ namespace
       return hr;
    }
 
+   void Note10BitSurface(HRESULT hr, D3DFORMAT format, IDirect3DSurface9** surface)
+   {
+      if (FAILED(hr) || format != D3DFMT_A2R10G10B10)
+         return;
+      g_dgv_10_bit_used.store(true, std::memory_order_relaxed);
+      (*surface)->AddRef();
+      PatchSurfaces(*surface);
+   }
+
+   HRESULT STDMETHODCALLTYPE HookCreateRenderTarget(IDirect3DDevice9* self, UINT width, UINT height, D3DFORMAT format, D3DMULTISAMPLE_TYPE multisample, DWORD quality, BOOL lockable, IDirect3DSurface9** surface, HANDLE* shared)
+   {
+      const HRESULT hr = Original<decltype(&HookCreateRenderTarget)>(self, SLOT_CREATE_RENDER_TARGET)(self, width, height, format, multisample, quality, lockable, surface, shared);
+      Note10BitSurface(hr, format, surface);
+      return hr;
+   }
+
+   // dgVoodoo reports success on YUY2/UYVY and writes nothing. The color is a D3DCOLOR_XYUV: red holds Y, green U, blue V.
+   HRESULT STDMETHODCALLTYPE HookColorFill(IDirect3DDevice9* self, IDirect3DSurface9* surface, const RECT* rect, D3DCOLOR color)
+   {
+      D3DSURFACE_DESC desc;
+      if (!surface || FAILED(surface->GetDesc(&desc)) || (desc.Format != D3DFMT_YUY2 && desc.Format != D3DFMT_UYVY))
+         return Original<decltype(&HookColorFill)>(self, SLOT_COLOR_FILL)(self, surface, rect, color);
+      const uint32_t y = (color >> 16) & 0xff, u = (color >> 8) & 0xff, v = color & 0xff;
+      const uint32_t macropixel = desc.Format == D3DFMT_YUY2 ? (y | u << 8 | y << 16 | v << 24) : (u | y << 8 | v << 16 | y << 24);
+      const RECT area = rect ? *rect : RECT{0, 0, LONG(desc.Width), LONG(desc.Height)};
+      if ((area.left | area.right) & 1)
+         return D3DERR_INVALIDCALL;
+      D3DLOCKED_RECT locked;
+      if (const HRESULT hr = surface->LockRect(&locked, &area, 0); FAILED(hr))
+         return hr;
+      for (LONG row = 0; row < area.bottom - area.top; row++)
+      {
+         std::fill_n((uint32_t*)((BYTE*)locked.pBits + row * locked.Pitch), (area.right - area.left) / 2, macropixel);
+      }
+      return surface->UnlockRect();
+   }
+
+   HRESULT STDMETHODCALLTYPE HookCreateOffscreenPlainSurface(IDirect3DDevice9* self, UINT width, UINT height, D3DFORMAT format, D3DPOOL pool, IDirect3DSurface9** surface, HANDLE* shared)
+   {
+      const HRESULT hr = Original<decltype(&HookCreateOffscreenPlainSurface)>(self, SLOT_CREATE_OFFSCREEN_PLAIN_SURFACE)(self, width, height, format, pool, surface, shared);
+      Note10BitSurface(hr, format, surface);
+      return hr;
+   }
+
    HRESULT STDMETHODCALLTYPE HookCreateStateBlock(IDirect3DDevice9* self, D3DSTATEBLOCKTYPE type, IDirect3DStateBlock9** block)
    {
       if (g_dgv_texture_lod_set.load(std::memory_order_relaxed))
@@ -2361,6 +2536,182 @@ namespace
             fprintf(g_log, "dgVoodoo sampler cache compares patched\n"); });
    }
 
+   enum class PatchKind
+   {
+      BYTES, // "code" replaces the original bytes in place
+      JUMP,  // the site jumps to "code" in a cave, nops fill the rest
+      CALL,  // the site calls "code" in a cave
+   };
+   // Hex bytes; "@rva" is a rel32 to that RVA of dgVoodoo.
+   struct CodePatch
+   {
+      DWORD rva;
+      const char* original;
+      PatchKind kind;
+      const char* code;
+   };
+   // One group per bug, applied in memory when every site of the group matches; the file stays as shipped.
+   struct CodePatchGroup
+   {
+      const char* name;
+      std::initializer_list<CodePatch> sites;
+      bool* applied = nullptr;
+   };
+
+   // Returns the size written.
+   size_t AssembleHex(const char* text, BYTE* out, const BYTE* base)
+   {
+      BYTE* at = out;
+      for (const char* p = text; *p;)
+      {
+         char* end;
+         if (*p == '@')
+         {
+            const int32_t rel = int32_t(base + strtoul(p + 1, &end, 16) - (at + 4));
+            memcpy(at, &rel, 4);
+            at += 4;
+         }
+         else
+         {
+            *at++ = BYTE(strtoul(p, &end, 16));
+         }
+         p = end;
+         while (*p == ' ')
+         {
+            p++;
+         }
+      }
+      return at - out;
+   }
+
+   // RVAs and root causes: docs/dgVoodoo-RE.md, "Workarounds in Luma's D3D9 proxy".
+   void PatchDgVoodooCode()
+   {
+      static const CodePatchGroup GROUPS[] = {
+         // Per-level dirty rect/box is "edge >> level" with no max(1), so a short side empties and the level is skipped
+         // (2D/cube/DXT, then volume). Clamped to the level inside the bounds of a level-0 region that wasn't empty.
+         {"UpdateTexture small mips",
+            {
+               {0x2da12, "3b 75 24 75 70", PatchKind::JUMP, "53 56 8b cf 8b 75 28 8d 5d d0 e8 1b 00 00 00 8d 75 38 8d 5d c0 e8 10 00 00 00 5e 5b 3b 75 24 0f 85 @2da87 e9 @2da17 8b 06 3b 46 08 7d 28 8b 46 04 3b 46 0c 7d 20 8b 06 8b 56 08 e8 17 00 00 00 89 03 89 53 08 8b 46 04 8b 56 0c e8 07 00 00 00 89 43 04 89 53 0c c3 d3 fa 85 d2 7f 05 ba 01 00 00 00 d3 f8 3b c2 7c 03 8d 42 ff c3"},
+               {0x1595a, "e8 4a f6 ff ff", PatchKind::CALL, "52 8b 45 a4 3b 45 b0 7d 70 8b 45 a8 3b 45 b4 7d 68 8b 45 ac 3b 45 b8 7d 60 8b 44 24 08 8b 54 24 14 85 d2 7f 05 ba 01 00 00 00 3b c2 7c 03 8d 42 ff 89 44 24 08 89 54 24 14 8b 44 24 0c 8b 54 24 18 85 d2 7f 05 ba 01 00 00 00 3b c2 7c 03 8d 42 ff 89 44 24 0c 89 54 24 18 8b 44 24 10 8b 54 24 1c 85 d2 7f 05 ba 01 00 00 00 3b c2 7c 03 8d 42 ff 89 44 24 10 89 54 24 1c 5a e9 @14fa9"},
+            },
+            &g_dgv_mips_patched},
+         // ColorFill treats the D3DCOLOR as a value packed in the surface's format: the conversion table has empty rows for
+         // internal formats 0x15..0x1f (A2R10G10B10, 16-bit and float), which fill 0, and 16-bit colour, L8 and A8 surfaces
+         // saturate. 0x15..0x1f read the A8R8G8B8 row (ClearRenderTargetView takes floats, so it's the same colour) and the
+         // others get the colour packed first. Every surface kind takes this path, there's no CPU fill.
+         {"ColorFill formats",
+            {
+               {0x8d941, "55 8b ec 51 80 7d 14 00", PatchKind::JUMP, "51 8b 54 24 10 8b 44 24 08 83 f8 01 0f 84 32 00 00 00 83 f8 02 0f 84 57 00 00 00 83 f8 03 0f 84 7c 00 00 00 83 f8 04 0f 84 ae 00 00 00 83 f8 07 0f 84 e0 00 00 00 83 f8 08 0f 84 df 00 00 00 e9 e6 00 00 00 33 c0 8b ca c1 e9 08 81 e1 00 f8 00 00 0b c1 8b ca c1 e9 05 81 e1 e0 07 00 00 0b c1 8b ca c1 e9 03 81 e1 1f 00 00 00 0b c1 e9 b4 00 00 00 33 c0 8b ca c1 e9 09 81 e1 00 7c 00 00 0b c1 8b ca c1 e9 06 81 e1 e0 03 00 00 0b c1 8b ca c1 e9 03 81 e1 1f 00 00 00 0b c1 e9 86 00 00 00 33 c0 8b ca c1 e9 09 81 e1 00 7c 00 00 0b c1 8b ca c1 e9 06 81 e1 e0 03 00 00 0b c1 8b ca c1 e9 03 81 e1 1f 00 00 00 0b c1 8b ca c1 e9 10 81 e1 00 80 00 00 0b c1 e9 4b 00 00 00 33 c0 8b ca c1 e9 10 81 e1 00 f0 00 00 0b c1 8b ca c1 e9 0c 81 e1 00 0f 00 00 0b c1 8b ca c1 e9 08 81 e1 f0 00 00 00 0b c1 8b ca c1 e9 04 81 e1 0f 00 00 00 0b c1 e9 10 00 00 00 0f b6 c2 e9 08 00 00 00 0f b6 c2 e9 00 00 00 00 89 44 24 10 59 8b 44 24 04 83 e8 15 83 f8 0a 77 08 c7 44 24 04 06 00 00 00 55 8b ec 51 80 7d 14 00 e9 @8d949"},
+               {0x8da6a, "55 8b ec 53 56", PatchKind::JUMP, "51 8b 54 24 10 8b 44 24 08 83 f8 01 0f 84 32 00 00 00 83 f8 02 0f 84 57 00 00 00 83 f8 03 0f 84 7c 00 00 00 83 f8 04 0f 84 ae 00 00 00 83 f8 07 0f 84 e0 00 00 00 83 f8 08 0f 84 df 00 00 00 e9 e6 00 00 00 33 c0 8b ca c1 e9 08 81 e1 00 f8 00 00 0b c1 8b ca c1 e9 05 81 e1 e0 07 00 00 0b c1 8b ca c1 e9 03 81 e1 1f 00 00 00 0b c1 e9 b4 00 00 00 33 c0 8b ca c1 e9 09 81 e1 00 7c 00 00 0b c1 8b ca c1 e9 06 81 e1 e0 03 00 00 0b c1 8b ca c1 e9 03 81 e1 1f 00 00 00 0b c1 e9 86 00 00 00 33 c0 8b ca c1 e9 09 81 e1 00 7c 00 00 0b c1 8b ca c1 e9 06 81 e1 e0 03 00 00 0b c1 8b ca c1 e9 03 81 e1 1f 00 00 00 0b c1 8b ca c1 e9 10 81 e1 00 80 00 00 0b c1 e9 4b 00 00 00 33 c0 8b ca c1 e9 10 81 e1 00 f0 00 00 0b c1 8b ca c1 e9 0c 81 e1 00 0f 00 00 0b c1 8b ca c1 e9 08 81 e1 f0 00 00 00 0b c1 8b ca c1 e9 04 81 e1 0f 00 00 00 0b c1 e9 10 00 00 00 0f b6 c2 e9 08 00 00 00 0f b6 c2 e9 00 00 00 00 89 44 24 10 59 8b 44 24 04 83 e8 15 83 f8 0a 77 08 c7 44 24 04 06 00 00 00 55 8b ec 53 56 e9 @8da6f"},
+            }},
+         // A compare sample's reference copies the coordinate's register token but not its index, so a constant coordinate
+         // yields an invalid operand and D3D11 removes the device.
+         {"depth compare reference operand", {{0x62357, "8b 53 1c 8b ca", PatchKind::JUMP, "8b 8e f0 03 00 00 89 8d 70 ff ff ff 8b 8e f4 03 00 00 89 8d 74 ff ff ff 8b 8e f8 03 00 00 89 8d 78 ff ff ff 8b 8e fc 03 00 00 89 8d 7c ff ff ff 8b 53 1c 8b ca e9 @6235c"}}},
+         // The X8L8V8U8 upload shader extracts L with offset 16 where the 7-bit field needs 17 (L is halved for SNORM).
+         {"X8L8V8U8 luminance", {{0x8ad35, "c1 e9 13 83 e1 18", PatchKind::JUMP, "c1 e9 13 83 e1 18 83 c1 08 2b 4d e0 e9 @8ad3b"}}},
+         // texbeml's luminance mul writes .xyz; it scales all four channels.
+         {"texbeml alpha",
+            {
+               {0x5f159, "68 a4 00 00", PatchKind::BYTES, "68 e4 00 00"},
+               {0x5f15f, "6a 07", PatchKind::BYTES, "6a 0f"},
+            }},
+         // L16 is R16_UNORM with no swizzle. It takes sampler type 4 (.xxxx, as INTZ), which the second site adds to the
+         // ps_1_x and fixed function sample path. Cube and volume have no such type and stay (L,0,0,1): the type is a 3-bit shader key with one value free.
+         {"L16 swizzle",
+            {
+               {0x52d79, "8a 84 be 30 75 00 00", PatchKind::JUMP, "83 7b 1c 17 75 07 80 fa 01 75 02 b2 04 8a 84 be 30 75 00 00 e9 @52d80"},
+               {0x594b1, "b8 e4 00 00 00 83 fe 07 8d 48 fd 0f 44 c1", PatchKind::JUMP, "b8 e4 00 00 00 83 fe 07 8d 48 fd 0f 44 c1 83 fe 04 75 02 31 c0 e9 @594bf"},
+            }},
+         // Fixed function vertex shader generator: the spot factor scaled diffuse only, ambient was added after it. The
+         // spot mul and the ambient mad swap places (same length, in place).
+         {"spot light ambient", {{0x6f212, "8b 45 dc 83 c4 64 85 c0 74 1d 6a 00 6a 00 50 8b 45 d4 68 a4 01 00 00 50 6a 07 50 6a 38 56 53 e8 db 4c 05 00 83 c4 28 8b 4d d4 ba a4 01 00 00 8b 87 c4 00 00 00 6a 00 52 51 ff 75 e0 0d 00 00 00 40 ff 75 f4 68 a0 06 00 00 52 50 ff b7 68 01 00 00 52 ff b7 64 01 00 00 6a 07 51 6a 32 56 53 e8 9b 4c 05 00 8b 87 a0 01 00 00 83 c4 40", PatchKind::BYTES, "83 c4 64 8b 4d d4 ba a4 01 00 00 8b 87 c4 00 00 00 6a 00 52 51 ff 75 e0 0d 00 00 00 40 ff 75 f4 68 a0 06 00 00 52 50 ff b7 68 01 00 00 52 ff b7 64 01 00 00 6a 07 51 6a 32 56 53 e8 bf 4c 05 00 83 c4 40 8b 45 dc 85 c0 74 1d 6a 00 6a 00 50 8b 45 d4 68 a4 01 00 00 50 6a 07 50 6a 38 56 53 e8 9b 4c 05 00 83 c4 28 8b 87 a0 01 00 00"}}},
+         // D3D11 has no mixed anisotropic filter and dgVoodoo picks ANISOTROPIC when either side is. NVIDIA's result: an
+         // anisotropic magnification is linear; an anisotropic minification stays anisotropic unless MAXANISOTROPY is 1.
+         // Minification with point magnification and MAXANISOTROPY > 1 can't be expressed and stays fully anisotropic.
+         {"anisotropic MIN/MAG crossover",
+            {
+               {0x3e89f, "80 fe 02 74 35 80 fa 02 74 30", PatchKind::JUMP, "80 fe 02 75 09 80 fa 02 74 1e b6 01 eb 15 80 fa 02 75 10 80 fe 00 75 10 83 b9 a4 00 00 00 01 77 07 b2 01 e9 @3e8a9 e9 @3e8d9"},
+               {0x32241, "80 fd 02 74 3b 80 f9 02 74 36", PatchKind::JUMP, "80 fd 02 75 09 80 f9 02 74 1f b5 01 eb 16 80 f9 02 75 11 80 fd 00 75 11 83 bc 37 a4 00 00 00 01 77 07 b1 01 e9 @3224b e9 @32281"},
+            }},
+         // The DOTPRODUCT3 stage op writes .xyz whatever pass emits it, so it never reaches alpha and clobbers colour from
+         // the alpha pass. It now honours the pass's mask, with the second bx2 argument in its own temp (it went to the
+         // stage's destination, which a .w dot left behind). The two "and" edits keep ALPHAREPLICATE on the arguments.
+         // ReplaceStageOps sets the alpha pass the hardware's way.
+         {"DOTPRODUCT3",
+            {
+               {0x5c90a, "25 ff fe 00 00", PatchKind::BYTES, "25 ff ff 00 00"},
+               {0x5c936, "25 ff fe 00 00", PatchKind::BYTES, "25 ff ff 00 00"},
+               {0x5c9cb, "e8 41 75 06 00", PatchKind::JUMP, "e8 @c3f11 6a 01 8b 4b 08 ba 04 00 00 00 e8 @c3164 59 50 6a 00 8b 4b 08 ba 04 00 00 00 e8 @c3164 59 89 45 f8 5a 8b 4b 08 e8 @c3202 e9 @5c9d0"},
+               {0x5ca30, "ff b5 20 ff ff ff", PatchKind::BYTES, "ff 75 f8 90 90 90"},
+               {0x5ca77, "ff b5 20 ff ff ff 6a 07 ff b5 20 ff ff ff", PatchKind::BYTES, "ff 75 f8 ff 73 1c ff b5 20 ff ff ff 90 90"},
+            },
+            &g_dgv_dot3_patched},
+      };
+      static std::once_flag once;
+      std::call_once(once, []
+         {
+            BYTE* base = (BYTE*)Chain();
+            MODULEINFO info = {};
+            GetModuleInformation(GetCurrentProcess(), Chain(), &info, sizeof(info));
+            constexpr size_t CAVE_SIZE = 0x1000, MAX_SITE = 128;
+            auto* cave = (BYTE*)VirtualAlloc(nullptr, CAVE_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (!cave)
+               return;
+            struct SiteWrite
+            {
+               BYTE* at;
+               size_t size;
+               BYTE bytes[MAX_SITE];
+            };
+            std::vector<SiteWrite> writes;
+            BYTE* cave_at = cave;
+            for (const CodePatchGroup& group : GROUPS)
+            {
+               const bool matches = std::all_of(group.sites.begin(), group.sites.end(), [&](const CodePatch& site)
+                  {
+                     BYTE original[MAX_SITE];
+                     const size_t size = AssembleHex(site.original, original, base);
+                     return info.SizeOfImage >= site.rva + size && memcmp(base + site.rva, original, size) == 0;
+                  });
+               fprintf(g_log, "dgVoodoo patch \"%s\": %s\n", group.name, matches ? "applied" : "not applied (unknown build)");
+               if (!matches)
+                  continue;
+               for (const CodePatch& site : group.sites)
+               {
+                  SiteWrite write = {.at = base + site.rva};
+                  BYTE original[MAX_SITE];
+                  write.size = AssembleHex(site.original, original, base);
+                  if (site.kind == PatchKind::BYTES)
+                  {
+                     AssembleHex(site.code, write.bytes, base);
+                  }
+                  else
+                  {
+                     std::fill(std::begin(write.bytes), std::end(write.bytes), BYTE(0x90)); // nop
+                     write.bytes[0] = (site.kind == PatchKind::JUMP ? 0xe9 : 0xe8);
+                     const int32_t rel = int32_t(cave_at - (write.at + 5));
+                     memcpy(write.bytes + 1, &rel, 4);
+                     cave_at += AssembleHex(site.code, cave_at, base);
+                  }
+                  writes.push_back(write);
+               }
+               if (group.applied)
+               {
+                  *group.applied = true;
+               }
+            }
+            DWORD old_protect;
+            VirtualProtect(cave, CAVE_SIZE, PAGE_EXECUTE_READ, &old_protect);
+            for (const SiteWrite& write : writes)
+            {
+               VirtualProtect(write.at, write.size, PAGE_EXECUTE_READWRITE, &old_protect);
+               memcpy(write.at, write.bytes, write.size);
+               VirtualProtect(write.at, write.size, old_protect, &old_protect);
+               FlushInstructionCache(GetCurrentProcess(), write.at, write.size);
+            } });
+   }
+
    // Takes the methods, hooks the device and its implicit swap chain, sets the documented point defaults. Before the
    // CSMT layer starts, so the vtable still holds dgVoodoo's methods. "app_params": the game's parameters as passed,
    // before CreateDevice wrote the actual back buffer format and size into them.
@@ -2387,6 +2738,7 @@ namespace
          g_dgv.texture_lods.clear();
       }
       PatchSamplerCacheCompare();
+      PatchDgVoodooCode();
       if (IDirect3DSwapChain9* swap_chain = nullptr; SUCCEEDED(device->GetSwapChain(0, &swap_chain)))
       {
          AppPresentation app = {
@@ -2411,6 +2763,9 @@ namespace
       SetDocumentedPointDefaults(device);
       Patch(device, SLOT_SET_RENDER_TARGET, (void*)&HookSetRenderTarget);
       Patch(device, SLOT_CREATE_STATE_BLOCK, (void*)&HookCreateStateBlock);
+      Patch(device, SLOT_CREATE_RENDER_TARGET, (void*)&HookCreateRenderTarget);
+      Patch(device, SLOT_CREATE_OFFSCREEN_PLAIN_SURFACE, (void*)&HookCreateOffscreenPlainSurface);
+      Patch(device, SLOT_COLOR_FILL, (void*)&HookColorFill);
       Patch(device, SLOT_BEGIN_STATE_BLOCK, (void*)&HookBeginStateBlock);
       Patch(device, SLOT_END_STATE_BLOCK, (void*)&HookEndStateBlock);
       Patch(device, SLOT_SET_TEXTURE, (void*)&HookSetTexture);
@@ -2480,6 +2835,10 @@ namespace
          }
       }
       IDirect3DTexture9* tex = *texture;
+      if (g_dgv_fixes && format == D3DFMT_A2R10G10B10)
+      {
+         g_dgv_10_bit_used.store(true, std::memory_order_relaxed);
+      }
       PatchBaseTexture(tex);
       Patch(tex, SLOT_LOCK, (void*)&HookTextureLockRect);
       Patch(tex, SLOT_UNLOCK, (void*)&HookTextureUnlockRect);
@@ -2557,6 +2916,10 @@ namespace
       }
       IDirect3DCubeTexture9* tex = *texture;
       PatchBaseTexture(tex);
+      if (g_dgv_fixes && format == D3DFMT_A2R10G10B10)
+      {
+         g_dgv_10_bit_used.store(true, std::memory_order_relaxed);
+      }
       Patch(tex, SLOT_LOCK, (void*)&HookCubeLockRect);
       Patch(tex, SLOT_UNLOCK, (void*)&HookCubeUnlockRect);
       IDirect3DSurface9* surface = nullptr;
@@ -2652,7 +3015,7 @@ namespace
    {
       CountUpdateInto(destination);
       const HRESULT hr = Original<decltype(&HookUpdateTexture)>(self, SLOT_UPDATE_TEXTURE)(self, source, destination);
-      if (SUCCEEDED(hr) && g_dgv_fixes && source && destination)
+      if (SUCCEEDED(hr) && g_dgv_fixes && !g_dgv_mips_patched && source && destination)
       {
          CopySkippedLevels(self, source, destination);
       }
@@ -2803,6 +3166,7 @@ namespace
       StartDgVoodooFixes(dev, app_params ? &*app_params : nullptr);
       if (csmt)
       {
+         Csmt::g_reset_on_caller = !ChainIsDgVoodoo();
          Csmt::Start(dev, g_log); // last: it patches above the hooks above
       }
       else if (g_csmt_requested)
@@ -2819,14 +3183,14 @@ namespace
       D3DPRESENT_PARAMETERS* params,
       IDirect3DDevice9** device)
    {
-      // CSMT runs only on dgVoodoo: on a native runtime NVIDIA's D3D9 driver hung
-      // when work recorded on the worker was waited for from the game thread (a
-      // query's GetData, a managed texture's UnlockRect), with or without
-      // MULTITHREADED, and the driver already threads its own work there. Under
+      // CSMT runs only on dgVoodoo unless d3d9_csmt_native.on: on Windows d3d9
+      // NVIDIA's driver hangs in CreateTexture on the worker without
+      // MULTITHREADED (d3d9_csmt_keepmt.on keeps it), and the VA fix's MANAGED
+      // emulation renders differently under it (docs/DX9-Support-Plan.md). Under
       // MULTITHREADED dgVoodoo takes its own critical section in every call; with
       // CSMT only one thread calls it at a time, so the flag only costs.
-      const bool csmt = g_csmt_requested && ChainIsDgVoodoo();
-      if (g_strip_multithreaded || csmt)
+      const bool csmt = g_csmt_requested && (ChainIsDgVoodoo() || g_csmt_native);
+      if (g_strip_multithreaded || (csmt && !g_csmt_keep_multithreaded))
       {
          behavior &= ~D3DCREATE_MULTITHREADED;
       }
@@ -2866,8 +3230,8 @@ namespace
    HRESULT STDMETHODCALLTYPE HookCreateDeviceEx(IDirect3D9Ex* self, UINT adapter, D3DDEVTYPE type, HWND window, DWORD behavior,
       D3DPRESENT_PARAMETERS* params, D3DDISPLAYMODEEX* mode, IDirect3DDevice9Ex** device)
    {
-      const bool csmt = g_csmt_requested && ChainIsDgVoodoo();
-      if (g_strip_multithreaded || csmt)
+      const bool csmt = g_csmt_requested && (ChainIsDgVoodoo() || g_csmt_native);
+      if (g_strip_multithreaded || (csmt && !g_csmt_keep_multithreaded))
       {
          behavior &= ~D3DCREATE_MULTITHREADED;
       }
@@ -3169,6 +3533,10 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void*)
       g_strip_multithreaded = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
       swprintf_s(flag_path, L"%sd3d9_csmt.on", g_dir);
       g_csmt_requested = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
+      swprintf_s(flag_path, L"%sd3d9_csmt_native.on", g_dir);
+      g_csmt_native = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
+      swprintf_s(flag_path, L"%sd3d9_csmt_keepmt.on", g_dir);
+      g_csmt_keep_multithreaded = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
       swprintf_s(flag_path, L"%sd3d9_fastlock.on", g_dir);
       g_fast_lock_requested = GetFileAttributesW(flag_path) != INVALID_FILE_ATTRIBUTES;
       swprintf_s(flag_path, L"%sd3d9_dgvfix.off", g_dir);

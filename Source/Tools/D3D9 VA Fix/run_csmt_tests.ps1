@@ -7,7 +7,16 @@
 # Usage: pwsh -File run_csmt_tests.ps1 -DgVoodoo <folder with dgVoodoo's D3D9.dll (or d3d9_chain.dll) and dgVoodoo.conf>
 # Use dgVoodoo 2.87.3 (_tools\dgv_re873\MS): offline, 2.87.5 behind the proxy overflows its stack (it runs in
 # the game; same shader hashes as 2.87.3). The test exe imports d3d9.dll like a game, so it runs from its folder.
-param([Parameter(Mandatory)][string]$DgVoodoo, [switch]$Bench, [int]$TimeoutSeconds = 20, [int]$Repeat = 1)
+# 2026-11-04 (Win11 26300, NVIDIA 617.42): 2.87.3 crashes inside its D3D9.dll before CreateDevice even with CSMT off;
+# 2.87.6 (_tools\dgv_hashgen\run2876: D3D9.dll + dgVoodoo.conf) passes.
+# -Native (experiment, docs/DX9-Support-Plan.md Phase 0 item 5): also runs CSMT on the Windows runtime through the test-only
+# d3d9_csmt_native.on, as a plain device, a D3D9Ex one (the VA fix creates the device with CreateDeviceEx) and both with
+# D3DCREATE_MULTITHREADED kept (d3d9_csmt_keepmt.on).
+# -Serial: one test process at a time (a weak GPU, such as an iGPU picked through the Windows graphics preference, misses
+# the test's query and watchdog timings with every run of a round at once).
+# -Only <runtime names>: run just those (windows, windows_vafix, dgvoodoo, native_plain, native_ex, native_mt, native_ex_mt).
+param([Parameter(Mandatory)][string]$DgVoodoo, [switch]$Bench, [switch]$Native, [switch]$Serial, [string[]]$Only,
+    [int]$TimeoutSeconds = 20, [int]$Repeat = 1)
 $ErrorActionPreference = "Stop"
 $bin = Join-Path $PSScriptRoot "..\..\..\Binaries\Win32-Tools\D3D9 VA Fix"
 $env:D3D9_MEMLOG_MS = "1000"
@@ -18,7 +27,7 @@ $failed = 0
 if ($LASTEXITCODE -ne 0) { $failed++ }
 
 $dgvDll = @("D3D9.dll", "d3d9_chain.dll") | ForEach-Object { Join-Path $DgVoodoo $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
-function New-Folder([string]$name, [string]$chain, [bool]$csmt, [bool]$vaFix) {
+function New-Folder([string]$name, [string]$chain, [bool]$csmt, [bool]$vaFix, [string[]]$flags = @()) {
     $dir = Join-Path $bin "csmt_tests\$name"
     New-Item -ItemType Directory -Force $dir | Out-Null
     Copy-Item (Join-Path $bin "d3d9.dll"), (Join-Path $bin "d3d9_csmt_test.exe") $dir -Force
@@ -29,6 +38,7 @@ function New-Folder([string]$name, [string]$chain, [bool]$csmt, [bool]$vaFix) {
     if ($vaFix) { New-Item -ItemType File -Force $vaFlag | Out-Null } else { Remove-Item $vaFlag -ErrorAction SilentlyContinue }
     $csmtFlag = Join-Path $dir "d3d9_csmt.on"
     if ($csmt) { New-Item -ItemType File -Force $csmtFlag | Out-Null } else { Remove-Item $csmtFlag -ErrorAction SilentlyContinue }
+    $flags | Where-Object { $_ } | ForEach-Object { New-Item -ItemType File -Force (Join-Path $dir $_) | Out-Null }
     return $dir
 }
 
@@ -65,6 +75,14 @@ function Invoke-Test([string]$dir, [string[]]$arguments) {
 $runtimes = @(@{ Name = "windows"; Chain = "$env:SystemRoot\SysWOW64\d3d9.dll"; VaFix = $false },
     @{ Name = "windows_vafix"; Chain = "$env:SystemRoot\SysWOW64\d3d9.dll"; VaFix = $true },
     @{ Name = "dgvoodoo"; Chain = $dgvDll; VaFix = $true })
+if ($Native) {
+    $windows = "$env:SystemRoot\SysWOW64\d3d9.dll"
+    $runtimes += @(@{ Name = "native_plain"; Chain = $windows; VaFix = $false; Flags = @("d3d9_csmt_native.on") },
+        @{ Name = "native_ex"; Chain = $windows; VaFix = $true; Flags = @("d3d9_csmt_native.on") },
+        @{ Name = "native_mt"; Chain = $windows; VaFix = $false; Flags = @("d3d9_csmt_native.on", "d3d9_csmt_keepmt.on") },
+        @{ Name = "native_ex_mt"; Chain = $windows; VaFix = $true; Flags = @("d3d9_csmt_native.on", "d3d9_csmt_keepmt.on") })
+}
+if ($Only) { $runtimes = @($runtimes | Where-Object { $_.Name -in $Only }) }
 $runs = @(
     @{ Name = "frames"; Args = @("frames=8") },
     @{ Name = "reset"; Args = @("frames=8", "reset") },
@@ -73,6 +91,9 @@ $runs = @(
     # A D3D9Ex game (Bayonetta): its own Direct3DCreate9Ex and CreateDeviceEx reach the layer
     @{ Name = "ex"; Args = @("frames=8", "ex") },
     @{ Name = "ex_reset"; Args = @("frames=8", "reset", "ex") },
+    # The same without MANAGED resources, so a D3D9Ex device runs it without the VA fix too
+    @{ Name = "exdefault"; Args = @("frames=8", "ex", "nomanaged") },
+    @{ Name = "exdefault_reset"; Args = @("frames=8", "reset", "ex", "nomanaged") },
     # dgVoodoo's uploaded vertex constants against the proxy's mirror at every D3D11 draw (Luma reads the mirror)
     @{ Name = "constants"; Args = @("frames=8", "constants") }
 )
@@ -82,8 +103,12 @@ foreach ($round in 1..$Repeat) {
 $started = foreach ($runtime in $runtimes) {
     foreach ($run in $runs) {
         $off = New-Folder "$($runtime.Name)_$($run.Name)_$($round)_off" $runtime.Chain $false $runtime.VaFix
-        $on = New-Folder "$($runtime.Name)_$($run.Name)_$($round)_on" $runtime.Chain $true $runtime.VaFix
-        @{ Name = "$($runtime.Name) / $($run.Name)"; A = (Start-Test $off $run.Args); B = (Start-Test $on $run.Args) }
+        $on = New-Folder "$($runtime.Name)_$($run.Name)_$($round)_on" $runtime.Chain $true $runtime.VaFix $runtime.Flags
+        $a = Start-Test $off $run.Args
+        if ($Serial) { $a.Process.WaitForExit($TimeoutSeconds * 1000) | Out-Null }
+        $b = Start-Test $on $run.Args
+        if ($Serial) { $b.Process.WaitForExit($TimeoutSeconds * 1000) | Out-Null }
+        @{ Name = "$($runtime.Name) / $($run.Name)"; A = $a; B = $b }
     }
 }
 foreach ($test in $started) {
@@ -93,7 +118,7 @@ foreach ($test in $started) {
     $crcB = $b.Output | Where-Object { $_ -like "crc *" }
     $diff = Compare-Object @($crcA) @($crcB)
     # dgVoodoo runs threaded; on the Windows runtime the flag must be refused, and everything else still pass.
-    $expected = if ($test.Name -like "dgvoodoo*") { "CSMT: on" } else { "CSMT: requested, but" }
+    $expected = if ($test.Name -like "dgvoodoo*" -or $test.Name -like "native*") { "CSMT: on" } else { "CSMT: requested, but" }
     $ok = ($a.Exit -eq 0) -and ($b.Exit -eq 0) -and -not $diff -and $crcA.Count -gt 0 -and
         ($b.Log | Select-String $expected)
     # With CSMT on dgVoodoo's draws must have been compared (the mirror is live), not merely found equal by having none

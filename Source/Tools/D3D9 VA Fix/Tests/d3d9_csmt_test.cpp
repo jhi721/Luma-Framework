@@ -145,8 +145,27 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0) : COLOR
       return ((x * 2654435761u) ^ (y * 40503u) ^ seed) | 0xFF000000u;
    }
 
+   // nomanaged: what the scene would put in MANAGED goes to DEFAULT (textures filled through a SYSTEMMEM texture and
+   // UpdateTexture), so a D3D9Ex device runs the scene without the VA fix.
+   bool g_no_managed = false;
+
    IDirect3DTexture9* PatternTexture(IDirect3DDevice9* device, UINT size, UINT seed, D3DPOOL pool)
    {
+      if (pool == D3DPOOL_MANAGED && g_no_managed)
+      {
+         IDirect3DTexture9* staging = PatternTexture(device, size, seed, D3DPOOL_SYSTEMMEM);
+         IDirect3DTexture9* texture = nullptr;
+         CHECK_HR(device->CreateTexture(size, size, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &texture, nullptr));
+         if (staging && texture)
+         {
+            CHECK_HR(device->UpdateTexture(staging, texture));
+         }
+         if (staging)
+         {
+            staging->Release();
+         }
+         return texture;
+      }
       IDirect3DTexture9* texture = nullptr;
       CHECK_HR(device->CreateTexture(size, size, 1, pool == D3DPOOL_DEFAULT ? D3DUSAGE_DYNAMIC : 0, D3DFMT_A8R8G8B8,
          pool, &texture, nullptr));
@@ -225,8 +244,9 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0) : COLOR
             code->Release();
          }
          CHECK_HR(device->CreateVertexDeclaration(ELEMENTS, &declaration));
-         CHECK_HR(device->CreateVertexBuffer(16 * sizeof(Vertex), D3DUSAGE_WRITEONLY, 0, D3DPOOL_MANAGED, &static_vertices, nullptr));
-         CHECK_HR(device->CreateIndexBuffer(6 * 4 * sizeof(WORD), D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_MANAGED, &static_indices, nullptr));
+         const D3DPOOL buffer_pool = (g_no_managed ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED);
+         CHECK_HR(device->CreateVertexBuffer(16 * sizeof(Vertex), D3DUSAGE_WRITEONLY, 0, buffer_pool, &static_vertices, nullptr));
+         CHECK_HR(device->CreateIndexBuffer(6 * 4 * sizeof(WORD), D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, buffer_pool, &static_indices, nullptr));
          Vertex* v = nullptr;
          CHECK_HR(static_vertices->Lock(0, 0, (void**)&v, 0));
          for (int i = 0; i < 4; i++)
@@ -328,6 +348,14 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0) : COLOR
          tint[1] = 0;
          float add[4] = {0.02f, 0.01f * (frame % 5), 0.0f, 0.0f};
          CHECK_HR(device->SetPixelShaderConstantF(0, add, 1));
+         // The repeat filter must not drop a recorded set of the current value, or a set after a state block's Apply changed it.
+         IDirect3DStateBlock9* add_block = nullptr;
+         CHECK_HR(device->BeginStateBlock());
+         CHECK_HR(device->SetPixelShaderConstantF(0, add, 1));
+         CHECK_HR(device->EndStateBlock(&add_block));
+         const float other_add[4] = {0.3f, 0.0f, 0.2f, 0.0f};
+         CHECK_HR(device->SetPixelShaderConstantF(0, other_add, 1));
+         CHECK_HR(add_block->Apply());
          add[0] = 9;
          int repeat_more[4] = {int(frame % 4), 0, 0, 0};
          CHECK_HR(device->SetPixelShaderConstantI(0, repeat_more, 1));
@@ -357,6 +385,11 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0) : COLOR
                temporary->Release();
             }
          }
+
+         CHECK_HR(device->SetPixelShaderConstantF(0, other_add, 1));
+         CHECK_HR(add_block->Apply());
+         CHECK_HR(device->SetPixelShaderConstantF(0, other_add, 1));
+         add_block->Release();
 
          // The render-to-texture result, sampled.
          CHECK_HR(device->SetTexture(0, defaults.offscreen));
@@ -955,7 +988,7 @@ int main(int argc, char** argv)
    SetUnhandledExceptionFilter(&CrashReport);
    StartWatchdog(8000);
    if (argc < 2)
-      return printf("usage: d3d9_csmt_test <d3d9.dll> [frames=N] [reset] [redevice] [thread] [thread_sleep=MS] [ex] [bench=N] [work=MS]\n"), 2;
+      return printf("usage: d3d9_csmt_test <d3d9.dll> [frames=N] [reset] [redevice] [thread] [thread_sleep=MS] [ex] [nomanaged] [bench=N] [work=MS]\n"), 2;
    UINT frames = 6, bench_draws = 0, thread_sleep_ms = 0;
    double work_ms = 0;
    bool reset = false, redevice = false, thread = false, constants = false, ex = false;
@@ -970,6 +1003,7 @@ int main(int argc, char** argv)
       redevice |= !strcmp(argv[i], "redevice");
       thread |= !strcmp(argv[i], "thread");
       ex |= !strcmp(argv[i], "ex"); // A D3D9Ex game's path (Bayonetta): Direct3DCreate9Ex and CreateDeviceEx
+      g_no_managed |= !strcmp(argv[i], "nomanaged");
    }
    // "import": d3d9.dll resolved by the loader from the exe's folder, as a game's import does (dgVoodoo behind the
    // proxy recurses into itself when the proxy is loaded by path instead).
@@ -1003,6 +1037,13 @@ int main(int argc, char** argv)
       .hDeviceWindow = hwnd,
       .Windowed = TRUE,
       .PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE};
+   // Which GPU renders (a hybrid system's graphics preference can move it off the display's adapter)
+   if (D3DADAPTER_IDENTIFIER9 identifier = {}; SUCCEEDED(d3d->GetAdapterIdentifier(D3DADAPTER_DEFAULT, 0, &identifier)))
+   {
+      printf("adapter %u of %u: %s, driver %u.%u.%u.%u\n", D3DADAPTER_DEFAULT, d3d->GetAdapterCount(), identifier.Description,
+         HIWORD(identifier.DriverVersion.HighPart), LOWORD(identifier.DriverVersion.HighPart),
+         HIWORD(identifier.DriverVersion.LowPart), LOWORD(identifier.DriverVersion.LowPart));
+   }
 
    for (int round = 0; round < (redevice ? 2 : 1); round++)
    {
