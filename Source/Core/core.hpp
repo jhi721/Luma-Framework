@@ -5959,6 +5959,13 @@ namespace
          native_list->Dispatch(draw_dispatch_data.dispatch_count.x, draw_dispatch_data.dispatch_count.y, draw_dispatch_data.dispatch_count.z);
          break;
       case D3D12DrawCommand::Other:
+#if ENABLE_MINHOOK && DEVELOPMENT
+         // ReShade's event has no command signature, the hook around its ExecuteIndirect() does. Mesh draws stay out.
+         if (const std::optional<D3D12CommandSignatures::Call>& call = D3D12CommandSignatures::current_call)
+         {
+            native_list->ExecuteIndirect(call->native_signature, call->max_count, call->argument_buffer, call->argument_offset, call->count_buffer, call->count_offset);
+         }
+#endif
          break;
       }
    }
@@ -6256,6 +6263,11 @@ namespace
       uint32_t plane = 0;
       ID3D12Resource* buffer = nullptr; // Constant buffers
       using Kind = D3D12Readback::Kind;
+#if ENABLE_MINHOOK
+      const bool can_reissue_indirect = D3D12CommandSignatures::current_call.has_value();
+#else
+      constexpr bool can_reissue_indirect = false;
+#endif
       if (native_list->GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE)
       {
          copy.error = "The draw is recorded in a bundle, which can't hold copies";
@@ -6268,9 +6280,9 @@ namespace
       {
          copy.error = "The game's draw callback skipped this draw";
       }
-      else if (target.kind != Kind::ConstantBuffer && target.kind != Kind::IndirectArguments && command == D3D12DrawCommand::Other && override_type == DrawOrDispatchOverrideType::None)
+      else if (target.kind != Kind::ConstantBuffer && target.kind != Kind::IndirectArguments && command == D3D12DrawCommand::Other && override_type == DrawOrDispatchOverrideType::None && !can_reissue_indirect)
       {
-         copy.error = "Indirect and mesh draws can't be re-issued to copy their output";
+         copy.error = "Mesh draws, and ExecuteIndirect() without Luma's hook, can't be re-issued to copy their output";
       }
       else
       {
