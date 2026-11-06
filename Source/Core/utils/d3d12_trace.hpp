@@ -99,7 +99,12 @@ namespace D3D12Trace
       while (std::getline(stream, line))
       {
          const size_t first = line.find_first_not_of("/; \t\r");
-         const std::string_view text = (first != std::string::npos) ? std::string_view(line).substr(first) : std::string_view();
+         std::string_view text = (first != std::string::npos) ? std::string_view(line).substr(first) : std::string_view();
+         // FXC prefixes every instruction with its offset ("0x0000000C: dcl_constantbuffer ..."), see "DisassembleShaderFXC()"
+         if (const size_t offset_end = text.find(": "); text.starts_with("0x") && offset_end != std::string_view::npos)
+         {
+            text.remove_prefix(offset_end + 2);
+         }
          // SM 6.6 "ResourceDescriptorHeap[]" and "SamplerDescriptorHeap[]" (listed under "shader requires additional functionality")
          if (text.starts_with("Resource descriptor heap indexing") || text.starts_with("Sampler descriptor heap indexing"))
          {
