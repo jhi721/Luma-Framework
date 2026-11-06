@@ -2089,7 +2089,9 @@ namespace Mcp
          }
          for (uint32_t slot = 0; slot < TraceDrawCallData::rtvs_size && !producer; slot++)
          {
-            if (entry.IsRTVValid(slot) && entry.rt_hash[slot] == resource && reads_mip(entry.rt_view[slot]))
+            // A pipeline can leave a bound render target out with a zero write mask, a G-buffer's motion vectors during lighting for example
+            const bool is_masked = entry.type == TraceDrawCallData::TraceDrawCallType::Shader && entry.blend_desc.RenderTarget[entry.blend_desc.IndependentBlendEnable ? slot : 0].RenderTargetWriteMask == 0;
+            if (entry.IsRTVValid(slot) && entry.rt_hash[slot] == resource && reads_mip(entry.rt_view[slot]) && !is_masked)
             {
                producer = i;
                target->kind = Kind::RenderTarget;
