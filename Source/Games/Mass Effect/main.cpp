@@ -2792,13 +2792,13 @@ public:
       auto& gd = GetGameDeviceData(device_data);
       if (gd.mv_active && gd.mv_scene_done && !gd.mv_scene_overwritten && gd.mv_scene_copy && gd.mv_scene_color)
       {
-         if (src_resource == uint64_t(gd.mv_scene_color.get()))
+         if (src_resource == uintptr_t(gd.mv_scene_color.get()))
          {
             gd.mv_stats.scene_reads_after_end++;
             gd.mv_stats.scene_reader = 0;
             gd.mv_scene_reads_after_end++;
          }
-         if (dst_resource == uint64_t(gd.mv_scene_color.get()))
+         if (dst_resource == uintptr_t(gd.mv_scene_color.get()))
             gd.mv_scene_overwritten = true;
       }
    }

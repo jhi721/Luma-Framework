@@ -869,7 +869,7 @@ public:
          if (rtv_resource)
          {
             const std::shared_lock lock(device_data.mutex);
-            if (device_data.back_buffers.contains(reinterpret_cast<uint64_t>(rtv_resource.get())))
+            if (device_data.back_buffers.contains(reinterpret_cast<uintptr_t>(rtv_resource.get())))
                return DrawOrDispatchOverrideType::Replaced;
          }
          return DrawOrDispatchOverrideType::None;

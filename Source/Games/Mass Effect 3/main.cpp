@@ -915,7 +915,7 @@ public:
       ComPtr<ID3D11Resource> res;
       view->GetResource(res.put());
       const std::shared_lock lock(device_data.mutex);
-      return device_data.back_buffers.contains((uint64_t)res.get());
+      return device_data.back_buffers.contains((uintptr_t)res.get());
    }
 
    // RT0 plus every bound PS SRV except dgVoodoo's 1x1 placeholders.

@@ -988,7 +988,7 @@ public:
    bool OverrideCopyResource(ID3D11Device* native_device, DeviceData& device_data, uint64_t& dst_resource, uint64_t& src_resource) override
    {
       auto& gd = GetGameDeviceData(device_data);
-      if (gd.mv.scene_open && gd.mv.scene_color && src_resource == reinterpret_cast<uint64_t>(gd.mv.scene_color.get()))
+      if (gd.mv.scene_open && gd.mv.scene_color && src_resource == reinterpret_cast<uintptr_t>(gd.mv.scene_color.get()))
       {
          gd.mv_scene_last_copy = reinterpret_cast<ID3D11Resource*>(dst_resource);
       }

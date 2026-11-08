@@ -1424,7 +1424,7 @@ public:
       {
          game_device_data.canvas = src_resource;
       }
-      if (game_device_data.mv.scene_open && game_device_data.mv.scene_color && src_resource == reinterpret_cast<uint64_t>(game_device_data.mv.scene_color.get()))
+      if (game_device_data.mv.scene_open && game_device_data.mv.scene_color && src_resource == reinterpret_cast<uintptr_t>(game_device_data.mv.scene_color.get()))
       {
          game_device_data.mv_scene_last_copy = reinterpret_cast<ID3D11Resource*>(dst_resource);
       }
@@ -1910,7 +1910,7 @@ public:
          {
             rtv->GetResource(rt.put());
          }
-         if (!rt || uint64_t(rt.get()) != game_device_data.canvas)
+         if (!rt || uintptr_t(rt.get()) != game_device_data.canvas)
          {
             rtv.reset();
          }
@@ -2137,7 +2137,7 @@ public:
          {
             ComPtr<ID3D11Resource> source;
             srv->GetResource(source.put());
-            game_device_data.present_source = uint64_t(source.get());
+            game_device_data.present_source = uintptr_t(source.get());
          }
          bind_luma_cbuffers();
          ID3D11ShaderResourceView* const scene_srv = (game_device_data.has_copied_scene_to_canvas ? game_device_data.scene_srv.get() : nullptr);
