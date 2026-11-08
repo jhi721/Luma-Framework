@@ -246,6 +246,8 @@ try {
             # The proxy's CSMT layer (D3D9 calls replayed on a worker thread), enabled by its flag file too
             if ($useD3D9CSMT) {
                 New-Item -ItemType File -Path (Join-Path $tempDir "d3d9_csmt.on") -Force | Out-Null
+                # The cheaper device lock is written for the Windows zip's dgVoodoo build (its offsets are version specific)
+                New-Item -ItemType File -Path (Join-Path $tempDir "d3d9_fastlock.on") -Force | Out-Null
             }
             $d3d9Path = Join-Path $tempDir "d3d9_chain.dll"
         }
@@ -289,6 +291,7 @@ try {
             $linuxArchive = [IO.Compression.ZipFile]::Open($linuxZipPath, [IO.Compression.ZipArchiveMode]::Update)
             try {
                 $linuxArchive.GetEntry("d3d9_csmt.on").Delete()
+                $linuxArchive.GetEntry("d3d9_fastlock.on").Delete()
             } finally {
                 $linuxArchive.Dispose()
             }
