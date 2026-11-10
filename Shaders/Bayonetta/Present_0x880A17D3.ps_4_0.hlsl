@@ -21,6 +21,6 @@ void main(float4 v0 : SV_POSITION0, float2 v1 : TEXCOORD0, out float4 o0 : SV_TA
    {
       uint2 size;
       t0.GetDimensions(size.x, size.y);
-      ApplyOutputDithering(o0.rgb, v0.xy / size, true, LumaSettings.DisplayMode == 1, UIPaperWhiteNits);
+      ApplyOutputDithering(o0.rgb, v0.xy / size, true, LumaSettings.DisplayMode != 0, UIPaperWhiteNits);
    }
 }

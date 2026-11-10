@@ -25,6 +25,6 @@ void main(float4 v0 : SV_POSITION0, float2 v1 : TEXCOORD0, out float4 o0 : SV_TA
    // composition scales the canvas by (UI_DRAW_TYPE 2), as MGR:R's
    [branch] if (LumaSettings.GameSettings.Dithering > 0.5)
    {
-      ApplyOutputDithering(o0.rgb, v0.xy / canvas_size, true, LumaSettings.DisplayMode == 1, UIPaperWhiteNits);
+      ApplyOutputDithering(o0.rgb, v0.xy / canvas_size, true, LumaSettings.DisplayMode != 0, UIPaperWhiteNits);
    }
 }
