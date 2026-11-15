@@ -36,8 +36,8 @@ float2 motion_vectors_ps(float4 position : SV_Position) : SV_Target
 {
    const uint2 pixel = uint2(position.xy);
    const float2 object = object_motion.Load(int3(pixel, 0));
-   // Ordered compare: a NaN one gets the camera motion
-   const bool is_object = use_object_motion != 0.0 && object.x < MOTION_VECTOR_MARKER;
+   // A non finite or NaN one gets the camera motion
+   const bool is_object = use_object_motion != 0.0 && IsObjectMotion(object);
    const float2 motion = is_object ? object : CameraMotion(pixel, uint2(size), reprojection, jitter_ndc, source.Load(int3(pixel, 0)).x);
    return all(isfinite(motion)) ? motion : 0.0;
 }

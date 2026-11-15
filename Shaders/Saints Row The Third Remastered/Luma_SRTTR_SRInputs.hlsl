@@ -29,12 +29,14 @@ RWTexture2D<float> OutDepth : register(u1);          // FSR only (no 24 bit dept
       const float4 position = float4(uv, depth, 1.0);
       const float3 previous_clip = float3(dot(matReprojection[0], position), dot(matReprojection[1], position), dot(matReprojection[3], position));
       const float2 previous_uv = float2(previous_clip.x / previous_clip.z * 0.5 + 0.5, 0.5 - previous_clip.y / previous_clip.z * 0.5);
-      motion = (uv - previous_uv) * screenSize;
+      // None for a point the previous camera can't project (w <= 0, NaN)
+      motion = previous_clip.z > 0.0 ? (uv - previous_uv) * screenSize : 0.0;
    }
    else
    {
       motion = encoded * 255.0 - 127.0;
    }
-   OutMotionVectors[id.xy] = -motion;
+   // A w near 0 overflows the R16G16_FLOAT target to +-Inf, which DLSS spreads through its history (black filling the screen)
+   OutMotionVectors[id.xy] = all(abs(motion) < 65504.0) ? -motion : 0.0;
    OutDepth[id.xy] = depth;
 }

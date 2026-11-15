@@ -1,7 +1,7 @@
 // Camera motion for motion vector pixels no patched draw wrote (still the frame start's marker, the largest float16: sky, unpatched
 // draws): the G-buffer depth reprojected from the current to the previous frame's projTM (vc2 c0-c3, column vectors). Depth isn't
 // reversed.
-#include "../Includes/Math.hlsl"
+#include "../Includes/MotionVectorFill.hlsl"
 
 cbuffer MotionVectorFill : register(b0)
 {
@@ -15,10 +15,7 @@ RWTexture2D<float2> motion_vectors : register(u0);
 
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
    const uint2 size = uint2(render_size);
-   if (any(id.xy >= size) || motion_vectors[id.xy].x != FLT16_MAX)
+   if (any(id.xy >= size) || IsObjectMotion(motion_vectors[id.xy]))
       return;
-   const float4 current = float4((id.xy + 0.5) / size * float2(2.0, -2.0) + float2(-1.0, 1.0) - jitter_ndc, depth.Load(int3(id.xy, 0)), 1.0);
-   const float4 previous = mul(reprojection, current);
-   // Previous minus current, UV space, like the patched draws
-   motion_vectors[id.xy] = (previous.xy / previous.w - current.xy) * float2(0.5, -0.5);
+   WriteCameraMotion(motion_vectors, id.xy, size, reprojection, jitter_ndc, depth.Load(int3(id.xy, 0)));
 }

@@ -108,7 +108,7 @@ RWTexture2D<float2> history_output : register(u1);
    const float expected_z = view_z * previous_clip.w;
    float2 motion = object_motion.Load(int3(dtid, 0));
    // Ordered compare: a NaN one gets the camera motion
-   if (!(ObjectMotionRT != 0.0 && motion.x < MOTION_VECTOR_MARKER))
+   if (!(ObjectMotionRT != 0.0 && IsObjectMotion(motion)))
    {
       motion = CameraMotion(dtid, size, ReprojectionRT, JitterNDCRT, device_depth);
    }

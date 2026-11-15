@@ -1,6 +1,6 @@
 // Camera motion for motion vector pixels no patched draw wrote (still cleared): scene depth reprojected from the current to the
 // previous frame's view projection (row vectors, as the game's "mW2P"). Sky (reversed Z depth 0) gets rotation only.
-#include "../Includes/Math.hlsl"
+#include "../Includes/MotionVectorFill.hlsl"
 
 cbuffer MotionVectorFill : register(b0)
 {
@@ -14,12 +14,12 @@ RWTexture2D<float2> motion_vectors : register(u0);
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
    uint2 size;
    motion_vectors.GetDimensions(size.x, size.y);
-   // The clear value (the largest float16)
-   if (any(id.xy >= size) || motion_vectors[id.xy].x != FLT16_MAX)
+   if (any(id.xy >= size) || IsObjectMotion(motion_vectors[id.xy]))
       return;
    const float2 uv = (id.xy + 0.5) / size;
    const float4 current = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0) - jitter_ndc, depth.Load(int3(id.xy, 0)), 1.0);
    const float4 previous = mul(current, reprojection);
    // Previous minus current, UV space, like the patched draws; none for a point behind the previous camera
-   motion_vectors[id.xy] = previous.w > 0.0 ? (previous.xy / previous.w - current.xy) * float2(0.5, -0.5) : 0.0;
+   const float2 motion = previous.w > 0.0 ? (previous.xy / previous.w - current.xy) * float2(0.5, -0.5) : 0.0;
+   motion_vectors[id.xy] = IsObjectMotion(motion) ? motion : 0.0;
 }

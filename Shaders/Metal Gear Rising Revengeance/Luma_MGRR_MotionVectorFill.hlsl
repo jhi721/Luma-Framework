@@ -40,7 +40,7 @@ RWTexture2D<float> previous_additive : register(u4); // The additive draws' mask
    }
    const float z = depth.Load(int3(id.xy, 0));
    device_depth[id.xy] = z;
-   if (motion_vectors[id.xy].x < MOTION_VECTOR_MARKER)
+   if (IsObjectMotion(motion_vectors[id.xy]))
       return;
    WriteCameraMotion(motion_vectors, id.xy, size, fill.reprojection, fill.jitter_ndc, z);
 }

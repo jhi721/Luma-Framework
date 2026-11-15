@@ -8,6 +8,15 @@
 // unpatched draws) get the camera motion. Test "!(x < MOTION_VECTOR_MARKER)" so a NaN one gets it too.
 #define MOTION_VECTOR_MARKER 65504.0
 
+// Whether a patched draw wrote a usable motion vector: below the marker in both components. A previous clip w near or under 0 (a
+// vertex behind the near plane last frame) overflows the float16 target to +-Inf in either one, and DLSS spreads a non finite motion
+// vector through its history (black filling the screen): those, NaN and the marker all get the camera motion. Ordered compares, so
+// fxc can't fold them away.
+bool IsObjectMotion(float2 motion)
+{
+   return all(abs(motion) < MOTION_VECTOR_MARKER);
+}
+
 // The camera motion of a pixel: its device depth reprojected from the current to the previous frame's camera ("reprojection":
 // current clip space to the previous frame's, column vectors). "jitter_ndc": this frame's projection jitter, in the depth, not in
 // the motion vectors. Previous minus current, UV space, like the patched draws.
@@ -20,7 +29,9 @@ float2 CameraMotion(uint2 pixel, uint2 size, float4x4 reprojection, float2 jitte
 
 void WriteCameraMotion(RWTexture2D<float2> motion_vectors, uint2 pixel, uint2 size, float4x4 reprojection, float2 jitter_ndc, float depth)
 {
-   motion_vectors[pixel] = CameraMotion(pixel, size, reprojection, jitter_ndc, depth);
+   // A point the previous camera can't project (w near 0, after a cut) gets none
+   const float2 motion = CameraMotion(pixel, size, reprojection, jitter_ndc, depth);
+   motion_vectors[pixel] = IsObjectMotion(motion) ? motion : 0.0;
 }
 
 // FSR's masks from what the alpha blended draws wrote themselves ("MotionVectorPatch::PatchPixelShaderReactive", max blended;

@@ -48,7 +48,7 @@ RWTexture2D<float2> history_output : register(u1);
    const float4 previous_clip = mul(ReprojectionRT, current_clip);
    const float expected_z = view_z * previous_clip.w;
    float2 motion = motion_vectors.Load(int3(XE_GTAO_DEPTH_LOAD_COORD(dtid), 0));
-   if (!(motion.x < MOTION_VECTOR_MARKER))
+   if (!IsObjectMotion(motion))
    {
       motion = CameraMotion(dtid, size, ReprojectionRT, JitterNDCRT, device_depth);
    }

@@ -30,7 +30,7 @@ RWTexture2D<float> transparency : register(u2);
    {
       WriteFsrMasks(reactive, transparency, id.xy, mask_input.Load(int3(id.xy, 0)), reactive_scale, reactive_threshold);
    }
-   if (motion_vectors[id.xy].x < MOTION_VECTOR_MARKER)
+   if (IsObjectMotion(motion_vectors[id.xy]))
       return;
    WriteCameraMotion(motion_vectors, id.xy, size, reprojection, jitter_ndc, depth.Load(int3(id.xy, 0)));
 }

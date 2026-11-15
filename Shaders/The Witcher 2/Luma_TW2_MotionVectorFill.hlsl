@@ -54,7 +54,7 @@ cbuffer ExposurePass : register(b1)
    const float linear_depth = view_depth.Load(int3(id.xy, 0));
    const float depth = linear_depth > 0.0 ? saturate(fill.depth_from_view.x + fill.depth_from_view.y / linear_depth) : 1.0;
    device_depth[id.xy] = depth;
-   if (motion_vectors[id.xy].x < MOTION_VECTOR_MARKER)
+   if (IsObjectMotion(motion_vectors[id.xy]))
       return;
    WriteCameraMotion(motion_vectors, id.xy, size, fill.reprojection, fill.jitter_ndc, depth);
 }

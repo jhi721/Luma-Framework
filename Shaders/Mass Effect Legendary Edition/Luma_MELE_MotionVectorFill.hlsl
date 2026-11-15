@@ -43,7 +43,7 @@ RWTexture2D<float> previous_additive : register(u3); // The additive draws' mask
    }
    // The alpha blended draws blend their motion vectors by their alpha: over a marker pixel (sky behind smoke) a partial weight leaves
    // a value between the two, never a real motion (2 screens per frame), so it takes the camera motion too (NaN as well)
-   if (abs(motion_vectors[id.xy].x) < 2.0)
+   if (all(abs(motion_vectors[id.xy]) < 2.0))
       return;
    WriteCameraMotion(motion_vectors, id.xy, size, reprojection, jitter_ndc, depth.Load(int3(id.xy, 0)));
 }

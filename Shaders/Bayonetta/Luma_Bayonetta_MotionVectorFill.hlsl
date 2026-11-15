@@ -42,7 +42,7 @@ RWTexture2D<float> previous_additive : register(u4); // The additive draws' mask
    // saturate() also drops a NaN
    const float depth = saturate(1.0 - prepass.Load(int3(id.xy, 0)));
    device_depth[id.xy] = depth;
-   if (motion_vectors[id.xy].x < MOTION_VECTOR_MARKER)
+   if (IsObjectMotion(motion_vectors[id.xy]))
       return;
    WriteCameraMotion(motion_vectors, id.xy, size, fill.reprojection, fill.jitter_ndc, depth);
 }

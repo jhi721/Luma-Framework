@@ -23,6 +23,9 @@ void VelocityOutputs(float2 uv, float2 prevViewXYOverZ, out float2 vanilla, out 
    const float2 prevUV = prevViewXYOverZ * g_MBV_ViewToScreen.xy + 0.5;
    const float2 currentUV = uv + (g_MBV_ViewVec.zw + g_MBV_ViewVec.xy * 0.5) / g_MBV_ViewVec.xy;
    motionVectors = (prevUV - currentUV) * g_MBV_VelocityScale.xy;
+   // The writers clamp the view z at 0.1 (rcp(max(z, 0.1))): a point near or behind the previous camera gives a huge motion that the
+   // R16G16_FLOAT target stores as +-Inf, which DLSS spreads through its history (black filling the screen). None instead, as NaN.
+   motionVectors = all(abs(motionVectors) < 65504.0) ? motionVectors : 0.0;
 
    float2 velocity = -motionVectors;
    velocity *= g_MBV_VelocityScale.w / max(length(velocity), g_MBV_VelocityScale.w);

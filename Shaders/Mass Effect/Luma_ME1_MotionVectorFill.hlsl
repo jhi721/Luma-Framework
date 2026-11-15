@@ -35,7 +35,7 @@ RWTexture2D<float> transparency : register(u3);
    // max() also drops a NaN; a cleared (0) alpha lands on the near plane
    const float depth = saturate(depth_from_view.x + depth_from_view.y / max(color.a, 1e-4));
    device_depth[id.xy] = depth;
-   if (motion_vectors[id.xy].x < MOTION_VECTOR_MARKER)
+   if (IsObjectMotion(motion_vectors[id.xy]))
       return;
    WriteCameraMotion(motion_vectors, id.xy, size, reprojection, jitter_ndc, depth);
 }
