@@ -44,7 +44,8 @@ cbuffer ExposurePass : register(b1)
          const float gain = fill.exposure_static != 0.0 ? exposure_pass[57].z : adaptation.Load(int3(0, 0, 0)).z;
          value = fill.user_exposure * min(gain, exposure_pass[59].x) * exposure_pass[59].y;
       }
-      exposure[uint2(0, 0)] = value;
+      // FSR divides by it: 0 (an unwritten adaptation texel, the Exposure slider at 0), NaN or Inf would turn its output to NaN
+      exposure[uint2(0, 0)] = (value > 0.0 && value < 65504.0) ? value : 1.0;
    }
    if (fill.reactive_enabled != 0.0)
    {
