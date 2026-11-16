@@ -1,171 +1,94 @@
-#define GAME_BAYONETTA 1
+// Bayonetta (PC, 2017) is x86 D3D9: Luma runs on the game's own device
+// (upgraded to D3D9Ex) through Core's native D3D9 module
+// (Source/Core/d3d9/core_d3d9.hpp), which hands the frame to an in-process
+// D3D12 presenter. This is the game half: motion vectors and jitter for the SR
+// bridge / Luma TAA / SMAA T2x, XeGTAO, Luma Bloom, Hide UI, the c208 Luma
+// block's host rows, the kernels' c194, the frame limiter, the shadow map size
+// and the settings. Pixel shaders are identified by the CRC32 of their SM3
+// bytecode (ShaderHashes.h). Single game thread assumed (no CSMT).
+#include <algorithm>
+#include <array>
+#include <cfloat>
+#include <cmath>
+#include <cstdio>
+#include <limits>
+#include <map>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
-#define GEOMETRY_SHADER_SUPPORT 0
-#define DISABLE_AUTO_DEBUGGER 1
-// The UI pixel shaders get the clamp of the 8-bit canvas they were made for (see "PatchShaderBytecodeSync")
-#define LUMA_PATCH_BYTECODE_SYNC 1
-// Outside DEVELOPMENT only this define makes "original_draw_dispatch_func" non-null (the scene copy and the present blit draw it)
-#define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
-// The motion vector draw key reads "last_draw_dispatch_data", which Publishing only fills with this
-#define ENABLE_DRAW_DISPATCH_DATA_CACHE 1
-// Luma TAA among the upscalers (in process; DLSS, FSR 3 and XeSS run in the SR bridge's x64 helper, "UseLumaSRBridge")
-#define ENABLE_LUMA_TAA 1
-// The game has MSAA but no shader AA: SMAA is added on the canvas after the scene copy (see "DrawSMAAOnCanvas")
-#define ENABLE_SMAA 1
-// SMAA's area texture without the U-shape smoothing (see "SMAA_AreaTex_SharpU.h"), as TW1 and ME1
-#define SMAA_SMOOTH_U_SHAPES 0
-// RCAS sharpening after SMAA, opt-in (ME1/TW2)
-#define ENABLE_RCAS 1
-
-#include "..\..\Core\core.hpp"
-#include "MotionVectorPatches.h"
-#include "..\..\Core\includes\patched_draws.h"
-#include "..\..\Core\includes\coverage_patch.h"
+// clang-format off
+#include "../../../Shaders/Bayonetta/Includes/GameCBuffers.hlsl" // CB::LumaGameSettings, before Core's cbuffers.h
+#include "../../Core/d3d9/core_d3d9.hpp"
+// clang-format on
+#include "../../Core/utils/system.h"
+#include "ShaderHashes.h"
 
 #include <dwmapi.h>
 #pragma comment(lib, "dwmapi.lib")
 
-// Bayonetta (PC, 2017) is x86 D3D9Ex: it runs through dgVoodoo (D3D9 -> D3D11), so every hash below is a dgVoodoo translation.
-// Hashes come from an offline mapping of the game's shader.dat through both dgVoodoo builds. Each pair is dgVoodoo 2.87.5 (ps_5_0, the
-// main zip) then 2.81.3 (ps_4_0, the Linux zip); the 2.81.3 replacements are forwarders to the 2.87.5 bodies (same signature and rows).
-// filter00: per-channel 1D curve LUT + saturation + vertical colour gradient (the grade, drawn before bloom).
-// filter04: the same grade with the curve on Y' only (GradeLuma_0xB7A08D4A).
-const ShaderHashesList shader_hashes_Grade = {.pixel_shaders = {0x719339A9, 0x3BE8E47F, 0xB7A08D4A, 0x2D4416C4}};
-// filtershadercopytex, the game's copy for everything. Its ResetRender draw (the scene into the D3D9 back buffer, before the UI)
-// carries the HDR display map in the replacement (Copy_0x91A6C437).
-const ShaderHashesList shader_hashes_Copy = {.pixel_shaders = {0x91A6C437, 0x7584B641}};
-// dgVoodoo's present blit (also TW1's, the same on both builds): when the swapchain format differs from the D3D9 back buffer's,
-// dgVoodoo copies the back buffer into an intermediate texture (CopyResource) and draws that into the swapchain with this.
-const ShaderHashesList shader_hashes_DgVoodooPresent = {.pixel_shaders = {0x880A17D3}};
-// filtershaderssao: reads the depth prepass (R32F 1 - z/w) on t2, the SMAA predication source
-const ShaderHashesList shader_hashes_SSAO = {.pixel_shaders = {0x40AF18CC, 0xC32759B1}};
-// The passes whose kernels step in pixels of their target, by "g_TargetSize" c194 (cb4[202], the target's size): the shadow mask blurs
-// (filtershadow_1 to _3), the DoF gathers (filter08_0 to _4) and the SSAO (filtershaderssao). Authored at 1280x720, at 4K each kernel was
-// a third of its size (PCGamingWiki: razor sharp shadows, little depth of field). Their c194 reads come from "TARGET_SIZE_CB_SLOT" instead
-// ("PatchShaderBytecodeSync"), the target's size at 720p with "g_resolution_scaled_effects" (all of them draw into scene sized targets).
-// Not the shadow receivers (modelshadershadowrec00, shadowfixed): their PCF offsets are also c194 based (the screen's size, read in game)
-// but step on the point sampled 4096 shadow map, so at 720p's size the taps landed ~1.6 texels apart and drew offset copies of the
-// shadow edges (stripes in game). Pairs (2.87.5, 2.81.3) in that order.
-const ShaderHashesList shader_hashes_PixelKernels = {.pixel_shaders = {0x0788DCAD, 0xB02CEC5A, 0xA7C3CCD7, 0x60FA1018, 0x4894A725, 0xD4F6B2D2, 0x0B1A2B23, 0x917C0C95, 0x58C43DE9, 0x11E66C0B, 0x2A8528AE, 0xA801906F, 0x2B93FD4F, 0xA0BD8BBA, 0x40D84AAB,
-                                                        0x29CE44D6, 0x40AF18CC, 0xC32759B1}};
-// The shadow receivers, replaced ("ShadowReceive_*": bilinear PCF at the map's size in place of the 512 texel grid's weights): they step
-// their taps by the kernel target size too, without the c194 redirection of their originals. rec00_xxxxx, rec00_bxxxx, shadowfixed;
-// pairs (2.87.5, 2.81.3).
-const ShaderHashesList shader_hashes_ShadowReceivers = {.pixel_shaders = {0x98BD17D3, 0x5088AF5D, 0x45E82A5F, 0x8B9A11DF, 0xCDA8ACDD, 0x06EB4448}};
-// The Sofdec movies' Y'CbCr -> R'G'B', drawn on the canvas after the scene (Video_0xC60649FD)
-const ShaderHashesList shader_hashes_Video = {.pixel_shaders = {0xC60649FD, 0xED0DA20F}};
-// The bloom chain (_tools/bayonetta/NOTES.md "Frame order"), all into the fixed size 320x176 bloom target: filter05 (the scene
-// into level 0, then each level's threshold and halving into the next), filter02 / filter01 (each level's V / H blur), then copytex
-// (the levels added into level 0, and the composite onto the scene)
-const ShaderHashesList shader_hashes_BloomSource = {.pixel_shaders = {0x8B6A8D61, 0x29FE50C2}};
-const ShaderHashesList shader_hashes_BloomBlur = {.pixel_shaders = {0x91CC01D3, 0xA5207DF1, 0xCE62BA4B, 0x4B605EEB}};
-// The scene's first post pass, which ends a motion vector frame (the fill and the upscaler run right before it): OtPost's motion blur
-// (87A169B9) and its cm* passes, BlurSrcWeight (651AC335) and BlurWeight (45BE027E), the DoF filter08 passes, then the grade. The frame
-// before them: prepass + opaque, SSAO, the scene copy, ~400 blended particle draws (resolves with MSAA only). Pairs: modelshaderblur,
-// blurcm4, blurcm8, blurcme, blurcmx (= blurcmy), blursrcweight, blurweight, filter08, filter08_0 to _4, filter00, filter04.
-const ShaderHashesList shader_hashes_ScenePost = {.pixel_shaders = {0x87A169B9, 0x5BF04DF8, 0x7EE1D9A2, 0x45A01432, 0x3669A853, 0x5BF73D0E, 0xDBAC8B89, 0x0C72D63B, 0xAC7672ED, 0x163BC9B9, 0x651AC335, 0x988429CF, 0x45BE027E, 0x352E7E25, 0x9D71029B, 0xCCDA0B04, 0x0B1A2B23, 0x917C0C95, 0x58C43DE9, 0x11E66C0B, 0x2A8528AE, 0xA801906F, 0x2B93FD4F, 0xA0BD8BBA, 0x40D84AAB, 0x29CE44D6, 0x719339A9, 0x3BE8E47F, 0xB7A08D4A, 0x2D4416C4}};
-// Screen space refraction in the scene: espshadershimmer, shimmer2, shimmerblur, waterwave. They redraw the scene copy displaced
-// (rain sheets, heat haze), often over the whole screen with a quad that follows the camera: their own motion vectors (near zero)
-// would replace the moving background's under them, and DLSS smeared the cutscenes' panning. Jittered, no motion vectors.
-const ShaderHashesList shader_hashes_SceneRefraction = {.pixel_shaders = {0x4AFBF378, 0xCA4B5A1A, 0xEC4DF64B, 0x0CE2225B, 0x0B7B615E, 0xADD71AF8, 0x8CD13FE4, 0x9F85DEF7}};
-// ModelShaderBlurSrcWeight, the skinned velocity for the motion blur, into an A8R8G8B8 target that the upgrades make fp16: the blur
-// passes (cm*) decode it as (x - 128/255) * 0.25 UV, so unclamped it blurred across most of the screen and an unquantized 0.5 offset
-// still objects by ~2 pixels. Clamped and rounded as the 8-bit target did.
-const std::unordered_set<uint32_t> velocity_pixel_shaders = {0x651AC335, 0x988429CF};
-// Drawn on the canvas after the scene: the 22 "idshader*" (UI, 2D effects), the runtime-compiled "HwShader*" (flat colour, textured
-// quad, font). Some UI sprites output colours above 1 that the 8-bit canvas clipped. Pairs: idshaderbase, blur_p1, blur_p2, mask,
-// mask2, maskandps, maskandpsedge, maskandreverseps, maskandreversepsedge, maskps, maskpsedge, maskreverse, maskreverse2,
-// maskreverseps, maskreversepsedge, mess, mono, overlay, prev, previd, shimmer, shimmerreverse; HwShaderCharacter (= PFT), PF, PFV.
-const std::unordered_set<uint32_t> canvas_clamped_pixel_shaders = {0x89843FB5, 0xA3B5337A, 0x24216ACC, 0x1F874192, 0x0BEC2A08, 0x8F6C7857, 0xF69D8D0A, 0x38CD0037, 0xA6B8C979, 0x44078C71, 0xF117E74C, 0x30842062, 0x21203CE7, 0xDBCA953B, 0x2C0D108F, 0xC2D1B526, 0x2B2C8854, 0xF519B6CE, 0x0961A82E, 0xE4BBB0B8, 0x157EFEF1, 0x9C79E1C6, 0xC32416F2, 0x8DB8D7DD, 0x7FAB7814, 0x3F10F71A, 0x1138503C, 0xDB514E84, 0xAA13DF37, 0xDBFAB108, 0xC6612FB9, 0x602A5F60, 0xF5CB254B, 0xE588CA92, 0x10E4B174, 0x75DAF3EF, 0xC288FB0A, 0x76E5C1D4, 0x7C5B0BBD, 0x0A41A152, 0x2C8B9F07, 0x8BE974D6, 0x16D99ADC, 0x9ACD218A, 0x30FFBB4D, 0xD4129BC5, 0x04A44467, 0x219808B4, 0x142D02C1, 0x95AA780A};
-
-static bool g_msaa_resolve_enable = true; // HDR-weighted MSAA resolve (Core's "DrawMSAAResolve()") on the fp16 mirrors
-#if DEVELOPMENT
-static bool g_msaa_coverage_enable = true; // The alpha tested materials' alpha to coverage (with the resolve)
-static bool g_msaa_resolve_wide = false;   // The resolve's 1 pixel radius filter ("MSAA Resolve Wide PS"), for A/B
-#else
-constexpr bool g_msaa_coverage_enable = true;
-constexpr bool g_msaa_resolve_wide = false;
-#endif
+// The settings (ini section NAME, the dgVoodoo mod's keys), read in
+// "Bayonetta::OnInit" and given to Core's state by "ApplySettings"
 static bool g_smaa_enable = true;
-static bool g_smaa_t2x = false;             // SMAA T2x: a two phase jitter and the previous frame, through the upscalers' motion vectors
-static bool g_smaa_predication = true;      // On geometry, from the depth prepass's edges
-static float g_smaa_pred_tolerance = 0.02f; // A fraction of view depth (TW2/ME1's)
-static float g_rcas_sharpness = 0.f;        // RCAS on the antialiased canvas, 0 = off
-static bool g_hide_ui = false;              // Session-only, never persisted: a stuck "on" would look like a broken HUD
-#if DEVELOPMENT
-static bool g_smaa_pred_debug = false; // The predication mask instead of the antialiased canvas
-#endif
-// The pixel sized kernels at their 1280x720 size on screen ("shader_hashes_PixelKernels"); off: the PC version's, smaller as the
-// resolution rises
+static bool g_smaa_t2x = false; // SMAA T2x: a two phase jitter and the previous
+                                // frame, through the motion vectors
+static bool g_smaa_predication =
+   true; // On geometry, from the depth prepass's edges
+static float g_smaa_pred_tolerance =
+   0.02f;                            // A fraction of view depth (TW2/ME1's)
+static float g_rcas_sharpness = 0.f; // RCAS on the antialiased canvas, 0 = off
+static bool g_hide_ui = false;       // Session-only, never persisted: a stuck "on"
+                                     // would look like a broken HUD
+// The pixel sized kernels at their 1280x720 size on screen (ShaderHashes.h
+// kPixelKernelPs); off: the PC version's, smaller as the resolution rises
 static bool g_resolution_scaled_effects = true;
-static bool g_fix_frame_pacing = true;        // The game's frame limiters replaced (see "FrameLimiter")
-static bool g_60_fps_cutscenes = true;        // The loop's 30 fps bit kept clear (see "FrameLimiter::Apply60FpsCutscenes")
-static bool g_luma_bloom_enable = true;       // The game's bloom chain drawn at a higher resolution (see "DrawBloomPass")
-static bool g_high_resolution_shadows = true; // An 8192 shadow map at the highest shadow quality (see "ShadowMap")
-#if DEVELOPMENT
-static int g_bloom_scale_override = 0; // Luma Bloom's scale, 0 = from the resolution
-#else
-constexpr int g_bloom_scale_override = 0;
-#endif
-// The target size the pixel kernel passes read instead of c194, a pixel shader slot used by neither dgVoodoo (b3, b4) nor Luma (b12, b13)
-static constexpr UINT TARGET_SIZE_CB_SLOT = 10;
-// Their c194 row in dgVoodoo's cb4 (pixel shaders: D3D9 c(n) = row n + 8)
-static constexpr UINT TARGET_SIZE_ROW = 194 + 8;
-static bool g_gtao_enable = true; // XeGTAO replaces the game's SSAO (see "RunXeGTAO")
-// GT-VBAO's visibility bitmask main pass instead of XeGTAO's horizons; prefilter, denoise and the b9 knobs stay XeGTAO's.
-static bool g_gtvbao_enable = false;
-// XeGTAO's knobs, "register(b9)" in Luma_Bayonetta_XeGTAO.hlsl and Luma_Bayonetta_XeGTAOApply.hlsl
-static constexpr UINT GTAO_KNOBS_CB_SLOT = 9;
-// The AO history's constants ("CB::GTAOTemporalConstants"), "register(b10)" in Includes/XeGTAOTemporal.hlsl
-static constexpr UINT GTAO_TEMPORAL_CB_SLOT = 10;
-// The prefilter's view depth mips, "XE_GTAO_DEPTH_MIP_LEVELS" in Includes/XeGTAO.hlsl
-static constexpr UINT GTAO_DEPTH_MIPS = 5;
-// Darkness dials (higher = darker). Their darkening sits about halfway between power 1's and that of the powers that matched the
-// thin contact lines of the game's SSAO (Fix High Resolution Effects on) on the lit station platform: 0.3 for XeGTAO, about 0.18 for
-// GT-VBAO. Other scenes differ (NOTES.md).
+static bool g_fix_frame_pacing =
+   true;                                // The game's frame limiters replaced (see "FrameLimiter")
+static bool g_60_fps_cutscenes = true;  // The loop's 30 fps bit kept clear (see
+                                        // "FrameLimiter::Apply60FpsCutscenes")
+static bool g_luma_bloom_enable = true; // The game's bloom chain drawn at a
+                                        // higher resolution (see "BloomDraw")
+static bool g_high_resolution_shadows =
+   true; // An 8192 shadow map at the highest shadow quality (see "ShadowMap")
+static bool g_gtao_enable =
+   true; // XeGTAO replaces the game's SSAO (see "RunGtao")
+// Darkness dial (higher = darker): about halfway between power 1's and that of
+// the power that matched the thin contact lines of the game's SSAO (Fix High
+// Resolution Effects on) on the lit station platform. Other scenes differ
+// (NOTES.md).
 static float g_gtao_final_value_power = 0.55f;
-static float g_gtvbao_final_value_power = 0.35f;
-static float g_gtao_depth_scale = 1.f;     // View depth divisor (game units -> ~meters)
-static float g_gtao_radius_override = 0.f; // > 0 overrides the shader's EFFECT_RADIUS (view units after the depth scale)
-#if DEVELOPMENT
-static int g_gtao_debug_view = 0; // 0 off, 1 depth gradient, 2 normals, 3 AO x8, 4 edges (the shader's debug blocks are DEVELOPMENT only)
-// The AO history's weight under an upscaler (see "RunXeGTAO"), 0 turns it off
-static float g_gtao_history_weight = 0.9f;
-#else
-constexpr int g_gtao_debug_view = 0;
-constexpr float g_gtao_history_weight = 0.9f;
-#endif
-// The reactive masks, the SMAA T2x frames and XeGTAO's scratch and history go after this many frames without their pass
-constexpr uint32_t IDLE_RELEASE_FRAMES = 600;
+static float g_gtao_depth_scale =
+   1.f; // View depth divisor (game units -> ~meters)
+static float g_gtao_radius_override =
+   0.f; // > 0 overrides the shader's EFFECT_RADIUS (view units after the depth
+        // scale)
+// Read in the SM3 ports through the Luma block ("UpdateLumaRows"), the display
+// map and the composition (Core's state)
+constexpr CB::LumaGameSettings DEFAULT_GAME_SETTINGS = {
+   .Dithering = 1.f,
+   // Light AutoHDR on the movies (the TW1/ME1 pair: at 0.5 the peak is 165
+   // nits)
+   .VideoAutoHDREnable = 1.f,
+   .VideoAutoHDRBoost = 0.5f,
+   .Exposure = 1.f,
+   .Contrast = 1.f,
+   .Saturation = 1.f,
+   .HighlightsDesaturation = 0.f,
+   .ColorGradingIntensity = 1.f,
+   .BloomIntensity = 1.f};
 
-#if DEVELOPMENT
-static bool g_mv_enable = false;         // Motion vectors without an upscaler
-static bool g_mv_debug_view = false;     // Core's debug draw of the motion vector target
-static bool g_mv_force_jitter = false;   // The projection jitter without an upscaler
-static bool g_bound_state_check = false; // The tracked bindings against the bound ones ("mv.bound_state_mismatches")
-static bool g_sr_reactive_enable = true;
-// The additive draws' reactivity, scaled and capped at 0.9 (laser cores write ~0.3, glows 0.05-0.2: under a threshold they smeared)
-static float g_sr_reactive_scale = 2.f;
-static float g_sr_reactive_threshold = 0.5f; // The alpha blended draws': under it 0, over it 0.9 (Mass Effect 2007's and Borderlands 2's 0.5)
-static bool g_sr_reactive_debug_view = false;
-#else
-constexpr bool g_mv_enable = false;
-constexpr bool g_mv_force_jitter = false;
-constexpr bool g_bound_state_check = false;
-constexpr bool g_sr_reactive_enable = true;
-constexpr float g_sr_reactive_scale = 2.f;
-constexpr float g_sr_reactive_threshold = 0.5f;
-#endif
-using SceneMotionVectors::PixelShaderPatch;
-// The coverage patch is the game's first pixel shader patch after Core's
-constexpr PixelShaderPatch COVERAGE_PATCH = PixelShaderPatch::GAME_0;
-
-// The Steam executable, whose fixed addresses the game code patches below use (relocations stripped: fixed base)
+// The Steam executable, whose fixed addresses the game code patches below use
+// (relocations stripped: fixed base)
 static bool IsSteamExecutable()
 {
    constexpr DWORD STEAM_TIME_DATE_STAMP = 0x591AD330;
-   const auto* const image = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
-   return reinterpret_cast<const IMAGE_NT_HEADERS*>(image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew)->FileHeader.TimeDateStamp == STEAM_TIME_DATE_STAMP;
+   const auto* const image =
+      reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+   return reinterpret_cast<const IMAGE_NT_HEADERS*>(
+             image +
+             reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew)
+             ->FileHeader.TimeDateStamp == STEAM_TIME_DATE_STAMP;
 }
 
 // The game's frame limiters, replaced with "g_fix_frame_pacing" (_tools/bayonetta/NOTES.md "Frame limiter and 30 fps cutscenes",
@@ -385,7 +308,7 @@ namespace FrameLimiter
 // The shadow map's size: FUN_00402270 (applying the options) sets DAT_05abbe6c from {1024, 2048, 4096} (DAT_00d9d74c) by the shadow
 // quality (options +0x17c, DAT_00fde17c), and FUN_0045b320 (after the options, level loads) recreates the map's targets (DAT_05abbe80,
 // DAT_051af108) when it differs from their size (DAT_05abbe70). Every other use reads the size from there (clears, viewports); the
-// receivers' replacements filter at the map's real size ("Includes/ShadowReceive.hlsl").
+// receivers' replacements filter at the map's real size ("Includes/ShadowReceive_sm3.hlsli").
 namespace ShadowMap
 {
    uint32_t* const SIZES = reinterpret_cast<uint32_t*>(0xD9D74C); // .rdata
@@ -424,2166 +347,2649 @@ namespace ShadowMap
    }
 } // namespace ShadowMap
 
-struct BayonettaGameDeviceData final : public GameDeviceData
+// Bayonetta's draw-time state
+static struct
 {
-   // The present blit's source and dgVoodoo's D3D9 back buffer (the canvas), copied into it or straight into the swapchain
-   std::atomic<uint64_t> present_source = 0;
-   std::atomic<uint64_t> canvas = 0;
-   // dgVoodoo draws the game's frame and its present blit from different threads, serialized on the immediate context
-   std::atomic<bool> has_copied_scene_to_canvas = false;
-   std::atomic<bool> has_drawn_reset_render = false; // The scene copy ran this frame: the canvas' later game draws are the UI (Hide UI)
-   // The canvas right after ResetRender, before the UI: the present blit clamps what the UI added (Present_0x880A17D3)
-   ComPtr<ID3D11Texture2D> scene_texture;
-   ComPtr<ID3D11ShaderResourceView> scene_srv;
-   // The game's 320x176 bloom target (the chain's first filter05 draws into it from the scene), identity only
-   uint64_t bloom_target = 0;
-   // Luma Bloom ("DrawBloomPass"): the target's chain at "bloom_scale" times its size. Each pass draws into the target's top left
-   // (the level's size) and dgVoodoo then copies that region into a texture of the region's size, which the next passes sample (the
-   // levels' last ones are what the composite adds up): "bloom_shadows" are those, by the game's texture, at the same scale
-   // ("MirrorBloomCopy").
-   struct BloomShadow
+   // The SSAO pass (env D9N_SSAO_PS adds CRCs): its s2 is the R32F depth prepass
+   // (1 - z/w) of the scene rect, SMAA's predication source. Valid for the frame
+   // it was drawn in.
+   std::set<uint32_t> ssao_crcs{std::begin(kSsaoPs), std::end(kSsaoPs)};
+   uint64_t depth_texture = 0;
+   uint32_t depth_present = UINT32_MAX;
+   // Pixel kernels whose c194 becomes the kernel target size at their draw (env
+   // D9N_KERNEL_PS adds CRCs)
+   std::set<uint32_t> kernel_crcs{std::begin(kPixelKernelPs),
+      std::end(kPixelKernelPs)};
+   bool c194_overridden = false;
+} bay;
+
+// ===========================================================================
+// Motion vectors and jitter for the SR bridge (env D9N_MV=1, implied by
+// D9N_SR). Port of Core's patched-draw scheme to native D3D9 (plan:
+// resilient-whistling-zebra.md):
+//  * init_pipeline: every VS / PS goes through sm3_mv_patch.h and the patched
+//    copy is created natively (the VS runs twice: current and previous camera /
+//    world / bones from a vertex texture; the PS writes the UV delta to oC1).
+//  * The scene opens at the R32F depth prepass (RT1 bound, full viewport, depth
+//    of the output size or its half) and ends at the first post-pass PS. Draws
+//    into the prepass RT / the fp16 scene RT with the scene depth get the
+//    jittered patched VS; opaque ones with a patched PS also write motion into
+//    our G16R16F target (RT1).
+//  * Previous constants per draw: Core's key + tie-break + FindNearest, with
+//    the camera fallbacks.
+//  * Scene end: fill pass (marker texels -> camera motion, depth from the
+//    prepass) into the shared SR textures, then the SR bridge, whose output is
+//    copied back RGB-only into the scene RT and the game's scene copy.
+// There is no post-draw event on D3D9: the patched state is put back lazily at
+// the next event that could observe it (next draw, render target bind, clear,
+// present), see MvRestoreGame.
+// ===========================================================================
+static bool g_mv = false;
+
+struct Mat4
+{
+   double m[4][4] = {};
+};
+static Mat4 MatFromRows(const float* rows)
+{
+   Mat4 result;
+   for (int row = 0; row < 4; ++row)
    {
-      uint64_t game_texture = 0;
-      ComPtr<ID3D11Texture2D> texture;
-      ComPtr<ID3D11ShaderResourceView> srv;
+      for (int column = 0; column < 4; ++column)
+      {
+         result.m[row][column] = rows[row * 4 + column];
+      }
+   }
+   return result;
+}
+static Mat4 MatIdentity()
+{
+   Mat4 result;
+   for (int i = 0; i < 4; ++i)
+   {
+      result.m[i][i] = 1.0;
+   }
+   return result;
+}
+static Mat4 MatMul(const Mat4& a, const Mat4& b)
+{
+   Mat4 result;
+   for (int row = 0; row < 4; ++row)
+   {
+      for (int column = 0; column < 4; ++column)
+      {
+         for (int k = 0; k < 4; ++k)
+         {
+            result.m[row][column] += a.m[row][k] * b.m[k][column];
+         }
+      }
+   }
+   return result;
+}
+static bool MatInvert(const Mat4& input, Mat4* inverse)
+{
+   double a[4][8] = {};
+   for (int row = 0; row < 4; ++row)
+   {
+      for (int column = 0; column < 4; ++column)
+      {
+         a[row][column] = input.m[row][column];
+      }
+      a[row][4 + row] = 1.0;
+   }
+   for (int column = 0; column < 4; ++column)
+   {
+      int pivot = column;
+      for (int row = column + 1; row < 4; ++row)
+      {
+         if (fabs(a[row][column]) > fabs(a[pivot][column]))
+         {
+            pivot = row;
+         }
+      }
+      if (fabs(a[pivot][column]) < 1e-300)
+      {
+         return false;
+      }
+      for (int k = 0; k < 8; ++k)
+      {
+         std::swap(a[column][k], a[pivot][k]);
+      }
+      const double scale = 1.0 / a[column][column];
+      for (int k = 0; k < 8; ++k)
+      {
+         a[column][k] *= scale;
+      }
+      for (int row = 0; row < 4; ++row)
+      {
+         if (row == column)
+         {
+            continue;
+         }
+         const double factor = a[row][column];
+         for (int k = 0; k < 8; ++k)
+         {
+            a[row][k] -= factor * a[column][k];
+         }
+      }
+   }
+   for (int row = 0; row < 4; ++row)
+   {
+      for (int column = 0; column < 4; ++column)
+      {
+         inverse->m[row][column] = a[row][4 + column];
+      }
+   }
+   return true;
+}
+
+// SR::GetViewProjectionCamera (super_resolution.h:170-190), row_vectors false
+// (clip component i = row i of the 4x4 at the camera register).
+struct MvCamera
+{
+   double vert_fov = 0.0, near_plane = 0.0, far_plane = 0.0;
+};
+static MvCamera MvViewProjectionCamera(const float* m)
+{
+   const auto at = [&](int row, int column)
+   {
+      return double(m[row * 4 + column]);
    };
-   uint32_t bloom_scale = 0;
-   ComPtr<ID3D11Texture2D> bloom_texture;
-   ComPtr<ID3D11RenderTargetView> bloom_rtv;
-   ComPtr<ID3D11ShaderResourceView> bloom_srv;
-   std::vector<BloomShadow> bloom_shadows;
-   // The depth prepass as this frame's SSAO pass read it (null without SSAO): the SMAA predication source
-   ComPtr<ID3D11ShaderResourceView> depth_srv;
-   // What "shader_hashes_PixelKernels" read in place of c194 (see "BindPixelKernelTargetSize"), and its value
-   com_ptr<ID3D11Buffer> pixel_kernel_target_size_buffer;
-   std::array<float, 4> pixel_kernel_target_size = {};
-   // XeGTAO (see "RunXeGTAO"): the scratch at the SSAO depth's size ("gtao_size", kept on a failed allocation so it isn't retried
-   // every frame) and its knobs
-   ComPtr<ID3D11Texture2D> gtao_depth_mips; // R32F view depth
-   ComPtr<ID3D11UnorderedAccessView> gtao_depth_mip_uavs[GTAO_DEPTH_MIPS];
-   ComPtr<ID3D11ShaderResourceView> gtao_depth_mips_srv;
-   ComPtr<ID3D11Texture2D> gtao_working[2]; // R8G8 AO and edges, ping-pong
-   ComPtr<ID3D11UnorderedAccessView> gtao_working_uavs[2];
-   ComPtr<ID3D11ShaderResourceView> gtao_working_srvs[2];
-   ComPtr<ID3D11Texture2D> gtao_output; // R8 visibility
-   ComPtr<ID3D11UnorderedAccessView> gtao_output_uav;
-   ComPtr<ID3D11ShaderResourceView> gtao_output_srv;
-   // The AO history under an upscaler, R16G16_FLOAT (AO, view Z), ping-ponged: written by "temporal_pass_cs", created at its first use
-   ComPtr<ID3D11Texture2D> gtao_history[2];
-   ComPtr<ID3D11UnorderedAccessView> gtao_history_uavs[2];
-   ComPtr<ID3D11ShaderResourceView> gtao_history_srvs[2];
-   uint32_t gtao_history_index = 0;  // The one written last
-   uint32_t gtao_history_frame = 0;  // Luma frame index of that write: the history restarts unless it was the previous frame
-   bool gtao_history_gtvbao = false; // That write's main pass was GT-VBAO's
-   uint32_t gtao_frame = 0;          // Luma frame index of the last XeGTAO run: the scratch goes after "IDLE_RELEASE_FRAMES" without one
-   com_ptr<ID3D11Buffer> gtao_temporal_buffer;
-   uint2 gtao_size = {};
-   com_ptr<ID3D11Buffer> gtao_knobs_buffer;
-   // The camera: a copy of a depth prepass draw's vertex constants (dgVoodoo's cb4) and the rows of its two matrices there
-   // ("CB::GTAOKnobs"), taken once per frame ("gtao_camera_taken"); the last frame's serves a frame without one. The prepass vertex
-   // shaders' layouts by hash (see "ClassifyPrepassCamera").
-   com_ptr<ID3D11Buffer> gtao_camera_buffer;
-   uint2 gtao_camera_rows = {};
-   bool gtao_camera_taken = false;
-   std::unordered_map<uint32_t, uint2> gtao_camera_layouts;
-   ComPtr<ID3D11Texture2D> smaa_predication;
-   ComPtr<ID3D11UnorderedAccessView> smaa_predication_uav;
-   ComPtr<ID3D11ShaderResourceView> smaa_predication_srv;
-   com_ptr<ID3D11Buffer> smaa_predication_buffer;
-   com_ptr<ID3D11Buffer> smaa_metrics_buffer;
-   bool smaa_resources_live = false;
-   // SMAA T2x (see "DrawSMAAOnCanvas"), set at present for the whole frame like "sr_active". The scene jitters only after a frame
-   // the resolve ran ("t2x_phase" 0 or 1, -1 for none). The two canvas sized frames (linear colour, velocity length in alpha)
-   // alternate; the other one is the history only if "t2x_frame", the last frame the resolve ran, was the frame before.
-   bool t2x_active = false;
-   int t2x_phase = -1;
-   ComPtr<ID3D11Texture2D> t2x_frames[2];
-   ComPtr<ID3D11RenderTargetView> t2x_frame_rtvs[2];
-   ComPtr<ID3D11ShaderResourceView> t2x_frame_srvs[2];
-   uint32_t t2x_frame = 0;
-   // "msaa_resolved" this frame, "msaa_active" the last one (the scene's coverage draws come before this frame's resolves)
-   std::atomic<bool> msaa_resolved = false;
-   std::atomic<bool> msaa_active = false;
-#if DEVELOPMENT
-   // For the MCP "luma_dev_values" tool: this frame's counts and the last finished frame's
-   struct AAStats
+   double dot_23 = 0.0, dot_33 = 0.0;
+   for (int column = 0; column < 3; ++column)
    {
-      uint32_t msaa_resolves = 0; // Resolves drawn by "DrawMSAAResolve()"
-      uint32_t smaa = 0;          // SMAA on the canvas
-      uint32_t smaa_predicated = 0;
-      uint32_t msaa_coverage = 0; // Draws swapped to their alpha to coverage pixel shader
-   };
-   AAStats aa_stats;
-   AAStats aa_last_stats;
-#endif
-
-   // ---- DLAA / FSR 3 Native AA / XeSS / Luma TAA with motion vectors and jitter from patched shaders (Mirror's Edge's path with The
-   // Witcher 2's CPU cuts, one per-draw buffer: dgVoodoo's vc4; the state machine is Core's "SceneMotionVectors") ----
-   // DLSS, FSR and XeSS run in the x64 helper of Core's SR bridge (the game is 32-bit, see "SRBridge.h"), Luma TAA in process.
-   // An upscaler is picked, hasn't failed (it then gives way to SMAA until picked again) and the game's MSAA is off, latched at present
-   // for the whole frame: a selection made after the motion vector state was set would otherwise run the upscaler on mixed state
-   bool sr_active = false;
-   // The upscaler's output goes back into the scene (and its copy, see "mv_scene_copy") without its alpha (the bloom source's
-   // threshold input), drawn from this view of it
-   com_ptr<ID3D11BlendState> sr_rgb_blend_state;
-   com_ptr<ID3D11ShaderResourceView> sr_output_srv;
-
-   // The motion vector targets, camera, objects and vc4 copies; "mv.active": motion vectors and jitter this frame (an upscaler or the
-   // DEV toggle, set at present)
-   SceneMotionVectors::State mv;
-   // The upscaler drew the last frame: only then the scene jitters (frames it skips would reach the screen jittered)
-   bool mv_jitter_allowed = false;
-   float sr_vert_fov = 1.0471976f; // FSR's vertical FOV (radians): the last camera's, 60 degrees until one is seen
-   // The upscalers' near and far (game units): the last camera's with a usable projection, Core's defaults until one is seen
-   float sr_near_plane = SR::SuperResolutionImpl::DrawData{}.near_plane;
-   float sr_far_plane = SR::SuperResolutionImpl::DrawData{}.far_plane;
-   // The copy of the scene the first post pass reads, null if it reads none. The upscaler's output goes into both
-   // ("Bayonetta Copy Back PS"). Found from the game's last CopyResource of the scene: the camera blur (cmx) also reads a copy of the
-   // velocity target, whose description matches the scene's.
-   com_ptr<ID3D11Resource> mv_scene_copy;
-   com_ptr<ID3D11Resource> mv_scene_last_copy;
-   com_ptr<ID3D11RenderTargetView> mv_scene_copy_rtv;
-   // The depth prepass' R32F target (1 - z/w, next to the normals): where the fill reads the depth. "prepass_drawn": it was drawn into
-   // this frame; "prepass_rtv" and "prepass_is_depth" classify the last target seen next to a second one.
-   com_ptr<ID3D11Resource> prepass_depth;
-   com_ptr<ID3D11ShaderResourceView> prepass_depth_srv;
-   ID3D11RenderTargetView* prepass_rtv = nullptr;
-   bool prepass_is_depth = false;
-   bool prepass_drawn = false;
-   bool mv_filled = false; // The fill wrote this frame's motion vectors (reset at present)
-   // The targets "OpenScene" refused (not the scene's); reset at present
-   ID3D11RenderTargetView* open_refused_rtv = nullptr;
-   ID3D11DepthStencilView* open_refused_dsv = nullptr;
-
-   // "sr_rgb_blend_state" (the upscaler copy back and SMAA T2x's resolve: the canvas alpha stays), made at its first use
-   ID3D11BlendState* GetRGBBlendState(ID3D11Device* native_device)
-   {
-      if (!sr_rgb_blend_state)
-      {
-         D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
-         blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
-         native_device->CreateBlendState(&blend_desc, &sr_rgb_blend_state);
-      }
-      return sr_rgb_blend_state.get();
+      dot_23 += at(2, column) * at(3, column);
+      dot_33 += at(3, column) * at(3, column);
    }
-
-   // XeGTAO's scratch (~90 MB at 4K), recreated at its next use
-   void ReleaseGTAOScratch()
+   const double depth_a = dot_33 > 0.0 ? dot_23 / dot_33 : 1.0;
+   const double depth_b = at(2, 3) - depth_a * at(3, 3);
+   const double up_length =
+      sqrt(at(1, 0) * at(1, 0) + at(1, 1) * at(1, 1) + at(1, 2) * at(1, 2));
+   MvCamera camera;
+   camera.vert_fov = up_length > 0.0 ? 2.0 * atan(1.0 / up_length) : 0.0;
+   camera.near_plane = depth_a != 0.0 ? -depth_b / depth_a : 0.0;
+   if (camera.near_plane > 0.0)
    {
-      gtao_depth_mips.reset();
-      for (auto& uav : gtao_depth_mip_uavs)
-      {
-         uav.reset();
-      }
-      gtao_depth_mips_srv.reset();
-      for (int i = 0; i < 2; i++)
-      {
-         gtao_working[i].reset();
-         gtao_working_uavs[i].reset();
-         gtao_working_srvs[i].reset();
-      }
-      gtao_output.reset();
-      gtao_output_uav.reset();
-      gtao_output_srv.reset();
-      ReleaseGTAOHistory();
-      gtao_size = {};
+      camera.far_plane = depth_a > 1.0 + 1e-6 ? depth_b / (1.0 - depth_a)
+                                              : camera.near_plane * 1e6;
    }
+   return camera;
+}
 
-   // The AO history (~66 MB at 4K): released with the scratch, when the upscaler stops and after "IDLE_RELEASE_FRAMES" without a write
-   void ReleaseGTAOHistory()
+// SR::HaltonSequence: [-0.5, 0.5] pixels, index from 0.
+static float MvHalton(unsigned index, unsigned base)
+{
+   index += 1;
+   float result = 0.0f;
+   const float inv_base = 1.0f / float(base);
+   float fraction = inv_base;
+   while (index > 0)
    {
-      for (int i = 0; i < 2; i++)
-      {
-         gtao_history[i].reset();
-         gtao_history_uavs[i].reset();
-         gtao_history_srvs[i].reset();
-      }
-      gtao_history_frame = 0;
+      result += float(index % base) * fraction;
+      index /= base;
+      fraction *= inv_base;
    }
+   return result - 0.5f;
+}
+constexpr unsigned MV_JITTER_PHASES = 8; // SR::GetDefaultJitterPhases (1x)
 
-   void ReleaseT2xFrames()
-   {
-      for (int i = 0; i < 2; i++)
-      {
-         t2x_frames[i].reset();
-         t2x_frame_rtvs[i].reset();
-         t2x_frame_srvs[i].reset();
-      }
-   }
+constexpr uint32_t MV_VTF_WIDTH = Sm3MvPatch::kBoneTexelCount; // texels
+constexpr uint32_t MV_BONE_FLOATS = MV_VTF_WIDTH * 4;
+constexpr int MV_VS_CONSTANTS = 256;
+
+struct MvShader
+{
+   IDirect3DVertexShader9* vs = nullptr; // patched copy
+   IDirect3DPixelShader9* ps = nullptr;
+   Sm3MvPatch::VertexInfo info = {};
+   uint32_t crc = 0; // CRC32 of the game's (original) bytecode
 };
 
-class Bayonetta final : public Game
+// One draw of a frame (Core's MotionVectorObject): what the next frame's same
+// draw takes as its previous constants.
+struct MvObject
 {
-   static BayonettaGameDeviceData& GetGameDeviceData(DeviceData& device_data)
-   {
-      return *static_cast<BayonettaGameDeviceData*>(device_data.game);
-   }
+   std::array<float, 12> transform = {};
+   std::array<float, 16> camera = {}, world = {}, effect_world = {};
+   std::vector<float> bones; // 144 float4 (skinned VS only)
+   int row = -1;             // its row in this frame's previous-bones texture
+};
+using MvObjectMap = std::unordered_map<uint64_t, std::vector<MvObject>>;
 
-   // Zeroed for a resource that isn't a 2D texture
-   static D3D11_TEXTURE2D_DESC GetTexture2DDesc(ID3D11Resource* resource)
+struct Mv
+{
+   std::map<uint64_t, MvShader> shaders; // by pipeline handle (VS and PS)
+   std::set<uint32_t> post_crcs{std::begin(kScenePostPs), std::end(kScenePostPs)},
+      refraction_crcs{std::begin(kRefractionPs), std::end(kRefractionPs)};
+   uint64_t game_vs = 0, game_ps = 0;
+   float vs_const[MV_VS_CONSTANTS * 4] = {};
+   // Render targets as the game bound them (events), without our own RT1
+   uint64_t rt_view[2] = {}, dsv = 0;
+   bool other_rt = false;
+   format rt0_format = format::unknown;
+   uint32_t rt0_w = 0, rt0_h = 0, dsv_w = 0, dsv_h = 0;
+   resource rt0_resource = {0};
+   // State we changed since the game's last bind
+   bool applied_vs = false, applied_ps = false, applied_rt1 = false;
+   DWORD saved_cwe1 = 0xF;
+   // Resources (DEFAULT pool: freed by DestroyMv before a Reset)
+   IDirect3DTexture9* textures[4] = {}; // shared: motion, depth, output, color
+   HANDLE kmt[4] = {};
+   UINT tex_w = 0, tex_h = 0;
+   IDirect3DTexture9* motion_rt = nullptr; // our RT1
+   IDirect3DSurface9* motion_surface = nullptr;
+   IDirect3DTexture9* vtf = nullptr;
+   UINT vtf_rows = 0;
+   IDirect3DStateBlock9* block = nullptr;
+   IDirect3DSurface9 *probe_motion = nullptr, *probe_depth = nullptr,
+                     *probe_raw = nullptr;
+   IDirect3DVertexShader9* vs_quad = nullptr;
+   IDirect3DPixelShader9 *ps_fill = nullptr, *ps_marker = nullptr,
+                         *ps_copy = nullptr, *ps_gtao = nullptr;
+   bool shaders_tried = false, vtf_checked = false, disabled = false;
+   // XeGTAO's camera (Bayonetta's TakePrepassCamera): the last depth prepass
+   // draw's c0..c27 as rows 0..27 of the shader's b4 (dgVoodoo's b4 has them at
+   // 20..47), so its rows are the D3D9 registers; the frame it was taken in
+   float gtao_camera[28 * 4] = {};
+   uint32_t gtao_affine_row = 0, gtao_matrix_row = 0;
+   uint32_t gtao_camera_frame = UINT32_MAX;
+   // Frame
+   uint32_t frame_index = 0, scene_frame = 0;
+   bool open = false, ended = false, sr_ran = false, sr_ran_last = false;
+   // The fill wrote this frame's motion vectors; SMAA T2x resolved this / last
+   // frame (Bayonetta's t2x_frame) and this scene's jitter phase (-1 none)
+   bool filled = false, t2x_ran = false, t2x_ran_last = false;
+   int t2x_phase = -1;
+   uint64_t refused_rt0 = 0;
+   uint64_t scene_depth = 0, scene_view = 0, prepass_view = 0;
+   IDirect3DSurface9* scene_surface = nullptr; // AddRef-ed while the scene lives
+   resource scene_resource = {0}, copy_dest = {0};
+   IDirect3DTexture9* prepass = nullptr; // AddRef-ed
+   UINT scene_w = 0, scene_h = 0, last_w = 0, last_h = 0;
+   float jitter[2] = {}, jitter_ndc[2] = {};
+   bool camera_valid = false, previous_valid = false;
+   std::array<float, 16> camera = {}, previous_camera = {};
+   Mat4 reprojection = MatIdentity();
+   MvObjectMap current, previous;
+};
+static Mv mv;
+
+static void MvReleaseShader(uint64_t handle)
+{
+   const auto it = mv.shaders.find(handle);
+   if (it == mv.shaders.end())
    {
-      D3D11_TEXTURE2D_DESC desc = {};
-      com_ptr<ID3D11Texture2D> texture;
-      if (resource && SUCCEEDED(resource->QueryInterface(&texture)))
+      return;
+   }
+   if (it->second.vs)
+   {
+      it->second.vs->Release();
+      --state.mv_shaders_live;
+   }
+   if (it->second.ps)
+   {
+      it->second.ps->Release();
+      --state.mv_shaders_live;
+   }
+   mv.shaders.erase(it);
+}
+
+// init_pipeline: patch and create natively (D3D9 runtime only). Env D9N_MV off:
+// nothing happens.
+static void MvInitPipeline(device* host, uint32_t count,
+   const pipeline_subobject* subobjects,
+   pipeline handle)
+{
+   IDirect3DDevice9* native = NativeOf(host);
+   MvReleaseShader(handle.handle);
+   for (uint32_t i = 0; i < count; ++i)
+   {
+      const bool vertex =
+         subobjects[i].type == pipeline_subobject_type::vertex_shader;
+      if (!vertex &&
+          subobjects[i].type != pipeline_subobject_type::pixel_shader)
       {
-         texture->GetDesc(&desc);
+         continue;
       }
-      return desc;
+      const auto* desc = static_cast<const shader_desc*>(subobjects[i].data);
+      if (!desc->code || desc->code_size < 8)
+      {
+         continue;
+      }
+      const auto* tokens = static_cast<const uint32_t*>(desc->code);
+      const size_t token_count = desc->code_size / 4;
+      MvShader entry;
+      entry.crc = vertex ? Crc32(desc->code, desc->code_size) : out.pending_crc;
+      std::vector<uint32_t> patched;
+      std::string error;
+      bool ok = vertex ? Sm3MvPatch::PatchVertexShader(
+                            tokens, token_count, Sm3MvPatch::VsMode::Production,
+                            &patched, &entry.info, &error, 512)
+                       : Sm3MvPatch::PatchPixelShader(tokens, token_count,
+                            &patched, &error);
+      if (ok)
+      {
+         const HRESULT hr =
+            vertex
+               ? native->CreateVertexShader(
+                    reinterpret_cast<const DWORD*>(patched.data()), &entry.vs)
+               : native->CreatePixelShader(
+                    reinterpret_cast<const DWORD*>(patched.data()), &entry.ps);
+         if (FAILED(hr))
+         {
+            ok = false;
+            error = "native create failed 0x" + std::to_string(uint32_t(hr));
+         }
+      }
+      uint32_t& patched_count =
+         vertex ? state.mv_patched_vs : state.mv_patched_ps;
+      uint32_t& refused_count =
+         vertex ? state.mv_refused_vs : state.mv_refused_ps;
+      if (ok)
+      {
+         ++patched_count;
+         ++state.mv_shaders_live;
+      }
+      else if (++refused_count <= 8)
+      {
+         Log("d9native: MV patch refused a %s %08X: %s", vertex ? "VS" : "PS",
+            entry.crc, error.c_str());
+      }
+      // Both stages are one pipeline each in D3D9: the entry holds the patched
+      // shader (or only the CRC when refused: the key needs it).
+      if (!ok)
+      {
+         entry.vs = nullptr;
+         entry.ps = nullptr;
+      }
+      mv.shaders[handle.handle] = entry;
    }
+}
 
-   // The weighted resolve reads the samples of the MSAA targets, which dgVoodoo creates without a shader resource bind (their mirrors
-   // copy it). The bind flag only: the formats stay as created.
-   static bool OnCreateResource(reshade::api::device* device, reshade::api::resource_desc& desc, reshade::api::subresource_data* initial_data, reshade::api::resource_usage initial_state)
+static void MvDestroyPipeline(uint64_t handle)
+{
+   MvReleaseShader(handle);
+}
+
+// Puts the game's shaders, RT1 and COLORWRITEENABLE1 back after a patched
+// draw. Cheap when nothing was changed.
+static void MvRestoreGame(IDirect3DDevice9* native)
+{
+   if (mv.applied_vs)
    {
-      if (desc.type != reshade::api::resource_type::texture_2d || desc.texture.samples <= 1 || (desc.usage & reshade::api::resource_usage::render_target) == 0 || (desc.usage & reshade::api::resource_usage::shader_resource) != 0)
-         return false;
-      if (desc.texture.format != reshade::api::format::r8g8b8a8_typeless && desc.texture.format != reshade::api::format::r8g8b8a8_unorm)
-         return false;
-      desc.usage |= reshade::api::resource_usage::shader_resource;
+      native->SetVertexShader(
+         reinterpret_cast<IDirect3DVertexShader9*>(mv.game_vs));
+      mv.applied_vs = false;
+   }
+   if (mv.applied_ps)
+   {
+      native->SetPixelShader(
+         reinterpret_cast<IDirect3DPixelShader9*>(mv.game_ps));
+      mv.applied_ps = false;
+   }
+   if (mv.applied_rt1)
+   {
+      native->SetRenderTarget(1, nullptr);
+      native->SetRenderState(D3DRS_COLORWRITEENABLE1, mv.saved_cwe1);
+      mv.applied_rt1 = false;
+   }
+}
+
+// Save / restore of everything a pass of ours touches. The state block holds
+// the shaders, constants, textures, samplers and render states; the render
+// targets, depth surface and viewport are not part of it.
+struct PassScope
+{
+   IDirect3DDevice9* native;
+   IDirect3DSurface9 *rt0 = nullptr, *rt1 = nullptr, *depth = nullptr;
+   D3DVIEWPORT9 viewport = {};
+   explicit PassScope(IDirect3DDevice9* device) : native(device)
+   {
+      if (!mv.block)
+      {
+         native->CreateStateBlock(D3DSBT_ALL, &mv.block);
+      }
+      if (mv.block)
+      {
+         mv.block->Capture();
+      }
+      native->GetRenderTarget(0, &rt0);
+      native->GetRenderTarget(1, &rt1);
+      native->GetDepthStencilSurface(&depth);
+      native->GetViewport(&viewport);
+      // A pass: opaque, no depth, no culling, all channels
+      static const std::pair<D3DRENDERSTATETYPE, DWORD> pass_states[] = {
+         {D3DRS_ZENABLE, 0},
+         {D3DRS_ZWRITEENABLE, 0},
+         {D3DRS_ALPHABLENDENABLE, 0},
+         {D3DRS_SEPARATEALPHABLENDENABLE, 0},
+         {D3DRS_ALPHATESTENABLE, 0},
+         {D3DRS_CULLMODE, D3DCULL_NONE},
+         {D3DRS_STENCILENABLE, 0},
+         {D3DRS_SCISSORTESTENABLE, 0},
+         {D3DRS_SRGBWRITEENABLE, 0},
+         {D3DRS_FILLMODE, D3DFILL_SOLID},
+         {D3DRS_COLORWRITEENABLE, 0xF},
+         {D3DRS_COLORWRITEENABLE1, 0xF}};
+      for (const auto& [render_state, value] : pass_states)
+      {
+         native->SetRenderState(render_state, value);
+      }
+   }
+   ~PassScope()
+   {
+      if (mv.block)
+      {
+         mv.block->Apply();
+      }
+      native->SetRenderTarget(0, rt0);
+      native->SetRenderTarget(1, rt1);
+      native->SetDepthStencilSurface(depth);
+      native->SetViewport(&viewport);
+      Free(&rt0);
+      Free(&rt1);
+      Free(&depth);
+   }
+   PassScope(const PassScope&) = delete;
+   PassScope& operator=(const PassScope&) = delete;
+};
+
+// Full screen triangle with vs_quad + `pixel_shader` into the bound targets.
+static void MvDrawQuad(IDirect3DDevice9* native, UINT width, UINT height,
+   IDirect3DPixelShader9* pixel_shader)
+{
+   static const float triangle[] = {-1, -1, 0, -1, 3, 0, 3, -1, 0};
+   const D3DVIEWPORT9 viewport = {0, 0, width, height, 0, 1};
+   native->SetViewport(&viewport);
+   native->SetFVF(D3DFVF_XYZ);
+   native->SetVertexShader(mv.vs_quad);
+   native->SetPixelShader(pixel_shader);
+   native->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, triangle, sizeof(float) * 3);
+}
+
+static void MvSetPointClamp(IDirect3DDevice9* native, DWORD sampler,
+   IDirect3DBaseTexture9* texture)
+{
+   native->SetTexture(sampler, texture);
+   for (D3DSAMPLERSTATETYPE type :
+      {D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER})
+   {
+      native->SetSamplerState(sampler, type, D3DTEXF_POINT);
+   }
+   native->SetSamplerState(sampler, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+   native->SetSamplerState(sampler, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+   native->SetSamplerState(sampler, D3DSAMP_SRGBTEXTURE, 0);
+}
+
+// One-time: the four pass shaders (Luma_Bayonetta_MotionVectorFill_SM3.hlsl,
+// Luma_Bayonetta_RGBCopy_SM3.hlsl).
+static bool MvLoadShaders(IDirect3DDevice9* native)
+{
+   if (mv.shaders_tried)
+   {
+      return mv.vs_quad && mv.ps_fill && mv.ps_marker && mv.ps_copy;
+   }
+   mv.shaders_tried = true;
+   const std::string fill_file = "Bayonetta/Luma_Bayonetta_MotionVectorFill_SM3.hlsl";
+   const std::vector<uint8_t>
+      quad = LoadShader(L"mv_quad.vs_3_0.cso", fill_file, "vs_quad", "vs_3_0"),
+      fill = LoadShader(L"mv_fill.ps_3_0.cso", fill_file, "ps_fill", "ps_3_0"),
+      marker = LoadShader(L"mv_marker.ps_3_0.cso", fill_file, "ps_marker", "ps_3_0"),
+      copy = LoadShader(L"rgb_copy.ps_3_0.cso",
+         "Bayonetta/Luma_Bayonetta_RGBCopy_SM3.hlsl", "main",
+         "ps_3_0");
+   const bool ok =
+      !quad.empty() && !fill.empty() && !marker.empty() && !copy.empty() &&
+      SUCCEEDED(native->CreateVertexShader(
+         reinterpret_cast<const DWORD*>(quad.data()), &mv.vs_quad)) &&
+      SUCCEEDED(native->CreatePixelShader(
+         reinterpret_cast<const DWORD*>(fill.data()), &mv.ps_fill)) &&
+      SUCCEEDED(native->CreatePixelShader(
+         reinterpret_cast<const DWORD*>(marker.data()), &mv.ps_marker)) &&
+      SUCCEEDED(native->CreatePixelShader(
+         reinterpret_cast<const DWORD*>(copy.data()), &mv.ps_copy));
+   Log("d9native: MV pass shaders %s", ok ? "loaded" : "FAILED to load");
+   return ok;
+}
+
+// A32B32G32R32F vertex texture fetch (the previous bones), else MV is off.
+static bool MvCheckVtf(IDirect3DDevice9* native)
+{
+   if (mv.vtf_checked)
+   {
+      return state.mv_vtf_ok != 0;
+   }
+   mv.vtf_checked = true;
+   IDirect3D9* d3d = nullptr;
+   D3DDISPLAYMODE mode = {};
+   D3DCAPS9 caps = {};
+   HRESULT hr = native->GetDirect3D(&d3d);
+   if (SUCCEEDED(hr))
+   {
+      native->GetDisplayMode(0, &mode);
+      native->GetDeviceCaps(&caps);
+      hr = d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, mode.Format,
+         D3DUSAGE_QUERY_VERTEXTEXTURE, D3DRTYPE_TEXTURE,
+         D3DFMT_A32B32G32R32F);
+      d3d->Release();
+   }
+   state.mv_vtf_ok = SUCCEEDED(hr);
+   state.mv_indep_mrt =
+      (caps.PrimitiveMiscCaps & D3DPMISCCAPS_MRTINDEPENDENTBITDEPTHS) != 0;
+   if (!state.mv_vtf_ok)
+   {
+      Log("d9native: MV disabled: no A32B32G32R32F vertex texture fetch "
+          "(CheckDeviceFormat 0x%08X)",
+         uint32_t(hr));
+   }
+   Log("d9native: MV: vertex texture A32B32G32R32F %s, MRT independent bit "
+       "depths %d",
+      state.mv_vtf_ok ? "ok" : "unsupported", state.mv_indep_mrt);
+   return state.mv_vtf_ok != 0;
+}
+
+static void MvFreeTargets(IDirect3DDevice9* native)
+{
+   if (native)
+   {
+      native->SetTexture(D3DVERTEXTEXTURESAMPLER0 + Sm3MvPatch::kVtfSampler,
+         nullptr);
+   }
+   Free(&mv.probe_motion);
+   Free(&mv.probe_depth);
+   Free(&mv.probe_raw);
+   Free(&mv.motion_surface);
+   Free(&mv.motion_rt);
+   Free(&mv.vtf);
+   for (IDirect3DTexture9*& texture : mv.textures)
+   {
+      Free(&texture);
+   }
+   std::fill(std::begin(mv.kmt), std::end(mv.kmt), nullptr);
+   mv.vtf_rows = 0;
+   mv.tex_w = mv.tex_h = 0;
+}
+
+// The shared SR textures (motion, depth, output, color), the render-size motion
+// target and the previous-bones texture for `rows` bone sets. Recreated when
+// the size changed or the rows do not fit. False = MV cannot run this frame.
+static bool MvEnsureTextures(IDirect3DDevice9* native, UINT width,
+   UINT height)
+{
+   if (mv.textures[0] && mv.tex_w == width && mv.tex_h == height)
+   {
       return true;
    }
-
-   // SMAA ULTRA on the canvas the scene copy (ResetRender) just wrote, display mapped, before the UI, predicated by the depth
-   // prepass's edges ("Luma_Bayonetta_DepthEdges.hlsl"). TW1's "DrawSMAAOnScene" on the snapshot the UI clamp already takes
-   // ("scene_texture"). "scene_rect" is the scene copy's viewport: the scene's 16:9 rect in the canvas with PreserveAspect.
-   static void DrawSMAAOnCanvas(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, ID3D11RenderTargetView* canvas_rtv, const D3D11_VIEWPORT& scene_rect)
+   MvFreeTargets(native);
+   const D3DFORMAT formats[4] = {D3DFMT_G16R16F, D3DFMT_R32F,
+      D3DFMT_A16B16G16R16F, D3DFMT_A16B16G16R16F};
+   bool ok = true;
+   for (int i = 0; ok && i < 4; ++i)
    {
-      auto& gd = GetGameDeviceData(device_data);
-      if (!HasSMAAShaders(device_data) || !gd.scene_srv)
-         return;
-      const uint2 size = GetViewTextureSize(gd.scene_srv.get());
-      gd.smaa_resources_live = true;
+      ok = SUCCEEDED(native->CreateTexture(
+         width, height, 1, D3DUSAGE_RENDERTARGET, formats[i], D3DPOOL_DEFAULT,
+         &mv.textures[i], &mv.kmt[i]));
+   }
+   for (int i = 0; ok && i < 2; ++i)
+   {
+      IDirect3DSurface9* surface = nullptr;
+      mv.textures[i]->GetSurfaceLevel(0, &surface);
+      native->ColorFill(surface, nullptr,
+         i ? D3DCOLOR_ARGB(0xFF, 0x80, 0, 0) : 0); // depth 0.5
+      Free(&surface);
+   }
+   ok = ok &&
+        SUCCEEDED(native->CreateTexture(
+           width, height, 1, D3DUSAGE_RENDERTARGET,
+           state.mv_indep_mrt ? D3DFMT_G16R16F : D3DFMT_A16B16G16R16F,
+           D3DPOOL_DEFAULT, &mv.motion_rt, nullptr)) &&
+        SUCCEEDED(mv.motion_rt->GetSurfaceLevel(0, &mv.motion_surface));
+   if (!ok)
+   {
+      Log("d9native: MV targets %ux%u FAILED", width, height);
+      MvFreeTargets(native);
+      return false;
+   }
+   mv.tex_w = width;
+   mv.tex_h = height;
+   return true;
+}
 
-      // Scale and mask fall back together: 2 with a null mask raises the threshold frame wide
-      auto* const predication_shader = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta Depth Edges CS"));
-      bool predication = g_smaa_predication && predication_shader && gd.depth_srv && GetViewTextureSize(gd.depth_srv.get()) == uint2{uint32_t(scene_rect.Width), uint32_t(scene_rect.Height)};
-      if (predication && (!gd.smaa_predication_srv || GetViewTextureSize(gd.smaa_predication_srv.get()) != size))
+static bool MvEnsureVtf(IDirect3DDevice9* native, UINT rows)
+{
+   if (mv.vtf && mv.vtf_rows >= rows)
+   {
+      return true;
+   }
+   Free(&mv.vtf);
+   const HRESULT hr = native->CreateTexture(
+      MV_VTF_WIDTH, rows, 1, D3DUSAGE_DYNAMIC, D3DFMT_A32B32G32R32F,
+      D3DPOOL_DEFAULT, &mv.vtf, nullptr);
+   mv.vtf_rows = SUCCEEDED(hr) ? rows : 0;
+   if (FAILED(hr))
+   {
+      Log("d9native: MV previous-bones texture %ux%u FAILED 0x%08X", MV_VTF_WIDTH,
+         rows, uint32_t(hr));
+   }
+   return SUCCEEDED(hr);
+}
+
+static void MvDestroy(device* host)
+{
+   IDirect3DDevice9* native = host ? NativeOf(host) : nullptr;
+   if (native)
+   {
+      MvRestoreGame(native);
+   }
+   Free(&mv.scene_surface);
+   Free(&mv.prepass);
+   mv.open = mv.ended = false;
+   mv.scene_resource = mv.copy_dest = {0};
+   mv.camera_valid = mv.previous_valid = false;
+   mv.current.clear();
+   mv.previous.clear();
+   Free(&mv.block);
+   MvFreeTargets(native);
+   Free(&mv.vs_quad);
+   Free(&mv.ps_fill);
+   Free(&mv.ps_marker);
+   Free(&mv.ps_copy);
+   Free(&mv.ps_gtao);
+   mv.shaders_tried = false;
+   mv.last_w = mv.last_h = 0;
+   mv.disabled = mv.vtf_checked && !state.mv_vtf_ok;
+}
+
+// The motion RT's raw content at the probes (before the fill) and the shared
+// motion / depth after it: test readback, one GPU stall per scene.
+static float MvHalfToFloat(uint16_t half)
+{
+   return HalfToFloat(half);
+}
+
+static bool MvReadSurface(IDirect3DDevice9* native, IDirect3DSurface9* source,
+   IDirect3DSurface9** sysmem, D3DFORMAT format,
+   D3DLOCKED_RECT* locked)
+{
+   if (!*sysmem &&
+       FAILED(native->CreateOffscreenPlainSurface(
+          mv.tex_w, mv.tex_h, format, D3DPOOL_SYSTEMMEM, sysmem, nullptr)))
+   {
+      return false;
+   }
+   return SUCCEEDED(native->GetRenderTargetData(source, *sysmem)) &&
+          SUCCEEDED((*sysmem)->LockRect(locked, nullptr, D3DLOCK_READONLY));
+}
+
+static void MvReadProbes(IDirect3DDevice9* native, bool raw)
+{
+   const int count = std::clamp<int>(state.mv_probe_count, 0, MV_MAX_PROBES);
+   if (!count)
+   {
+      return;
+   }
+   D3DLOCKED_RECT locked = {};
+   if (raw)
+   {
+      // The motion target: G16R16F (R, G half floats) or A16B16G16R16F; both
+      // keep x, y first
+      const bool two_channels = state.mv_indep_mrt != 0;
+      if (!MvReadSurface(native, mv.motion_surface, &mv.probe_raw,
+             two_channels ? D3DFMT_G16R16F : D3DFMT_A16B16G16R16F,
+             &locked))
       {
-         gd.smaa_predication_srv.reset();
-         gd.smaa_predication_uav.reset();
-         gd.smaa_predication.reset();
-         const CD3D11_TEXTURE2D_DESC desc(DXGI_FORMAT_R16_FLOAT, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-         if (SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, gd.smaa_predication.put())) && SUCCEEDED(native_device->CreateUnorderedAccessView(gd.smaa_predication.get(), nullptr, gd.smaa_predication_uav.put())))
-         {
-            native_device->CreateShaderResourceView(gd.smaa_predication.get(), nullptr, gd.smaa_predication_srv.put());
-         }
+         return;
       }
-      const CB::DepthEdgesConstants predication_constants = {.tolerance = g_smaa_pred_tolerance, .scene_origin = {scene_rect.TopLeftX, scene_rect.TopLeftY}};
-      predication = predication && gd.smaa_predication_srv && PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.smaa_predication_buffer), &predication_constants, sizeof(predication_constants));
-      // SMAA T2x: SMAA into this frame's linear target with the velocity, then the resolve with the previous frame into the canvas
-      // (Mirror's Edge's). It needs this frame's motion vectors from the fill, at the canvas' size: the motion vectors cover the scene
-      // rect, so a canvas wider than the scene (PreserveAspect) stays 1x. Without them this frame is 1x and the next one doesn't jitter.
-      auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
-      auto* const t2x_weight_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Bayonetta SMAA T2x Blending Weight Calculation PS"));
-      auto* const t2x_blend_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Bayonetta SMAA T2x Neighborhood Blending PS"));
-      auto* const t2x_resolve_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Bayonetta SMAA T2x Resolve PS"));
-      const uint32_t frame_index = cb_luma_global_settings.FrameIndex;
-      bool t2x = gd.t2x_active && gd.mv_filled && gd.mv.srv && copy_vs && t2x_weight_ps && t2x_blend_ps && t2x_resolve_ps && GetViewTextureSize(gd.mv.srv.get()) == size;
-      const int t2x_current = int(frame_index & 1);
-      bool t2x_history = gd.t2x_frames[0] && gd.t2x_frame + 1 == frame_index;
-      if (t2x && GetViewTextureSize(gd.t2x_frame_srvs[0].get()) != size)
+      const size_t texel = two_channels ? 4 : 8;
+      for (int i = 0; i < count; ++i)
       {
-         t2x_history = false;
-         gd.ReleaseT2xFrames();
-         for (int i = 0; i < 2; i++)
+         const auto* base = static_cast<const uint8_t*>(locked.pBits) +
+                            size_t(state.mv_probe_xy[2 * i + 1]) * locked.Pitch +
+                            size_t(state.mv_probe_xy[2 * i]) * texel;
+         uint16_t halves[2];
+         memcpy(halves, base, 4);
+         state.mv_probe_raw[i][0] = MvHalfToFloat(halves[0]);
+         state.mv_probe_raw[i][1] = MvHalfToFloat(halves[1]);
+      }
+      mv.probe_raw->UnlockRect();
+      return;
+   }
+   IDirect3DSurface9* surface = nullptr;
+   mv.textures[0]->GetSurfaceLevel(0, &surface);
+   if (MvReadSurface(native, surface, &mv.probe_motion, D3DFMT_G16R16F,
+          &locked))
+   {
+      for (int i = 0; i < count; ++i)
+      {
+         const auto* base = static_cast<const uint8_t*>(locked.pBits) +
+                            size_t(state.mv_probe_xy[2 * i + 1]) * locked.Pitch +
+                            size_t(state.mv_probe_xy[2 * i]) * 4;
+         uint16_t halves[2];
+         memcpy(halves, base, 4);
+         state.mv_probe_motion[i][0] = MvHalfToFloat(halves[0]);
+         state.mv_probe_motion[i][1] = MvHalfToFloat(halves[1]);
+      }
+      mv.probe_motion->UnlockRect();
+   }
+   Free(&surface);
+   mv.textures[1]->GetSurfaceLevel(0, &surface);
+   if (MvReadSurface(native, surface, &mv.probe_depth, D3DFMT_R32F, &locked))
+   {
+      for (int i = 0; i < count; ++i)
+      {
+         const auto* base = static_cast<const uint8_t*>(locked.pBits) +
+                            size_t(state.mv_probe_xy[2 * i + 1]) * locked.Pitch +
+                            size_t(state.mv_probe_xy[2 * i]) * 4;
+         memcpy(&state.mv_probe_depth[i], base, 4);
+      }
+      mv.probe_depth->UnlockRect();
+   }
+   Free(&surface);
+}
+
+// Opens the scene at the depth prepass (Bayonetta main OpenScene): R32F RT0
+// with a second target, of the bound depth's size, which is the output's or up
+// to half of it, full viewport. Rolls last frame's camera and objects over and
+// picks the jitter.
+static void MvTryOpenScene(device* host, IDirect3DDevice9* native)
+{
+   mv.refused_rt0 = mv.rt_view[0];
+   const UINT width = mv.dsv_w, height = mv.dsv_h;
+   if (!width || mv.rt0_w != width || mv.rt0_h != height ||
+       width > state.width || height > state.height || width * 2 < state.width ||
+       height * 2 < state.height)
+   {
+      return;
+   }
+   D3DVIEWPORT9 viewport = {};
+   native->GetViewport(&viewport);
+   if (viewport.X || viewport.Y || viewport.Width != width ||
+       viewport.Height != height)
+   {
+      return;
+   }
+   // The SR bridge's textures are the render size's (no render scale here)
+   if (g_sr_upscaler >= 0 &&
+       (width != state.render_width || height != state.render_height))
+   {
+      return;
+   }
+   IDirect3DTexture9* prepass = nullptr;
+   if (!mv.rt0_resource.handle ||
+       FAILED(reinterpret_cast<IUnknown*>(mv.rt0_resource.handle)
+             ->QueryInterface(IID_PPV_ARGS(&prepass))))
+   {
+      return;
+   }
+   if (!MvCheckVtf(native) || !MvLoadShaders(native) ||
+       !MvEnsureTextures(native, width, height))
+   {
+      mv.disabled = true;
+      Free(&prepass);
+      return;
+   }
+   mv.refused_rt0 = 0;
+   Free(&mv.prepass);
+   mv.prepass = prepass;
+   mv.prepass_view = mv.rt_view[0];
+   mv.scene_depth = mv.dsv;
+   mv.scene_w = width;
+   mv.scene_h = height;
+   mv.scene_view = 0;
+   Free(&mv.scene_surface);
+   mv.scene_resource = mv.copy_dest = {0};
+   mv.open = true;
+   mv.ended = false;
+   ++state.mv_scene_frames;
+
+   // Last frame's camera and objects are the previous ones, unless frames
+   // without a scene came between (SMV:747-792).
+   const bool same_size = mv.last_w == width && mv.last_h == height;
+   mv.previous_valid =
+      mv.camera_valid && same_size && mv.frame_index - mv.scene_frame <= 1;
+   mv.previous_camera = mv.camera;
+   mv.camera_valid = false;
+   mv.reprojection = MatIdentity();
+   mv.scene_frame = mv.frame_index;
+   mv.last_w = width;
+   mv.last_h = height;
+   mv.previous = std::move(mv.current);
+   mv.current.clear();
+   if (!mv.previous_valid)
+   {
+      mv.previous.clear();
+   }
+
+   // Jitter: Halton (2, 3) over the 1x phase count, pixels to NDC (y up), only
+   // when the upscaler drew last frame (or forced by the test).
+   mv.jitter[0] = mv.jitter[1] = 0.0f;
+   if (state.force_jitter || mv.sr_ran_last)
+   {
+      const unsigned phase = mv.frame_index % MV_JITTER_PHASES;
+      mv.jitter[0] = MvHalton(phase, 2);
+      mv.jitter[1] = MvHalton(phase, 3);
+   }
+   // SMAA T2x (Bayonetta's OpenScene): (-0.25, -0.25) then (0.25, 0.25) in y
+   // down pixels for its subsample indices 1 and 2, only after a frame it
+   // resolved
+   mv.t2x_phase = -1;
+   if (state.smaa && state.smaa_t2x && !sr.ready && !state.luma_taa &&
+       mv.t2x_ran_last)
+   {
+      mv.t2x_phase = int(mv.frame_index & 1);
+      mv.jitter[0] = mv.jitter[1] = (mv.t2x_phase == 0) ? -0.25f : 0.25f;
+   }
+   state.t2x_phase = mv.t2x_phase;
+   mv.jitter_ndc[0] = mv.jitter[0] * 2.0f / float(width);
+   mv.jitter_ndc[1] = mv.jitter[1] * -2.0f / float(height);
+   state.jitter_x = mv.jitter[0];
+   state.jitter_y = mv.jitter[1];
+
+   // Previous bones: one row per skinned object of last frame, written once per
+   // frame (unmatched draws select their current bones in the VS instead)
+   UINT skinned = 0;
+   for (auto& [key, objects] : mv.previous)
+   {
+      for (MvObject& object : objects)
+      {
+         object.row = object.bones.empty() ? -1 : int(skinned++);
+      }
+   }
+   if (!MvEnsureVtf(native, std::max(skinned, 1u)))
+   {
+      mv.disabled = true;
+      return;
+   }
+   if (D3DLOCKED_RECT locked = {};
+      SUCCEEDED(mv.vtf->LockRect(0, &locked, nullptr, D3DLOCK_DISCARD)))
+   {
+      // Zeroed: a current-bones draw still fetches a row and multiplies it by 0
+      auto* texels = static_cast<uint8_t*>(locked.pBits);
+      memset(texels, 0, size_t(mv.vtf_rows) * locked.Pitch);
+      if (!Mutated(MUT_NO_PREV_BONES))
+      {
+         for (const auto& [key, objects] : mv.previous)
          {
-            const CD3D11_TEXTURE2D_DESC desc(DXGI_FORMAT_R16G16B16A16_FLOAT, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
-            if (FAILED(native_device->CreateTexture2D(&desc, nullptr, gd.t2x_frames[i].put())) || FAILED(native_device->CreateRenderTargetView(gd.t2x_frames[i].get(), nullptr, gd.t2x_frame_rtvs[i].put())) ||
-                FAILED(native_device->CreateShaderResourceView(gd.t2x_frames[i].get(), nullptr, gd.t2x_frame_srvs[i].put())))
+            for (const MvObject& object : objects)
             {
-               gd.ReleaseT2xFrames();
-               break;
-            }
-         }
-         t2x = gd.t2x_frames[0].get() != nullptr;
-      }
-      // b1 ("Luma_SMAA_impl.hlsl"'s "SmaaMetricsCB"): the metrics, the predication threshold scale and T2x's subsample indices for the
-      // jitter phase (see "OpenScene"), 0 for 1x
-      const float subsample_indices = ((t2x && gd.t2x_phase >= 0) ? float(gd.t2x_phase + 1) : 0.f);
-      const CB::SmaaMetrics metrics = {
-         .rt_metrics = {1.f / float(size.x), 1.f / float(size.y), float(size.x), float(size.y)},
-         .predication = {(predication ? 2.f : 1.f), 0.f, 0.f, 0.f},
-         .subsample_indices = {subsample_indices, subsample_indices, subsample_indices, 0.f},
-      };
-      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.smaa_metrics_buffer), &metrics, sizeof(metrics)))
-         return;
-
-      if (predication)
-      {
-         ID3D11ShaderResourceView* const srv = gd.depth_srv.get();
-         ID3D11UnorderedAccessView* const uav = gd.smaa_predication_uav.get();
-         ID3D11Buffer* const buffer = gd.smaa_predication_buffer.get();
-         native_device_context->CSSetShaderResources(0, 1, &srv);
-         native_device_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-         native_device_context->CSSetConstantBuffers(0, 1, &buffer);
-         native_device_context->CSSetShader(predication_shader, nullptr, 0);
-         native_device_context->Dispatch((size.x + 7) / 8, (size.y + 7) / 8, 1);
-         ID3D11ShaderResourceView* const null_srv = nullptr;
-         ID3D11UnorderedAccessView* const null_uav = nullptr;
-         native_device_context->CSSetShaderResources(0, 1, &null_srv);
-         native_device_context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
-      }
-#if DEVELOPMENT
-      // Calibration aid: predication's effect is the absence of smearing, which the eye misjudges; judge the mask instead (red)
-      if (predication && g_smaa_pred_debug)
-      {
-         auto* const copy_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Copy PS"));
-         if (copy_vs && copy_ps)
-         {
-            DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, copy_vs, copy_ps, gd.smaa_predication_srv.get(), canvas_rtv, size.x, size.y, false);
-            return;
-         }
-      }
-#endif
-
-      // Writing the canvas is safe: the chain samples the snapshot, never the canvas itself
-      ID3D11ShaderResourceView* const predication_srv = (predication ? gd.smaa_predication_srv.get() : nullptr);
-      if (t2x)
-      {
-         // The game's state back after the resolve (dgVoodoo doesn't rebind what it thinks is bound)
-         DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
-         graphics_state.Cache(native_device_context, device_data.uav_max_count);
-         // The metrics at VS+PS b1, bound here rather than through "DrawSMAA()" (which restores the slot): the resolve reads them too
-         ID3D11Buffer* const metrics_buffer = gd.smaa_metrics_buffer.get();
-         native_device_context->VSSetConstantBuffers(1, 1, &metrics_buffer);
-         native_device_context->PSSetConstantBuffers(1, 1, &metrics_buffer);
-         const SMAAT2xPasses t2x_passes = {.blending_weight_calculation_ps = t2x_weight_ps, .neighborhood_blending_ps = t2x_blend_ps, .velocity = gd.mv.srv.get()};
-         DrawSMAA(native_device, native_device_context, device_data, gd.t2x_frame_rtvs[t2x_current].get(), gd.scene_srv.get(), gd.scene_srv.get(), predication_srv, nullptr, &t2x_passes);
-         // The resolve: t0 this frame, t1 the previous one or this one again without a history, t2 the motion vectors, s0 linear and
-         // s1 point. RGB only: the canvas alpha stays the scene copy's (T2x's alpha is the velocity length).
-         native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
-         ID3D11ShaderResourceView* const resolve_srvs[2] = {gd.t2x_frame_srvs[t2x_history ? (t2x_current ^ 1) : t2x_current].get(), gd.mv.srv.get()};
-         native_device_context->PSSetShaderResources(1, 2, resolve_srvs);
-         ID3D11SamplerState* const resolve_samplers[2] = {device_data.sampler_state_linear.get(), device_data.sampler_state_point.get()};
-         native_device_context->PSSetSamplers(0, 2, resolve_samplers);
-         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), gd.GetRGBBlendState(native_device), nullptr, copy_vs, t2x_resolve_ps, gd.t2x_frame_srvs[t2x_current].get(), canvas_rtv, size.x, size.y, false);
-         graphics_state.Restore(native_device_context);
-         gd.t2x_frame = frame_index;
-      }
-      else
-      {
-         DrawSMAA(native_device, native_device_context, device_data, canvas_rtv, gd.scene_srv.get(), gd.scene_srv.get(), predication_srv, gd.smaa_metrics_buffer.get());
-      }
-#if DEVELOPMENT
-      gd.aa_stats.smaa++;
-      gd.aa_stats.smaa_predicated += (predication ? 1 : 0);
-#endif
-   }
-
-   // ---- DLAA / FSR 3 Native AA / XeSS / Luma TAA (the vc4 layout is in "MotionVectorPatches.h") ----
-   // The view projection's vc4 byte offset: the camera FSR reads
-   static constexpr UINT VIEW_PROJECTION_OFFSET = MotionVectorPatches::view_projection_row * 16;
-
-   // The game's motion vector state for Core's buffer and bind events, null before the device data exists
-   static SceneMotionVectors::State* GetSceneMotionVectors(reshade::api::device* device)
-   {
-      DeviceData* const device_data = device->get_private_data<DeviceData>();
-      return ((device_data && device_data->game) ? &GetGameDeviceData(*device_data).mv : nullptr);
-   }
-
-   // What "SceneMotionVectors" asks of the game
-   struct MotionVectorGame
-   {
-      static constexpr const char* log_tag = "Bayonetta";
-      static constexpr MotionVectorPatch::Layout layout = MotionVectorPatches::layout;
-      static constexpr auto cameras = MotionVectorPatches::cameras;
-      static constexpr auto tie_break_rows = MotionVectorPatches::tie_break_rows;
-      static constexpr auto frame_camera = MotionVectorPatches::frame_camera;
-      static constexpr const char* patch_names[size_t(PixelShaderPatch::COUNT)] = {"MV PS", "MV PS (mask)", "MV PS (mask)", "MV PS (blended)", "Coverage PS", "", "", ""};
-
-      // The scene color: fp16, single sample, with a shader resource view (the upscaler reads it)
-      static bool AcceptSceneColor(const D3D11_RENDER_TARGET_VIEW_DESC& rtv_desc, const D3D11_TEXTURE2D_DESC& color_desc)
-      {
-         return rtv_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && color_desc.ArraySize == 1 && color_desc.SampleDesc.Count == 1 && (color_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
-      }
-
-      static bool IsExcludedPixelShader(uint32_t pixel_shader_hash)
-      {
-         return shader_hashes_SceneRefraction.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel);
-      }
-
-      // The shadow receivers are patched from their replacements, which read the Fix High Resolution Effects target size (b10,
-      // "TARGET_SIZE_CB_SLOT"); the game's code doesn't
-      static bool PatchesReplacement(uint32_t pixel_shader_hash)
-      {
-         return shader_hashes_ShadowReceivers.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel);
-      }
-
-      // The upscalers that read the reactive mask the alpha blended draws write: FSR and Luma TAA (DLSS's current presets ignore it,
-      // DLSS-Best-Practices TRN-2)
-      static bool ReactiveMaskUsed(const DeviceData& device_data)
-      {
-         return g_sr_reactive_enable && static_cast<const BayonettaGameDeviceData*>(device_data.game)->sr_active && (device_data.sr_type == SR::Type::FSR || device_data.sr_type == SR::Type::LumaTAA);
-      }
-
-      static bool CanFill(DeviceData& device_data)
-      {
-         auto& gd = GetGameDeviceData(device_data);
-         return gd.prepass_drawn && gd.prepass_depth_srv && HasShaders(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta Motion Vector Fill CS"));
-      }
-
-      static void FillMarkersBeforeBlend(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
-      {
-         FillMotionVectors(native_device, native_device_context, device_data, /* write_reactive */ false);
-      }
-
-      // A game pixel shader's "patch", from the bytecode its shader object was created with; empty with "error" if it can't be patched. Any
-      // thread ("AddShaderWarmupVariants" too).
-      static std::vector<uint8_t> PatchPixelShader(PixelShaderPatch patch, const uint8_t* code, size_t code_size, std::string* error)
-      {
-         switch (patch)
-         {
-         case PixelShaderPatch::MOTION_VECTORS:
-            return MotionVectorPatch::PatchPixelShader(code, code_size, MotionVectorPatches::layout, error, /* targets_only */ true);
-         case PixelShaderPatch::MASK_ALPHA:
-         case PixelShaderPatch::MASK_ADDITIVE:
-            return MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, MotionVectorPatches::reactive_slot,
-               (patch == PixelShaderPatch::MASK_ADDITIVE ? MotionVectorPatch::ReactiveMode::ADDITIVE : MotionVectorPatch::ReactiveMode::ALPHA), error);
-         case PixelShaderPatch::BLENDED:
-            return MotionVectorPatch::PatchPixelShaderReactive(code, code_size, MotionVectorPatches::layout, UINT32_MAX, MotionVectorPatch::ReactiveMode::ALPHA_MOTION_VECTORS, error);
-         case COVERAGE_PATCH:
-            // The alpha tested materials clip at 0.5; the clips at 0.001 (blended materials' invisible texels) and the depth prepass's
-            // at 0.05 are below the threshold and stay as they are
-            return CoveragePatch::PatchPixelShader(code, code_size, error, 0.1f);
-         }
-         return {};
-      }
-   };
-
-   // Opens the scene at the frame's first mesh draw into its targets: a single sample fp16 color or the depth prepass' R32F (with the
-   // normals in the second target), of the bound depth's size, which is the scene's (a full viewport of it). The scene is the output's
-   // size or smaller (the 16:9 rect of the canvas with PreserveAspect): the shadow maps and the other offscreen passes aren't. Takes the
-   // scene depth, rolls the last frame's camera and objects over and picks the jitter the whole scene draws with. Once per present (the
-   // UI and later passes never reopen it).
-   static void OpenScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const CommandListData& cmd_list_data, DeviceData& device_data, uint32_t vertex_shader_hash,
-      ID3D11RenderTargetView* rtv, bool has_second_target, ID3D11DepthStencilView* dsv)
-   {
-      auto& gd = GetGameDeviceData(device_data);
-      const auto refuse = [&]
-      {
-         gd.open_refused_rtv = rtv;
-         gd.open_refused_dsv = dsv;
-      };
-      const uint2 depth_size = GetViewTextureSize(dsv);
-      const uint2 output_size = {uint32_t(device_data.output_resolution.x), uint32_t(device_data.output_resolution.y)};
-      if (depth_size.x > output_size.x || depth_size.y > output_size.y || depth_size.x * 2 < output_size.x || depth_size.y * 2 < output_size.y)
-      {
-         refuse();
-         return;
-      }
-      D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-      rtv->GetDesc(&rtv_desc);
-      com_ptr<ID3D11Resource> color;
-      rtv->GetResource(&color);
-      const D3D11_TEXTURE2D_DESC color_desc = GetTexture2DDesc(color.get());
-      // Only the depth prepass (R32F 1 - z/w next to the normals) opens the scene: OtMirror draws its reflection earlier into another
-      // full size fp16 target, with no prepass (and a view projection whose determinant has the opposite sign of the scene's). The
-      // scene color is the first fp16 target drawn with this depth ("SceneMotionVectors::DrawWithMotionVectors").
-      const bool scene_format = rtv_desc.Format == DXGI_FORMAT_R32_FLOAT && has_second_target;
-      if (!scene_format || color_desc.SampleDesc.Count != 1 || color_desc.Width != depth_size.x || color_desc.Height != depth_size.y)
-      {
-         refuse();
-         return;
-      }
-      UINT viewport_count = 1;
-      D3D11_VIEWPORT viewport = {};
-      native_device_context->RSGetViewports(&viewport_count, &viewport);
-      if (viewport_count == 0 || viewport.Width != float(depth_size.x) || viewport.Height != float(depth_size.y) || !SceneMotionVectors::GetPatchedVertexShader<MotionVectorGame>(&gd.mv, native_device, cmd_list_data, device_data, vertex_shader_hash).shader)
-         return;
-      gd.mv_scene_last_copy.reset();
-      gd.prepass_rtv = nullptr;
-      gd.prepass_drawn = false;
-      // Halton (2, 3) over the upscaler's phase count; pixels to NDC (y up). None until the upscaler is ready (the bridge's helper
-      // starting shows the scene as it is, antialiased with SMAA).
-      std::array<float, 2> jitter = {};
-      {
-         const SRDrawLock sr = LockSRForDraw(device_data);
-         const SR::InstanceData* const ready_instance_data = ((gd.sr_active && sr.implementation && sr.implementation->IsReady(sr.instance_data)) ? sr.instance_data : nullptr);
-         if ((ready_instance_data && gd.mv_jitter_allowed) || g_mv_force_jitter)
-         {
-            jitter = GetSRJitter(device_data, ready_instance_data);
-         }
-      }
-      // SMAA T2x: the sample offsets (0.25, 0.25) then (-0.25, -0.25) in y down pixels, for "SMAA.hlsl"'s T2x subsample indices 1 and
-      // 2. That is its table read with y up, which measured better (docs/SMAA-Lab.md). The projection moves the other way.
-      gd.t2x_phase = ((gd.t2x_active && gd.t2x_frames[0] && gd.t2x_frame + 1 == cb_luma_global_settings.FrameIndex) ? int(cb_luma_global_settings.FrameIndex & 1) : -1);
-      if (gd.t2x_phase >= 0)
-      {
-         const float shift = (gd.t2x_phase == 0 ? -0.25f : 0.25f);
-         jitter = {shift, shift};
-      }
-      if (!SceneMotionVectors::BeginFrame(&gd.mv, native_device, native_device_context, dsv, depth_size, jitter))
-      {
-         gd.t2x_phase = -1;
-      }
-   }
-
-   // DLAA, FSR 3 Native AA, XeSS or Luma TAA on the jittered scene, its depth (from the depth prepass, see the fill) and the motion vectors;
-   // the result goes back into the scene's color (and its copy, see "mv_scene_copy"), its alpha (the bloom source's threshold input)
-   // kept. False if it didn't draw (missing input, or the upscaler failed). "reactive_mask": the fill wrote this scene's masks.
-   static bool DrawUpscaler(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, bool reactive_mask)
-   {
-      auto& gd = GetGameDeviceData(device_data);
-      auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
-      auto* const copy_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Copy PS"));
-      if (!gd.mv.texture || !gd.mv.camera || !gd.mv.device_depth || !gd.mv.scene_color || !gd.mv.scene_rtv || !copy_vs || !copy_ps)
-         return false;
-      com_ptr<ID3D11Texture2D> scene;
-      if (FAILED(gd.mv.scene_color->QueryInterface(&scene)))
-         return false;
-      D3D11_TEXTURE2D_DESC scene_desc = {};
-      scene->GetDesc(&scene_desc);
-      // Held to the end: "ApplySRType()" can't switch or retire the upscaler meanwhile (nothing below raises ReShade events)
-      const SRDrawLock sr = LockSRForDraw(device_data);
-      if (!sr.implementation)
-         return false;
-
-      D3D11_TEXTURE2D_DESC output_desc = {};
-      if (device_data.sr_output_color)
-      {
-         device_data.sr_output_color->GetDesc(&output_desc);
-      }
-      bool output_recreated = false;
-      if (output_desc.Width != scene_desc.Width || output_desc.Height != scene_desc.Height)
-      {
-         device_data.sr_output_color.reset();
-         gd.sr_output_srv.reset();
-         output_desc = CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_R16G16B16A16_FLOAT, scene_desc.Width, scene_desc.Height, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-         if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, output_desc, &device_data.sr_output_color)))
-         {
-            native_device->CreateShaderResourceView(device_data.sr_output_color.get(), nullptr, &gd.sr_output_srv);
-         }
-         output_recreated = true;
-      }
-      if (!device_data.sr_output_color || !gd.sr_output_srv)
-      {
-         // Back to SMAA until the upscaler is picked again
-         device_data.sr_suppressed = true;
-         return false;
-      }
-      ID3D11BlendState* const rgb_blend_state = gd.GetRGBBlendState(native_device);
-      if (!rgb_blend_state)
-         return false;
-
-      // FSR needs the camera (column vectors: vc4's view projection rows are the clip components)
-      const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(reinterpret_cast<const float*>(gd.mv.camera->data() + VIEW_PROJECTION_OFFSET), /* row_vectors */ false);
-
-      const SR::SettingsData settings_data = {
-         .output_width = scene_desc.Width,
-         .output_height = scene_desc.Height,
-         .render_width = scene_desc.Width,
-         .render_height = scene_desc.Height,
-         // The gamma encoded scene (1 = SDR white, the values above it from the lighting, grade and bloom)
-         .hdr = true,
-         // The motion vectors are UV deltas, previous minus current
-         .mvs_x_scale = float(scene_desc.Width),
-         .mvs_y_scale = float(scene_desc.Height),
-         // DLSS's auto exposure; FSR's clips highlights (FSR-Best-Practices FIN-3), so it runs at exposure 1
-         .auto_exposure = sr.type != SR::Type::FSR,
-         // DLAA on scene-referred HDR input takes preset J or K, never L or M (DLSS-Best-Practices PRE-4): "Default" picks K (11), so
-         // NVIDIA can't change it over the air; an explicit choice is kept
-         .render_preset = (dlss_render_preset != 0 ? dlss_render_preset : 11u),
-      };
-      sr.implementation->UpdateSettings(sr.instance_data, native_device_context, settings_data);
-
-      // FSR requires a FOV (it errors on 0), and both take near and far: a camera without an up axis or a usable projection keeps the
-      // last ones. A finite far (depth 1) even when the projection has none (FSR's context is FFX_FSR3_ENABLE_DEPTH_INFINITE only with
-      // inverted depth).
-      if (camera.vert_fov > 0.0)
-      {
-         gd.sr_vert_fov = float(camera.vert_fov);
-      }
-      if (camera.near_plane > 0.0)
-      {
-         gd.sr_near_plane = float(camera.near_plane);
-         gd.sr_far_plane = float(camera.far_plane);
-      }
-      // The reactive masks (FSR and Luma TAA; DLSS ignores them)
-      const SR::SuperResolutionImpl::DrawData draw_data = {
-         .reset = device_data.force_reset_sr || output_recreated,
-         .output_color = device_data.sr_output_color.get(),
-         .source_color = scene.get(),
-         .motion_vectors = gd.mv.texture.get(),
-         .depth_buffer = gd.mv.device_depth.get(),
-         .bias_mask = (reactive_mask ? gd.mv.reactive.get() : nullptr),
-         .transparency_alpha = (reactive_mask ? gd.mv.transparency.get() : nullptr),
-         // As applied (pixels, +y down)
-         .jitter_x = gd.mv.jitter[0],
-         .jitter_y = gd.mv.jitter[1],
-         .vert_fov = gd.sr_vert_fov,
-         .near_plane = gd.sr_near_plane,
-         .far_plane = gd.sr_far_plane,
-      };
-      if (!sr.implementation->Draw(sr.instance_data, native_device_context, draw_data))
-      {
-         // Back to SMAA until the upscaler is picked again
-         device_data.sr_suppressed = true;
-         return false;
-      }
-      // The RGB write mask keeps the scene's alpha; the copy is the first post pass' input, written in the same pass (with a view like
-      // the scene's: dgVoodoo's are single slice arrays), else copied whole after it
-      ID3D11RenderTargetView* copy_rtv = nullptr;
-      auto* const copy_back_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Bayonetta Copy Back PS"));
-      if (gd.mv_scene_copy && copy_back_ps)
-      {
-         com_ptr<ID3D11Resource> copy_rtv_resource;
-         if (gd.mv_scene_copy_rtv)
-         {
-            gd.mv_scene_copy_rtv->GetResource(&copy_rtv_resource);
-         }
-         if (copy_rtv_resource != gd.mv_scene_copy)
-         {
-            gd.mv_scene_copy_rtv.reset();
-            com_ptr<ID3D11Texture2D> copy;
-            if (SUCCEEDED(gd.mv_scene_copy->QueryInterface(&copy)))
-            {
-               D3D11_TEXTURE2D_DESC copy_desc = {};
-               copy->GetDesc(&copy_desc);
-               D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-               gd.mv.scene_rtv->GetDesc(&rtv_desc);
-               if (copy_desc.BindFlags & D3D11_BIND_RENDER_TARGET)
+               if (object.row >= 0)
                {
-                  native_device->CreateRenderTargetView(copy.get(), &rtv_desc, &gd.mv_scene_copy_rtv);
+                  memcpy(texels + size_t(object.row) * locked.Pitch,
+                     object.bones.data(), MV_BONE_FLOATS * sizeof(float));
                }
             }
          }
-         copy_rtv = gd.mv_scene_copy_rtv.get();
       }
-      DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), rgb_blend_state, nullptr, copy_vs, copy_rtv ? copy_back_ps : copy_ps,
-         gd.sr_output_srv.get(), gd.mv.scene_rtv.get(), scene_desc.Width, scene_desc.Height, true, copy_rtv);
-      if (gd.mv_scene_copy && !copy_rtv)
-      {
-         native_device_context->CopyResource(gd.mv_scene_copy.get(), scene.get());
-      }
-      // Not while the bridge's helper starts (the color copied as it is): SMAA stays on and the next frame resets
-      device_data.has_drawn_sr = sr.implementation->IsReady(sr.instance_data);
-      return true;
+      mv.vtf->UnlockRect(0);
    }
+   MvSetPointClamp(native, D3DVERTEXTEXTURESAMPLER0 + Sm3MvPatch::kVtfSampler,
+      mv.vtf);
 
-   // The depth and camera motion fill (see "Luma_Bayonetta_MotionVectorFill.hlsl"), with the reactive masks if "write_reactive". The
-   // caller caches and restores the state. False if it didn't run.
-   static bool FillMotionVectors(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, bool write_reactive)
+   // Motion target = the marker (D3D9 Clear can't express 65504)
    {
-      auto& gd = GetGameDeviceData(device_data);
-      auto* const fill_shader = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta Motion Vector Fill CS"));
-      if (!fill_shader || !gd.mv.camera || !gd.prepass_drawn || !gd.prepass_depth_srv)
-         return false;
-#if ENABLE_LUMA_TAA
-      // Luma TAA without its 2x history (Medium; the game renders at the output size, so no TAAU) flickered on lasers at the High
-      // scale in the TAA lab: half of it balanced flicker and smear (_tools/taa_lab/reactive_bayo_eval.py)
-      const float reactive_scale = (device_data.sr_type == SR::Type::LumaTAA && LumaTAA::quality.load() < LumaTAA::history_2x_quality ? 0.5f : 1.f) * g_sr_reactive_scale;
-#else
-      const float reactive_scale = g_sr_reactive_scale;
-#endif
-      const CB::MotionVectorFillConstants constants = {
-         .reprojection = gd.mv.reprojection,
-         .jitter_ndc = {gd.mv.jitter_ndc[0], gd.mv.jitter_ndc[1]},
-         .reactive_scale = reactive_scale,
-         .reactive_threshold = g_sr_reactive_threshold,
-         .reactive_enabled = (write_reactive ? 1.f : 0.f),
-      };
-      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.mv.fill_buffer), &constants, sizeof(constants)))
-         return false;
-      // The scene and the motion vectors may be bound as render targets
-      native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
-      ID3D11Buffer* const buffer = gd.mv.fill_buffer.get();
-      ID3D11ShaderResourceView* const srvs[2] = {gd.prepass_depth_srv.get(), write_reactive ? gd.mv.reactive_target_srv.get() : nullptr};
-      ID3D11UnorderedAccessView* const uavs[5] = {gd.mv.uav.get(), gd.mv.device_depth_uav.get(), write_reactive ? gd.mv.reactive_uav.get() : nullptr, write_reactive ? gd.mv.transparency_uav.get() : nullptr,
-         write_reactive ? gd.mv.reactive_previous_uav.get() : nullptr};
-      native_device_context->CSSetConstantBuffers(0, 1, &buffer);
-      native_device_context->CSSetShaderResources(0, UINT(std::size(srvs)), srvs);
-      native_device_context->CSSetUnorderedAccessViews(0, UINT(std::size(uavs)), uavs, nullptr);
-      native_device_context->CSSetShader(fill_shader, nullptr, 0);
-      native_device_context->Dispatch((gd.mv.scene_size.x + 7) / 8, (gd.mv.scene_size.y + 7) / 8, 1);
-      ID3D11UnorderedAccessView* const null_uavs[std::size(uavs)] = {};
-      ID3D11ShaderResourceView* const null_srvs[std::size(srvs)] = {};
-      native_device_context->CSSetUnorderedAccessViews(0, UINT(std::size(null_uavs)), null_uavs, nullptr);
-      native_device_context->CSSetShaderResources(0, UINT(std::size(null_srvs)), null_srvs);
-      if (write_reactive)
-      {
-         gd.mv.sr_reactive_frame = cb_luma_global_settings.FrameIndex;
-      }
-      return true;
+      PassScope scope(native);
+      native->SetRenderTarget(1, nullptr);
+      native->SetRenderTarget(0, mv.motion_surface);
+      native->SetDepthStencilSurface(nullptr);
+      MvDrawQuad(native, width, height, mv.ps_marker);
    }
+}
 
-   // Ends the scene at its first post pass: the fill (the last camera motion, the depth, the reactive masks), then the upscaler, both
-   // before that pass reads the scene
-   static void EndScene(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data)
+// FindNearest (PD:792-830): this draw's place in its key's order and its
+// neighbours with an exact transform, else the nearest transform.
+static const MvObject* MvFindNearest(const std::vector<MvObject>& candidates,
+   size_t order,
+   const std::array<float, 12>& transform)
+{
+   for (const size_t place : {order, order + 1, order - 1})
    {
-      auto& gd = GetGameDeviceData(device_data);
-      gd.mv.scene_open = false;
-      gd.mv.scene_done = true;
-      DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
-      DrawStateStack<DrawStateStackType::Compute> compute_state;
-      graphics_state.Cache(native_device_context, device_data.uav_max_count);
-      compute_state.Cache(native_device_context, device_data.uav_max_count);
-      // The reactive and transparency & composition masks, written by the fill from what the alpha blended draws wrote
-      const bool reactive = MotionVectorGame::ReactiveMaskUsed(device_data) && gd.mv.reactive_target_srv;
-      if (reactive)
+      if (place < candidates.size() && candidates[place].transform == transform)
       {
-         D3D11_TEXTURE2D_DESC desc = {};
-         if (gd.mv.reactive)
+         return &candidates[place];
+      }
+   }
+   // ponytail: always the linear scan (Core indexes lists over 32 candidates)
+   const MvObject* match = nullptr;
+   float nearest = FLT_MAX;
+   for (const MvObject& candidate : candidates)
+   {
+      float distance = 0.0f;
+      for (size_t i = 0; i < transform.size(); ++i)
+      {
+         const float difference = candidate.transform[i] - transform[i];
+         distance += difference * difference;
+      }
+      if (distance < nearest)
+      {
+         nearest = distance;
+         match = &candidate;
+         if (distance == 0.0f)
          {
-            gd.mv.reactive->GetDesc(&desc);
-         }
-         if (desc.Width != gd.mv.scene_size.x || desc.Height != gd.mv.scene_size.y)
-         {
-            const std::unique_lock lock(gd.mv.mutex);
-            gd.mv.reactive.reset();
-            gd.mv.reactive_uav.reset();
-            gd.mv.transparency.reset();
-            gd.mv.transparency_uav.reset();
-            gd.mv.reactive_previous.reset();
-            gd.mv.reactive_previous_uav.reset();
-            desc = CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_R8_UNORM, gd.mv.scene_size.x, gd.mv.scene_size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-            if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, desc, &gd.mv.reactive)))
-            {
-               native_device->CreateUnorderedAccessView(gd.mv.reactive.get(), nullptr, &gd.mv.reactive_uav);
-            }
-            if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, desc, &gd.mv.transparency)))
-            {
-               native_device->CreateUnorderedAccessView(gd.mv.transparency.get(), nullptr, &gd.mv.transparency_uav);
-            }
-            const CD3D11_TEXTURE2D_DESC previous_desc(DXGI_FORMAT_R32_FLOAT, gd.mv.scene_size.x, gd.mv.scene_size.y, 1, 1, D3D11_BIND_UNORDERED_ACCESS);
-            if (SUCCEEDED(native_device->CreateTexture2D(&previous_desc, nullptr, &gd.mv.reactive_previous)) &&
-                SUCCEEDED(native_device->CreateUnorderedAccessView(gd.mv.reactive_previous.get(), nullptr, &gd.mv.reactive_previous_uav)))
-            {
-               constexpr float zero[4] = {};
-               native_device_context->ClearUnorderedAccessViewFloat(gd.mv.reactive_previous_uav.get(), zero);
-            }
+            break;
          }
       }
-      const bool write_reactive = reactive && gd.mv.reactive_uav && gd.mv.transparency_uav && gd.mv.reactive_previous_uav;
-      const bool filled = std::exchange(gd.mv.fill_pending, false) && FillMotionVectors(native_device, native_device_context, device_data, write_reactive);
-      gd.mv_filled = filled;
-      // The upscaler's depth comes from the fill
-      if (gd.sr_active && filled)
+   }
+   return match;
+}
+
+static uint64_t MvHash(uint64_t seed, uint64_t value)
+{
+   return seed ^ (value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2));
+}
+
+// The patched VS (jitter, previous constants) and optionally the patched PS +
+// RT1 for this draw.
+static void MvApplyState(IDirect3DDevice9* native, const MvShader& vertex,
+   const MvShader* pixel)
+{
+   native->SetVertexShader(vertex.vs);
+   mv.applied_vs = true;
+   if (pixel)
+   {
+      native->SetPixelShader(pixel->ps);
+      mv.applied_ps = true;
+      if (!mv.applied_rt1)
       {
-         [[maybe_unused]] const bool drawn = DrawUpscaler(native_device, native_device_context, device_data, write_reactive);
-#if DEVELOPMENT
-         gd.mv.stats.sr_draws += drawn;
-#endif
+         native->GetRenderState(D3DRS_COLORWRITEENABLE1, &mv.saved_cwe1);
+         native->SetRenderTarget(1, mv.motion_surface);
+         native->SetRenderState(D3DRS_COLORWRITEENABLE1,
+            D3DCOLORWRITEENABLE_RED |
+               D3DCOLORWRITEENABLE_GREEN);
+         mv.applied_rt1 = true;
       }
-      compute_state.Restore(native_device_context);
-      graphics_state.Restore(native_device_context);
+   }
+   else
+   {
+      if (mv.applied_ps)
+      {
+         native->SetPixelShader(
+            reinterpret_cast<IDirect3DPixelShader9*>(mv.game_ps));
+         mv.applied_ps = false;
+      }
+      if (mv.applied_rt1)
+      {
+         native->SetRenderTarget(1, nullptr);
+         native->SetRenderState(D3DRS_COLORWRITEENABLE1, mv.saved_cwe1);
+         mv.applied_rt1 = false;
+      }
+   }
+}
+
+// The SR output back, RGB only (the alpha is the bloom threshold input), into
+// the scene and into the game's last copy of it.
+static void MvCopyBack(IDirect3DDevice9* native)
+{
+   PassScope scope(native);
+   native->SetRenderTarget(1, nullptr);
+   native->SetDepthStencilSurface(nullptr);
+   native->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED |
+                                                     D3DCOLORWRITEENABLE_GREEN |
+                                                     D3DCOLORWRITEENABLE_BLUE);
+   MvSetPointClamp(native, 0, mv.textures[2]);
+   const float size[4] = {float(mv.scene_w), float(mv.scene_h), 0, 0};
+   native->SetPixelShaderConstantF(0, size, 1);
+   native->SetRenderTarget(0, mv.scene_surface);
+   MvDrawQuad(native, mv.scene_w, mv.scene_h, mv.ps_copy);
+   ++state.mv_copy_backs;
+   if (mv.copy_dest.handle && !Mutated(MUT_NO_COPY_BACK))
+   {
+      IDirect3DTexture9* texture = nullptr;
+      IDirect3DSurface9* surface = nullptr;
+      D3DSURFACE_DESC desc = {};
+      if (SUCCEEDED(reinterpret_cast<IUnknown*>(mv.copy_dest.handle)
+                ->QueryInterface(IID_PPV_ARGS(&texture))) &&
+          SUCCEEDED(texture->GetLevelDesc(0, &desc)) &&
+          desc.Width == mv.scene_w && desc.Height == mv.scene_h &&
+          (desc.Usage & D3DUSAGE_RENDERTARGET) &&
+          SUCCEEDED(texture->GetSurfaceLevel(0, &surface)) &&
+          SUCCEEDED(native->SetRenderTarget(0, surface)))
+      {
+         MvDrawQuad(native, mv.scene_w, mv.scene_h, mv.ps_copy);
+         ++state.mv_copy_backs;
+      }
+      Free(&surface);
+      Free(&texture);
+   }
+}
+
+// Scene end: marker texels -> camera motion + depth (the fill), then Luma TAA
+// (pass device) or the SR bridge on a shared copy of the scene, whose output
+// goes back RGB-only.
+static void MvEndScene(device* host, IDirect3DDevice9* native)
+{
+   mv.ended = true;
+   ++state.mv_scene_ends;
+   if (!mv.scene_surface || !mv.prepass)
+   {
+      return;
+   }
+   MvReadProbes(native, true);
+   // Fill (own state scope)
+   {
+      PassScope scope(native);
+      float constants[5 * 4] = {};
+      for (int row = 0; row < 4; ++row)
+      {
+         for (int column = 0; column < 4; ++column)
+         {
+            constants[row * 4 + column] = float(mv.reprojection.m[row][column]);
+         }
+      }
+      constants[16] = mv.jitter_ndc[0];
+      constants[17] = mv.jitter_ndc[1];
+      constants[18] = float(mv.scene_w);
+      constants[19] = float(mv.scene_h);
+      IDirect3DSurface9 *motion = nullptr, *depth = nullptr;
+      mv.textures[0]->GetSurfaceLevel(0, &motion);
+      mv.textures[1]->GetSurfaceLevel(0, &depth);
+      native->SetRenderTarget(0, motion);
+      native->SetRenderTarget(1, depth);
+      native->SetDepthStencilSurface(nullptr);
+      MvSetPointClamp(native, 0, mv.motion_rt);
+      MvSetPointClamp(native, 1, mv.prepass);
+      native->SetPixelShaderConstantF(0, constants, 5);
+      MvDrawQuad(native, mv.scene_w, mv.scene_h, mv.ps_fill);
+      native->SetRenderTarget(1, nullptr);
+      Free(&motion);
+      Free(&depth);
+   }
+   mv.filled = true;
+   MvReadProbes(native, false);
+
+   // SR on the scene: Luma TAA on the pass device, else the SR bridge
+   const bool taa = state.luma_taa && PassEnsureOpen(host);
+   if ((!taa && !sr.ready) || !out.query9)
+   {
+      return;
+   }
+   if (!taa &&
+       (!hp.gpu_sync || WaitForSingleObject(sr.process, 0) == WAIT_OBJECT_0))
+   {
+      Log("d9native: SR bridge stopped (%s)",
+         hp.gpu_sync ? "it exited" : "the presenter lost GPU sync");
+      StopUpscaler();
+      return;
+   }
+   D3DSURFACE_DESC scene_desc = {};
+   mv.scene_surface->GetDesc(&scene_desc);
+   if (scene_desc.Format != D3DFMT_A16B16G16R16F ||
+       scene_desc.Width != mv.scene_w || scene_desc.Height != mv.scene_h)
+   {
+      return;
+   }
+   IDirect3DSurface9* color = nullptr;
+   mv.textures[3]->GetSurfaceLevel(0, &color);
+   const HRESULT copy_hr = native->StretchRect(mv.scene_surface, nullptr, color,
+      nullptr, D3DTEXF_NONE);
+   Free(&color);
+   out.query9->Issue(D3DISSUE_END);
+   const HRESULT query_hr = out.query9->GetData(nullptr, 0, D3DGETDATA_FLUSH);
+   if (FAILED(copy_hr) || FAILED(query_hr))
+   {
+      Log("d9native: SR scene copy failed (StretchRect 0x%08X, query 0x%08X)",
+         uint32_t(copy_hr), uint32_t(query_hr));
+      return;
+   }
+   // FSR needs the camera (DLSS ignores it); defaults without one
+   MvCamera camera = {1.0, 0.1, 1000.0};
+   if (mv.camera_valid)
+   {
+      camera = MvViewProjectionCamera(mv.camera.data());
+   }
+   if (taa)
+   {
+      if (g_pass.taa_color != mv.kmt[3])
+      {
+         g_pass.taa_color =
+            D3D9Passes::SetTaaTextures(mv.kmt[3], mv.kmt[1], mv.kmt[0], mv.kmt[2])
+               ? mv.kmt[3]
+               : nullptr;
+      }
+      const bool reset = !mv.previous_valid || Mutated(MUT_NO_TAA_HISTORY);
+      const uint64_t value = ++g_pass.value;
+      if (!g_pass.taa_color ||
+          !KmtSignalObject(&g_pass.sync, g_pass.in.object, value) ||
+          !D3D9Passes::RunTaa(value, {.jitter = {mv.jitter[0], mv.jitter[1]},
+                                        .near_plane = float(camera.near_plane),
+                                        .far_plane = float(camera.far_plane),
+                                        .reset = reset}) ||
+          !KmtWaitObject(&g_pass.sync, g_pass.out.object, value))
+      {
+         ++state.pass_failures;
+         Log("d9native: Luma TAA failed (%s, kmt %s 0x%08X)", D3D9Passes::Error(),
+            g_pass.sync.first_error_call,
+            static_cast<uint32_t>(g_pass.sync.first_error));
+         return;
+      }
+      ++state.taa_runs;
+      state.taa_resets += reset ? 1 : 0;
+      mv.sr_ran = true;
+      MvCopyBack(native);
+      return;
+   }
+   SRBridgeProtocol::Frame frame = {.jitter_x = mv.jitter[0],
+      .jitter_y = mv.jitter[1],
+      .reset = mv.previous_valid ? 0 : 1,
+      .render_width = mv.scene_w,
+      .render_height = mv.scene_h,
+      .pre_exposure = 1.0f,
+      .sharpness = -1.0f,
+      .near_plane = float(camera.near_plane),
+      .far_plane = float(camera.far_plane),
+      .vert_fov = float(camera.vert_fov)};
+   if (!D3D9SR::RunFrame(&sr, &frame))
+   {
+      Log("d9native: SR bridge frame %llu failed (%s 0x%08X), stopped", frame.n,
+         sr.sync.first_error_call, static_cast<uint32_t>(sr.sync.first_error));
+      StopUpscaler();
+      return;
+   }
+   ++state.sr_frames;
+   ++state.sr_mid_frames;
+   state.sr_frame_jitter[0] = mv.jitter[0];
+   state.sr_frame_jitter[1] = mv.jitter[1];
+   state.sr_frame_reset = frame.reset;
+   state.sr_frame_camera[0] = float(camera.vert_fov);
+   state.sr_frame_camera[1] = float(camera.near_plane);
+   state.sr_frame_camera[2] = float(camera.far_plane);
+   mv.sr_ran = true;
+   MvCopyBack(native);
+}
+
+// Every draw event (before the game's draw): scene end, scene open, then the
+// patched state for draws into the scene.
+static void MvOnDraw(device* host, uint32_t count, uint32_t first,
+   int32_t vertex_offset)
+{
+   if (mv.disabled)
+   {
+      return;
+   }
+   IDirect3DDevice9* native = NativeOf(host);
+   const bool prepass_like = mv.rt0_format == format::r32_float &&
+                             mv.rt_view[1] && !mv.other_rt && mv.dsv;
+   if (!mv.open && !mv.ended && prepass_like && !state.msaa_active &&
+       mv.refused_rt0 != mv.rt_view[0])
+   {
+      MvRestoreGame(native);
+      MvTryOpenScene(host, native);
+   }
+   if (mv.open && !mv.ended && mv.post_crcs.contains(out.bound_ps_crc))
+   {
+      MvRestoreGame(native);
+      MvEndScene(host, native);
+   }
+   const auto restore = [&]
+   { MvRestoreGame(native); };
+   if (!mv.open || mv.ended || mv.dsv != mv.scene_depth ||
+       mv.rt0_w != mv.scene_w || mv.rt0_h != mv.scene_h || mv.other_rt)
+   {
+      restore();
+      return;
+   }
+   // Draw class: the prepass RT (jitter only, its PS writes oC1 itself) or the
+   // fp16 scene color (the first one drawn with this depth)
+   const bool is_prepass = prepass_like && mv.rt_view[0] == mv.prepass_view;
+   bool is_color = false;
+   if (!is_prepass && mv.rt0_format == format::r16g16b16a16_float &&
+       !mv.rt_view[1])
+   {
+      if (!mv.scene_view)
+      {
+         mv.scene_view = mv.rt_view[0];
+         mv.scene_resource = mv.rt0_resource;
+         mv.scene_surface = reinterpret_cast<IDirect3DSurface9*>(mv.scene_view);
+         mv.scene_surface->AddRef();
+      }
+      is_color = mv.rt_view[0] == mv.scene_view;
+   }
+   if (!is_prepass && !is_color)
+   {
+      restore();
+      return;
+   }
+   DWORD depth_test = 0, blend = 0;
+   native->GetRenderState(D3DRS_ZENABLE, &depth_test);
+   const auto vertex_entry = mv.shaders.find(mv.game_vs);
+   if (!depth_test || vertex_entry == mv.shaders.end() ||
+       !vertex_entry->second.vs)
+   {
+      ++state.mv_draws_unpatched;
+      restore();
+      return;
+   }
+   const MvShader& vertex = vertex_entry->second;
+   const Sm3MvPatch::VertexInfo& info = vertex.info;
+   const float* constants = mv.vs_const;
+   const int camera_register = info.camera_register;
+   std::array<float, 16> current_camera = {};
+   if (camera_register >= 0)
+   {
+      memcpy(current_camera.data(), constants + camera_register * 4,
+         sizeof(current_camera));
+      // The frame's camera: the first c8 draw's view projection;
+      // reprojection = previous * inverse(current), in double (SMV:846)
+      if (camera_register == 8 && !mv.camera_valid)
+      {
+         mv.camera = current_camera;
+         mv.camera_valid = true;
+         mv.reprojection = MatIdentity();
+         Mat4 inverse;
+         if (mv.previous_valid &&
+             MatInvert(MatFromRows(mv.camera.data()), &inverse))
+         {
+            mv.reprojection =
+               MatMul(MatFromRows(mv.previous_camera.data()), inverse);
+         }
+      }
+   }
+   const float jitter_row[4] = {mv.jitter_ndc[0], mv.jitter_ndc[1], 0, 0};
+   native->SetVertexShaderConstantF(Sm3MvPatch::kJitterRegister, jitter_row, 1);
+   if (is_prepass)
+   {
+      ++state.mv_draws_prepass;
+      // XeGTAO's camera: "Rmodelview" c20 + "g_WorldViewProj" c24 (static
+      // meshes) or "view" c0 + "g_ViewProjection" c8 (skinned)
+      // ponytail: the c8 layout assumes every skinned prepass VS reads "view" at
+      // c0, as Bayonetta's do; check the reads (Core DXBC::ReadsConstantRow) if
+      // another game shares this
+      const bool modelview =
+                    camera_register == 24 && info.effect_world_register == 20,
+                 skinned_view = camera_register == 8 && info.skinned;
+      if (modelview || skinned_view)
+      {
+         const uint32_t affine = modelview ? 20 : 0;
+         memcpy(mv.gtao_camera, constants, sizeof(mv.gtao_camera));
+         mv.gtao_affine_row = affine;
+         mv.gtao_matrix_row = uint32_t(camera_register);
+         mv.gtao_camera_frame = mv.frame_index;
+      }
+      MvApplyState(native, vertex, nullptr);
+      return;
    }
 
-public:
-   // Core's motion vector events (the motion vector target in every blend state, the tracked bindings, the vc4 copies) and the MSAA
-   // targets' shader resource bind
-   static void SetEvents(bool enable)
+   native->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
+   const auto pixel_entry = mv.shaders.find(mv.game_ps);
+   const bool refraction = mv.refraction_crcs.contains(out.bound_ps_crc);
+   const bool patch_pixel = !blend && !refraction && !info.jitter_only &&
+                            pixel_entry != mv.shaders.end() &&
+                            pixel_entry->second.ps;
+   state.mv_draws_blended += blend != 0;
+   state.mv_draws_jitter_only += info.jitter_only;
+   if (!patch_pixel)
    {
-      const auto set = [enable]<reshade::addon_event event>(typename reshade::addon_event_traits<event>::decl callback)
+      ++state.mv_draws_patched;
+      MvApplyState(native, vertex, nullptr);
+      return;
+   }
+   ++state.mv_draws_patched;
+
+   // The draw's identity (SMV:1076): VS, PS, stream 0, index buffer, draw
+   // arguments. The buffers come from the device: ReShade's bind_vertex_buffers
+   // / bind_index_buffer events make DrawPrimitiveUP use a fake buffer that
+   // dangles after a Reset (the next UP draw crashes in the runtime).
+   IDirect3DVertexBuffer9* vertex_buffer = nullptr;
+   IDirect3DIndexBuffer9* index_buffer = nullptr;
+   UINT vertex_buffer_offset = 0, vertex_buffer_stride = 0;
+   native->GetStreamSource(0, &vertex_buffer, &vertex_buffer_offset,
+      &vertex_buffer_stride);
+   native->GetIndices(&index_buffer);
+   const uint64_t vertex_buffer_id = reinterpret_cast<uint64_t>(vertex_buffer),
+                  index_buffer_id = reinterpret_cast<uint64_t>(index_buffer);
+   Free(&vertex_buffer);
+   Free(&index_buffer);
+   uint64_t key = 0;
+   for (const uint64_t value :
+      {uint64_t(vertex.crc), uint64_t(out.bound_ps_crc), vertex_buffer_id,
+         uint64_t(vertex_buffer_offset), index_buffer_id, uint64_t(count),
+         uint64_t(first), uint64_t(uint32_t(vertex_offset))})
+   {
+      key = MvHash(key, value);
+   }
+   MvObject object;
+   if (info.tie_break_register >= 0)
+   {
+      memcpy(object.transform.data(), constants + info.tie_break_register * 4,
+         sizeof(object.transform));
+   }
+   object.camera = current_camera;
+   if (info.world_register >= 0)
+   {
+      memcpy(object.world.data(), constants + info.world_register * 4,
+         sizeof(object.world));
+   }
+   if (info.effect_world_register >= 0)
+   {
+      memcpy(object.effect_world.data(),
+         constants + info.effect_world_register * 4,
+         sizeof(object.effect_world));
+   }
+   if (info.skinned)
+   {
+      object.bones.assign(constants + Sm3MvPatch::kBoneFirstRegister * 4,
+         constants + Sm3MvPatch::kBoneFirstRegister * 4 +
+            MV_BONE_FLOATS);
+   }
+   const MvObject* match = nullptr;
+   if (mv.previous_valid && info.tie_break_register >= 0)
+   {
+      if (const auto candidates = mv.previous.find(key);
+         candidates != mv.previous.end())
       {
-         if (enable)
+         const auto drawn = mv.current.find(key);
+         match =
+            MvFindNearest(candidates->second,
+               drawn != mv.current.end() ? drawn->second.size() : 0,
+               object.transform);
+      }
+   }
+   std::array<float, 16> previous_camera = current_camera,
+                         previous_world = object.world,
+                         previous_effect_world = object.effect_world;
+   int bones_row = -1;
+   if (match)
+   {
+      previous_camera = match->camera;
+      previous_world = match->world;
+      previous_effect_world = match->effect_world;
+      bones_row = match->row;
+      ++state.mv_matches;
+   }
+   else if (mv.previous_valid && mv.camera_valid && camera_register >= 0)
+   {
+      if (camera_register == 8)
+      {
+         // A c8 draw with the frame's camera: last frame's camera only
+         if (memcmp(current_camera.data(), mv.camera.data(),
+                size_t(info.camera_rows) * 4 * sizeof(float)) == 0)
          {
-            reshade::register_event<event>(callback);
+            previous_camera = mv.previous_camera;
+            ++state.mv_fallback_camera;
          }
          else
          {
-            reshade::unregister_event<event>(callback);
-         }
-      };
-      SceneMotionVectors::SetEvents<GetSceneMotionVectors>(enable);
-      set.template operator()<reshade::addon_event::create_resource>(OnCreateResource);
-      set.template operator()<reshade::addon_event::copy_resource>(OnCopyResource);
-      set.template operator()<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
-   }
-
-   void OnInit(bool async) override
-   {
-      // The canvas stays gamma encoded (1 = paper white, gamma 2.2 in and out as the other dgVoodoo mods). The scene copy before the
-      // UI does the HDR display map and pre-scales the scene by the UI paper white, which the composition applies to the canvas.
-      std::vector<ShaderDefineData> game_shader_defines_data = {
-         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (clamped reference)\n1 - HDR: extended grade + C-infinity display map", 1},
-         {"XE_GTAO_QUALITY", '3', true, false, "XeGTAO quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
-      };
-      shader_defines_data.append_range(game_shader_defines_data);
-      assert(shader_defines_data.size() < MAX_SHADER_DEFINES);
-      GetShaderDefineData(POST_PROCESS_SPACE_TYPE_HASH).SetDefaultValue('0');
-      GetShaderDefineData(EARLY_DISPLAY_ENCODING_HASH).SetDefaultValue('0');
-      GetShaderDefineData(VANILLA_ENCODING_TYPE_HASH).SetDefaultValue('1');
-      GetShaderDefineData(GAMMA_CORRECTION_TYPE_HASH).SetDefaultValue('1');
-      GetShaderDefineData(UI_DRAW_TYPE_HASH).SetDefaultValue('2');
-
-      // dgVoodoo's translated shaders use b3 (its state) and b4 (the D3D9 constants)
-      luma_settings_cbuffer_index = 13;
-      luma_data_cbuffer_index = 12;
-      luma_ui_cbuffer_index = -1;
-
-      sr_game_tooltip = "Needs Anti-Aliasing off in the game's options. DLSS, FSR and XeSS require Luma-Upscaler.exe next to the game's exe (Luma TAA doesn't).\n";
-
-      default_luma_global_game_settings.Dithering = 1.f;
-      // Light AutoHDR on the movies (the TW1/ME1 pair: at 0.5 the peak is 165 nits)
-      default_luma_global_game_settings.VideoAutoHDREnable = 1.f;
-      default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;
-      default_luma_global_game_settings.Exposure = 1.f;
-      default_luma_global_game_settings.Contrast = 1.f;
-      default_luma_global_game_settings.Saturation = 1.f;
-      default_luma_global_game_settings.HighlightsDesaturation = 0.f;
-      default_luma_global_game_settings.ColorGradingIntensity = 1.f;
-      default_luma_global_game_settings.BloomIntensity = 1.f;
-      cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
-
-      FrameLimiter::Install();
-      ShadowMap::Install();
-#if DEVELOPMENT
-      Mcp::RegisterCounters({{"frame_limiter.late_frames", &FrameLimiter::late_frames}, {"frame_limiter.resyncs", &FrameLimiter::resyncs}, {"frame_limiter.adopted_deadlines", &FrameLimiter::adopted_deadlines},
-         {"frame_limiter.period_us", &FrameLimiter::period_us}, { "frame_limiter.spin_margin_us",
-            &FrameLimiter::spin_margin_us }});
-      Mcp::RegisterToggles({
-         {"fix_frame_pacing", &g_fix_frame_pacing},
-         {"60_fps_cutscenes", &g_60_fps_cutscenes},
-         {"luma_bloom_enable", &g_luma_bloom_enable},
-         {"hide_ui", &g_hide_ui},
-         {"msaa_resolve_enable", &g_msaa_resolve_enable},
-         {"msaa_coverage_enable", &g_msaa_coverage_enable},
-         {"msaa_resolve_wide", &g_msaa_resolve_wide},
-         {"smaa_enable", &g_smaa_enable},
-         {"smaa_t2x", &g_smaa_t2x},
-         {"smaa_predication", &g_smaa_predication},
-         {"smaa_pred_debug", &g_smaa_pred_debug},
-         {"mv_enable", &g_mv_enable},
-         {"mv_debug_view", &g_mv_debug_view},
-         {"mv_force_jitter", &g_mv_force_jitter},
-         {"bound_state_check", &g_bound_state_check},
-         {"sr_reactive_enable", &g_sr_reactive_enable},
-         {"sr_reactive_debug_view", &g_sr_reactive_debug_view},
-      });
-      Mcp::RegisterValues({{"smaa_pred_tolerance", &g_smaa_pred_tolerance, 0.002f, 0.2f}, {"rcas_sharpness", &g_rcas_sharpness, 0.f, 1.f}, {"sr_reactive_scale", &g_sr_reactive_scale, 0.f, 4.f}, {"sr_reactive_threshold", &g_sr_reactive_threshold, 0.f, 1.f}});
-      Mcp::RegisterToggles({{"gtao_enable", &g_gtao_enable}, {"gtvbao_enable", &g_gtvbao_enable}, { "resolution_scaled_effects",
-                               &g_resolution_scaled_effects }});
-      Mcp::RegisterValues({{"gtao_final_value_power", &g_gtao_final_value_power, 0.1f, 4.5f}, {"gtvbao_final_value_power", &g_gtvbao_final_value_power, 0.1f, 4.5f}, {"gtao_depth_scale", &g_gtao_depth_scale, 0.01f, 200.f}, {"gtao_radius_override", &g_gtao_radius_override, 0.f, 5.f}});
-      Mcp::RegisterValues({{"gtao_history_weight", &g_gtao_history_weight, 0.f, 0.98f}});
-      Mcp::RegisterInts({{"gtao_debug_view", &g_gtao_debug_view, 0, 4}});
-      Mcp::RegisterTextures({MCP_GAME_TEXTURE("gtao.depth_mips", gtao_depth_mips), MCP_GAME_TEXTURE("gtao.output", gtao_output), MCP_GAME_TEXTURE("gtao.history0", gtao_history[0]), MCP_GAME_TEXTURE("gtao.history1", gtao_history[1])});
-      Mcp::RegisterTextures({MCP_GAME_TEXTURE("bloom.target", bloom_texture)});
-      Mcp::RegisterInts({{"bloom_scale_override", &g_bloom_scale_override, 0, 4}});
-      Mcp::RegisterTextures({MCP_GAME_TEXTURE("smaa.pred_mask", smaa_predication_srv), MCP_GAME_TEXTURE("canvas.scene", scene_srv), MCP_GAME_TEXTURE("depth_prepass", depth_srv),
-         MCP_GAME_TEXTURE("mv.velocity", mv.texture), MCP_GAME_TEXTURE("mv.depth", mv.device_depth), MCP_GAME_TEXTURE("mv.prepass", prepass_depth_srv),
-         MCP_GAME_TEXTURE("sr.reactive", mv.reactive), MCP_GAME_TEXTURE("sr.transparency", mv.transparency), MCP_GAME_TEXTURE("sr.draws_mask", mv.reactive_target)});
-#endif
-
-      // SMAA: Core registers its 6 passes ("Luma_SMAA_impl.hlsl"); the predication mask from the depth prepass
-      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta Depth Edges CS"), ShaderDefinition("Luma_Bayonetta_DepthEdges", reshade::api::pipeline_subobject_type::compute_shader));
-      // SMAA T2x's own passes ("SMAA_T2X" in Luma_SMAA_impl.hlsl). The edge detection and the vertex shaders are 1x's.
-      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta SMAA T2x Blending Weight Calculation PS"),
-         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps", {{"SMAA_T2X", "1"}}});
-      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta SMAA T2x Neighborhood Blending PS"),
-         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps", {{"SMAA_T2X", "1"}}});
-      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta SMAA T2x Resolve PS"),
-         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_resolve_ps", {{"SMAA_T2X", "1"}}});
-      // DLAA/FSR/XeSS/Luma TAA: their depth and the camera motion from the depth prepass, the CPU copies of vc4 (dgVoodoo maps it or updates
-      // it), and the motion vector target written by every blend state
-      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta Motion Vector Fill CS"), ShaderDefinition("Luma_Bayonetta_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader));
-      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta Copy Back PS"), ShaderDefinition("Luma_Bayonetta_CopyBack", reshade::api::pipeline_subobject_type::pixel_shader));
-      // XeGTAO in place of the game's SSAO (see "RunXeGTAO"); the two denoisers differ only by "XE_GTAO_FINAL_APPLY"
-      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta XeGTAO Prefilter Depths CS"),
-         ShaderDefinition{"Luma_Bayonetta_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs"});
-      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta XeGTAO Main Pass CS"),
-         ShaderDefinition{"Luma_Bayonetta_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs"});
-      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta GT-VBAO Main Pass CS"),
-         ShaderDefinition{"Luma_Bayonetta_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "gtvbao_main_pass_cs"});
-      // GT-VBAO's main pass under the AO history: 1 slice with the FAST noise (see "RunXeGTAO")
-      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta GT-VBAO Temporal Main Pass CS"),
-         ShaderDefinition{"Luma_Bayonetta_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "gtvbao_main_pass_cs", {{"GTVBAO_SLICE_COUNT", "1.0"}, {"GTVBAO_FAST_NOISE", "1"}}});
-      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta XeGTAO Temporal CS"),
-         ShaderDefinition{"Luma_Bayonetta_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "temporal_pass_cs"});
-      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta XeGTAO Denoise Pass 1 CS"),
-         ShaderDefinition{"Luma_Bayonetta_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "0"}}});
-      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta XeGTAO Denoise Pass 2 CS"),
-         ShaderDefinition{"Luma_Bayonetta_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs", {{"XE_GTAO_FINAL_APPLY", "1"}}});
-      native_shaders_definitions.emplace(CompileTimeStringHash("Bayonetta XeGTAO Apply PS"), ShaderDefinition("Luma_Bayonetta_XeGTAOApply", reshade::api::pipeline_subobject_type::pixel_shader));
-      // The weighted MSAA resolve on the samples as they are: the scene is gamma encoded, its values above 1 from the lighting, grade
-      // and bloom (1 = SDR white). The 8-bit targets averaged samples clipped at 1, the fp16 mirrors the unclipped ones, which the weight
-      // brings back to the edge gradient the game was made for. Alpha (the bloom source's threshold input) keeps the average.
-      native_shaders_definitions.emplace(CompileTimeStringHash("MSAA Resolve PS"), ShaderDefinition("Luma_MSAAResolve_PS", reshade::api::pipeline_subobject_type::pixel_shader));
-#if DEVELOPMENT
-      native_shaders_definitions.emplace(CompileTimeStringHash("MSAA Resolve Wide PS"), ShaderDefinition{"Luma_MSAAResolve_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, { {"MSAA_RESOLVE_FILTER_RADIUS", "1.0"} }});
-#endif
-      SetEvents(true);
-   }
-
-   std::unique_ptr<std::byte[]> PatchShaderBytecodeSync(const std::byte* code, size_t& size, reshade::api::pipeline_subobject_type type, uint64_t shader_hash, const std::byte* shader_object, size_t shader_object_size) override
-   {
-      if (type != reshade::api::pipeline_subobject_type::pixel_shader)
-         return nullptr;
-      // The pixel kernels' target size from "TARGET_SIZE_CB_SLOT" (see "shader_hashes_PixelKernels"), then the clamps below on top
-      std::unique_ptr<std::byte[]> redirected;
-      if (shader_hashes_PixelKernels.Contains(uint32_t(shader_hash), reshade::api::shader_stage::pixel))
-      {
-         redirected = DXBC::RedirectConstantRow(code, &size, MotionVectorPatches::object_slot, TARGET_SIZE_ROW, TARGET_SIZE_CB_SLOT, 0);
-         ASSERT_ONCE(redirected);
-         if (redirected)
-         {
-            code = redirected.get();
+            ++state.mv_fallback_zero;
          }
       }
-      // A clamp's patch, else the redirected program (or none)
-      const auto patched = [&](std::unique_ptr<std::byte[]> clamped)
+      else
       {
-         return clamped ? std::move(clamped) : std::move(redirected);
-      };
-      if (velocity_pixel_shaders.contains(uint32_t(shader_hash)))
-         return patched(DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::UNORM8));
-      if (canvas_clamped_pixel_shaders.contains(uint32_t(shader_hash)))
-         return patched(DXBC::ClampOutput0(code, &size));
-      // Every other float target 0 (dgVoodoo's own R32_UINT outputs aside): the game's targets are A8R8G8B8 (upgraded to fp16, which
-      // doesn't clamp blend inputs) or R32F (depth in 0-1). Scene alpha reached 2 in captures, making the SRC_ALPHA/INV_SRC_ALPHA
-      // blends' destination weight negative.
-      std::vector<DXBC::Chunk> chunks;
-      std::vector<DXBC::SignatureElement> outputs;
-      DXBC::Chunk* output_signature = nullptr;
-      if (DXBC::ReadChunks(reinterpret_cast<const uint8_t*>(shader_object), shader_object_size, &chunks))
-      {
-         output_signature = DXBC::FindChunk(&chunks, DXBC::FourCC("OSGN"));
-      }
-      if (!output_signature || !DXBC::ReadSignature(output_signature->data, &outputs))
-         return patched(nullptr);
-      const auto target = std::ranges::find_if(outputs, [](const DXBC::SignatureElement& element)
-         { return MotionVectorPatch::IsTarget(element) && element.reg == 0; });
-      if (target == outputs.end() || target->component_type != D3D_REGISTER_COMPONENT_FLOAT32)
-         return patched(nullptr);
-      return patched(DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::BLEND_INPUT, target->mask));
-   }
-
-   // Every patch a draw may ask "SceneMotionVectors::GetPatchedShader" for: which one it takes depends on its state
-   void AddShaderWarmupVariants(reshade::api::pipeline_subobject_type type, const std::vector<uint8_t>& code, std::vector<std::vector<uint8_t>>* variants) override
-   {
-      std::string error;
-      if (type == reshade::api::pipeline_subobject_type::vertex_shader)
-      {
-         if (std::vector<uint8_t> patched = MotionVectorPatch::PatchVertexShader(code.data(), code.size(), MotionVectorPatches::layout, &error); !patched.empty())
+         // A c24 world view projection: reprojection * WVP (camera only)
+         const Mat4 reprojected =
+            MatMul(mv.reprojection, MatFromRows(current_camera.data()));
+         for (int row = 0; row < 4; ++row)
          {
-            variants->push_back(std::move(patched));
-         }
-         return;
-      }
-      // dgVoodoo's own compute shaders have no variants
-      if (type != reshade::api::pipeline_subobject_type::pixel_shader)
-         return;
-      for (size_t patch = 0; patch <= size_t(COVERAGE_PATCH); patch++)
-      {
-         if (std::vector<uint8_t> patched = MotionVectorGame::PatchPixelShader(PixelShaderPatch(patch), code.data(), code.size(), &error); !patched.empty())
-         {
-            variants->push_back(std::move(patched));
-         }
-      }
-   }
-
-   void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
-   {
-      device_data.game = new BayonettaGameDeviceData;
-#if DEVELOPMENT
-      const auto& stats = GetGameDeviceData(device_data).aa_last_stats;
-      Mcp::RegisterCounters(
-         {
-            {"msaa_resolves", &stats.msaa_resolves},
-            {"smaa", &stats.smaa},
-            {"smaa_predicated", &stats.smaa_predicated},
-            {"msaa_coverage", &stats.msaa_coverage},
-         },
-         &device_data);
-      // The last complete frame's motion vector counts
-      SceneMotionVectors::RegisterDevValues(GetGameDeviceData(device_data).mv, &device_data);
-#endif
-   }
-
-   void OnDestroyDeviceData(DeviceData& device_data) override
-   {
-#if DEVELOPMENT
-      Mcp::Unregister(&device_data);
-#endif
-      Game::OnDestroyDeviceData(device_data);
-   }
-
-   // The game's MSAA colour resolves, on the fp16 mirrors: Core's weighted one instead. Anything else, or a pair it can't bind, keeps
-   // the hardware resolve. A scene resolve marks the game's MSAA on ("msaa_active") whether Luma's draws it or not.
-   bool OverrideResolveTextureRegion(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, uint64_t dst_resource, uint64_t src_resource, DXGI_FORMAT format) override
-   {
-      if (format != DXGI_FORMAT_R16G16B16A16_FLOAT)
-         return false;
-      GetGameDeviceData(device_data).msaa_resolved = true;
-      if (!g_msaa_resolve_enable)
-         return false;
-      // Held through the draw so a shader reload can't release them mid-use
-      const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-      const uint32_t resolve_ps = (g_msaa_resolve_wide ? CompileTimeStringHash("MSAA Resolve Wide PS") : CompileTimeStringHash("MSAA Resolve PS"));
-      if (!DrawMSAAResolve(native_device, native_device_context, device_data, reinterpret_cast<ID3D11Resource*>(src_resource), reinterpret_cast<ID3D11Resource*>(dst_resource), format, nullptr, nullptr, resolve_ps))
-         return false;
-#if DEVELOPMENT
-      GetGameDeviceData(device_data).aa_stats.msaa_resolves++;
-#endif
-      return true;
-   }
-
-   bool OverrideCopyResource(ID3D11Device* native_device, DeviceData& device_data, uint64_t& dst_resource, uint64_t& src_resource) override
-   {
-      auto& game_device_data = GetGameDeviceData(device_data);
-      if (device_data.back_buffers.contains(dst_resource) || dst_resource == game_device_data.present_source)
-      {
-         game_device_data.canvas = src_resource;
-      }
-      if (game_device_data.mv.scene_open && game_device_data.mv.scene_color && src_resource == reinterpret_cast<uintptr_t>(game_device_data.mv.scene_color.get()))
-      {
-         game_device_data.mv_scene_last_copy = reinterpret_cast<ID3D11Resource*>(dst_resource);
-      }
-      return false;
-   }
-
-   // The target size "shader_hashes_PixelKernels" read in place of c194: render target 0's, or what it would be at 720p (width * 720 /
-   // height, 720) with "g_resolution_scaled_effects". Kept bound: neither dgVoodoo nor Luma uses its slot.
-   static void BindPixelKernelTargetSize(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, BayonettaGameDeviceData* gd)
-   {
-      com_ptr<ID3D11RenderTargetView> rtv;
-      native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
-      if (!rtv)
-         return;
-      const uint2 size = GetViewTextureSize(rtv.get());
-      if (size.y == 0)
-         return;
-      const float scale = (g_resolution_scaled_effects ? 720.f / float(size.y) : 1.f);
-      const std::array<float, 4> target_size = {float(size.x) * scale, float(size.y) * scale, 0.f, 0.f};
-      if (target_size != gd->pixel_kernel_target_size)
-      {
-         if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd->pixel_kernel_target_size_buffer), target_size.data(), sizeof(target_size)))
-            return;
-         gd->pixel_kernel_target_size = target_size;
-      }
-      ID3D11Buffer* const buffer = gd->pixel_kernel_target_size_buffer.get();
-      native_device_context->PSSetConstantBuffers(TARGET_SIZE_CB_SLOT, 1, &buffer);
-   }
-
-   // XeGTAO's camera: where a depth prepass vertex shader keeps its affine view transform and the same transform followed by the
-   // projection, as rows of dgVoodoo's cb4 (D3D9 c(n) = row n + 20): "Rmodelview" c20 + "Rmodelviewproj" c24 (static meshes, grass) or
-   // "view" c0 + "g_ViewProjection" c8 (skinned meshes). {} for any other shader. Cached by hash.
-   static uint2 ClassifyPrepassCamera(DeviceData& device_data, BayonettaGameDeviceData* gd, uint32_t hash, reshade::api::pipeline pipeline)
-   {
-      constexpr uint2 MODELVIEW_ROWS = {MotionVectorPatches::object_row_offset + 20, MotionVectorPatches::object_row_offset + 24}; // "Rmodelview" c20, "Rmodelviewproj" c24
-      constexpr uint2 VIEW_ROWS = {MotionVectorPatches::object_row_offset, MotionVectorPatches::view_projection_row};              // "view" c0, "g_ViewProjection" c8
-      if (const auto it = gd->gtao_camera_layouts.find(hash); it != gd->gtao_camera_layouts.end())
-         return it->second;
-      uint2 rows = {};
-      {
-         const std::shared_lock lock(s_mutex_generic);
-         if (const auto it = device_data.pipeline_cache_by_pipeline_handle.find(pipeline.handle); it != device_data.pipeline_cache_by_pipeline_handle.end() && it->second->subobjects_cache)
-         {
-            const auto* desc = static_cast<const reshade::api::shader_desc*>(it->second->subobjects_cache[0].data);
-            const auto reads = [&](uint32_t row)
+            for (int column = 0; column < 4; ++column)
             {
-               return DXBC::ReadsConstantRow(static_cast<const uint8_t*>(desc->code), desc->code_size, MotionVectorPatches::object_slot, row);
-            };
-            if (reads(MODELVIEW_ROWS.x) && reads(MODELVIEW_ROWS.y))
-            {
-               rows = MODELVIEW_ROWS;
-            }
-            else if (reads(VIEW_ROWS.x) && reads(VIEW_ROWS.y))
-            {
-               rows = VIEW_ROWS;
+               previous_camera[row * 4 + column] = float(reprojected.m[row][column]);
             }
          }
+         ++state.mv_fallback_reprojection;
       }
-      gd->gtao_camera_layouts.emplace(hash, rows);
-      return rows;
    }
-
-   // XeGTAO's camera from a depth prepass draw (R32F "1 - z/w" in target 0, the normals in target 1): its vertex constants copied as they
-   // are on the GPU (the projection is solved in the shader), and the rows of its matrices there
-   static void TakePrepassCamera(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const CommandListData& cmd_list_data, DeviceData& device_data, uint32_t vertex_shader_hash)
+   else
    {
-      auto& gd = GetGameDeviceData(device_data);
-      const uint2 rows = ClassifyPrepassCamera(device_data, &gd, vertex_shader_hash, cmd_list_data.pipeline_state_original_vertex_shader);
-      if (rows.x == 0)
-         return;
-      com_ptr<ID3D11RenderTargetView> rtvs[2];
-      native_device_context->OMGetRenderTargets(2, &rtvs[0], nullptr);
-      if (!rtvs[0] || !rtvs[1])
-         return;
-      D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-      rtvs[0]->GetDesc(&rtv_desc);
-      if (rtv_desc.Format != DXGI_FORMAT_R32_FLOAT)
-         return;
-      com_ptr<ID3D11Buffer> constants;
-      native_device_context->VSGetConstantBuffers(MotionVectorPatches::object_slot, 1, &constants);
-      if (!constants)
-         return;
-      D3D11_BUFFER_DESC desc = {};
-      constants->GetDesc(&desc);
-      D3D11_BUFFER_DESC copy_desc = {};
-      if (gd.gtao_camera_buffer)
-      {
-         gd.gtao_camera_buffer->GetDesc(&copy_desc);
-      }
-      if (copy_desc.ByteWidth != desc.ByteWidth)
-      {
-         gd.gtao_camera_buffer.reset();
-         const D3D11_BUFFER_DESC new_desc = {.ByteWidth = desc.ByteWidth, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_CONSTANT_BUFFER};
-         if (FAILED(native_device->CreateBuffer(&new_desc, nullptr, &gd.gtao_camera_buffer)))
-            return;
-      }
-      native_device_context->CopyResource(gd.gtao_camera_buffer.get(), constants.get());
-      gd.gtao_camera_rows = rows;
-      gd.gtao_camera_taken = true;
+      ++state.mv_fallback_zero;
    }
+   // An unmatched skinned draw's previous bones are its current ones: the
+   // patched VS selects them over the VTF (c252.zw = 1, 0)
+   const bool current_bones = info.skinned && bones_row < 0;
+   state.mv_current_bones += current_bones;
+   mv.current[key].push_back(std::move(object));
 
-   // dgVoodoo's copy of the bloom target's region a chain pass just wrote into the texture the next passes sample, repeated from
-   // "bloom_texture" into that texture's "bloom_shadows" entry (made at the same scale on its first copy)
-   static void MirrorBloomCopy(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest, const reshade::api::subresource_box* source_box, const reshade::api::subresource_box* dest_box)
+   float previous_constants[13 * 4] = {};
+   memcpy(previous_constants, previous_camera.data(), sizeof(previous_camera));
+   memcpy(previous_constants + 16, previous_world.data(),
+      sizeof(previous_world));
+   memcpy(previous_constants + 32, previous_effect_world.data(),
+      sizeof(previous_effect_world));
+   previous_constants[48] = 1.0f / float(MV_VTF_WIDTH);
+   previous_constants[49] =
+      (float(std::max(bones_row, 0)) + 0.5f) / float(mv.vtf_rows);
+   previous_constants[50] = current_bones ? 1.0f : 0.0f;
+   previous_constants[51] = current_bones ? 0.0f : 1.0f;
+   native->SetVertexShaderConstantF(Sm3MvPatch::kPrevCameraRegister,
+      previous_constants, 13);
+   MvApplyState(native, vertex, &pixel_entry->second);
+}
+
+static void MvOnBindRenderTargets(device* host, uint32_t count,
+   const resource_view* rtvs,
+   resource_view depth)
+{
+   MvRestoreGame(NativeOf(host));
+   mv.rt_view[0] = count > 0 ? rtvs[0].handle : 0;
+   uint64_t second = count > 1 ? rtvs[1].handle : 0;
+   if (mv.motion_surface &&
+       second == reinterpret_cast<uint64_t>(mv.motion_surface))
    {
-      DeviceData* const device_data = cmd_list->get_device()->get_private_data<DeviceData>();
-      if (!g_luma_bloom_enable || !device_data || !device_data->game)
-         return;
-      auto& gd = GetGameDeviceData(*device_data);
-      if (source.handle != gd.bloom_target || !gd.bloom_texture)
-         return;
-      auto* const dest_texture = reinterpret_cast<ID3D11Texture2D*>(dest.handle);
-      D3D11_TEXTURE2D_DESC dest_desc = {};
-      dest_texture->GetDesc(&dest_desc);
-      const uint32_t scale = gd.bloom_scale;
-      auto shadow = std::ranges::find(gd.bloom_shadows, dest.handle, &BayonettaGameDeviceData::BloomShadow::game_texture);
-      if (shadow == gd.bloom_shadows.end())
-      {
-         D3D11_TEXTURE2D_DESC desc = {};
-         gd.bloom_texture->GetDesc(&desc);
-         desc.Width = dest_desc.Width * scale;
-         desc.Height = dest_desc.Height * scale;
-         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-         BayonettaGameDeviceData::BloomShadow created{.game_texture = dest.handle};
-         ComPtr<ID3D11Device> native_device;
-         gd.bloom_texture->GetDevice(native_device.put());
-         if (FAILED(native_device->CreateTexture2D(&desc, nullptr, created.texture.put())) || FAILED(native_device->CreateShaderResourceView(created.texture.get(), nullptr, created.srv.put())))
-            return;
-         shadow = gd.bloom_shadows.insert(gd.bloom_shadows.end(), std::move(created));
-      }
-      const D3D11_BOX box = (source_box ? D3D11_BOX{.left = source_box->left * scale, .top = source_box->top * scale, .front = 0, .right = source_box->right * scale, .bottom = source_box->bottom * scale, .back = 1}
-                                        : D3D11_BOX{.left = 0, .top = 0, .front = 0, .right = dest_desc.Width * scale, .bottom = dest_desc.Height * scale, .back = 1});
-      auto* const native_device_context = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
-      native_device_context->CopySubresourceRegion(shadow->texture.get(), 0, dest_box ? dest_box->left * scale : 0, dest_box ? dest_box->top * scale : 0, 0, gd.bloom_texture.get(), 0, &box);
+      second = 0; // ours, restored just now
    }
-
-   static bool OnCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest)
+   mv.rt_view[1] = second;
+   mv.other_rt = false;
+   for (uint32_t i = 2; i < count; ++i)
    {
-      MirrorBloomCopy(cmd_list, source, dest, nullptr, nullptr);
+      mv.other_rt |= rtvs[i].handle != 0;
+   }
+   mv.dsv = depth.handle;
+   mv.rt0_format = format::unknown;
+   mv.rt0_resource = {0};
+   mv.rt0_w = mv.rt0_h = mv.dsv_w = mv.dsv_h = 0;
+   if (mv.rt_view[0])
+   {
+      const resource rt0 =
+         host->get_resource_from_view(resource_view{mv.rt_view[0]});
+      if (rt0.handle)
+      {
+         const resource_desc desc = host->get_resource_desc(rt0);
+         mv.rt0_resource = rt0;
+         mv.rt0_format = desc.texture.format;
+         mv.rt0_w = desc.texture.width;
+         mv.rt0_h = desc.texture.height;
+      }
+   }
+   if (mv.dsv)
+   {
+      const resource depth_resource = host->get_resource_from_view(depth);
+      if (depth_resource.handle)
+      {
+         const resource_desc desc = host->get_resource_desc(depth_resource);
+         mv.dsv_w = desc.texture.width;
+         mv.dsv_h = desc.texture.height;
+      }
+   }
+}
+
+static void MvOnPresent(device* host)
+{
+   IDirect3DDevice9* native = NativeOf(host);
+   MvRestoreGame(native);
+   if (mv.open)
+   {
+      if (!mv.ended)
+      {
+         Log("d9native: MV scene without a post pass (no SR this frame)");
+      }
+      Free(&mv.scene_surface);
+      Free(&mv.prepass);
+   }
+   mv.sr_ran_last = mv.sr_ran;
+   mv.sr_ran = false;
+   mv.t2x_ran_last = mv.t2x_ran;
+   mv.t2x_ran = mv.filled = false;
+   mv.open = mv.ended = false;
+   mv.refused_rt0 = 0;
+   mv.scene_view = 0;
+   mv.rt0_resource = {0};
+   ++mv.frame_index;
+}
+
+// The frame's depth prepass (the SSAO pass' s2) shared (ShareDepth) when it
+// is R32F of the scene rect's size (as Bayonetta's DrawSMAAOnCanvas). False:
+// no predication this frame.
+static bool CopyDepth(device* device)
+{
+   if (bay.depth_present != state.presents || !bay.depth_texture)
+   {
       return false;
    }
-
-   static bool OnCopyTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, const reshade::api::subresource_box* dest_box, reshade::api::filter_mode filter)
+   auto* const texture =
+      reinterpret_cast<IDirect3DTexture9*>(bay.depth_texture);
+   D3DSURFACE_DESC desc = {};
+   if (FAILED(texture->GetLevelDesc(0, &desc)) || desc.Format != D3DFMT_R32F ||
+       desc.Width != out.scene_rect.Width ||
+       desc.Height != out.scene_rect.Height)
    {
-      MirrorBloomCopy(cmd_list, source, dest, source_box, dest_box);
       return false;
    }
+   return ShareDepth(device, texture, desc);
+}
 
-   // A bloom chain draw (filter05, the blurs, a level copy). Records the bloom target at the chain's first draw (the scene into it);
-   // with Luma Bloom, draws into "bloom_texture" instead: the bloom target's size times the scene's height / 720 (level 0 a quarter
-   // of the screen, as at the 1280x720 the game was made for), the viewport scaled alike, sampling the scene or a "bloom_shadows"
-   // texture, the game's shaders and constants unchanged (their taps are UV fractions: the same footprint, sampled finer). False, for
-   // the game's draw, on anything else.
-   static bool DrawBloomPass(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, bool is_bloom_source, const std::function<void()>& draw, bool* updated_cbuffers)
+// XeGTAO in place of the game's SSAO draw (Bayonetta's RunXeGTAO): its s2
+// depth shared, the passes on the pass device into the shared AO, then the
+// apply PS over the game's target with its s0 scene and s2 depth. False: the
+// game's draw runs (no camera this frame, no pass device, a failure).
+static bool RunGtao(device* device)
+{
+   IDirect3DDevice9* const native = NativeOf(device);
+   auto* const depth = reinterpret_cast<IDirect3DTexture9*>(out.ps_textures[2]);
+   auto* const scene = reinterpret_cast<IDirect3DTexture9*>(out.ps_textures[0]);
+   D3DSURFACE_DESC desc = {};
+   if (mv.gtao_camera_frame != mv.frame_index || !mv.vs_quad || !scene ||
+       !out.query9 || FAILED(depth->GetLevelDesc(0, &desc)) ||
+       desc.Format != D3DFMT_R32F || !PassEnsureOpen(device))
    {
-      auto& gd = GetGameDeviceData(device_data);
-      // The copies (the game's most drawn pass: particles too) only matter into a known bloom target
-      if (!is_bloom_source && (!g_luma_bloom_enable || gd.bloom_target == 0))
-         return false;
-      ComPtr<ID3D11RenderTargetView> rtv;
-      native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
-      if (!rtv)
-         return false;
-      ComPtr<ID3D11Resource> target;
-      rtv->GetResource(target.put());
-      // Before the source and sizes: most copies draw elsewhere
-      if (!is_bloom_source && uint64_t(target.get()) != gd.bloom_target)
-         return false;
-      ComPtr<ID3D11ShaderResourceView> source_srv;
-      native_device_context->PSGetShaderResources(0, 1, source_srv.put());
-      if (!source_srv)
-         return false;
-      const uint2 target_size = GetViewTextureSize(rtv.get());
-      const uint2 source_size = GetViewTextureSize(source_srv.get());
-      const bool from_scene = is_bloom_source && source_size.y > target_size.y;
-      if (from_scene)
-      {
-         gd.bloom_target = uint64_t(target.get());
-      }
-      if (!g_luma_bloom_enable || uint64_t(target.get()) != gd.bloom_target)
-         return false;
-
-      if (from_scene)
-      {
-         const uint32_t scale = ((g_bloom_scale_override > 0) ? uint32_t(g_bloom_scale_override) : (std::max)(1u, uint32_t(std::lround(source_size.y / 720.0))));
-         if (scale != gd.bloom_scale || !gd.bloom_rtv || GetViewTextureSize(gd.bloom_rtv.get()) != uint2{target_size.x * scale, target_size.y * scale})
-         {
-            gd.bloom_rtv.reset();
-            gd.bloom_srv.reset();
-            gd.bloom_texture.reset();
-            gd.bloom_shadows.clear();
-            // 16 bit UNORM: the 8 bit target's [0, 1] range (the chain relies on its clamp) without its banding at the finer size
-            const CD3D11_TEXTURE2D_DESC desc(DXGI_FORMAT_R16G16B16A16_UNORM, target_size.x * scale, target_size.y * scale, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
-            if (FAILED(native_device->CreateTexture2D(&desc, nullptr, gd.bloom_texture.put())) || FAILED(native_device->CreateRenderTargetView(gd.bloom_texture.get(), nullptr, gd.bloom_rtv.put())) ||
-                FAILED(native_device->CreateShaderResourceView(gd.bloom_texture.get(), nullptr, gd.bloom_srv.put())))
-            {
-               gd.bloom_rtv.reset();
-            }
-            gd.bloom_scale = scale;
-         }
-      }
-      if (!gd.bloom_rtv)
-         return false;
-      ID3D11ShaderResourceView* source = source_srv.get();
-      if (!from_scene)
-      {
-         ComPtr<ID3D11Resource> game_source;
-         source_srv->GetResource(game_source.put());
-         const auto shadow = std::ranges::find(gd.bloom_shadows, uint64_t(game_source.get()), &BayonettaGameDeviceData::BloomShadow::game_texture);
-         // Not copied yet (Luma Bloom just turned on): the game's pass, this frame
-         if (shadow == gd.bloom_shadows.end())
-            return false;
-         source = shadow->srv.get();
-      }
-
-      DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
-      graphics_state.Cache(native_device_context, device_data.uav_max_count);
-      D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
-      UINT viewport_count = std::size(viewports);
-      native_device_context->RSGetViewports(&viewport_count, viewports);
-      // The origin scales exactly too: dgVoodoo's half texel offset is in clip space, so it scales with the viewport (capped at 0.75,
-      // every level drew ~0.8 game texel up and left of the game's)
-      for (UINT i = 0; i < viewport_count; i++)
-      {
-         viewports[i].TopLeftX *= gd.bloom_scale;
-         viewports[i].TopLeftY *= gd.bloom_scale;
-         viewports[i].Width *= gd.bloom_scale;
-         viewports[i].Height *= gd.bloom_scale;
-      }
-      native_device_context->RSSetViewports(viewport_count, viewports);
-      D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
-      UINT scissor_count = std::size(scissors);
-      native_device_context->RSGetScissorRects(&scissor_count, scissors);
-      for (UINT i = 0; i < scissor_count; i++)
-      {
-         scissors[i].left *= gd.bloom_scale;
-         scissors[i].top *= gd.bloom_scale;
-         scissors[i].right *= gd.bloom_scale;
-         scissors[i].bottom *= gd.bloom_scale;
-      }
-      native_device_context->RSSetScissorRects(scissor_count, scissors);
-      ID3D11RenderTargetView* const bloom_rtv = gd.bloom_rtv.get();
-      native_device_context->OMSetRenderTargets(1, &bloom_rtv, nullptr);
-      native_device_context->PSSetShaderResources(0, 1, &source);
-      // filter05 (BloomSource_0x8B6A8D61) averages the whole footprint of each texel; the blurs (BlurV_0x91CC01D3, BlurH_0xCE62BA4B)
-      // widen each tap to a game texel at the scale (CustomData3)
-      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
-      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, is_bloom_source ? 1 : 0, 0, float(gd.bloom_scale));
-      *updated_cbuffers = true;
-      draw();
-      graphics_state.Restore(native_device_context);
-      // The game's quads start just inside the target's first texel, short of the first Luma row and column at the exact origin.
-      // Those repeat their neighbours, else they stay black and the blurs' clamped taps darken the top and left edge.
-      const uint2 size = GetViewTextureSize(gd.bloom_rtv.get());
-      const D3D11_BOX row = {.left = 0, .top = 1, .front = 0, .right = size.x, .bottom = 2, .back = 1};
-      native_device_context->CopySubresourceRegion(gd.bloom_texture.get(), 0, 0, 0, 0, gd.bloom_texture.get(), 0, &row);
-      const D3D11_BOX column = {.left = 1, .top = 0, .front = 0, .right = 2, .bottom = size.y, .back = 1};
-      native_device_context->CopySubresourceRegion(gd.bloom_texture.get(), 0, 0, 0, 0, gd.bloom_texture.get(), 0, &column);
-      return true;
+      return false;
    }
-
-   // XeGTAO in place of the game's SSAO, from the SSAO draw's t2 (the prepass' "1 - z/w", normals derived from it) and the prepass'
-   // camera ("TakePrepassCamera"): 4 compute passes into "gtao_output", then the draw with "Bayonetta XeGTAO Apply PS" in place
-   // of the game's (scene * visibility). False, for the game's SSAO to draw, without the shaders, a camera, or on a failed allocation.
-   static bool RunXeGTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, const std::function<void()>& draw)
+   if (!mv.ps_gtao)
    {
-      auto& gd = GetGameDeviceData(device_data);
-      if (!gd.gtao_camera_buffer)
-         return false;
-      auto* const prefilter_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta XeGTAO Prefilter Depths CS"));
-      const uint32_t main_cs_name = (g_gtvbao_enable ? CompileTimeStringHash("Bayonetta GT-VBAO Main Pass CS") : CompileTimeStringHash("Bayonetta XeGTAO Main Pass CS"));
-      auto* main_cs = FindShader(device_data.native_compute_shaders, main_cs_name);
-      auto* const denoise_1_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta XeGTAO Denoise Pass 1 CS"));
-      auto* const denoise_2_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta XeGTAO Denoise Pass 2 CS"));
-      auto* const apply_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Bayonetta XeGTAO Apply PS"));
-      if (!prefilter_cs || !main_cs || !denoise_1_cs || !denoise_2_cs || !apply_ps)
-         return false;
-      com_ptr<ID3D11ShaderResourceView> depth_srv; // t2
-      native_device_context->PSGetShaderResources(2, 1, &depth_srv);
-      ID3D11ShaderResourceView* const depth = depth_srv.get();
-      if (!depth)
-         return false;
-      const uint2 size = GetViewTextureSize(depth);
-      if (size.x == 0 || size.y == 0)
-         return false;
-
-      gd.gtao_frame = cb_luma_global_settings.FrameIndex;
-      if (size != gd.gtao_size)
+      const std::vector<uint8_t> code =
+         LoadShader(L"gtao_apply.ps_3_0.cso",
+            "Bayonetta/Luma_Bayonetta_GTAOApply_SM3.hlsl", "main",
+            "ps_3_0");
+      if (code.empty() ||
+          FAILED(native->CreatePixelShader(
+             reinterpret_cast<const DWORD*>(code.data()), &mv.ps_gtao)))
       {
-         gd.ReleaseGTAOScratch();
-         const CD3D11_TEXTURE2D_DESC depth_desc(DXGI_FORMAT_R32_FLOAT, size.x, size.y, 1, GTAO_DEPTH_MIPS, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-         bool created = SUCCEEDED(native_device->CreateTexture2D(&depth_desc, nullptr, gd.gtao_depth_mips.put()));
-         for (UINT mip = 0; created && mip < GTAO_DEPTH_MIPS; mip++)
-         {
-            const CD3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc(D3D11_UAV_DIMENSION_TEXTURE2D, depth_desc.Format, mip);
-            created = SUCCEEDED(native_device->CreateUnorderedAccessView(gd.gtao_depth_mips.get(), &uav_desc, gd.gtao_depth_mip_uavs[mip].put()));
-         }
-         created = created && SUCCEEDED(native_device->CreateShaderResourceView(gd.gtao_depth_mips.get(), nullptr, gd.gtao_depth_mips_srv.put()));
-         const CD3D11_TEXTURE2D_DESC working_desc(DXGI_FORMAT_R8G8_UNORM, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-         for (int i = 0; created && i < 2; i++)
-         {
-            created = SUCCEEDED(native_device->CreateTexture2D(&working_desc, nullptr, gd.gtao_working[i].put())) && SUCCEEDED(native_device->CreateUnorderedAccessView(gd.gtao_working[i].get(), nullptr, gd.gtao_working_uavs[i].put())) &&
-                      SUCCEEDED(native_device->CreateShaderResourceView(gd.gtao_working[i].get(), nullptr, gd.gtao_working_srvs[i].put()));
-         }
-         const CD3D11_TEXTURE2D_DESC output_desc(DXGI_FORMAT_R8_UNORM, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-         created = created && SUCCEEDED(native_device->CreateTexture2D(&output_desc, nullptr, gd.gtao_output.put())) && SUCCEEDED(native_device->CreateUnorderedAccessView(gd.gtao_output.get(), nullptr, gd.gtao_output_uav.put())) &&
-                   SUCCEEDED(native_device->CreateShaderResourceView(gd.gtao_output.get(), nullptr, gd.gtao_output_srv.put()));
-         if (!created)
-         {
-            gd.ReleaseGTAOScratch();
-         }
-         // Kept on a failure too: the game's SSAO draws at this size, without an allocation attempt per frame (32-bit address space)
-         gd.gtao_size = size;
-      }
-      if (!gd.gtao_output_srv)
          return false;
-
-      // The AO history ("temporal_pass_cs" in "Luma_Bayonetta_XeGTAO.hlsl") turns working0 into working1, only with the per frame noise
-      // and this frame's motion vectors. The SSAO draws after the opaque scene's motion vector draws and before the fill, so the target
-      // was cleared to the fill's marker this frame ("fill_pending") and the shader computes the camera motion of the marked pixels.
-      auto* const temporal_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta XeGTAO Temporal CS"));
-      const bool history_wanted = gd.sr_active && g_gtao_history_weight > 0.f && temporal_cs && gd.mv.srv && gd.mv.camera && !gd.mv.frame_ended && gd.mv.fill_pending &&
-                                  gd.mv.frame_index == cb_luma_global_settings.FrameIndex && GetViewTextureSize(gd.mv.srv.get()) == size;
-      if (!gd.sr_active && gd.gtao_history[0])
-      {
-         gd.ReleaseGTAOHistory();
       }
-      if (history_wanted && !gd.gtao_history[1])
+   }
+   if (g_pass.ao_width != desc.Width || g_pass.ao_height != desc.Height)
+   {
+      D3D9Passes::SetGtaoOutput(nullptr);
+      if (g_pass.ao.handle)
       {
-         const CD3D11_TEXTURE2D_DESC history_desc(DXGI_FORMAT_R16G16_FLOAT, size.x, size.y, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-         bool created = true;
-         for (int i = 0; created && i < 2; i++)
-         {
-            created = SUCCEEDED(native_device->CreateTexture2D(&history_desc, nullptr, gd.gtao_history[i].put())) && SUCCEEDED(native_device->CreateUnorderedAccessView(gd.gtao_history[i].get(), nullptr, gd.gtao_history_uavs[i].put())) &&
-                      SUCCEEDED(native_device->CreateShaderResourceView(gd.gtao_history[i].get(), nullptr, gd.gtao_history_srvs[i].put()));
-         }
-         if (!created)
-         {
-            gd.ReleaseGTAOHistory();
-         }
+         device->destroy_resource(g_pass.ao);
+         g_pass.ao = {0};
       }
-      const bool history_active = history_wanted && gd.gtao_history_srvs[1];
-      // GT-VBAO takes 1 slice under it, with the FAST noise at t4 (Core's "FAST Noise")
-      ID3D11ShaderResourceView* fast_noise = nullptr;
-      if (const auto it = device_data.managed_resources.shader_resource_views.find("FAST Noise"_h); g_gtvbao_enable && history_active && it != device_data.managed_resources.shader_resource_views.end())
+      HANDLE kmt = nullptr;
+      if (!CreateSharedR32f(device, desc.Width, desc.Height, &g_pass.ao, &kmt) ||
+          !D3D9Passes::SetGtaoOutput(kmt))
       {
-         if (auto* const temporal_main_cs = FindShader(device_data.native_compute_shaders, CompileTimeStringHash("Bayonetta GT-VBAO Temporal Main Pass CS")))
-         {
-            fast_noise = it->second.get();
-            main_cs = temporal_main_cs;
-         }
+         Log("d9native: XeGTAO output %ux%u failed (%s)", desc.Width, desc.Height,
+            D3D9Passes::Error());
+         return false;
       }
-
-      const CB::GTAOKnobs knobs = {
-         .final_value_power = (g_gtvbao_enable ? g_gtvbao_final_value_power : g_gtao_final_value_power),
+      g_pass.ao_width = desc.Width;
+      g_pass.ao_height = desc.Height;
+   }
+   auto* const ao = reinterpret_cast<IDirect3DTexture9*>(g_pass.ao.handle);
+   if (!ShareDepth(device, depth, desc))
+   {
+      return false;
+   }
+   if (Mutated(MUT_NO_GTAO_PASS))
+   {
+      IDirect3DSurface9* surface = nullptr;
+      ao->GetSurfaceLevel(0, &surface);
+      native->ColorFill(surface, nullptr, 0xFFFFFFFF);
+      Free(&surface);
+   }
+   else
+   {
+      D3D9Passes::GtaoParams params = {.affine_row = mv.gtao_affine_row,
+         .matrix_row = mv.gtao_matrix_row,
+         .final_value_power = g_gtao_final_value_power,
          .depth_scale = g_gtao_depth_scale,
-         .radius_override = g_gtao_radius_override,
-         .debug_view = float(g_gtao_debug_view),
-         .viewport_pixel_size = {1.f / float(size.x), 1.f / float(size.y)},
-         .noise_index = (gd.sr_active ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f),
-         .camera_affine_row = float(gd.gtao_camera_rows.x),
-         .camera_matrix_row = float(gd.gtao_camera_rows.y),
-      };
-      if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.gtao_knobs_buffer), &knobs, sizeof(knobs)))
-         return false;
-      ID3D11Buffer* const knobs_buffer = gd.gtao_knobs_buffer.get();
-
+         .radius_override = g_gtao_radius_override};
+      memcpy(params.camera, mv.gtao_camera, sizeof(params.camera));
+      out.query9->Issue(D3DISSUE_END);
+      const uint64_t value = ++g_pass.value;
+      if (FAILED(out.query9->GetData(nullptr, 0, D3DGETDATA_FLUSH)) ||
+          !KmtSignalObject(&g_pass.sync, g_pass.in.object, value) ||
+          !D3D9Passes::RunGtao(value, params) ||
+          !KmtWaitObject(&g_pass.sync, g_pass.out.object, value))
       {
-         DrawStateStack<DrawStateStackType::Compute> compute_state;
-         compute_state.Cache(native_device_context, device_data.uav_max_count);
-         ID3D11Buffer* const camera_buffer = gd.gtao_camera_buffer.get();
-         native_device_context->CSSetConstantBuffers(MotionVectorPatches::object_slot, 1, &camera_buffer);
-         native_device_context->CSSetConstantBuffers(GTAO_KNOBS_CB_SLOT, 1, &knobs_buffer);
-         ID3D11SamplerState* const point_sampler = device_data.sampler_state_point.get();
-         native_device_context->CSSetSamplers(0, 1, &point_sampler);
-         // Each pass binds its destination UAVs before its source SRVs: D3D11 otherwise nulls an SRV that still aliases the previous
-         // pass' bound UAV
-         static constexpr std::array<ID3D11ShaderResourceView*, 5> null_srvs = {};
-         ID3D11UnorderedAccessView* const null_uavs[GTAO_DEPTH_MIPS] = {}; // The most a pass binds (the prefilter)
-         const auto pass = [&](ID3D11ComputeShader* shader, UINT uav_count, ID3D11UnorderedAccessView* const* uavs, std::initializer_list<ID3D11ShaderResourceView*> srvs, UINT groups_x, UINT groups_y)
-         {
-            native_device_context->CSSetShaderResources(0, UINT(null_srvs.size()), null_srvs.data());
-            native_device_context->CSSetUnorderedAccessViews(0, uav_count, uavs, nullptr);
-            native_device_context->CSSetShaderResources(0, UINT(srvs.size()), srvs.begin());
-            native_device_context->CSSetShader(shader, nullptr, 0);
-            native_device_context->Dispatch(groups_x, groups_y, 1);
-            native_device_context->CSSetUnorderedAccessViews(0, uav_count, null_uavs, nullptr);
-         };
-         ID3D11UnorderedAccessView* const mip_uavs[GTAO_DEPTH_MIPS] = {gd.gtao_depth_mip_uavs[0].get(), gd.gtao_depth_mip_uavs[1].get(), gd.gtao_depth_mip_uavs[2].get(), gd.gtao_depth_mip_uavs[3].get(), gd.gtao_depth_mip_uavs[4].get()};
-         ID3D11UnorderedAccessView* const working_uavs[2] = {gd.gtao_working_uavs[0].get(), gd.gtao_working_uavs[1].get()};
-         ID3D11UnorderedAccessView* const output_uav = gd.gtao_output_uav.get();
-         pass(prefilter_cs, GTAO_DEPTH_MIPS, mip_uavs, {depth}, (size.x + 15) / 16, (size.y + 15) / 16);
-         pass(main_cs, 1, &working_uavs[0], {gd.gtao_depth_mips_srv.get(), nullptr, nullptr, nullptr, fast_noise}, (size.x + 7) / 8, (size.y + 7) / 8);
-         int denoise_source = 0;
-         if (history_active)
-         {
-            // Not across a switch between XeGTAO and GT-VBAO either (their AO differs)
-            const bool history_valid = gd.gtao_history_frame + 1 == cb_luma_global_settings.FrameIndex && gd.gtao_history_gtvbao == g_gtvbao_enable && gd.mv.previous_camera && !device_data.force_reset_sr;
-            const CB::GTAOTemporalConstants temporal_constants = {
-               .reprojection = gd.mv.reprojection,
-               .jitter_ndc = {gd.mv.jitter_ndc[0], gd.mv.jitter_ndc[1]},
-               .history_weight = (history_valid ? g_gtao_history_weight : 0.f),
-            };
-            if (PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(gd.gtao_temporal_buffer), &temporal_constants, sizeof(temporal_constants)))
-            {
-               // A motion vector target still bound for output would null its view as an input
-               com_ptr<ID3D11RenderTargetView> rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
-               com_ptr<ID3D11DepthStencilView> dsv;
-               native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv);
-               const bool mv_bound = std::ranges::any_of(rtvs, [&](const com_ptr<ID3D11RenderTargetView>& rtv)
-                  { return rtv && rtv.get() == gd.mv.rtv.get(); });
-               if (mv_bound)
-               {
-                  native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
-               }
-               ID3D11Buffer* const temporal_buffer = gd.gtao_temporal_buffer.get();
-               native_device_context->CSSetConstantBuffers(GTAO_TEMPORAL_CB_SLOT, 1, &temporal_buffer);
-               const uint32_t previous = gd.gtao_history_index, next = previous ^ 1u;
-               ID3D11UnorderedAccessView* const temporal_uavs[2] = {working_uavs[1], gd.gtao_history_uavs[next].get()};
-               pass(temporal_cs, 2, temporal_uavs, {gd.gtao_working_srvs[0].get(), gd.gtao_history_srvs[previous].get(), gd.mv.srv.get(), depth}, (size.x + 7) / 8, (size.y + 7) / 8);
-               if (mv_bound)
-               {
-                  native_device_context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, reinterpret_cast<ID3D11RenderTargetView* const*>(&rtvs[0]), dsv.get());
-               }
-               gd.gtao_history_index = next;
-               gd.gtao_history_frame = cb_luma_global_settings.FrameIndex;
-               gd.gtao_history_gtvbao = g_gtvbao_enable;
-               denoise_source = 1;
-            }
-         }
-         // Both denoise passes, from wherever the AO is now
-         pass(denoise_1_cs, 1, &working_uavs[denoise_source ^ 1], {gd.gtao_working_srvs[denoise_source].get()}, (size.x + 15) / 16, (size.y + 7) / 8);
-         pass(denoise_2_cs, 1, &output_uav, {gd.gtao_working_srvs[denoise_source ^ 1].get()}, (size.x + 15) / 16, (size.y + 7) / 8);
-#if DEVELOPMENT
-         QueueInjectedPassTrace(native_device_context, "Luma XeGTAO", output_uav);
-#endif
-         compute_state.Restore(native_device_context);
+         ++state.pass_failures;
+         Log("d9native: XeGTAO failed (%s)", D3D9Passes::Error());
+         return false;
       }
+   }
+   PassScope scope(native);
+   MvSetPointClamp(native, 0, scene);
+   MvSetPointClamp(native, 2, depth);
+   MvSetPointClamp(native, 3, ao);
+   const float size[4] = {float(desc.Width), float(desc.Height), 0, 0};
+   native->SetPixelShaderConstantF(0, size, 1);
+   MvDrawQuad(native, desc.Width, desc.Height, mv.ps_gtao);
+   ++state.gtao_runs;
+   return true;
+}
+// The MV module's render-size motion, depth, output and color textures shared
+// by KMT, two fences on the D3D9 kernel device, then the "bridge" start line;
+// "out" reaches kReady once the upscaler exists (EnsureHelper polls it). The
+// upscaler runs mid frame at the scene end (MvEndScene).
+static void StartUpscaler(device* device)
+{
+   sr.gave_up = true;
+   auto* native = reinterpret_cast<IDirect3DDevice9*>(device->get_native());
+   const UINT width = state.render_width, height = state.render_height;
+   LUID luid = {};
+   const bool ok = D3D9AdapterLuid(device, &luid) &&
+                   D3D9SR::Open(&sr, KmtGeneration(device)) &&
+                   MvCheckVtf(native) && MvEnsureTextures(native, width, height);
+   // Render = output size, hdr, unjittered motion (the patched PS writes it),
+   // motion scale = render size (UV delta), DLSS preset 0, FSR newest.
+   // Textures: color motion depth, no reactive / transparency / exposure,
+   // output.
+   if (!ok ||
+       !D3D9SR::Start(&sr, ModuleFilePath(L""), g_sr_upscaler, luid,
+          {.render_width = width,
+             .render_height = height,
+             .output_width = width,
+             .output_height = height,
+             .hdr = true,
+             .motion_scale_x = float(width),
+             .motion_scale_y = float(height)},
+          {mv.kmt[3], mv.kmt[0], mv.kmt[1], nullptr, nullptr,
+             nullptr, mv.kmt[2]}))
+   {
+      if (sr.launch_error)
+      {
+         Log("d9native: CreateProcess(%ls) failed %lu",
+            ModuleFilePath(SRBridgeProtocol::kHelperName).c_str(),
+            sr.launch_error);
+      }
+      Log("d9native: SR bridge start failed (%s 0x%08X)",
+         sr.sync.first_error_call, static_cast<uint32_t>(sr.sync.first_error));
+      StopUpscaler();
+      return;
+   }
+   ++state.sr_starts;
+   Log("d9native: SR bridge %d started %ux%u (pid %lu)", g_sr_upscaler, width,
+      height, GetProcessId(sr.process));
+}
+// P4.5 Luma Bloom: Bayonetta's DrawBloomPass / MirrorBloomCopy. The game's
+// bloom chain (filter05 from the scene into its 320x176 target, the blurs and
+// level copies) drawn into a 16-bit UNORM texture "scale" times the target's
+// size (scene height / 720), the viewport and scissor scaled alike, with the
+// game's shaders: each StretchRect of the target's region into a level texture
+// is repeated from the Luma texture into that texture's shadow at the same
+// scale, which the next chain draws sample. A composite (copytex sampling the
+// target, SRC_ALPHA + ONE or INV_SRC_ALPHA) samples the Luma texture. The game
+// draws with DrawPrimitiveUP, which can't be issued again: its draw runs on
+// our RT0 / viewport / scissor / s0, and the game's come back at the next
+// draw, copy, clear or present unless it set them itself first.
+// ponytail: the DX11 pass' copy of row / column 1 into the texture's first
+// row / column (the game's quads start inside the first texel) is not done;
+// add it with a temp RT if the top / left edge darkens.
+struct BloomShadow
+{
+   uint64_t game_texture = 0;
+   IDirect3DTexture9* texture = nullptr;
+};
+static struct
+{
+   std::set<uint32_t> source_crcs{std::begin(kBloomSourcePs), std::end(kBloomSourcePs)},
+      blur_crcs{std::begin(kBloomBlurPs), std::end(kBloomBlurPs)},
+      copy_crcs{std::begin(kBloomCopyPs), std::end(kBloomCopyPs)};
+   uint64_t target = 0; // the game's bloom target (identity only)
+   uint32_t scale = 0;
+   IDirect3DTexture9* texture = nullptr;
+   IDirect3DSurface9* surface = nullptr;
+   std::vector<BloomShadow> shadows;
+   // The game's state under a redirected draw
+   IDirect3DSurface9* game_rt0 = nullptr;
+   IDirect3DBaseTexture9* game_s0 = nullptr;
+   D3DVIEWPORT9 game_viewport = {};
+   RECT game_scissor = {};
+   bool restore_rt0 = false, restore_viewport = false, restore_scissor = false,
+        restore_s0 = false;
+} bloom;
 
-      // The game's draw (its vertex shader, target, t0 scene and t2 depth) with the apply shader, the visibility on t3 and the knobs
-      com_ptr<ID3D11PixelShader> game_shader;
-      native_device_context->PSGetShader(&game_shader, nullptr, nullptr);
-      com_ptr<ID3D11ShaderResourceView> game_t3;
-      native_device_context->PSGetShaderResources(3, 1, &game_t3);
-      com_ptr<ID3D11Buffer> game_knobs_slot;
-      native_device_context->PSGetConstantBuffers(GTAO_KNOBS_CB_SLOT, 1, &game_knobs_slot);
-      ID3D11ShaderResourceView* const output_srv = gd.gtao_output_srv.get();
-      native_device_context->PSSetShader(apply_ps, nullptr, 0);
-      native_device_context->PSSetShaderResources(3, 1, &output_srv);
-      native_device_context->PSSetConstantBuffers(GTAO_KNOBS_CB_SLOT, 1, &knobs_buffer);
-      draw();
-      native_device_context->PSSetShader(game_shader.get(), nullptr, 0);
-      ID3D11ShaderResourceView* const t3 = game_t3.get();
-      native_device_context->PSSetShaderResources(3, 1, &t3);
-      ID3D11Buffer* const knobs_slot = game_knobs_slot.get();
-      native_device_context->PSSetConstantBuffers(GTAO_KNOBS_CB_SLOT, 1, &knobs_slot);
+static void BloomRestore(IDirect3DDevice9* native)
+{
+   if (bloom.restore_rt0)
+   {
+      native->SetRenderTarget(0, bloom.game_rt0); // resets the viewport
+   }
+   if (bloom.restore_viewport)
+   {
+      native->SetViewport(&bloom.game_viewport);
+   }
+   if (bloom.restore_scissor)
+   {
+      native->SetScissorRect(&bloom.game_scissor);
+   }
+   if (bloom.restore_s0)
+   {
+      native->SetTexture(0, bloom.game_s0);
+   }
+   bloom.restore_rt0 = bloom.restore_viewport = bloom.restore_scissor =
+      bloom.restore_s0 = false;
+   Free(&bloom.game_rt0);
+   Free(&bloom.game_s0);
+}
+
+static void BloomRelease()
+{
+   for (BloomShadow& shadow : bloom.shadows)
+   {
+      Free(&shadow.texture);
+   }
+   bloom.shadows.clear();
+   Free(&bloom.surface);
+   Free(&bloom.texture);
+}
+
+static IDirect3DTexture9* BloomCreateTexture(IDirect3DDevice9* native,
+   UINT width, UINT height)
+{
+   IDirect3DTexture9* texture = nullptr;
+   // 16 bit UNORM: the 8 bit target's [0, 1] range (the chain relies on its
+   // clamp) without its banding at the finer size
+   native->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET,
+      D3DFMT_A16B16G16R16, D3DPOOL_DEFAULT, &texture,
+      nullptr);
+   return texture;
+}
+
+// The game's StretchRect of the target's region into a level texture,
+// repeated from the Luma texture into that texture's shadow
+static void BloomMirrorCopy(device* device, resource source, resource dest,
+   const subresource_box* source_box,
+   const subresource_box* dest_box)
+{
+   if (source.handle != bloom.target || !bloom.texture || !state.luma_bloom ||
+       Mutated(MUT_NO_LUMA_BLOOM))
+   {
+      return;
+   }
+   IDirect3DDevice9* native = NativeOf(device);
+   const resource_desc dest_desc = device->get_resource_desc(dest);
+   // Level textures are render targets (a GetRenderTargetData readback is not)
+   if ((dest_desc.usage & resource_usage::render_target) == 0)
+   {
+      return;
+   }
+   const UINT scale = bloom.scale;
+   auto shadow =
+      std::ranges::find(bloom.shadows, dest.handle, &BloomShadow::game_texture);
+   if (shadow == bloom.shadows.end())
+   {
+      IDirect3DTexture9* texture =
+         BloomCreateTexture(native, dest_desc.texture.width * scale,
+            dest_desc.texture.height * scale);
+      if (!texture)
+      {
+         return;
+      }
+      bloom.shadows.push_back({.game_texture = dest.handle, .texture = texture});
+      shadow = bloom.shadows.end() - 1;
+   }
+   const auto scaled = [scale](const subresource_box* box, UINT width,
+                          UINT height)
+   {
+      return box ? RECT{LONG(box->left * scale), LONG(box->top * scale),
+                      LONG(box->right * scale), LONG(box->bottom * scale)}
+                 : RECT{0, 0, LONG(width * scale), LONG(height * scale)};
+   };
+   const RECT from =
+      scaled(source_box, dest_desc.texture.width, dest_desc.texture.height);
+   RECT to = scaled(dest_box, dest_desc.texture.width, dest_desc.texture.height);
+   if (dest_box && !source_box)
+   {
+      to.right = to.left + (from.right - from.left);
+      to.bottom = to.top + (from.bottom - from.top);
+   }
+   IDirect3DSurface9* destination = nullptr;
+   shadow->texture->GetSurfaceLevel(0, &destination);
+   if (destination &&
+       SUCCEEDED(native->StretchRect(bloom.surface, &from, destination, &to,
+          D3DTEXF_POINT)))
+   {
+      ++state.bloom_mirrors;
+   }
+   Free(&destination);
+}
+
+// A bloom chain draw or composite: redirects it and gives the rows it reads
+// (c209 composite mode, c210 t0 size, c211 the chain's scale / footprint).
+// False for the game's draw as it is.
+static bool BloomDraw(device* device, float rows[3][4])
+{
+   const uint32_t crc = out.bound_ps_crc;
+   const bool is_source = bloom.source_crcs.contains(crc),
+              is_blur = bloom.blur_crcs.contains(crc),
+              is_copy = bloom.copy_crcs.contains(crc);
+   if (!is_source && !is_blur && !is_copy)
+   {
+      return false;
+   }
+   const bool enabled = state.luma_bloom && !Mutated(MUT_NO_LUMA_BLOOM);
+   IDirect3DDevice9* native = NativeOf(device);
+   const uint64_t source = out.ps_textures[0];
+   if (!source || !out.rt0.handle)
+   {
+      return false;
+   }
+   // The composite: copytex sampling the target, blended
+   if (is_copy && source == bloom.target && bloom.target)
+   {
+      DWORD blend = 0, source_blend = 0, dest_blend = 0;
+      native->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
+      native->GetRenderState(D3DRS_SRCBLEND, &source_blend);
+      native->GetRenderState(D3DRS_DESTBLEND, &dest_blend);
+      if (!blend || source_blend != D3DBLEND_SRCALPHA ||
+          (dest_blend != D3DBLEND_ONE && dest_blend != D3DBLEND_INVSRCALPHA))
+      {
+         return false;
+      }
+      const bool luma = enabled && bloom.texture;
+      memcpy(rows[0], state.injected + 4, sizeof(rows[0])); // c209: z intensity
+      rows[0][0] = (dest_blend == D3DBLEND_ONE ? 2.0f : 3.0f);
+      rows[0][1] = luma ? 1.0f : 0.0f;
+      TextureSize(device, source, rows[1]);
+      if (luma)
+      {
+         native->GetTexture(0, &bloom.game_s0);
+         bloom.restore_s0 = true;
+         native->SetTexture(0, bloom.texture);
+         TextureSize(device, reinterpret_cast<uint64_t>(bloom.texture), rows[1]);
+         ++state.bloom_composites;
+      }
       return true;
    }
-
-   DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
+   if (is_copy && !is_source && !is_blur && out.rt0.handle != bloom.target)
    {
-      auto& game_device_data = GetGameDeviceData(device_data);
-      if (original_draw_dispatch_func == nullptr || !*original_draw_dispatch_func)
+      return false;
+   }
+   const resource_desc target_desc = device->get_resource_desc(out.rt0);
+   const resource_desc source_desc = device->get_resource_desc(resource{source});
+   const bool from_scene =
+      is_source && source_desc.texture.height > target_desc.texture.height;
+   if (from_scene)
+   {
+      bloom.target = out.rt0.handle;
+   }
+   if (!enabled || out.rt0.handle != bloom.target)
+   {
+      return false;
+   }
+   if (from_scene)
+   {
+      const uint32_t scale =
+         std::max(1u, uint32_t(std::lround(source_desc.texture.height / 720.0)));
+      D3DSURFACE_DESC luma_desc = {};
+      if (bloom.surface)
       {
-         return DrawOrDispatchOverrideType::None;
+         bloom.surface->GetDesc(&luma_desc);
       }
-      const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
-      // The game's lists are all pixel shaders, looked up by this hash ("Contains" with a whole hash list would walk it)
-      const uint32_t pixel_shader_hash = uint32_t(original_shader_hashes.pixel_shaders[0]);
-      const auto bind_luma_cbuffers = [&](uint32_t custom_data_1 = 0, uint32_t custom_data_2 = 0)
+      if (scale != bloom.scale || !bloom.surface ||
+          luma_desc.Width != target_desc.texture.width * scale ||
+          luma_desc.Height != target_desc.texture.height * scale)
       {
-         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
-         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, custom_data_1, custom_data_2);
-         updated_cbuffers = true;
-      };
-      // The bound render target 0's view if it's the canvas (dgVoodoo's D3D9 back buffer), else null
-      const auto bound_canvas_rtv = [&]
-      {
-         ComPtr<ID3D11RenderTargetView> rtv;
-         native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
-         ComPtr<ID3D11Resource> rt;
-         if (rtv)
+         BloomRelease();
+         bloom.texture =
+            BloomCreateTexture(native, target_desc.texture.width * scale,
+               target_desc.texture.height * scale);
+         if (bloom.texture)
          {
-            rtv->GetResource(rt.put());
+            bloom.texture->GetSurfaceLevel(0, &bloom.surface);
          }
-         if (!rt || uintptr_t(rt.get()) != game_device_data.canvas)
-         {
-            rtv.reset();
-         }
-         return rtv;
-      };
-      // Hide UI: cancel the game's draws into the canvas after this frame's scene copy (the HUD, menus and 2D effects), not the movies.
-      // An original pixel shader hash is what separates a game draw.
-      if (g_hide_ui && game_device_data.has_drawn_reset_render && original_shader_hashes.pixel_shaders[0] != SHADER_HASH_NONE && !shader_hashes_Video.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel) && bound_canvas_rtv())
-      {
-         return DrawOrDispatchOverrideType::Replaced;
+         bloom.scale = state.bloom_scale = scale;
       }
-      // Draws the replaced pass with the Luma cbuffers, then copies the canvas it drew on into "scene_texture": the floor the
-      // present blit clamps the later UI to
-      auto draw_and_snapshot_canvas = [&](ID3D11RenderTargetView* rtv, ID3D11Resource* canvas, uint32_t custom_data)
+   }
+   if (!bloom.surface)
+   {
+      return false;
+   }
+   IDirect3DTexture9* shadow_texture = nullptr;
+   if (!from_scene)
+   {
+      const auto shadow =
+         std::ranges::find(bloom.shadows, source, &BloomShadow::game_texture);
+      // Not copied yet (Luma Bloom just turned on): the game's pass, this frame
+      if (shadow == bloom.shadows.end())
       {
-         bind_luma_cbuffers(custom_data);
-         (*original_draw_dispatch_func)();
-         D3D11_TEXTURE2D_DESC canvas_desc = {};
-         static_cast<ID3D11Texture2D*>(canvas)->GetDesc(&canvas_desc);
-         D3D11_TEXTURE2D_DESC scene_desc = {};
-         if (game_device_data.scene_texture)
-         {
-            game_device_data.scene_texture->GetDesc(&scene_desc);
-         }
-         if (scene_desc.Width != canvas_desc.Width || scene_desc.Height != canvas_desc.Height || scene_desc.Format != canvas_desc.Format)
-         {
-            game_device_data.scene_srv.reset();
-            game_device_data.scene_texture.reset();
-            canvas_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            canvas_desc.MiscFlags = 0;
-            if (SUCCEEDED(native_device->CreateTexture2D(&canvas_desc, nullptr, game_device_data.scene_texture.put())))
-            {
-               // A typeless canvas needs the render target's view format
-               D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-               rtv->GetDesc(&rtv_desc);
-               const D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {.Format = rtv_desc.Format, .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D, .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1}};
-               native_device->CreateShaderResourceView(game_device_data.scene_texture.get(), &srv_desc, game_device_data.scene_srv.put());
-            }
-         }
-         if (!game_device_data.scene_srv)
-            return DrawOrDispatchOverrideType::Replaced;
-         native_device_context->CopyResource(game_device_data.scene_texture.get(), canvas);
-         game_device_data.has_copied_scene_to_canvas = true;
-         // SMAA then RCAS on the scene copy (not on the movies), each reading the snapshot and writing the canvas, then the snapshot
-         // again: the UI clamp floor must be the final canvas. An upscaler that drew this frame antialiased it: SMAA stays out, RCAS
-         // stays on.
-         if (custom_data != 1)
-            return DrawOrDispatchOverrideType::Replaced;
-         game_device_data.has_drawn_reset_render = true;
-         bool canvas_changed = false;
-         D3D11_VIEWPORT scene_rect;
-         UINT viewport_count = 1;
-         native_device_context->RSGetViewports(&viewport_count, &scene_rect);
-         if (g_smaa_enable && !device_data.has_drawn_sr && viewport_count == 1)
-         {
-            DrawSMAAOnCanvas(native_device, native_device_context, device_data, rtv, scene_rect);
-            canvas_changed = true;
-         }
-         if (g_rcas_sharpness > 0.f && PrepareRCAS(native_device, device_data))
-         {
-            if (canvas_changed)
-            {
-               native_device_context->CopyResource(game_device_data.scene_texture.get(), canvas);
-            }
-            DrawRCAS(native_device_context, device_data, game_device_data.scene_srv.get(), rtv, g_rcas_sharpness);
-            canvas_changed = true;
-         }
-         if (canvas_changed)
-         {
-            native_device_context->CopyResource(game_device_data.scene_texture.get(), canvas);
-         }
-         return DrawOrDispatchOverrideType::Replaced;
-      };
+         return false;
+      }
+      shadow_texture = shadow->texture;
+   }
+   native->GetRenderTarget(0, &bloom.game_rt0);
+   native->GetViewport(&bloom.game_viewport);
+   native->GetScissorRect(&bloom.game_scissor);
+   native->SetRenderTarget(0, bloom.surface);
+   D3DVIEWPORT9 viewport = bloom.game_viewport;
+   viewport.X *= bloom.scale;
+   viewport.Y *= bloom.scale;
+   viewport.Width *= bloom.scale;
+   viewport.Height *= bloom.scale;
+   native->SetViewport(&viewport);
+   const RECT scissor = {LONG(bloom.game_scissor.left * bloom.scale),
+      LONG(bloom.game_scissor.top * bloom.scale),
+      LONG(bloom.game_scissor.right * bloom.scale),
+      LONG(bloom.game_scissor.bottom * bloom.scale)};
+   native->SetScissorRect(&scissor);
+   bloom.restore_rt0 = bloom.restore_viewport = bloom.restore_scissor = true;
+   uint64_t sampled = source;
+   if (shadow_texture)
+   {
+      native->GetTexture(0, &bloom.game_s0);
+      native->SetTexture(0, shadow_texture);
+      bloom.restore_s0 = true;
+      sampled = reinterpret_cast<uint64_t>(shadow_texture);
+   }
+   memcpy(rows[0], state.injected + 4, sizeof(rows[0]));
+   TextureSize(device, sampled, rows[1]);
+   // filter05 averages the footprint of each texel (y, zw: source texels per
+   // target texel); the blurs widen each tap to a game texel at the scale (x)
+   rows[2][0] = float(bloom.scale);
+   rows[2][1] = is_source ? 1.0f : 0.0f;
+   rows[2][2] = rows[1][0] / float(target_desc.texture.width * bloom.scale);
+   rows[2][3] = rows[1][1] / float(target_desc.texture.height * bloom.scale);
+   ++state.bloom_draws;
+   return true;
+}
 
-      if (shader_hashes_PixelKernels.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel) || shader_hashes_ShadowReceivers.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
-      {
-         BindPixelKernelTargetSize(native_device, native_device_context, &game_device_data);
-      }
-      // XeGTAO's camera, from the frame's first depth prepass draw with a known layout. Before the motion vector draws, which replace the
-      // prepass' draws when they jitter.
-      const bool has_vertex_shader = (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex;
-      if (g_gtao_enable && is_immediate && !game_device_data.gtao_camera_taken && has_vertex_shader)
-      {
-         TakePrepassCamera(native_device, native_device_context, cmd_list_data, device_data, uint32_t(original_shader_hashes.vertex_shaders[0]));
-      }
+// RT0's size (the back buffer's while none was bound since the last Reset)
+// and the kernel target size of Fix High Resolution Effects (kernel_720: RT0
+// size * 720 / RT0 height).
+static void Rt0Size(float* width, float* height)
+{
+   *width = float(out.rt0_width ? out.rt0_width : state.width);
+   *height = float(out.rt0_height ? out.rt0_height : state.height);
+}
 
-      // DLAA/FSR/XeSS/Luma TAA: the scene's draws with motion vectors or jitter (see "DrawWithMotionVectors"), and the fill and upscaler at
-      // its first post pass
-      if (game_device_data.mv.active && is_immediate)
+static std::array<float, 4> KernelSize()
+{
+   float rt0_width = 0, rt0_height = 0;
+   Rt0Size(&rt0_width, &rt0_height);
+   const float kernel_scale =
+      (state.kernel_720 && rt0_height > 0 ? 720.0f / rt0_height : 1.0f);
+   return {rt0_width * kernel_scale, rt0_height * kernel_scale, 0, 0};
+}
+
+// The settings into Core's state (SMAA, RCAS, the display map, the dither,
+// XeGTAO, Luma Bloom, the kernels' c194, Hide UI) and the shadow map size.
+// Core's D9N_* settings (DEVELOPMENT env, ini) read at create_device win over
+// these until a setting is edited.
+static void ApplySettings()
+{
+   const CB::LumaGameSettings& settings = cb_luma_global_settings.GameSettings;
+   state.smaa = g_smaa_enable;
+   state.smaa_t2x = g_smaa_t2x;
+   state.smaa_predication = g_smaa_predication;
+   state.rcas_sharpness = g_rcas_sharpness;
+   state.dither = settings.Dithering > 0.5f;
+   state.map_contrast = settings.Contrast;
+   state.map_saturation = settings.Saturation;
+   state.map_highlights_desaturation = settings.HighlightsDesaturation;
+   state.gtao = g_gtao_enable;
+   state.luma_bloom = g_luma_bloom_enable;
+   state.kernel_720 = g_resolution_scaled_effects;
+   state.hide_ui = g_hide_ui;
+   ShadowMap::Apply();
+}
+
+// The Luma block's settings rows (Includes/Luma_Block_sm3.hlsli): c208.x the
+// grade's gamma encoded exposure gain, c209.z the bloom intensity, c214 the
+// movies' AutoHDR and its peak relative to the UI paper white (1 in SDR: an
+// identity). Per present: the display mode can change under the game.
+static void UpdateLumaRows()
+{
+   const CB::LumaGameSettings& settings = cb_luma_global_settings.GameSettings;
+   state.injected[0] = std::pow(settings.Exposure, 1.f / 2.2f);
+   state.injected[4 * (209 - INJECT_BASE_REGISTER) + 2] =
+      settings.BloomIntensity;
+   float* const c214 = state.injected + 4 * (214 - INJECT_BASE_REGISTER);
+   c214[0] = settings.VideoAutoHDREnable;
+   const float video_peak =
+      std::lerp(srgb_white_level, 250.f, settings.VideoAutoHDRBoost) /
+      srgb_white_level;
+   c214[1] = (EffectiveMode() == OUTPUT_SRGB
+                 ? 1.f
+                 : std::max(std::min(video_peak,
+                               cb_luma_global_settings.ScenePeakWhite /
+                                  cb_luma_global_settings.UIPaperWhite),
+                      1.f));
+}
+
+class Bayonetta final : public D3D9Game
+{
+public:
+   void OnInit() override
+   {
+      shaders_folder = "Bayonetta";
+      shader_defines = {"VANILLA_ENCODING_TYPE=1", "UI_DRAW_TYPE=2",
+         "TONEMAP_TYPE=1", "LUMA_SETTINGS_CB_INDEX=b13",
+         "LUMA_DATA_CB_INDEX=b12", "LUMA_UI_DATA_CB_INDEX=b11"};
+      display_map_file = "Luma_Bayonetta_DisplayMap.hlsl";
+      smaa_file = "Luma_SMAA_impl.hlsl";
+      depth_edges_file = "Luma_Bayonetta_DepthEdges.hlsl";
+      // XeGTAO at the dgVoodoo mod's quality; the final denoise writes R32F,
+      // which D3D9 can share
+      gtao_file = "Luma_Bayonetta_XeGTAO.hlsl";
+      gtao_defines = {"XE_GTAO_QUALITY=3"};
+      // ponytail: ResetRender = the frame's first hand-off copy into the canvas,
+      // without the D3D11 mod's opaque-blend test
+      out.handoff_crcs.insert(std::begin(kHandoffPs), std::end(kHandoffPs));
+      out.video_crcs.insert(std::begin(kVideoPs), std::end(kVideoPs));
+      out.velocity_crcs.insert(std::begin(kVelocityPs), std::end(kVelocityPs));
+      development_crc_lists = {{"D9N_SCENE_POST_PS", &mv.post_crcs},
+         {"D9N_KERNEL_PS", &bay.kernel_crcs},
+         {"D9N_SSAO_PS", &bay.ssao_crcs},
+         {"D9N_BLOOM_SOURCE_PS", &bloom.source_crcs},
+         {"D9N_BLOOM_BLUR_PS", &bloom.blur_crcs},
+         {"D9N_BLOOM_COPY_PS", &bloom.copy_crcs}};
+      char mv_text[8] = "";
+      const bool mv_set = ReadSetting("MV", mv_text, sizeof(mv_text));
+      if (OfflineHarness())
       {
-         // A game draw with a vertex shader, which the patched shaders can redo: replaced ones too (the particles translate to copytex,
-         // replaced by "Copy_0x91A6C437"; their patched versions come from the game's code, see "SceneMotionVectors::GetPatchedShader")
-         const bool game_mesh_draw = has_vertex_shader && original_shader_hashes.pixel_shaders[0] != SHADER_HASH_NONE;
-         if (!game_device_data.mv.scene_done && shader_hashes_ScenePost.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
-         {
-            if (game_device_data.mv.scene_open)
-            {
-#if DEVELOPMENT
-               game_device_data.mv.stats.ended_by = pixel_shader_hash;
-               game_device_data.mv.stats.prepass_drawn = game_device_data.prepass_drawn;
+         // The harness' runs: motion vectors only when asked for (MV, GTAO or SR),
+         // its own inputs
+         char gtao_text[8] = "";
+         ReadSetting("GTAO", gtao_text, sizeof(gtao_text));
+         g_mv = (mv_text[0] && mv_text[0] != '0') ||
+                (gtao_text[0] && gtao_text[0] != '0') || g_sr_upscaler >= 0;
+      }
+      else
+      {
+         // ponytail: motion vectors always on (MV=0 turns them off): XeGTAO's
+         // camera, SMAA T2x, Luma TAA and the SR bridge need them, and the patched
+         // shaders are created with the game's; gate them on those settings if the
+         // doubled scene VS costs too much
+         g_mv = !mv_set || mv_text[0] != '0';
+         reshade::get_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
+         reshade::get_config_value(nullptr, NAME, "SMAAT2x", g_smaa_t2x);
+#if DEVELOPMENT // Development settings only (see "DrawImGuiSettings"): a saved
+                // "off" must not outlive its control
+         reshade::get_config_value(nullptr, NAME, "SMAAPredication",
+            g_smaa_predication);
+         reshade::get_config_value(nullptr, NAME, "SMAAPredicationTolerance",
+            g_smaa_pred_tolerance);
 #endif
-               // The scene's last copy, if the pass reads it
-               game_device_data.mv_scene_copy.reset();
-               if (game_device_data.mv_scene_last_copy)
-               {
-                  com_ptr<ID3D11ShaderResourceView> srvs[8];
-                  native_device_context->PSGetShaderResources(0, 8, &srvs[0]);
-                  for (const auto& srv : srvs)
-                  {
-                     com_ptr<ID3D11Resource> resource;
-                     if (srv)
-                     {
-                        srv->GetResource(&resource);
-                     }
-                     if (resource && resource == game_device_data.mv_scene_last_copy)
-                     {
-                        game_device_data.mv_scene_copy = resource;
-                        break;
-                     }
-                  }
-               }
-               EndScene(native_device, native_device_context, device_data);
-            }
-         }
-         // Until the scene opens only its targets matter (the shadow maps come first)
-         else if (!game_device_data.mv.scene_done && !game_device_data.mv.scene_open && game_mesh_draw)
-         {
-            com_ptr<ID3D11RenderTargetView> rtvs[2];
-            com_ptr<ID3D11DepthStencilView> scene_dsv;
-            native_device_context->OMGetRenderTargets(2, &rtvs[0], &scene_dsv);
-            if (rtvs[0] && scene_dsv && (rtvs[0].get() != game_device_data.open_refused_rtv || scene_dsv.get() != game_device_data.open_refused_dsv))
-            {
-               OpenScene(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0], rtvs[0].get(), rtvs[1] != nullptr, scene_dsv.get());
-            }
-         }
-         if (game_device_data.mv.scene_open && game_mesh_draw)
-         {
-            com_ptr<ID3D11RenderTargetView> rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
-            com_ptr<ID3D11DepthStencilView> dsv;
-            native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv);
-            // The depth prepass writes 1 - z/w to an R32F target next to the normals' (the fill's depth). Classified once per target.
-            if (rtvs[0] && rtvs[1])
-            {
-               if (rtvs[0].get() != game_device_data.prepass_rtv)
-               {
-                  game_device_data.prepass_rtv = rtvs[0].get();
-                  game_device_data.prepass_is_depth = false;
-                  D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-                  rtvs[0]->GetDesc(&rtv_desc);
-                  if (rtv_desc.Format == DXGI_FORMAT_R32_FLOAT)
-                  {
-                     com_ptr<ID3D11Resource> resource;
-                     rtvs[0]->GetResource(&resource);
-                     const D3D11_TEXTURE2D_DESC desc = GetTexture2DDesc(resource.get());
-                     if (desc.SampleDesc.Count == 1 && (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0 && uint2{desc.Width, desc.Height} == game_device_data.mv.scene_size)
-                     {
-                        game_device_data.prepass_is_depth = true;
-                        if (resource != game_device_data.prepass_depth)
-                        {
-                           game_device_data.prepass_depth = resource;
-                           game_device_data.prepass_depth_srv.reset();
-                           // dgVoodoo's targets are single-slice arrays: a plain 2D view of the first slice
-                           const CD3D11_SHADER_RESOURCE_VIEW_DESC srv_desc(D3D11_SRV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R32_FLOAT);
-                           native_device->CreateShaderResourceView(resource.get(), &srv_desc, &game_device_data.prepass_depth_srv);
-                        }
-                     }
-                  }
-               }
-               game_device_data.prepass_drawn |= game_device_data.prepass_is_depth;
-            }
-            const bool motion_vectors = SceneMotionVectors::DrawWithMotionVectors<MotionVectorGame>(&game_device_data.mv, native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv.get());
-            // An alpha blending state blends the motion vector target by the alpha written there: a draw that doesn't write it (refused
-            // above) must not have it bound
-            if (!motion_vectors && rtvs[MotionVectorPatches::target_slot] && rtvs[MotionVectorPatches::target_slot] == game_device_data.mv.rtv)
-            {
-               SceneMotionVectors::ClassifyBoundBlend(native_device_context, &game_device_data.mv);
-               if (game_device_data.mv.alpha_blended)
-               {
-                  rtvs[MotionVectorPatches::target_slot].reset();
-                  native_device_context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, reinterpret_cast<ID3D11RenderTargetView* const*>(&rtvs[0]), dsv.get());
-               }
-            }
-            const bool jitter = !motion_vectors && SceneMotionVectors::DrawWithJitter<MotionVectorGame>(&game_device_data.mv, native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func, rtvs, dsv.get());
-#if DEVELOPMENT
-            Mcp::Annotate(cmd_list_data, motion_vectors ? "mv" : (jitter ? "jitter" : "unpatched"));
-            if (const SceneMotionVectors::MotionVectorReject reject = std::exchange(game_device_data.mv.draw_reject, SceneMotionVectors::REJECT_COUNT); reject != SceneMotionVectors::REJECT_COUNT)
-            {
-               Mcp::Annotate(cmd_list_data, "mv_reject", int(reject));
-            }
-#endif
-            if (motion_vectors || jitter)
-               return DrawOrDispatchOverrideType::Replaced;
-         }
+         reshade::get_config_value(nullptr, NAME, "RCASSharpness",
+            g_rcas_sharpness);
+         reshade::get_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
+         reshade::get_config_value(nullptr, NAME, "FixHighResolutionEffects",
+            g_resolution_scaled_effects);
+         reshade::get_config_value(nullptr, NAME, "FixFramePacing",
+            g_fix_frame_pacing);
+         reshade::get_config_value(nullptr, NAME, "60FPSCutscenes",
+            g_60_fps_cutscenes);
+         reshade::get_config_value(nullptr, NAME, "LumaBloomEnable",
+            g_luma_bloom_enable);
+         reshade::get_config_value(nullptr, NAME, "HighResolutionShadows",
+            g_high_resolution_shadows);
+         CB::LumaGameSettings& settings = cb_luma_global_settings.GameSettings;
+         settings = DEFAULT_GAME_SETTINGS;
+         reshade::get_config_value(nullptr, NAME, "Dithering", settings.Dithering);
+         reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable",
+            settings.VideoAutoHDREnable);
+         reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost",
+            settings.VideoAutoHDRBoost);
+         reshade::get_config_value(nullptr, NAME, "Exposure", settings.Exposure);
+         reshade::get_config_value(nullptr, NAME, "Contrast", settings.Contrast);
+         reshade::get_config_value(nullptr, NAME, "Saturation",
+            settings.Saturation);
+         reshade::get_config_value(nullptr, NAME, "HighlightsDesaturation",
+            settings.HighlightsDesaturation);
+         reshade::get_config_value(nullptr, NAME, "BloomIntensity",
+            settings.BloomIntensity);
+         FrameLimiter::Install();
+         ShadowMap::Install();
+         ApplySettings();
+         UpdateLumaRows();
+         // The canvas stays gamma encoded (VANILLA_ENCODING_TYPE 1): the scene
+         // copy before the UI does the HDR display map and pre-scales the scene by
+         // the UI paper white, the composition decodes it and the UI clamp keeps
+         // the UI at its paper white
+         g_decode_gamma = 2.2f;
+         state.display_map = state.present_clamp = 1;
       }
-      // Every draw without a patched shader: the game's own, if the last patched draw's are still bound
-      if (is_immediate)
-      {
-         PatchedDraws::RestoreGameShader(native_device_context, &game_device_data.mv.bound_vertex_shader);
-         PatchedDraws::RestoreGameShader(native_device_context, &game_device_data.mv.bound_pixel_shader);
-      }
-
-      const bool is_bloom_source = shader_hashes_BloomSource.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel);
-      const bool is_copy = shader_hashes_Copy.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel);
-      if (is_immediate && (is_bloom_source || shader_hashes_BloomBlur.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel) || is_copy) &&
-          DrawBloomPass(native_device, native_device_context, cmd_list_data, device_data, stages, is_bloom_source, *original_draw_dispatch_func, &updated_cbuffers))
-         return DrawOrDispatchOverrideType::Replaced;
-
-      if (shader_hashes_Grade.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
-      {
-         device_data.has_drawn_main_post_processing = true;
-      }
-      else if (shader_hashes_SSAO.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
-      {
-         game_device_data.depth_srv.reset();
-         native_device_context->PSGetShaderResources(2, 1, game_device_data.depth_srv.put());
-         if (g_gtao_enable && is_immediate && RunXeGTAO(native_device, native_device_context, device_data, *original_draw_dispatch_func))
-            return DrawOrDispatchOverrideType::Replaced;
-      }
-      else if (shader_hashes_DgVoodooPresent.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel))
-      {
-         ComPtr<ID3D11ShaderResourceView> srv;
-         native_device_context->PSGetShaderResources(0, 1, srv.put());
-         if (srv)
-         {
-            ComPtr<ID3D11Resource> source;
-            srv->GetResource(source.put());
-            game_device_data.present_source = uintptr_t(source.get());
-         }
-         bind_luma_cbuffers();
-         ID3D11ShaderResourceView* const scene_srv = (game_device_data.has_copied_scene_to_canvas ? game_device_data.scene_srv.get() : nullptr);
-         native_device_context->PSSetShaderResources(1, 1, &scene_srv);
-         (*original_draw_dispatch_func)();
-         ID3D11ShaderResourceView* const null_srv = nullptr;
-         native_device_context->PSSetShaderResources(1, 1, &null_srv);
-         return DrawOrDispatchOverrideType::Replaced;
-      }
-      else if (is_custom_pass && (is_copy || shader_hashes_Video.Contains(pixel_shader_hash, reshade::api::shader_stage::pixel)))
-      {
-         const bool is_video = !is_copy;
-         // The bloom composite (FUN_0044bc90): the bloom target blended onto the scene, its mode 1 SRCALPHA/INVSRCALPHA or 2
-         // SRCALPHA/ONE (mode 0, opaque, is its copies between levels). The shader scales the source alpha by "Bloom Intensity"
-         // (LumaData.CustomData1 2 when it adds, 3 when it lerps); with Luma Bloom it reads "bloom_texture" (CustomData2 1: a B-spline
-         // magnification).
-         ComPtr<ID3D11BlendState> blend_state;
-         native_device_context->OMGetBlendState(blend_state.put(), nullptr, nullptr);
-         D3D11_BLEND_DESC blend_desc = {};
-         if (blend_state)
-         {
-            blend_state->GetDesc(&blend_desc);
-         }
-         ComPtr<ID3D11ShaderResourceView> source_srv;
-         if (!is_video && game_device_data.bloom_target != 0)
-         {
-            native_device_context->PSGetShaderResources(0, 1, source_srv.put());
-         }
-         ComPtr<ID3D11Resource> source;
-         if (source_srv)
-         {
-            source_srv->GetResource(source.put());
-         }
-         if (source && uint64_t(source.get()) == game_device_data.bloom_target)
-         {
-            const D3D11_RENDER_TARGET_BLEND_DESC& blend = blend_desc.RenderTarget[0];
-            if (blend.BlendEnable && blend.SrcBlend == D3D11_BLEND_SRC_ALPHA && (blend.DestBlend == D3D11_BLEND_ONE || blend.DestBlend == D3D11_BLEND_INV_SRC_ALPHA))
-            {
-               ID3D11ShaderResourceView* const luma_bloom_srv = (g_luma_bloom_enable ? game_device_data.bloom_srv.get() : nullptr);
-               bind_luma_cbuffers((blend.DestBlend == D3D11_BLEND_ONE ? 2 : 3), luma_bloom_srv ? 1 : 0);
-               if (!luma_bloom_srv)
-                  return DrawOrDispatchOverrideType::None;
-               native_device_context->PSSetShaderResources(0, 1, &luma_bloom_srv);
-               (*original_draw_dispatch_func)();
-               ID3D11ShaderResourceView* const game_srv = source_srv.get();
-               native_device_context->PSSetShaderResources(0, 1, &game_srv);
-               return DrawOrDispatchOverrideType::Replaced;
-            }
-         }
-         // ResetRender is the frame's first opaque copy into the canvas (the bloom composite also copies, additively, into the scene)
-         if (!is_video && (game_device_data.has_copied_scene_to_canvas || blend_desc.RenderTarget[0].BlendEnable))
-         {
-            return DrawOrDispatchOverrideType::None;
-         }
-         const ComPtr<ID3D11RenderTargetView> rtv = bound_canvas_rtv();
-         if (!rtv)
-         {
-            return DrawOrDispatchOverrideType::None;
-         }
-         // The movies' AutoHDR goes above 1, which the present blit's clamp must keep
-         return draw_and_snapshot_canvas(rtv.get(), reinterpret_cast<ID3D11Resource*>(uint64_t(game_device_data.canvas)), is_video ? 0 : 1);
-      }
-      // MSAA (4x and up, as Mirror's Edge: 2x gives a coarser edge than the alpha test): the alpha tested materials' draws into the
-      // multisampled scene with their alpha to coverage version, the game's shader put back after. The coverage version keeps the
-      // in place "PatchShaderBytecodeSync" clamp of the float target 0 shaders.
-      else if (g_msaa_resolve_enable && g_msaa_coverage_enable && game_device_data.msaa_active && !is_custom_pass && original_shader_hashes.pixel_shaders[0] != SHADER_HASH_NONE)
-      {
-         // The target first: most draws with MSAA on (the UI, post) aren't multisampled, and need no shader lookup
-         ComPtr<ID3D11RenderTargetView> rtv;
-         native_device_context->OMGetRenderTargets(1, rtv.put(), nullptr);
-         ComPtr<ID3D11Resource> rt;
-         if (rtv)
-         {
-            rtv->GetResource(rt.put());
-         }
-         if (GetTexture2DDesc(rt.get()).SampleDesc.Count >= 4)
-         {
-            if (ID3D11PixelShader* const coverage_shader = SceneMotionVectors::GetPatchedShader<MotionVectorGame, ID3D11PixelShader>(&game_device_data.mv, native_device, device_data, pixel_shader_hash, cmd_list_data.pipeline_state_original_pixel_shader, COVERAGE_PATCH).shader.get())
-            {
-               com_ptr<ID3D11PixelShader> game_shader;
-               native_device_context->PSGetShader(&game_shader, nullptr, nullptr);
-               native_device_context->PSSetShader(coverage_shader, nullptr, 0);
-               (*original_draw_dispatch_func)();
-               native_device_context->PSSetShader(game_shader.get(), nullptr, 0);
-#if DEVELOPMENT
-               game_device_data.aa_stats.msaa_coverage++;
-#endif
-               return DrawOrDispatchOverrideType::Replaced;
-            }
-         }
-      }
-      return DrawOrDispatchOverrideType::None;
+      state.mv_enabled = g_mv;
+      mv_text[0] = 0;
+      state.force_jitter =
+         DevelopmentEnv("D9N_MV_JITTER", mv_text, sizeof(mv_text)) &&
+         mv_text[0] != '0';
    }
 
-   void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
+   // Core's settings KERNEL_720, GTAO, LUMA_BLOOM and HIDE_UI (DEVELOPMENT env,
+   // ini) over the game's
+   void OnCreateDevice() override
    {
-      auto& game_device_data = GetGameDeviceData(device_data);
-      game_device_data.has_copied_scene_to_canvas = false;
-      game_device_data.has_drawn_reset_render = false;
-      const bool msaa_was_active = game_device_data.msaa_active;
-      game_device_data.msaa_active = game_device_data.msaa_resolved.exchange(false);
-      if (game_device_data.msaa_active && !msaa_was_active)
+      if (OfflineHarness())
       {
-         reshade::log::message(reshade::log::level::warning, "[Bayonetta] The game's MSAA is on: DLAA, FSR, XeSS, Luma TAA and SMAA T2x stay off until Anti-Aliasing is off in the game's options");
+         state.kernel_720 = state.luma_bloom = 1;
       }
-#if DEVELOPMENT
-      game_device_data.aa_last_stats = std::exchange(game_device_data.aa_stats, {});
-#endif
-      game_device_data.depth_srv.reset(); // Don't hold the game's view across frames (a resize recreates it)
-      game_device_data.gtao_camera_taken = false;
-      // Turned off or idle (the game's SSAO off), XeGTAO gives its address space back (recreated at its next use)
-      if (game_device_data.gtao_size != uint2{} && (!g_gtao_enable || cb_luma_global_settings.FrameIndex - game_device_data.gtao_frame > IDLE_RELEASE_FRAMES))
+      char text[64] = "";
+      if (ReadSetting("KERNEL_720", text, sizeof(text)))
       {
-         game_device_data.ReleaseGTAOScratch();
+         state.kernel_720 = atoi(text) != 0;
       }
-      else if (game_device_data.gtao_history[0] && cb_luma_global_settings.FrameIndex - game_device_data.gtao_history_frame > IDLE_RELEASE_FRAMES)
+      if (ReadSetting("GTAO", text, sizeof(text)))
       {
-         game_device_data.ReleaseGTAOHistory();
+         state.gtao = atoi(text) != 0;
       }
-
-      // DLSS/FSR/XeSS/Luma TAA: the history restarts after any frame it didn't draw (menus, loading, just picked); the selection and the
-      // motion vector state are fixed here for the next frame (see "sr_active")
-      game_device_data.mv_jitter_allowed = device_data.has_drawn_sr;
-      // Not on a multisampled scene (the motion vector draws refuse it): with MSAA the motion vector path stays off
-      game_device_data.sr_active = LatchSRFrame(device_data) && !game_device_data.msaa_active;
-      // SMAA T2x runs on the upscalers' motion vectors and gives way to an upscaler. Turned off, its frames go, and the motion vectors
-      // go as when no upscaler is picked.
-      game_device_data.t2x_phase = -1;
-      game_device_data.mv_filled = false;
-      const bool t2x_was_active = game_device_data.t2x_active;
-      game_device_data.t2x_active = g_smaa_enable && g_smaa_t2x && !game_device_data.sr_active && !game_device_data.msaa_active;
-      if (t2x_was_active && !game_device_data.t2x_active)
+      if (ReadSetting("LUMA_BLOOM", text, sizeof(text)))
       {
-         game_device_data.ReleaseT2xFrames();
-         device_data.release_sr_resources = true;
+         state.luma_bloom = atoi(text) != 0;
       }
-      if (game_device_data.t2x_frames[0] && cb_luma_global_settings.FrameIndex - game_device_data.t2x_frame > IDLE_RELEASE_FRAMES)
+      if (ReadSetting("HIDE_UI", text, sizeof(text)))
       {
-         game_device_data.ReleaseT2xFrames();
+         state.hide_ui = atoi(text) != 0;
       }
-      const bool mv_was_active = game_device_data.mv.active.exchange((game_device_data.sr_active || game_device_data.t2x_active || g_mv_enable) && !game_device_data.msaa_active);
-      if (game_device_data.mv.active && !mv_was_active)
-      {
-         game_device_data.mv.constants.Restart();
-      }
-      // SMAA turned off or replaced by an upscaler that drew: its ~80 MB of 4K intermediates go
-      if ((!g_smaa_enable || game_device_data.mv_jitter_allowed) && game_device_data.smaa_resources_live)
-      {
-         ReleaseSMAAIntermediates(device_data);
-         game_device_data.smaa_predication_srv.reset();
-         game_device_data.smaa_predication_uav.reset();
-         game_device_data.smaa_predication.reset();
-         game_device_data.smaa_resources_live = false;
-      }
-      // None picked: Core stopped the SR bridge's helper ("ReleaseResources"), our upscaler inputs and output go too. Recreated when an
-      // upscaler is picked again (the helper takes seconds to start).
-      if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false))
-      {
-         game_device_data.sr_output_srv.reset();
-         if (!g_mv_enable && !game_device_data.t2x_active)
-         {
-            const std::unique_lock lock(game_device_data.mv.mutex);
-            game_device_data.mv.ReleaseMotionVectorTargets();
-            // The game's scene, depth, prepass and scene copy (taken again at the next scene), so a resize after None doesn't keep the
-            // old ones alive; and the vc4 copies the object tables and the cameras hold
-            game_device_data.mv.depth.reset();
-            game_device_data.mv.scene_color.reset();
-            game_device_data.mv.scene_rtv.reset();
-            game_device_data.mv_scene_copy.reset();
-            game_device_data.mv_scene_last_copy.reset();
-            game_device_data.mv_scene_copy_rtv.reset();
-            game_device_data.prepass_depth.reset();
-            game_device_data.prepass_depth_srv.reset();
-            game_device_data.mv.scene_size = {};
-            game_device_data.mv.objects.Reset();
-            game_device_data.mv.camera.reset();
-            game_device_data.mv.previous_camera.reset();
-            game_device_data.mv.fill_buffer.reset();
-            game_device_data.mv.jitter_buffer.reset();
-            game_device_data.mv.previous_constants = {}; // Its 4 MiB dynamic ring is address space too
-            game_device_data.mv.constants.ReleasePool();
-         }
-      }
-      game_device_data.mv.constants.TrimPool(game_device_data.mv.active);
-#if DEVELOPMENT
-      game_device_data.mv.stats.constants_pool = uint32_t(game_device_data.mv.constants.pool.size());
-      game_device_data.mv.bound_states.check = g_bound_state_check;
-      game_device_data.mv.stats.bound_state_mismatches += std::exchange(game_device_data.mv.bound_states.mismatches, 0);
-#endif
-      // The reactive masks go once the fill stopped writing them (DLSS, the masks off, SMAA)
-      if (game_device_data.mv.reactive_target && cb_luma_global_settings.FrameIndex - game_device_data.mv.sr_reactive_frame > IDLE_RELEASE_FRAMES)
-      {
-         const std::unique_lock lock(game_device_data.mv.mutex);
-         game_device_data.mv.ReleaseReactiveMasks();
-      }
-      // A scene no post pass ended ends here: its jitter must not reach the next frame's draws before its first mesh
-      game_device_data.mv.scene_open = false;
-      game_device_data.mv.scene_done = false;
-      game_device_data.mv.frame_ended = true;
-      game_device_data.mv.fill_pending = false;
-      game_device_data.open_refused_rtv = nullptr;
-      game_device_data.open_refused_dsv = nullptr;
-      // -1 at native resolution once the upscaler draws, 0 with XeSS (Core biases the game's samplers at bias 0, the trilinear ones
-      // upgraded to AF16x, see "DllMain"); none while the bridge's helper starts (SMAA on the unjittered scene)
-      SetTextureMipLodBias(nullptr, device_data, ((game_device_data.sr_active && game_device_data.mv_jitter_allowed) ? SR::GetMipLODBias(device_data.sr_type, device_data.output_resolution.y, device_data.output_resolution.y) : 0.f));
-#if DEVELOPMENT
-      game_device_data.mv.last_stats = std::exchange(game_device_data.mv.stats, {});
-      // "MV Debug View": Core's debug draw of the target, absolute values in pixels
-      {
-         const std::shared_lock lock(game_device_data.mv.mutex);
-         if (g_mv_debug_view && game_device_data.mv.texture)
-         {
-            D3D11_TEXTURE2D_DESC desc = {};
-            game_device_data.mv.texture->GetDesc(&desc);
-            debug_draw_auto_clear_texture = false;
-            debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::Abs | (uint32_t)DebugDrawTextureOptionsMask::UVToPixelSpace;
-            device_data.debug_draw_texture = game_device_data.mv.texture.get();
-            device_data.debug_draw_texture_format = desc.Format;
-            device_data.debug_draw_texture_size = {desc.Width, desc.Height, 1, 1};
-         }
-         else if (g_sr_reactive_debug_view && game_device_data.mv.reactive)
-         {
-            debug_draw_auto_clear_texture = false;
-            debug_draw_options |= (uint32_t)DebugDrawTextureOptionsMask::RedOnly;
-            debug_draw_options &= ~((uint32_t)DebugDrawTextureOptionsMask::Abs | (uint32_t)DebugDrawTextureOptionsMask::UVToPixelSpace);
-            device_data.debug_draw_texture = game_device_data.mv.reactive.get();
-            device_data.debug_draw_texture_format = DXGI_FORMAT_R8_UNORM;
-            device_data.debug_draw_texture_size = {game_device_data.mv.scene_size.x, game_device_data.mv.scene_size.y, 1, 1};
-         }
-         else if (device_data.debug_draw_texture && (device_data.debug_draw_texture.get() == game_device_data.mv.texture.get() || device_data.debug_draw_texture.get() == game_device_data.mv.reactive.get()))
-         {
-            device_data.debug_draw_texture = nullptr;
-         }
-      }
-#endif
    }
 
-   void LoadConfigs() override
+   // The largest 16:9 rectangle inside the back buffer (Bayonetta renders a
+   // 16:9 cut of its back buffer).
+   void GetRenderSize(uint32_t bb_width, uint32_t bb_height, uint32_t* width,
+      uint32_t* height) override
    {
-      reshade::get_config_value(nullptr, NAME, "MSAAResolveEnable", g_msaa_resolve_enable);
-      reshade::get_config_value(nullptr, NAME, "SMAAEnable", g_smaa_enable);
-      reshade::get_config_value(nullptr, NAME, "SMAAT2x", g_smaa_t2x);
-#if DEVELOPMENT // Development settings only (see "DrawImGuiSettings"): a saved "off" must not outlive its control
-      reshade::get_config_value(nullptr, NAME, "SMAAPredication", g_smaa_predication);
-      reshade::get_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
-#endif
-      reshade::get_config_value(nullptr, NAME, "RCASSharpness", g_rcas_sharpness);
-      reshade::get_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
-      reshade::get_config_value(nullptr, NAME, "GTVBAOEnable", g_gtvbao_enable);
-      reshade::get_config_value(nullptr, NAME, "FixHighResolutionEffects", g_resolution_scaled_effects);
-      reshade::get_config_value(nullptr, NAME, "FixFramePacing", g_fix_frame_pacing);
-      reshade::get_config_value(nullptr, NAME, "60FPSCutscenes", g_60_fps_cutscenes);
-      reshade::get_config_value(nullptr, NAME, "LumaBloomEnable", g_luma_bloom_enable);
-      reshade::get_config_value(nullptr, NAME, "HighResolutionShadows", g_high_resolution_shadows);
-      ShadowMap::Apply();
-      reshade::get_config_value(nullptr, NAME, "Dithering", cb_luma_global_settings.GameSettings.Dithering);
-      reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
-      reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", cb_luma_global_settings.GameSettings.VideoAutoHDRBoost);
-      reshade::get_config_value(nullptr, NAME, "Exposure", cb_luma_global_settings.GameSettings.Exposure);
-      reshade::get_config_value(nullptr, NAME, "Contrast", cb_luma_global_settings.GameSettings.Contrast);
-      reshade::get_config_value(nullptr, NAME, "Saturation", cb_luma_global_settings.GameSettings.Saturation);
-      reshade::get_config_value(nullptr, NAME, "HighlightsDesaturation", cb_luma_global_settings.GameSettings.HighlightsDesaturation);
-      reshade::get_config_value(nullptr, NAME, "ColorGradingIntensity", cb_luma_global_settings.GameSettings.ColorGradingIntensity);
-      reshade::get_config_value(nullptr, NAME, "BloomIntensity", cb_luma_global_settings.GameSettings.BloomIntensity);
+      *height = std::min<UINT>(bb_height, bb_width * 9 / 16);
+      *width = std::min<UINT>(bb_width, bb_height * 16 / 9);
+      if (*width * 9 > *height * 16)
+      {
+         *width = *height * 16 / 9;
+      }
+      else
+      {
+         *height = *width * 9 / 16;
+      }
    }
 
-   void DrawImGuiSettings(DeviceData& device_data) override
+   void OnInitPipeline(device* device, uint32_t count,
+      const pipeline_subobject* subobjects,
+      pipeline pipeline) override
    {
+      if (g_mv)
+      {
+         MvInitPipeline(device, count, subobjects, pipeline);
+      }
+   }
+
+   void OnDestroyPipeline(uint64_t pipeline) override
+   {
+      if (g_mv)
+      {
+         MvDestroyPipeline(pipeline);
+      }
+   }
+
+   void OnBindPipeline(pipeline_stage stages, pipeline pipeline) override
+   {
+      if (!g_mv)
+      {
+         return;
+      }
+      // The game's own bind replaces whatever patched shader we put on the
+      // device
+      if ((stages & pipeline_stage::vertex_shader) != 0)
+      {
+         mv.game_vs = pipeline.handle;
+         mv.applied_vs = false;
+      }
+      if ((stages & pipeline_stage::pixel_shader) != 0)
+      {
+         mv.game_ps = pipeline.handle;
+         mv.applied_ps = false;
+      }
+   }
+
+   void OnBindRenderTargets(device* device, uint32_t count,
+      const resource_view* rtvs,
+      resource_view depth_stencil) override
+   {
+      if (g_mv)
+      {
+         MvOnBindRenderTargets(device, count, rtvs, depth_stencil);
+      }
+      // Its RT0 (and the viewport D3D9 resets with it) replaces ours
+      bloom.restore_rt0 = bloom.restore_viewport = false;
+   }
+
+   void OnBindPixelTextures(uint32_t first, uint32_t count) override
+   {
+      if (first == 0 && count > 0)
+      {
+         bloom.restore_s0 = false;
+      }
+   }
+
+   // The vertex constants (MV's previous constants) and the shadow of the
+   // game's c194, which the kernel draws overwrite.
+   void OnPushConstants(shader_stage stages, uint32_t layout_param,
+      uint32_t first, uint32_t count,
+      const void* values) override
+   {
+      if (g_mv && stages == shader_stage::vertex && layout_param == 2 &&
+          first + count <= MV_VS_CONSTANTS * 4)
+      {
+         memcpy(mv.vs_const + first, values, count * sizeof(float));
+      }
+      constexpr uint32_t c194_first = GAME_TARGET_SIZE_REGISTER * 4;
+      if (stages != shader_stage::pixel || layout_param != 5 ||
+          first + count <= c194_first || first >= c194_first + 4)
+      {
+         return;
+      }
+      for (uint32_t i = std::max(first, c194_first);
+         i < std::min(first + count, c194_first + 4); ++i)
+      {
+         state.game_c194[i - c194_first] =
+            static_cast<const float*>(values)[i - first];
+      }
+      bay.c194_overridden = false; // the game's value is on the device again
+   }
+
+   void OnDrawBegin(device* device, uint32_t count, uint32_t first,
+      int32_t vertex_offset) override
+   {
+      BloomRestore(NativeOf(device));
+      if (g_mv)
+      {
+         MvOnDraw(device, count, first, vertex_offset);
+      }
+   }
+
+   // c210.xy s0 size, c211.zw s0 texels per RT0 pixel, c212.xy kernel target
+   // size, c213.xy s14 size.
+   void OnInjectConstants(device* device, float* rows) override
+   {
+      if (Mutated(MUT_NO_HOST_CONSTS))
+      {
+         return;
+      }
+      float rt0_width = 0, rt0_height = 0;
+      Rt0Size(&rt0_width, &rt0_height);
+      float* const c210 = rows + 4 * (210 - INJECT_BASE_REGISTER);
+      float *const c211 = c210 + 4, *const c212 = c210 + 8,
+                   *const c213 = c210 + 12;
+      TextureSize(device, out.ps_textures[0], c210);
+      if (out.ps_textures[0] && rt0_width > 0 && rt0_height > 0)
+      {
+         c211[2] = c210[0] / rt0_width; // source texels per target pixel (what
+                                        // BloomSource's ddx/ddy gave)
+         c211[3] = c210[1] / rt0_height;
+      }
+      memcpy(c212, KernelSize().data(), sizeof(float) * 2);
+      TextureSize(device, out.ps_textures[SHADOW_MAP_SAMPLER], c213);
+      ++state.host_rows_draws;
+   }
+
+   // Luma Bloom's rows, the kernels' c194, XeGTAO in place of the SSAO draw,
+   // HideUI.
+   bool OnDraw(command_list* cmd_list) override
+   {
+      device* device = cmd_list->get_device();
+      if (float rows[3][4] = {}; BloomDraw(device, rows))
+      {
+         cmd_list->push_constants(shader_stage::pixel, pipeline_layout{0}, 5,
+            (state.inject_base + 1) * 4, 12, rows);
+      }
+      // Fix High Resolution Effects for the unreplaced kernels (route C): their
+      // c194 is the kernel size for this draw only.
+      if (!Mutated(MUT_NO_HOST_CONSTS) && state.kernel_720 &&
+          bay.kernel_crcs.contains(out.bound_ps_crc))
+      {
+         cmd_list->push_constants(shader_stage::pixel, pipeline_layout{0}, 5,
+            GAME_TARGET_SIZE_REGISTER * 4, 4,
+            KernelSize().data());
+         bay.c194_overridden = true;
+         ++state.kernel_pushes;
+      }
+      else if (bay.c194_overridden && !Mutated(MUT_NO_KERNEL_RESTORE))
+      {
+         cmd_list->push_constants(shader_stage::pixel, pipeline_layout{0}, 5,
+            GAME_TARGET_SIZE_REGISTER * 4, 4,
+            state.game_c194);
+         bay.c194_overridden = false;
+         ++state.kernel_restores;
+      }
+      if (bay.ssao_crcs.contains(out.bound_ps_crc) && out.ps_textures[2])
+      {
+         bay.depth_texture = out.ps_textures[2];
+         bay.depth_present = state.presents;
+         if (state.gtao)
+         {
+            if (RunGtao(device))
+            {
+               return true;
+            }
+            ++state.gtao_fallbacks;
+         }
+      }
+      // HideUI: every draw into the canvas after this frame's ResetRender is the
+      // UI, except the movies
+      if (state.hide_ui && !Mutated(MUT_NO_HIDE_UI) && out.rt0_is_back_buffer &&
+          Redirecting() && out.last_reset_render == state.presents &&
+          !out.video_crcs.contains(out.bound_ps_crc))
+      {
+         ++state.hidden_ui_draws;
+         return true;
+      }
+      return false;
+   }
+
+   // A clear with our RT1 still bound would wipe the motion target too.
+   void OnClear(IDirect3DDevice9* native) override
+   {
+      if (g_mv)
+      {
+         MvRestoreGame(native);
+      }
+      BloomRestore(native);
+   }
+
+   void OnCopyTextureRegion(device* device, resource source,
+      resource destination,
+      const subresource_box* source_box,
+      const subresource_box* destination_box) override
+   {
+      BloomRestore(NativeOf(device));
+      BloomMirrorCopy(device, source, destination, source_box, destination_box);
+      if (g_mv && mv.open && !mv.ended && mv.scene_resource.handle &&
+          source.handle == mv.scene_resource.handle)
+      {
+         mv.copy_dest =
+            destination; // the game's copy of the scene (post pass input)
+      }
+   }
+
+   void OnDestroyResource(uint64_t resource) override
+   {
+      if (g_mv && mv.copy_dest.handle == resource)
+      {
+         mv.copy_dest = {0};
+      }
+      if (resource == bloom.target)
+      {
+         bloom.target = 0;
+      }
+      if (const auto shadow = std::ranges::find(bloom.shadows, resource,
+             &BloomShadow::game_texture);
+         shadow != bloom.shadows.end())
+      {
+         Free(&shadow->texture);
+         bloom.shadows.erase(shadow);
+      }
+      if (bay.depth_texture == resource)
+      {
+         bay.depth_texture = 0;
+      }
+   }
+
+   void OnRunPasses(device* device, const D3DSURFACE_DESC& desc,
+      D3D9Passes::Params* params) override
+   {
+      params->predication =
+         params->smaa && state.smaa_predication && CopyDepth(device);
+      params->predication_tolerance = g_smaa_pred_tolerance;
+      // T2x on this frame's motion vectors (filled at the scene's end, so
+      // ordered before the D3D9 signal too); Bayonetta's DrawSMAAOnCanvas: off
+      // under SR
+      params->t2x = params->smaa && state.smaa_t2x && !sr.ready &&
+                    !state.luma_taa && mv.filled && mv.kmt[0] &&
+                    mv.tex_w == desc.Width && mv.tex_h == desc.Height;
+      if (params->t2x && g_pass.motion != mv.kmt[0])
+      {
+         params->t2x = D3D9Passes::SetMotion(mv.kmt[0]);
+         g_pass.motion = params->t2x ? mv.kmt[0] : nullptr;
+      }
+      params->t2x_history = mv.t2x_ran_last && !Mutated(MUT_NO_T2X_HISTORY);
+      params->t2x_current = int(mv.frame_index & 1);
+      params->t2x_phase = mv.t2x_phase;
+   }
+
+   void OnPassesRan(const D3D9Passes::Params& params) override
+   {
+      mv.t2x_ran = params.t2x;
+   }
+
+   void OnStartUpscaler(device* device) override
+   {
+      StartUpscaler(device);
+   }
+
+   bool UpscaledLastFrame() const override
+   {
+      return mv.sr_ran_last;
+   }
+
+   // Its shared textures and previous bones go before a Reset
+   void OnDestroyShared(device* device) override
+   {
+      if (g_mv)
+      {
+         MvDestroy(device);
+      }
+   }
+
+   void OnDestroySwapchain(device* device, bool resize) override
+   {
+      BloomRestore(NativeOf(device));
+      BloomRelease();
+      bloom.target = 0;
+      if (g_mv && !resize)
+      {
+         // ReShade's D3D9 runtime fires no destroy_pipeline for the game's
+         // shaders: the patched copies go with the device
+         while (!mv.shaders.empty())
+         {
+            MvReleaseShader(mv.shaders.begin()->first);
+         }
+      }
+   }
+
+   void OnPresent(device* device) override
+   {
+      BloomRestore(NativeOf(device));
+      if (!OfflineHarness())
+      {
+         UpdateLumaRows();
+      }
+      if (g_mv && g_bound)
+      {
+         MvOnPresent(device);
+      }
+   }
+
+   void DrawImGuiSettings() override
+   {
+      bool changed = false;
       ImGui::SeparatorText("Anti-Aliasing");
-      const auto& gd = GetGameDeviceData(device_data);
-      if (gd.msaa_active)
+      if (state.msaa_active)
       {
-         ImGui::TextColored(ImVec4(1.f, 0.8f, 0.f, 1.f), "MSAA is on: DLAA, FSR, XeSS, Luma TAA and SMAA T2x need Anti-Aliasing off in the game's options.");
+         ImGui::TextColored(ImVec4(1.f, 0.8f, 0.f, 1.f),
+            "MSAA is on: DLAA, FSR, XeSS, Luma TAA and SMAA T2x "
+            "need Anti-Aliasing off in the game's options.");
       }
-      // The HDR-weighted resolve and alpha to coverage: both act only with the game's MSAA on (Saints Row's merged toggle)
-      ImGui::BeginDisabled(!gd.msaa_active);
-      DrawSettingCheckbox("Luma MSAA Enable", "MSAAResolveEnable", &g_msaa_resolve_enable, true, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, foliage and fences; requires Anti-Aliasing enabled in the game's options; not used with DLSS/FSR/XeSS or Luma TAA).", !gd.msaa_active);
-      ImGui::EndDisabled();
-      // The upscaler (Super Resolution, in the Settings tab) replaces SMAA: greyed, its value kept. Not with MSAA ("sr_active"): SMAA
-      // runs then.
-      ImGui::BeginDisabled(gd.sr_active);
-      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own MSAA (or alone with it off; not used with DLSS/FSR/XeSS or Luma TAA).", gd.sr_active);
+      // The upscalers (Core's SR / LUMA_TAA settings) replace SMAA: greyed, its
+      // value kept. Not with MSAA: SMAA runs then.
+      const bool sr_active =
+         (g_sr_upscaler >= 0 || state.luma_taa) && !state.msaa_active;
+      ImGui::BeginDisabled(sr_active);
+      changed |= DrawSettingCheckbox(
+         "SMAA Enable", "SMAAEnable", &g_smaa_enable, true,
+         "Adds SMAA anti-aliasing on top of the game's own MSAA (or alone with it "
+         "off; not used with DLSS/FSR/XeSS or Luma TAA).",
+         sr_active);
       ImGui::EndDisabled();
       // T2x needs the motion vectors, which a multisampled scene doesn't get
-      const bool t2x_unavailable = gd.sr_active || gd.msaa_active;
+      const bool t2x_unavailable = sr_active || state.msaa_active;
       ImGui::BeginDisabled(!g_smaa_enable || t2x_unavailable);
-      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS/FSR/XeSS, Luma TAA or the game's MSAA (Anti-Aliasing in the game's options).", t2x_unavailable);
+      changed |= DrawSettingCheckbox(
+         "SMAA T2x", "SMAAT2x", &g_smaa_t2x, false,
+         "Smoother edges and less shimmering, by blending each frame with the "
+         "previous one.\nCan look slightly softer in motion. Not used with "
+         "DLSS/FSR/XeSS, Luma TAA or the game's MSAA (Anti-Aliasing in the game's "
+         "options).",
+         t2x_unavailable);
       ImGui::EndDisabled();
 #if DEVELOPMENT
-      // Predication only relaxes the edge threshold back to ULTRA's on geometry, never below: off is strictly worse (MoH 2010, ME1)
+      // Predication only relaxes the edge threshold back to ULTRA's on geometry,
+      // never below: off is strictly worse (MoH 2010, ME1)
       if (g_smaa_enable)
       {
-         DrawSettingCheckbox("SMAA Predication", "SMAAPredication", &g_smaa_predication, true, "Edges from the depth prepass' geometry (needs SSAO on in the game's options).");
+         changed |= DrawSettingCheckbox("SMAA Predication", "SMAAPredication",
+            &g_smaa_predication, true,
+            "Edges from the depth prepass' geometry "
+            "(needs SSAO on in the game's options).");
          ImGui::BeginDisabled(!g_smaa_predication);
-         DrawSettingSlider("SMAA Predication Tolerance", "SMAAPredicationTolerance", &g_smaa_pred_tolerance, 0.02f, 0.002f, 0.2f, "Deviation from the local depth plane that counts as an edge, as a fraction of view depth. Lower = more edges.", "%.3f", ImGuiSliderFlags_Logarithmic);
+         DrawSettingSlider("SMAA Predication Tolerance", "SMAAPredicationTolerance",
+            &g_smaa_pred_tolerance, 0.02f, 0.002f, 0.2f,
+            "Deviation from the local depth plane that counts as an "
+            "edge, as a fraction of view depth. Lower = more edges.",
+            "%.3f", ImGuiSliderFlags_Logarithmic);
          ImGui::EndDisabled();
-         ImGui::Checkbox("SMAA Predication Debug View", &g_smaa_pred_debug);
-         if (ImGui::IsItemHovered())
-         {
-            ImGui::SetTooltip("Show the predication mask (red) instead of the frame.\nWant: black on flat surfaces, red across silhouettes.");
-         }
       }
 #endif
-      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening applied on top of anti-aliasing (0 = off).");
+      changed |= DrawSettingSlider(
+         "RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f,
+         "Sharpening applied on top of anti-aliasing (0 = off).");
 
-      auto& gs = cb_luma_global_settings.GameSettings;
+      CB::LumaGameSettings& settings = cb_luma_global_settings.GameSettings;
       ImGui::SeparatorText("Grade");
-      // Read in Grade_0x719339A9.ps_5_0.hlsl and GradeLuma_0xB7A08D4A.ps_5_0.hlsl
-      DrawSettingSlider("Exposure", "Exposure", &gs.Exposure, default_luma_global_game_settings.Exposure, 0.f, 2.f, "Overall image brightness (1 = vanilla).");
-      // Read in Copy_0x91A6C437.ps_5_0.hlsl
-      DrawSettingSlider("Contrast", "Contrast", &gs.Contrast, default_luma_global_game_settings.Contrast, 0.f, 2.f, "Overall image contrast, HDR only (1 = vanilla).");
-      DrawSettingSlider("Saturation", "Saturation", &gs.Saturation, default_luma_global_game_settings.Saturation, 0.f, 2.f, "Color saturation, HDR only (1 = vanilla).");
-      DrawSettingSlider("Highlights Desaturation", "HighlightsDesaturation", &gs.HighlightsDesaturation, default_luma_global_game_settings.HighlightsDesaturation, 0.f, 1.f, "How far the brightest sources fade to neutral white, HDR only (0 = keep color at any brightness).");
-      // Read in Grade_0x719339A9.ps_5_0.hlsl and GradeLuma_0xB7A08D4A.ps_5_0.hlsl
-      DrawSettingSlider("Color Grading Intensity", "ColorGradingIntensity", &gs.ColorGradingIntensity, default_luma_global_game_settings.ColorGradingIntensity, 0.f, 1.f, "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
+      // c208.x in Grade_* and CentreAverage_*
+      DrawSettingSlider("Exposure", "Exposure", &settings.Exposure,
+         DEFAULT_GAME_SETTINGS.Exposure, 0.f, 2.f,
+         "Overall image brightness (1 = vanilla).");
+      // The display map (Luma_Bayonetta_DisplayMap.hlsl)
+      changed |=
+         DrawSettingSlider("Contrast", "Contrast", &settings.Contrast,
+            DEFAULT_GAME_SETTINGS.Contrast, 0.f, 2.f,
+            "Overall image contrast, HDR only (1 = vanilla).");
+      changed |= DrawSettingSlider("Saturation", "Saturation", &settings.Saturation,
+         DEFAULT_GAME_SETTINGS.Saturation, 0.f, 2.f,
+         "Color saturation, HDR only (1 = vanilla).");
+      changed |=
+         DrawSettingSlider("Highlights Desaturation", "HighlightsDesaturation",
+            &settings.HighlightsDesaturation,
+            DEFAULT_GAME_SETTINGS.HighlightsDesaturation, 0.f, 1.f,
+            "How far the brightest sources fade to neutral white, "
+            "HDR only (0 = keep color at any brightness).");
 
       ImGui::SeparatorText("Bloom");
-      DrawSettingCheckbox("Luma Bloom Enable", "LumaBloomEnable", &g_luma_bloom_enable, true, "Replaces the game's bloom with a higher resolution one (the same look, without its blocky, flickering glow).");
-      // Read in Copy_0x91A6C437.ps_5_0.hlsl on the bloom composite
-      DrawSettingSlider("Bloom Intensity", "BloomIntensity", &gs.BloomIntensity, default_luma_global_game_settings.BloomIntensity, 0.f, 2.f, "Bloom strength (1 = vanilla, 0 = none).");
+      changed |= DrawSettingCheckbox(
+         "Luma Bloom Enable", "LumaBloomEnable", &g_luma_bloom_enable, true,
+         "Replaces the game's bloom with a higher resolution one (the same look, "
+         "without its blocky, flickering glow).");
+      // c209.z on the bloom composite (Copy_0xB8690130)
+      DrawSettingSlider("Bloom Intensity", "BloomIntensity",
+         &settings.BloomIntensity,
+         DEFAULT_GAME_SETTINGS.BloomIntensity, 0.f, 2.f,
+         "Bloom strength (1 = vanilla, 0 = none).");
 
       ImGui::SeparatorText("Ambient Occlusion");
-      DrawSettingCheckbox("XeGTAO Enable", "GTAOEnable", &g_gtao_enable, true, "Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient occlusion; requires SSAO enabled in the game's options).");
-      DrawSettingCheckbox("GT-VBAO Enable", "GTVBAOEnable", &g_gtvbao_enable, false, "Replaces XeGTAO's occlusion with GT-VBAO (less dark halo around thin objects). Needs XeGTAO Enable.", !g_gtao_enable, false);
+      changed |= DrawSettingCheckbox(
+         "XeGTAO Enable", "GTAOEnable", &g_gtao_enable, true,
+         "Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient "
+         "occlusion; requires SSAO enabled in the game's options).");
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
-      ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.1f, 4.5f, "%.2f");
+      ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.1f,
+         4.5f, "%.2f");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("XeGTAO's darkness dial (higher = darker AO).");
       }
-      ImGui::SliderFloat("GT-VBAO Final Value Power", &g_gtvbao_final_value_power, 0.1f, 4.5f, "%.2f");
+      ImGui::SliderFloat("GTAO Depth Scale", &g_gtao_depth_scale, 0.01f, 200.f,
+         "%.2f", ImGuiSliderFlags_Logarithmic);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
-         ImGui::SetTooltip("GT-VBAO's darkness dial (higher = darker AO).");
+         ImGui::SetTooltip("View depth divisor (game units -> meters): the scale "
+                           "XeGTAO's radius and falloff are tuned for.");
       }
-      ImGui::SliderFloat("GTAO Depth Scale", &g_gtao_depth_scale, 0.01f, 200.f, "%.2f", ImGuiSliderFlags_Logarithmic);
+      ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f,
+         "%.3f");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
-         ImGui::SetTooltip("View depth divisor (game units -> meters): the scale XeGTAO's radius and falloff are tuned for.");
+         ImGui::SetTooltip("0 = the shader's EFFECT_RADIUS; > 0 overrides it (view "
+                           "units after the depth scale).");
       }
-      ImGui::SliderFloat("GTAO Radius Override", &g_gtao_radius_override, 0.f, 5.f, "%.3f");
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      {
-         ImGui::SetTooltip("0 = the shader's EFFECT_RADIUS; > 0 overrides it (view units after the depth scale).");
-      }
-#if DEVELOPMENT // The shader's debug blocks are DEVELOPMENT only
-      ImGui::Combo("GTAO Debug View", &g_gtao_debug_view, "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      {
-         ImGui::SetTooltip("Shows XeGTAO's diagnostics instead of the scene. Depth gradient dead or flat, or blocky normals = a wrong input; AO x8 = broad over-occlusion.");
-      }
-#endif
       ImGui::EndDisabled();
 #endif
 
       ImGui::SeparatorText("Effects");
-      // Read in Video_0xC60649FD.ps_5_0.hlsl. Inert in SDR: peak == paper white makes PumboAutoHDR an identity.
-      DrawSettingCheckbox("Video AutoHDR", "VideoAutoHDREnable", &gs.VideoAutoHDREnable, default_luma_global_game_settings.VideoAutoHDREnable, "Adds HDR highlights to pre-rendered videos (HDR only).");
-
-      ImGui::BeginDisabled(gs.VideoAutoHDREnable <= 0.5f);
-      DrawSettingSlider("Video HDR Boost", "VideoAutoHDRBoost", &gs.VideoAutoHDRBoost, default_luma_global_game_settings.VideoAutoHDRBoost, 0.f, 1.f, "Video highlight strength (0 = off).");
+      // c214 in Video_0x831047DD. Inert in SDR (see "UpdateLumaRows").
+      DrawSettingCheckbox("Video AutoHDR", "VideoAutoHDREnable",
+         &settings.VideoAutoHDREnable,
+         DEFAULT_GAME_SETTINGS.VideoAutoHDREnable,
+         "Adds HDR highlights to pre-rendered videos (HDR only).");
+      ImGui::BeginDisabled(settings.VideoAutoHDREnable <= 0.5f);
+      DrawSettingSlider("Video HDR Boost", "VideoAutoHDRBoost",
+         &settings.VideoAutoHDRBoost,
+         DEFAULT_GAME_SETTINGS.VideoAutoHDRBoost, 0.f, 1.f,
+         "Video highlight strength (0 = off).");
       ImGui::EndDisabled();
-
-      DrawSettingCheckbox("Dithering", "Dithering", &gs.Dithering, default_luma_global_game_settings.Dithering, "Reduces gradient banding.");
-
+      changed |= DrawSettingCheckbox("Dithering", "Dithering", &settings.Dithering,
+         DEFAULT_GAME_SETTINGS.Dithering,
+         "Reduces gradient banding.");
       // On the Steam executable only ("ShadowMap::Install")
-      if (DrawSettingCheckbox("High Resolution Shadows", "HighResolutionShadows", &g_high_resolution_shadows, true,
-             "Sharper, steadier shadow outlines at the game's highest shadow quality. Applies with the next level load or options change.",
-             !ShadowMap::patchable))
-      {
-         ShadowMap::Apply();
-      }
+      changed |= DrawSettingCheckbox(
+         "High Resolution Shadows", "HighResolutionShadows",
+         &g_high_resolution_shadows, true,
+         "Sharper, steadier shadow outlines at the game's highest shadow quality. "
+         "Applies with the next level load or options change.",
+         !ShadowMap::patchable);
 
       ImGui::SeparatorText("UI");
-      ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui);
+      changed |= ImGui::Checkbox("Hide Gameplay UI", &g_hide_ui);
       if (ImGui::IsItemHovered())
       {
          ImGui::SetTooltip("Disables the in-game UI.");
       }
 
       ImGui::SeparatorText("Fixes");
-      DrawSettingCheckbox("Fix High Resolution Effects", "FixHighResolutionEffects", &g_resolution_scaled_effects, true,
-         "Keeps shadow softness, depth of field and SSAO the size they had at 1280x720, the resolution the game was made for.");
+      changed |= DrawSettingCheckbox(
+         "Fix High Resolution Effects", "FixHighResolutionEffects",
+         &g_resolution_scaled_effects, true,
+         "Keeps shadow softness, depth of field and SSAO the size they had at "
+         "1280x720, the resolution the game was made for.");
       // Only the Steam executable's limiters are hooked ("FrameLimiter::Install")
       ImGui::BeginDisabled(!FrameLimiter::installed);
-      DrawSettingCheckbox("Fix Frame Pacing", "FixFramePacing", &g_fix_frame_pacing, true,
-         "Replaces the game's frame limiter with a precise one. Turn off an external frame rate limit with it.", !FrameLimiter::installed);
+      DrawSettingCheckbox("Fix Frame Pacing", "FixFramePacing", &g_fix_frame_pacing,
+         true,
+         "Replaces the game's frame limiter with a precise one. "
+         "Turn off an external frame rate limit with it.",
+         !FrameLimiter::installed);
       ImGui::EndDisabled();
-      // Patched from the limiter hooks, on the Steam executable only ("FrameLimiter::Apply60FpsCutscenes")
+      // Patched from the limiter hooks, on the Steam executable only
+      // ("FrameLimiter::Apply60FpsCutscenes")
       ImGui::BeginDisabled(!FrameLimiter::cutscenes_patchable);
-      DrawSettingCheckbox("60 FPS Cutscenes", "60FPSCutscenes", &g_60_fps_cutscenes, true,
-         "Draws the real-time cutscenes at 60 fps instead of 30.", !FrameLimiter::cutscenes_patchable);
+      DrawSettingCheckbox("60 FPS Cutscenes", "60FPSCutscenes", &g_60_fps_cutscenes,
+         true,
+         "Draws the real-time cutscenes at 60 fps instead of 30.",
+         !FrameLimiter::cutscenes_patchable);
       ImGui::EndDisabled();
 #if DEVELOPMENT
-      ImGui::Text("Frame limiter: period %u us, spin margin %u us, late %u, resyncs %u, adopted %u", FrameLimiter::period_us, FrameLimiter::spin_margin_us, FrameLimiter::late_frames, FrameLimiter::resyncs, FrameLimiter::adopted_deadlines);
-
-      ImGui::SeparatorText("Motion Vectors (DLSS/FSR/XeSS/Luma TAA)");
-      ImGui::Checkbox("MV Enable", &g_mv_enable);
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("Draws the scene with the motion vector shaders without an upscaler. The image must not change; the debug view is\nblack with a static camera and lights up only what moves. Not saved.");
-      }
-      ImGui::Checkbox("MV Debug View", &g_mv_debug_view);
-      ImGui::Checkbox("MV Force Jitter", &g_mv_force_jitter);
-      ImGui::Checkbox("Reactive Mask", &g_sr_reactive_enable);
-      ImGui::Checkbox("Reactive Mask Debug View", &g_sr_reactive_debug_view);
+      ImGui::Text("Frame limiter: period %u us, spin margin %u us, late %u, "
+                  "resyncs %u, adopted %u",
+         FrameLimiter::period_us, FrameLimiter::spin_margin_us,
+         FrameLimiter::late_frames, FrameLimiter::resyncs,
+         FrameLimiter::adopted_deadlines);
 #endif
+      if (changed)
+      {
+         ApplySettings();
+      }
    }
 
    void PrintImGuiAbout() override
    {
       ImGui::PushTextWrapPos(0.f);
-      ImGui::Text(
-         "Luma for \"Bayonetta\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR, DLAA, FSR 3 or XeSS native anti-aliasing or Luma TAA, SMAA (with T2x) and an HDR-aware MSAA with alpha to coverage, and replaces the game's bloom with a higher resolution one and its SSAO with XeGTAO or GT-VBAO, plus higher resolution shadows, even frame pacing and 60 fps cutscenes.\n"
-         "It runs through dgVoodoo2 (DirectX 9 -> 11).\n"
-         "Enable SSAO in the game's options for XeGTAO to apply; SMAA works either way.\n"
-         "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
-         "Thanks to the Luma team and contributors.\n"
-         "If you enjoy it, consider donating.");
+      ImGui::Text("Luma for \"Bayonetta\" is developed by DristoforColumb and is "
+                  "open source and free.\n"
+                  "It adds HDR, DLAA, FSR 3 or XeSS native anti-aliasing or Luma "
+                  "TAA and SMAA (with T2x), and replaces the game's bloom with a "
+                  "higher resolution one and its SSAO with XeGTAO, plus higher "
+                  "resolution shadows, even frame pacing and 60 fps cutscenes.\n"
+                  "It runs on the game's own DirectX 9 device and presents through "
+                  "DirectX 12.\n"
+                  "Enable SSAO in the game's options for XeGTAO to apply; SMAA "
+                  "works either way.\n"
+                  "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
+                  "Thanks to the Luma team and contributors.\n"
+                  "If you enjoy it, consider donating.");
       ImGui::PopTextWrapPos();
 
       ImGui::NewLine();
       ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(70, 134, 0, 255));
-      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(70 + 9, 134 + 9, 0, 255));
-      ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(70 + 18, 134 + 18, 0, 255));
-      static const std::string donation_link = std::string("Buy DristoforColumb a Coffee on ko-fi ") + std::string(ICON_FK_OK);
-      if (ImGui::Button(donation_link.c_str()))
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+         IM_COL32(70 + 9, 134 + 9, 0, 255));
+      ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+         IM_COL32(70 + 18, 134 + 18, 0, 255));
+      if (ImGui::Button("Buy DristoforColumb a Coffee on ko-fi"))
       {
-         ShellExecuteA(nullptr, "open", "https://ko-fi.com/dristoforcolumb", nullptr, nullptr, SW_SHOWNORMAL);
+         ShellExecuteA(nullptr, "open", "https://ko-fi.com/dristoforcolumb", nullptr,
+            nullptr, SW_SHOWNORMAL);
       }
       ImGui::PopStyleColor(3);
 
       ImGui::NewLine();
-      static const std::string social_link = std::string("Join our \"HDR Den\" Discord ") + std::string(ICON_FK_SEARCH);
-      if (ImGui::Button(social_link.c_str()))
+      if (ImGui::Button("Join our \"HDR Den\" Discord"))
       {
-         // Unique link for Luma's HDR Den (tracks the origin of people joining); do not share for other purposes.
-         static const std::string discord_link = std::string("https://discord.gg/J9fM") + std::string("3EVuEZ");
-         ShellExecuteA(nullptr, "open", discord_link.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+         // Unique link for Luma's HDR Den (tracks the origin of people joining); do
+         // not share for other purposes.
+         static const std::string discord_link =
+            std::string("https://discord.gg/J9fM") + std::string("3EVuEZ");
+         ShellExecuteA(nullptr, "open", discord_link.c_str(), nullptr, nullptr,
+            SW_SHOWNORMAL);
       }
-      static const std::string contributing_link = std::string("Contribute on Github ") + std::string(ICON_FK_FILE_CODE);
-      if (ImGui::Button(contributing_link.c_str()))
+      if (ImGui::Button("Contribute on Github"))
       {
-         ShellExecuteA(nullptr, "open", "https://github.com/Filoppi/Luma-Framework", nullptr, nullptr, SW_SHOWNORMAL);
+         ShellExecuteA(nullptr, "open", "https://github.com/Filoppi/Luma-Framework",
+            nullptr, nullptr, SW_SHOWNORMAL);
       }
 
       ImGui::NewLine();
@@ -2600,111 +3006,24 @@ public:
                   "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"
-                  "\nGT-VBAO (Mirko Salm)"
                   "\nAMD FidelityFX (RCAS + FSR 3)"
                   "\nNVIDIA NGX (DLSS)"
-                  "\nIntel XeSS"
-                  "\ndgVoodoo2 by Dege (DirectX 9 -> 11 wrapper, required)");
+                  "\nIntel XeSS");
    }
 };
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
+static Bayonetta g_bayonetta;
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
-   if (ul_reason_for_call == DLL_PROCESS_ATTACH)
+   if (reason == DLL_PROCESS_ATTACH)
    {
-      const char* project_name = PROJECT_NAME;
-      const char* cleared_project_name = (project_name[0] == '_') ? (project_name + 1) : project_name;
-
-      uint32_t mod_version = 1;
-      Globals::SetGlobals(cleared_project_name, "Bayonetta Luma mod", "", mod_version);
-
-      swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
-      swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
-
-      // Exclusive fullscreen -> borderless, also when leaving it, as the other dgVoodoo mods
-      prevent_fullscreen_state = true;
-      force_borderless = true;
-
-      // dgVoodoo forwards D3D9 SetGammaRamp to the OS device ramp, which distorts HDR output
-      allow_disabling_gamma_ramp = true;
-
-      // The upscalers' mip bias. Mode 3: only samplers at bias 0 get it, the game already sets -1 on its material samplers (seen in a
-      // trace) and adding ours would make -2. force_upgrade_linear_samplers also gives the trilinear ones the bias (Core rewrites only
-      // anisotropic samplers otherwise, TW2).
-      enable_samplers_upgrade = true; // boot-time only (cannot be changed after device creation)
-      samplers_upgrade_mode = 3;
-      force_upgrade_linear_samplers = true;
-
-      // Every scene target is A8R8G8B8. Indirect (creation-time mirrors, substituted at bind): changing dgVoodoo's own
-      // creation formats breaks its bookkeeping (TW2).
-      texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
-      enable_indirect_texture_format_upgrades = true;
-      enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::DirectDependencies;
-      texture_upgrade_formats = {
-         reshade::api::format::r8g8b8a8_typeless, // dgVoodoo's D3D9 back buffer (the canvas) and the scene/post targets
-         reshade::api::format::r8g8b8a8_unorm,
-      };
-      // "No1Px" as in the other dgVoodoo mods: the wrapper binds 1x1 placeholders in unused sampler slots, which pass the aspect filter
-      texture_format_upgrades_2d_size_filters = (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px;
-      // With PreserveAspect (the default) the scene targets are cut to 16:9 inside any back buffer
-      texture_format_upgrades_2d_size_filters |= (uint32_t)TextureFormatUpgrades2DSizeFilters::CustomAspectRatio;
-      texture_format_upgrades_2d_custom_aspect_ratios = {16.f / 9.f};
-      // dgVoodoo creates its D3D9 back buffer (the canvas) before it sizes the swapchain (a 1x1 one at device creation, the old size
-      // on a resolution change), so the size filters miss it at creation: its mirror is made when the scene copy (ResetRender) binds it
-      for (const uint32_t hash : shader_hashes_Copy.pixel_shaders)
-      {
-         auto_texture_format_upgrade_shader_hashes[hash] = {.rtv_slots = {0}};
-      }
-
-#if DEVELOPMENT
-      // Offline map of the post shaders (both dgVoodoo builds), for traces and the DevKit
-      for (const auto& [hash, name] : std::initializer_list<std::pair<uint32_t, const char*>>{
-              {0x719339A9, "Grade (filter00)"},
-              {0x3BE8E47F, "Grade (filter00)"},
-              {0xB7A08D4A, "Grade Luma Curve (filter04)"},
-              {0x2D4416C4, "Grade Luma Curve (filter04)"},
-              {0x8B6A8D61, "Bloom Source (filter05)"},
-              {0x29FE50C2, "Bloom Source (filter05)"},
-              {0x49231C65, "Bloom Blur H (filter06)"},
-              {0xFB14B417, "Bloom Blur H (filter06)"},
-              {0xF758B2DC, "Bloom Blur V (filter07)"},
-              {0x1F962E82, "Bloom Blur V (filter07)"},
-              {0xCE62BA4B, "Blur H (filter01)"},
-              {0x4B605EEB, "Blur H (filter01)"},
-              {0x91CC01D3, "Blur V (filter02)"},
-              {0xA5207DF1, "Blur V (filter02)"},
-              {0x68B566FE, "Centre Average (filter03)"},
-              {0xAB34862D, "Centre Average (filter03)"},
-              {0x9D71029B, "DoF CoC (filter08)"},
-              {0xCCDA0B04, "DoF CoC (filter08)"},
-              {0x40AF18CC, "SSAO"},
-              {0xC32759B1, "SSAO"},
-              {0x91A6C437, "Copy"},
-              {0x7584B641, "Copy"},
-              {0xB4CE6220, "Copy No Alpha"},
-              {0xF70BABE8, "Copy No Alpha"},
-              {0x87A169B9, "Object Motion Blur"},
-              {0x5BF04DF8, "Object Motion Blur"},
-              {0x651AC335, "Skinned Velocity (BlurSrcWeight)"},
-              {0x988429CF, "Skinned Velocity (BlurSrcWeight)"},
-              {0xC60649FD, "Video Y'CbCr"},
-              {0xED0DA20F, "Video Y'CbCr"},
-           })
-      {
-         forced_shader_names.emplace(hash, name);
-      }
-#endif
-
-      game = new Bayonetta();
+      Globals::SetGlobals("Bayonetta", "Bayonetta Luma mod");
    }
-   else if (ul_reason_for_call == DLL_PROCESS_DETACH)
+   else if (reason == DLL_PROCESS_DETACH)
    {
-      Bayonetta::SetEvents(false);
       FrameLimiter::Uninstall();
       ShadowMap::Uninstall();
    }
-
-   CoreMain(hModule, ul_reason_for_call, lpReserved);
-
-   return TRUE;
+   return CoreMain(module, reason, &g_bayonetta);
 }

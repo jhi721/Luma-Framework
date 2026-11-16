@@ -5,7 +5,7 @@
 // - Input is the SSAO draw's t2 (R32F "1 - z/w" from the depth prepass) to the prefilter. The normals come from that depth, not from
 //   the SSAO draw's t1 (the prepass' "normalize(normal * modelview) * 0.5 + 0.5"): those vertex normals are smoothed across flat walls
 //   and corners, and the main pass' horizons, measured against them, darkened wide bands of flat walls that slid with the camera. The
-//   final visibility (R8_UNORM) is applied by "Luma_Bayonetta_XeGTAOApply.hlsl", drawn in place of the game's SSAO shader.
+//   final visibility (R8_UNORM) is applied by "Luma_Bayonetta_GTAOApply_SM3.hlsl", drawn in place of the game's SSAO shader.
 // - No projection reaches the SSAO draw: b4 is a copy of the vertex constants (dgVoodoo's cb4, D3D9 c(n) = row n + 20) of a depth
 //   prepass draw of the frame (main.cpp). Every prepass vertex shader has an affine view transform (3 rows) and the same transform
 //   followed by the projection (4 rows): "Rmodelview" c20 + "Rmodelviewproj" c24, or "view" c0 + "g_ViewProjection" c8. The projection
@@ -97,8 +97,11 @@ float XeGTAO_ScreenSpaceToViewSpaceDepth(const float screenDepth)
 }
 
 #define XE_GTAO_ADJUST_VISIBILITY(visibility, viewspaceZ) visibility = max(0.03, visibility); // A visible surface can't be fully occluded
-#define XE_GTAO_FINAL_OUTPUT_TYPE                         unorm float
 #define XE_GTAO_ENCODE_FINAL(v)                           (v)
+// The native D3D9 port defines it as float: D3D9 shares R32F, not R8
+#ifndef XE_GTAO_FINAL_OUTPUT_TYPE
+#define XE_GTAO_FINAL_OUTPUT_TYPE unorm float
+#endif
 
 // tex0 = the SSAO draw's t2, the R32F "1 - z/w" depth.
 // GT-VBAO's main pass ("gtvbao_main_pass_cs", "GT-VBAO Enable") on top of XeGTAO's, which it includes, as MELE's. Steps and

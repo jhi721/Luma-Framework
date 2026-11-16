@@ -8,7 +8,7 @@
     root plus a "Luma/" folder (the shaders mount, filtered to this project),
     with the project-level (Core/Textures) folders only included when the
     project opts in via UseLumaFastNoise, plus the runtime DLLs the project
-    needs (dxcompiler.dll for D3D12 projects, d3dcompiler_47.dll, ReShade as dxgi.dll,
+    needs (dxcompiler.dll for D3D12 projects, d3dcompiler_47.dll, ReShade as dxgi.dll (d3d9.dll for LumaGraphicsAPI D3D9),
     NGX DLSS when opted in). dgVoodoo games (UseDgVoodoo) also get dgVoodoo2,
     plus a "-Linux" zip with its Wine/Proton build (UseDgVoodooLinux),
     optionally behind the D3D9 VA Fix proxy (UseD3D9VAFix), with its CSMT layer on in
@@ -101,6 +101,7 @@ $useDgVoodooLinux = Test-PropEnabled $vcxproj "UseDgVoodooLinux"
 $useD3D9VAFix = Test-PropEnabled $vcxproj "UseD3D9VAFix"
 $useD3D9CSMT = Test-PropEnabled $vcxproj "UseD3D9CSMT"
 $isD3D12 = (Get-Content $vcxproj -Raw) -match "<LumaGraphicsAPI>\s*D3D12\s*</LumaGraphicsAPI>"
+$isD3D9 = (Get-Content $vcxproj -Raw) -match "<LumaGraphicsAPI>\s*D3D9\s*</LumaGraphicsAPI>"
 Write-Host "Opt-ins: UseLumaFastNoise=$useLumaFastNoise UseLumaDXP=$useLumaDXP UseLumaNGX=$useLumaNGX UseLumaFSR=$useLumaFSR UseLumaXeSS=$useLumaXeSS UseLumaSRBridge=$useLumaSRBridge UseLumaD3D12SR=$useLumaD3D12SR UseDgVoodoo=$useDgVoodoo UseDgVoodooLinux=$useDgVoodooLinux UseD3D9VAFix=$useD3D9VAFix UseD3D9CSMT=$useD3D9CSMT D3D12=$isD3D12"
 if (($useDgVoodooLinux -or $useD3D9VAFix) -and -not $useDgVoodoo) {
     Write-Error "UseDgVoodooLinux and UseD3D9VAFix need UseDgVoodoo"
@@ -174,7 +175,9 @@ try {
     }
     $reshadeSrc = if ($Platform -eq "Win32") { Join-Path $repoRoot "Source\External\reshade\bin\Win32\Release\ReShade32.dll" }
                   else { Join-Path $repoRoot "Source\External\reshade\bin\x64\Release\ReShade64.dll" }
-    if (Test-Path $reshadeSrc) { Copy-Item $reshadeSrc -Destination (Join-Path $tempDir "dxgi.dll") -Force }
+    # A native D3D9 game (LumaGraphicsAPI D3D9) never loads dxgi.dll
+    $reshadeName = if ($isD3D9) { "d3d9.dll" } else { "dxgi.dll" }
+    if (Test-Path $reshadeSrc) { Copy-Item $reshadeSrc -Destination (Join-Path $tempDir $reshadeName) -Force }
     # The SR bridge's x64 helper (a Luma.sln project, built next to the Win32 addons), which also loads DLSS's dll
     if ($useLumaSRBridge) {
         $helperSrc = Join-Path $repoRoot "Binaries\Win32-$Config\Luma-Upscaler.exe"

@@ -33,7 +33,7 @@ struct GTAOKnobs
    float final_value_power;    // Darkness dial (higher = darker)
    float depth_scale;          // View depth divisor (game units -> ~meters)
    float radius_override;      // > 0 overrides EFFECT_RADIUS (view units after depth_scale)
-   float debug_view;           // DEVELOPMENT debug view (legend in Includes/XeGTAO.hlsl), shown alone by Luma_Bayonetta_XeGTAOApply.hlsl
+   float debug_view;           // DEVELOPMENT debug view (legend in Includes/XeGTAO.hlsl), shown alone by Luma_Bayonetta_GTAOApply_SM3.hlsl
    float2 viewport_pixel_size; // 1 / the depth's size
    float noise_index;          // XeGTAO's temporal noise: frame % 64 while an upscaler accumulates the AO, else 0
    float camera_affine_row;    // b4's first row of the prepass draw's affine view transform (3 rows)
@@ -41,7 +41,7 @@ struct GTAOKnobs
    float3 padding;
 };
 
-// The motion vector fill's constants (Luma_Bayonetta_MotionVectorFill.hlsl, b0), written by "FillMotionVectors"
+// The motion vector fill's constants (Luma_Bayonetta_MotionVectorFill_SM3.hlsl), written by "FillMotionVectors"
 struct MotionVectorFillConstants
 {
    row_major float4x4 reprojection; // Current clip space to the previous frame's

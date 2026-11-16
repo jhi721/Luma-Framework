@@ -35,8 +35,8 @@
     <LumaPackage>false</LumaPackage>
   </PropertyGroup>
   <PropertyGroup>
-    <UseDgVoodoo>true</UseDgVoodoo>
-    <UseDgVoodooLinux>true</UseDgVoodooLinux>
+    <LumaGraphicsAPI>D3D9</LumaGraphicsAPI>
+
     <UseLumaSRBridge>true</UseLumaSRBridge>
     <UseLumaFastNoise>true</UseLumaFastNoise>
   </PropertyGroup>
