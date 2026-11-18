@@ -333,6 +333,8 @@ static constexpr bool kDefaultSmaaPredication = true;     // predicate SMAA on g
 static constexpr float kDefaultSmaaPredTolerance = 0.02f; // plane deviation counted as a full edge, as a fraction of view depth
 static constexpr bool kDefaultDisableTaaSharpening = false;
 static constexpr bool kDefaultImproveTaaJitter = true;
+static constexpr int kDefaultSRJitterPhases = 0; // 0 = the upscaler's own count
+static constexpr int kMaxSRJitterPhases = 64;
 // DEVELOPMENT only: both always on otherwise. The peak and paper white levels are Core's (ScenePeakWhite, ScenePaperWhite,
 // UIPaperWhite).
 static constexpr bool kDefaultHDRFix = true;
@@ -354,6 +356,7 @@ static bool g_smaa_predication = kDefaultSmaaPredication;
 static float g_smaa_pred_tolerance = kDefaultSmaaPredTolerance;
 static bool g_disable_taa_sharpening = kDefaultDisableTaaSharpening;
 static bool g_improve_taa_jitter = kDefaultImproveTaaJitter;
+static int g_sr_jitter_phases = kDefaultSRJitterPhases;
 static bool g_hdr_fix = kDefaultHDRFix;
 static bool g_hdr_gamma_correction = kDefaultHDRGammaCorrection;
 static bool g_video_auto_hdr = kDefaultVideoAutoHDR;
@@ -1213,7 +1216,16 @@ class MassEffectAndromeda final : public Game
       {
          const SR::InstanceData* sr_instance_data = device_data.GetSRInstanceData();
          values.jitter_use_cmj = 1;
-         values.jitter_count = uint32_t((sr_active && sr_instance_data) ? GetSRJitterPhases(device_data, sr_instance_data) : g_halton_jitter_native_phases);
+         int phases = g_halton_jitter_native_phases;
+         if (sr_active && g_sr_jitter_phases > 0)
+         {
+            phases = g_sr_jitter_phases;
+         }
+         else if (sr_active && sr_instance_data)
+         {
+            phases = GetSRJitterPhases(device_data, sr_instance_data);
+         }
+         values.jitter_count = uint32_t(phases);
          // The engine rebuilds the table at the new count during the next frame: the points go in from the present after it
          const JitterTable& table = FindJitterTable();
          if (table.begin && *table.begin && size_t(*table.end - *table.begin) == size_t(values.jitter_count) * 2)
@@ -3598,6 +3610,7 @@ public:
       });
       Mcp::RegisterInts({
          {"halton_jitter_native_phases", &g_halton_jitter_native_phases, 1, 64},
+         {"sr_jitter_phases", &g_sr_jitter_phases, 0, kMaxSRJitterPhases},
          {"engine_aa_mode", &g_dev_engine_aa_mode, -1, 8},
          {"engine_resample_mode", &g_dev_engine_resample_mode, -1, 6},
       });
@@ -4065,6 +4078,8 @@ public:
       reshade::get_config_value(nullptr, NAME, "SMAAPredicationTolerance", g_smaa_pred_tolerance);
       reshade::get_config_value(nullptr, NAME, "DisableTAASharpening", g_disable_taa_sharpening);
       reshade::get_config_value(nullptr, NAME, "ImproveTAAJitter", g_improve_taa_jitter);
+      reshade::get_config_value(nullptr, NAME, "SRJitterPhases", g_sr_jitter_phases);
+      g_sr_jitter_phases = std::clamp(g_sr_jitter_phases, 0, kMaxSRJitterPhases);
       reshade::get_config_value(nullptr, NAME, "RenderScale", g_render_scale);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDREnable", g_video_auto_hdr);
       reshade::get_config_value(nullptr, NAME, "VideoAutoHDRBoost", g_video_auto_hdr_boost);
@@ -4103,6 +4118,16 @@ public:
 #if ENABLE_SR
       ImGui::BeginDisabled(!sr_selected);
       DrawRenderScaleSlider(&g_render_scale, kMinRenderScale, "The resolution the game renders at, upscaled by DLSS/FSR. Replaces the game's Resolution Scale while they run.");
+      ImGui::SliderInt("Halton Phases", &g_sr_jitter_phases, 0, kMaxSRJitterPhases, g_sr_jitter_phases > 0 ? "%d" : "Auto", ImGuiSliderFlags_AlwaysClamp);
+      if (ImGui::IsItemDeactivatedAfterEdit())
+      {
+         reshade::set_config_value(nullptr, NAME, "SRJitterPhases", g_sr_jitter_phases);
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("How many jitter positions DLSS/FSR cycle through before repeating.\nAuto = the upscaler's own count for the current Render Scale.\nFewer phases flicker less on still images, more phases resolve finer detail.");
+      }
+      DrawResetButton(g_sr_jitter_phases, kDefaultSRJitterPhases, "SRJitterPhases");
       ImGui::EndDisabled();
 #endif
       DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, kDefaultSmaaEnable, "Replaces the game's FXAA with SMAA (only active when in-game Anti-Aliasing is set to FXAA).");
