@@ -815,9 +815,11 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    std::unordered_set<uint64_t> pipelines_to_reload;
    static_assert(sizeof(reshade::api::pipeline::handle) == sizeof(uint64_t));
 
-#if DX12 && DEVELOPMENT // For the frame capture, for now
+#if DX12 && (DEVELOPMENT || ENABLE_D3D12_DESCRIPTOR_TRACKING)
    D3D12State::PipelineLayouts pipeline_layouts;
    D3D12State::DescriptorHeaps descriptor_heaps;
+#endif
+#if DX12 && DEVELOPMENT // For the frame capture, for now
    D3D12State::BufferAddresses buffer_addresses;
    D3D12State::LiveResources live_resources;
    // The frame capture, joined from the command lists in submission order (the queue's immediate command list is ReShade's own)

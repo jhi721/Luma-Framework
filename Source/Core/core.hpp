@@ -231,6 +231,11 @@ using NativeCommandList = ID3D11DeviceContext;
 #define ENABLE_D3D12_PASSES 0
 #endif
 #endif
+// The root signatures and the shadow of the descriptor heaps in release builds too, without the views' "ViewInfo", for a game that has to read what a table holds
+// ("D3D12State::FindDescriptor()"). Every "CreateConstantBufferView()" and "CopyDescriptors()" of the game goes through it, so it's opt in
+#ifndef ENABLE_D3D12_DESCRIPTOR_TRACKING
+#define ENABLE_D3D12_DESCRIPTOR_TRACKING 0
+#endif
 
 // This might not disable all shaders dumping related code, but it disables enough to remove any performance cost
 #ifndef ALLOW_SHADERS_DUMPING
@@ -6554,17 +6559,17 @@ namespace
       return nullptr;
    }
 
-#if DX12 && DEVELOPMENT // State tracking for the frame capture
+#if DX12 && (DEVELOPMENT || ENABLE_D3D12_DESCRIPTOR_TRACKING) // State tracking for the frame capture
    void OnInitPipelineLayout(reshade::api::device* device, uint32_t param_count, const reshade::api::pipeline_layout_param* params, reshade::api::pipeline_layout layout)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
       auto* const pipeline_layouts = &device->get_private_data<DeviceData>()->pipeline_layouts;
       D3D12State::AddPipelineLayout(pipeline_layouts, layout, param_count, params);
-#if ENABLE_MINHOOK
+#if DEVELOPMENT && ENABLE_MINHOOK
       D3D12State::AddStaticSamplers(pipeline_layouts, layout, D3D12RootSignatures::pending_static_samplers);
 #endif
    }
-#endif // DX12 && DEVELOPMENT
+#endif // DX12 && (DEVELOPMENT || ENABLE_D3D12_DESCRIPTOR_TRACKING)
 
 #if DX12
    // All builds forget the root signatures Luma added CBVs to when they are destroyed, development builds also the layouts of the frame capture
@@ -6574,13 +6579,13 @@ namespace
 #if ENABLE_MINHOOK
       D3D12RootSignatures::Forget(layout.handle);
 #endif
-#if DEVELOPMENT
+#if (DEVELOPMENT || ENABLE_D3D12_DESCRIPTOR_TRACKING)
       D3D12State::RemovePipelineLayout(&device->get_private_data<DeviceData>()->pipeline_layouts, layout);
 #endif
    }
 #endif // DX12
 
-#if DX12 && DEVELOPMENT
+#if DX12 && (DEVELOPMENT || ENABLE_D3D12_DESCRIPTOR_TRACKING)
    bool OnUpdateDescriptorTables(reshade::api::device* device, uint32_t count, const reshade::api::descriptor_table_update* updates)
    {
       SKIP_UNSUPPORTED_DEVICE_API(device->get_api(), false);
@@ -6594,7 +6599,9 @@ namespace
       D3D12State::CopyDescriptors(&device->get_private_data<DeviceData>()->descriptor_heaps, device, count, copies);
       return false;
    }
+#endif
 
+#if DX12 && DEVELOPMENT
    // The desc of a sampler a game created, by the CPU descriptor it created it in (the frame capture reads it back from the descriptors' copies)
    void OnInitSamplerDescriptor(reshade::api::device* device, const reshade::api::sampler_desc& desc, reshade::api::sampler sampler)
    {
@@ -23283,10 +23290,12 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
 #if DX12 && (DEVELOPMENT || ENABLE_DRAW_DISPATCH_DATA_CACHE)
       reshade::register_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
 #endif
-#if DX12 && DEVELOPMENT
+#if DX12 && (DEVELOPMENT || ENABLE_D3D12_DESCRIPTOR_TRACKING)
       reshade::register_event<reshade::addon_event::init_pipeline_layout>(OnInitPipelineLayout);
       reshade::register_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
       reshade::register_event<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables);
+#endif
+#if DX12 && DEVELOPMENT
       reshade::register_event<reshade::addon_event::init_sampler>(OnInitSamplerDescriptor);
       reshade::register_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
       reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
@@ -23514,10 +23523,12 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
 #if DX12 && (DEVELOPMENT || ENABLE_DRAW_DISPATCH_DATA_CACHE)
       reshade::unregister_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
 #endif
-#if DX12 && DEVELOPMENT
+#if DX12 && (DEVELOPMENT || ENABLE_D3D12_DESCRIPTOR_TRACKING)
       reshade::unregister_event<reshade::addon_event::init_pipeline_layout>(OnInitPipelineLayout);
       reshade::unregister_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
       reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables);
+#endif
+#if DX12 && DEVELOPMENT
       reshade::unregister_event<reshade::addon_event::init_sampler>(OnInitSamplerDescriptor);
       reshade::unregister_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
       reshade::unregister_event<reshade::addon_event::init_resource>(OnInitResource);

@@ -551,7 +551,7 @@ namespace D3D12State
    }
 #endif
 
-   // What a game wrote into a descriptor heap slot
+   // What a game wrote into a descriptor heap slot ("view" only in development builds)
    struct Descriptor
    {
       reshade::api::descriptor_type type = reshade::api::descriptor_type::sampler;
@@ -623,14 +623,18 @@ namespace D3D12State
             }
             case reshade::api::descriptor_type::sampler_with_resource_view:
                descriptor.handle = static_cast<const reshade::api::sampler_with_resource_view*>(update.descriptors)[j].view.handle;
+#if DEVELOPMENT // For the frame capture, and a cost per descriptor written
                descriptor.view = GetViewInfo(device, {descriptor.handle});
+#endif
                break;
             case reshade::api::descriptor_type::sampler:
                descriptor.handle = static_cast<const uint64_t*>(update.descriptors)[j];
                break;
             default: // Views are a single handle
                descriptor.handle = static_cast<const uint64_t*>(update.descriptors)[j];
+#if DEVELOPMENT
                descriptor.view = GetViewInfo(device, {descriptor.handle});
+#endif
                break;
             }
          }
