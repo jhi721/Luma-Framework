@@ -11634,6 +11634,10 @@ namespace
 #if ENABLE_SR_BRIDGE
          SRBridge::fsr_major_version = (fsr_4 ? 4 : 3);
 #endif
+#if DX12 && ENABLE_FIDELITY_SK
+         // Auto stays on the runtime's newest: the GPU's vendor isn't known on D3D12
+         FidelityFX::major_version_override = (sr_user_type == SR::UserType::FSR ? 4 : (sr_user_type == SR::UserType::FSR3 ? 3 : 0));
+#endif
          ApplySRType(device_data, device_data.sr_type_selected);
 #if ENABLE_D3D12_SR
          SRBridge::api_setting = (fsr_4 ? SRBridge::Api::D3D12 : SRBridge::Api::D3D11); // XeSS falls back on D3D12 where its D3D11 one isn't supported (not an Intel GPU)
@@ -20716,7 +20720,7 @@ namespace
                selected_sr_user_type = "DLSS";
                break;
             case SR::UserType::FSR:
-#if ENABLE_SR_BRIDGE || ENABLE_D3D12_SR
+#if ENABLE_SR_BRIDGE || ENABLE_D3D12_SR || (DX12 && ENABLE_FIDELITY_SK)
                selected_sr_user_type = "FSR 4";
 #else
                selected_sr_user_type = "FSR";
@@ -20786,7 +20790,7 @@ namespace
                if (always_show_auto_sr || sr_auto_type != SR::Type::None)
                   AddComboItem("Auto", SR::UserType::Auto, sr_auto_type, !device_data.sr_implementations_instances.empty());
                AddComboItem("DLSS", SR::UserType::DLSS, SR::Type::DLSS, device_data.sr_implementations_instances.contains(SR::Type::DLSS));
-#if ENABLE_SR_BRIDGE || ENABLE_D3D12_SR // The FidelityFX API's version ("SRBridge::fsr_major_version"), or D3D12 vs D3D11 ("SRBridge::api_setting")
+#if ENABLE_SR_BRIDGE || ENABLE_D3D12_SR || (DX12 && ENABLE_FIDELITY_SK) // The FidelityFX API's version ("SRBridge::fsr_major_version", "FidelityFX::major_version_override"), or D3D12 vs D3D11 ("SRBridge::api_setting")
                AddComboItem("FSR 3", SR::UserType::FSR3, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
                AddComboItem("FSR 4", SR::UserType::FSR, SR::Type::FSR, device_data.sr_implementations_instances.contains(SR::Type::FSR));
 #else

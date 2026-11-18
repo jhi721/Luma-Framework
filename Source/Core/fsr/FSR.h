@@ -37,7 +37,7 @@ namespace FidelityFX
    inline bool draw_debug_view = !DX12; // "core.fsr_debug_view" on D3D12
 #endif
 
-   // FSR 3 SR on D3D11, FSR 4 (or the newest version the GPU supports) on D3D12
+   // FSR 3 SR on D3D11, the version of "major_version_override" on D3D12
    class FSR : public SR::SuperResolutionImpl
    {
    public:

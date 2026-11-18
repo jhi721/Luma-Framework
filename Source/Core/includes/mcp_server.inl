@@ -3858,7 +3858,7 @@ namespace Mcp
       RegisterInts({{"core.fsr_version_index", &FidelityFX::version_index_override, -1, 15}});
 #endif
 #if ENABLE_SR
-      // As the "Super Resolution" combo, not saved to the config: 0 None, 1 Auto, 2 DLSS, 3 FSR (the SR bridge's "FSR 4"), 4 Luma TAA, 5 XeSS, 6 the SR bridge's "FSR 3"
+      // As the "Super Resolution" combo, not saved to the config: 0 None, 1 Auto, 2 DLSS, 3 FSR ("FSR 4" on D3D12 and the SR bridge), 4 Luma TAA, 5 XeSS, 6 "FSR 3" (D3D12 and the SR bridge)
       static_assert(sizeof(SR::UserType) == sizeof(int));
       RegisterInts({{"core.sr_user_type", reinterpret_cast<int*>(&sr_user_type), 0, 6, [](DeviceData& device_data, double value)
          {

@@ -51,10 +51,10 @@ namespace SR
 		None,
 		Auto,
 		DLSS,
-		FSR, // FSR 3 on D3D11, FSR 4 or 3.1 on D3D12
+		FSR, // FSR 3 on D3D11 without the SR bridge or the in-process D3D12 upscaler, else FSR 4 (3.1 where the GPU can't run it)
 		LumaTAA,
 		XeSS, // D3D12 only
-		FSR3, // The SR bridge's FSR at its newest 3.x ("FSR" is "FSR 4" there)
+		FSR3, // FSR at its newest 3.x, on D3D12 and through the SR bridge ("FSR" is "FSR 4" there)
 	};
 
 	// Put these in order of preference (most preferred first). For automatic selection.
