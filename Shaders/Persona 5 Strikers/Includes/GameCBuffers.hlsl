@@ -14,8 +14,8 @@ struct LumaGameSettings
    float RCASSharpness;
    float Exposure;               // 1 = vanilla. Scene multiplier before the LUT (SDR + HDR)
    float ColorGradingIntensity;  // 1 = vanilla, 0 = the LUT's gray tone curve only, by luminance (SDR + HDR)
-   float Saturation;             // 1 = vanilla. PsychoV31's purity, HDR only
-   float HighlightsDesaturation; // 0 = off. PsychoV31 highlights desaturation, HDR only
+   float Saturation;             // 1 = vanilla. Scales the linear RGB residual from relative luminance before the display map, HDR only
+   float HighlightsDesaturation; // 0 = off. Whitening of highlights above 1.5 toward a per-channel Reinhard (MacLeod-Boynton), HDR only
    float BloomIntensity;         // 1 = vanilla, 0 = none. Scales the bloom combine (SDR + HDR)
 };
 

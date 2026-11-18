@@ -5,13 +5,20 @@
 // Luma: in HDR, the vanilla LUT output is scaled by E(Y) / G(Y) of the pre-LUT relative luminance Y, where G is the LUT's gray tone
 // curve and E is G continued by its tangent past the pivot where G reaches mid gray. Only luminance crosses into the output (as in
 // BL2/TPS); a scalar can't rotate hue, so the grade and its path to white stay vanilla, and output below the pivot is exactly vanilla.
-// PsychoV31 then maps it to the peak. The LUT is a per area asset, so the tangent is found per pixel.
+// The C-infinity max-channel rolloff then maps it to the peak, keeping RGB ratios. The LUT is a per area asset, so the tangent is
+// found per pixel.
 // clang-format off
 #include "Includes/Common.hlsl"
 #include "../Includes/ColorGradingLUT.hlsl"
 #include "Includes/cbComposite.hlsl"
-#include "../Includes/PsychoV31.hlsl"
+#include "../Includes/CInfinityRolloff.hlsl" // Tonemap::CInfinityRollOff::MaxChannel (the display map)
+#include "../Includes/Reinhard.hlsl" // Reinhard::ReinhardPiecewise (highlights desaturation reference)
+#include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueAndPurityEmulationBT2020
 // clang-format on
+
+// fxc flags the early return of "MacLeodBoynton::SolvePurity()" as an uninitialized result (X4000). It comes at code
+// generation, so it stays off for the whole shader; here, last, because "ColorGradingLUT.hlsl" turns it back on.
+#pragma warning(disable : 4000)
 
 SamplerState sampleLinear_s : register(s7);
 Texture2D<float4> g_tSceneMap : register(t0);
@@ -186,13 +193,12 @@ void main(
       r0.x = r0.x * r0.w + (1.0 - r0.w);
       r2.xyz = r2.xyz * r0.xxx;
    }
-   const float3 untonemappedColor = r2.xyz;
+   const float untonemappedLuminance = GetLuminance(r2.xyz);
    r0.xyz = g_tHdrLut.SampleLevel(sampleLinear_s, EncodeLUTInput(r2.xyz), 0).rgb;
    // Luma: "Color Grading Intensity" fades the grade towards the LUT's gray tone curve alone (0), applied by luminance
    [branch] if (LumaSettings.GameSettings.ColorGradingIntensity != 1.0)
    {
-      const float luminance = GetLuminance(r2.xyz);
-      const float3 neutral = luminance > 0.0 ? r2.xyz * (LUTGrayCurve(luminance) / luminance) : 0.0;
+      const float3 neutral = untonemappedLuminance > 0.0 ? r2.xyz * (LUTGrayCurve(untonemappedLuminance) / untonemappedLuminance) : 0.0;
       r0.xyz = lerp(neutral, r0.xyz, LumaSettings.GameSettings.ColorGradingIntensity);
    }
 
@@ -216,21 +222,34 @@ void main(
    }
    else
    {
-      const float luminance = GetLuminance(untonemappedColor);
-      const float grayOutput = LUTGrayCurve(luminance);
+      const float grayOutput = LUTGrayCurve(untonemappedLuminance);
       // The curve is monotonic: pixels mapped below mid gray are under the pivot and skip the 32 texel search
       [branch] if (grayOutput >= MidGray)
       {
          float pivot, pivotOutput, slope;
          FindLUTTangent(MidGray, pivot, pivotOutput, slope);
          // Never below vanilla, in case the curve is still convex past the pivot
-         if (luminance > pivot)
-            r0.xyz *= max(1.0, (pivotOutput + slope * (luminance - pivot)) / grayOutput);
+         if (untonemappedLuminance > pivot)
+            r0.xyz *= max(1.0, (pivotOutput + slope * (untonemappedLuminance - pivot)) / grayOutput);
       }
 
-      // See "PsychoVDisplayMap".
-      r0.xyz = PsychoVDisplayMap(r0.xyz, 1.0, LumaSettings.GameSettings.Saturation,
-                                 LumaSettings.GameSettings.HighlightsDesaturation);
+      // Highlights Desaturation: only the whitening (MacLeod-Boynton chrominance) of a per-channel Reinhard (ceiling 5, shoulder
+      // 1.5: identity below it), as MELE, MGR:R and Mirror's Edge; the hue stays the LUT's. Skipped below the shoulder.
+      const float3 color2020 = BT709_To_BT2020(r0.xyz);
+      [branch] if (LumaSettings.GameSettings.HighlightsDesaturation > 0.0 && max3(color2020) > 1.5)
+      {
+         r0.xyz = BT2020_To_BT709(MacLeodBoynton::HueAndPurityEmulationBT2020(color2020, Reinhard::ReinhardPiecewise(color2020, 5.0, 1.5),
+                                                                              0.0, LumaSettings.GameSettings.HighlightsDesaturation));
+      }
+      // Scales the linear RGB residual from relative luminance: the rolloff doesn't take a saturation
+      [branch] if (LumaSettings.GameSettings.Saturation != 1.0)
+      {
+         r0.xyz = Saturation(r0.xyz, LumaSettings.GameSettings.Saturation, CS_BT709);
+      }
+      // Max-channel rolloff to the peak (strength 1, as the sibling mods: paper white stays within 1%). The peak can't go below paper
+      // white (the rolloff needs it above its 0.18 anchor).
+      const float paperWhite = max(LumaSettings.GamePaperWhiteNits, 1.0);
+      r0.xyz = Tonemap::CInfinityRollOff::MaxChannel(r0.xyz, max(LumaSettings.PeakWhiteNits, paperWhite) / paperWhite, 0.18, 1.0);
    }
 
    o0.xyz = g_vRadialBlurCenter.zzz * r0.xyz;

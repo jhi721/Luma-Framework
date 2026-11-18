@@ -8,7 +8,7 @@
 // SMAA runs right after the composite, through "original_draw_dispatch_func"
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 #define ENABLE_SMAA 1
-// A third "Super Resolution" choice next to DLSS and FSR 3, drawn in process on any GPU, on the same inputs
+// A "Super Resolution" choice next to DLSS, FSR and XeSS, drawn in process on any GPU, on the same inputs
 #define ENABLE_LUMA_TAA 1
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
 #define SMAA_SMOOTH_U_SHAPES 0
@@ -32,10 +32,10 @@ namespace
    constexpr uint32_t composite_hash = 0x45A96F2D;
    // FXAA 3 from a swapchain copy (after the UI) back into it
    constexpr uint32_t fxaa_hash = 0xED2D9823;
-   // SMAA's scratch is freed after this many frames without SMAA (DLSS/FSR antialias), the copies after as many without SMAA or RCAS
+   // SMAA's scratch is freed after this many frames without SMAA (the upscaler antialiases), the copies after as many without SMAA or RCAS
    // (~10 s at the game's 60 fps cap)
    constexpr uint32_t smaa_idle_release_frames = 600;
-   // Presents with DLSS/FSR off before their motion vectors, upscaled output and output resolution post targets are freed
+   // Presents with the upscaler off before their motion vectors, upscaled output and output resolution post targets are freed
    constexpr uint32_t sr_release_presents = 8;
    // PostEffect3 ApplyFxaa{,Repair,Console,Quality}PS: the engine's FXAA (plus radial blur), from an intermediate composite target into
    // the swapchain. Never captured yet.
@@ -50,7 +50,7 @@ namespace
    // final ret (see "PatchShaderBytecodeSync")
    const std::unordered_set<uint32_t> ui_pixel_shaders = {0x90C6B12E, 0xEE9FC290, 0x07378D54, 0x4A0CB253, 0x8BA60D22, 0xD1BEFD65, 0xF0863953, 0x76C3BC5E, 0xA4DFC750, 0xBEF2C79E};
    // A scene frame's first post pass (scene at t0): DOF prefilter (E0DB2D7E or its two highlight mask variants), else bloom prefilter,
-   // else composite. It ends the scene frame; DLSS/FSR run right before it. The preceding lighting varies by scene (691D080F, or
+   // else composite. It ends the scene frame; the upscaler runs right before it. The preceding lighting varies by scene (691D080F, or
    // 4376F855 twice).
    const ShaderHashesList post_process_start_shader_hashes = {.pixel_shaders = {0xE0DB2D7E, 0xD65ABD25, 0x3D7CAD40, 0xB6289AC0, composite_hash}};
    // Bloom upsamples (3x3 tent into the next mip up, and its g_vMaxUV clamped twin): the first of a frame adds the iterations the game
@@ -80,6 +80,9 @@ namespace
    constexpr uint32_t exposure_histogram_hash = 0xCC8D4849;
 
    bool g_hide_ui = false; // Session only, so a restart always has a HUD
+
+   // SMAA T2x, on the motion vector draws' jitter and motion vectors. Off without SMAA, or with an upscaler
+   bool g_smaa_t2x = false;
 
    // Forced over the game's "RenderScale" option (5 = 50% ... 10 = 100%)
    int g_render_scale = 10;
@@ -186,14 +189,41 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // Composite only: the frame SMAA last ran, and SMAA or RCAS (both use the copies), for "smaa_idle_release_frames"
    uint32_t smaa_frame = 0;
    uint32_t smaa_copies_frame = 0;
+   // SMAA T2x, guarded likewise: the antialiased linear frames of the two jitter phases, and the scene frame (see "t2x_phase_frame") the
+   // last one was written for. The frame is also read unguarded when the next scene frame picks its jitter.
+   com_ptr<ID3D11Texture2D> t2x_frames[2];
+   com_ptr<ID3D11RenderTargetView> t2x_frame_rtvs[2];
+   com_ptr<ID3D11ShaderResourceView> t2x_frame_srvs[2];
+   std::atomic<uint32_t> t2x_frame = 0;
 
-   void ReleaseSMAACopies()
+   void ReleaseSMAAScratch()
    {
       smaa_scratch_texture.reset();
       smaa_scratch_srv.reset();
       smaa_scratch_rtv.reset();
+   }
+
+   void ReleaseSMAACopies()
+   {
+      ReleaseSMAAScratch();
       smaa_gamma_srv.reset();
       smaa_gamma_uav.reset();
+   }
+
+   void ReleaseSMAAPredication()
+   {
+      smaa_predication_srv.reset();
+      smaa_predication_uav.reset();
+   }
+
+   void ReleaseT2xFrames()
+   {
+      for (int i = 0; i < 2; i++)
+      {
+         t2x_frames[i].reset();
+         t2x_frame_rtvs[i].reset();
+         t2x_frame_srvs[i].reset();
+      }
    }
 
    // Full res scene depth (SSAO depth downsample's t0) for predication, and for motion vectors when the G-buffer's is unreadable.
@@ -202,10 +232,10 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::shared_mutex smaa_depth_mutex;
    com_ptr<ID3D11ShaderResourceView> smaa_depth_srv;
 
-   // SMAA ran after this frame's composite, or DLSS/FSR before its post: skip the vanilla FXAA. Reset by FXAA, which the game skips
+   // SMAA ran after this frame's composite, or the upscaler before its post: skip the vanilla FXAA. Reset by FXAA, which the game skips
    // below render scale 1, so it can stay set: the composite decides on "sr_antialiased" instead.
    std::atomic<bool> scene_antialiased = false;
-   // DLSS/FSR ran on the scene: set at its split, taken by the next composite
+   // The upscaler ran on the scene: set at its split, taken by the next composite
    std::atomic<bool> sr_antialiased = false;
    // A 3D layer outside the scene was drawn (main menu, pause screen), composed by the UI after SMAA: FXAA still runs
    std::atomic<bool> layer_drawn = false;
@@ -224,7 +254,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11UnorderedAccessView> gtao_final_uav;
    uint32_t gtao_width = 0;
    uint32_t gtao_height = 0;
-   com_ptr<ID3D11Buffer> gtao_knobs_cb; // dynamic, rewritten every run (the noise index changes per frame with DLSS/FSR)
+   com_ptr<ID3D11Buffer> gtao_knobs_cb; // dynamic, rewritten every run (the noise index changes per frame with the upscaler)
 
    void ReleaseGTAOScratch()
    {
@@ -247,6 +277,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::unordered_map<uint32_t, com_ptr<ID3D11PixelShader>> mv_pixel_shaders;
    com_ptr<ID3D11Texture2D> mv_texture;
    com_ptr<ID3D11RenderTargetView> mv_rtv;
+   com_ptr<ID3D11ShaderResourceView> mv_srv; // SMAA T2x's velocity
    // G-buffer blend state copies (independent blending) that also write the MV target, by original, with its description in case the
    // address is reused
    std::unordered_map<ID3D11BlendState*, std::pair<D3D11_BLEND_DESC, com_ptr<ID3D11BlendState>>> mv_blend_states;
@@ -321,6 +352,8 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11UnorderedAccessView> mv_uav;
    com_ptr<ID3D11Buffer> mv_fill_buffer;
    bool mv_fill_pending = false;
+   // The fill ran since the last present: SMAA T2x's motion vectors are whole (not the 65504 marker)
+   std::atomic<bool> mv_filled = false;
    com_ptr<ID3D11ShaderResourceView> mv_scene_depth_srv;
    com_ptr<ID3D11Resource> mv_frame_depth;
    std::array<float, 16> mv_view_projection = {};
@@ -331,7 +364,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::atomic<uint32_t> mv_presents = 0;
 
 #if DEVELOPMENT
-   // "Performance Test": GPU timestamps from the scene frame's start (in the game's command list) to the split and around DLSS/FSR, in a
+   // "Performance Test": GPU timestamps from the scene frame's start (in the game's command list) to the split and around the upscaler, in a
    // ring read back a few frames later without waiting (the game caps at 60 fps, so frame times say nothing), and the CPU time in the
    // motion vector hooks
    struct PerfQueries
@@ -352,7 +385,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    };
 #endif
 
-   // DLSS/FSR run on the immediate context but the scene records on a deferred one, so its command list is split before post; the
+   // The upscaler runs on the immediate context but the scene records on a deferred one, so its command list is split before post; the
    // first part runs before the upscaler when the game executes the rest (see "OnExecuteSecondaryCommandList").
    struct SRSplit
    {
@@ -389,6 +422,11 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    std::atomic<ID3D11DeviceContext*> sr_upscaling_context = nullptr; // This frame's scene context, once split for upscaling (only compared)
    // "IsSRActive", taken at present: Core's "Super Resolution" selection changes after it, mid frame for the scene's command lists
    std::atomic<bool> sr_active = false;
+   // SMAA T2x, taken at present likewise (the motion vectors and jitter then run without an upscaler)
+   std::atomic<bool> t2x_active = false;
+   // Scene context only, from a scene frame's start to its composite: its SMAA T2x jitter phase (-1 without) and frame index
+   int t2x_phase = -1;
+   uint32_t t2x_phase_frame = 0;
    // The upscaler drew the last presented frame: the jitter only goes where it gets resolved (a scene the split refuses, e.g. an
    // unexpected size or format, would otherwise just shake)
    std::atomic<bool> sr_drew = false;
@@ -398,7 +436,7 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    // The reasons a scene frame wasn't split for the upscaler, each logged once (bits as in the "[P5S SR]" warning's legend)
    std::atomic<uint32_t> sr_split_refusals_logged = 0;
    com_ptr<ID3D11Texture2D> sr_upscaled_output;
-   // Immediate context only: the upscaled output DLSS/FSR last drew into, null after a DLAA frame (see "output_recreated")
+   // Immediate context only: the upscaled output the upscaler last drew into, null after a DLAA frame (see "output_recreated")
    com_ptr<ID3D11Texture2D> sr_drawn_output;
    com_ptr<ID3D11RenderTargetView> sr_upscaled_output_rtv;
    com_ptr<ID3D11ShaderResourceView> sr_upscaled_output_srv;
@@ -427,6 +465,30 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    };
    std::unordered_map<ID3D11View*, PostView> post_views;
    std::array<uint2, 2> post_sizes = {};
+
+   void ReleaseMotionVectorTarget() // Under "mv_mutex"
+   {
+      mv_texture.reset();
+      mv_rtv.reset();
+      mv_srv.reset();
+      mv_uav.reset();
+   }
+
+   void ReleaseUpscaledOutput()
+   {
+      sr_upscaled_output.reset();
+      sr_upscaled_output_rtv.reset();
+      sr_upscaled_output_srv.reset();
+      sr_upscaled_canvas_rtv.reset();
+      sr_upscaled_canvas_srv.reset();
+   }
+
+   void ReleasePostTargets()
+   {
+      post_targets.clear();
+      post_views.clear();
+      post_sizes = {};
+   }
    // The tent scale of the frame's bloom upsamples with the iterations the game skips below the output resolution ("ExtendBloom",
    // "LumaData.CustomData3"): 0 for the game's, < 0 until the first upsample
    float bloom_sample_scale = -1.f;
@@ -532,6 +594,13 @@ class Persona5Strikers final : public Game
       return device_data.game && static_cast<const Persona5StrikersGameDeviceData*>(device_data.game)->sr_active;
    }
 
+   // The motion vectors and jitter run for the upscaler or SMAA T2x
+   static bool IsMotionVectorActive(const DeviceData& device_data)
+   {
+      const auto* const game_device_data = static_cast<const Persona5StrikersGameDeviceData*>(device_data.game);
+      return game_device_data && (game_device_data->sr_active || game_device_data->t2x_active);
+   }
+
    static DeviceData* GetDeviceData(reshade::api::device* device)
    {
       auto* const device_data = device->get_private_data<DeviceData>();
@@ -578,7 +647,7 @@ class Persona5Strikers final : public Game
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
       DeviceData* const device_data = GetDeviceData(device);
-      if (!device_data || !IsSRActive(*device_data))
+      if (!device_data || !IsMotionVectorActive(*device_data))
          return;
       auto& game_device_data = GetGameDeviceData(*device_data);
 #if DEVELOPMENT
@@ -826,6 +895,17 @@ class Persona5Strikers final : public Game
       const bool jitter = IsSRActive(device_data) && game_device_data.sr_drew;
       const SR::InstanceData* const sr_instance_data = (jitter ? device_data.GetSRInstanceData() : nullptr);
       game_device_data.mv_jitter = (jitter ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{});
+      // SMAA T2x: the sample offsets (0.25, 0.25) then (-0.25, -0.25) in y down pixels, for "SMAA.hlsl"'s T2x subsample indices 1 and
+      // 2. That is its table read with y up, which measured better in the SMAA lab. The projection moves the other way. Only right
+      // after a T2x frame: the first one, or one after a gap, is unjittered and seeds the history.
+      const uint32_t frame_index = cb_luma_global_settings.FrameIndex;
+      game_device_data.t2x_phase_frame = frame_index;
+      game_device_data.t2x_phase = ((game_device_data.t2x_active && game_device_data.t2x_frame + 1 == frame_index) ? int(frame_index & 1) : -1);
+      if (game_device_data.t2x_phase >= 0)
+      {
+         const float shift = (game_device_data.t2x_phase == 0 ? -0.25f : 0.25f);
+         game_device_data.mv_jitter = {shift, shift};
+      }
       // Pixels to NDC (y up)
       const float ndc_jitter[4] = {game_device_data.mv_jitter[0] * 2.f / float(depth_size.x), game_device_data.mv_jitter[1] * -2.f / float(depth_size.y), 0.f, 0.f};
       if (!PatchedDraws::WriteDynamicConstants(native_device, native_device_context, std::addressof(game_device_data.mv_jitter_buffer), ndc_jitter, sizeof(ndc_jitter)))
@@ -833,6 +913,7 @@ class Persona5Strikers final : public Game
          // No stale jitter on the scene draws either (its slot then reads 0), nor for the upscaler
          game_device_data.mv_jitter = {};
          game_device_data.mv_jitter_buffer.reset();
+         game_device_data.t2x_phase = -1;
       }
    }
 
@@ -991,6 +1072,7 @@ class Persona5Strikers final : public Game
             native_device_context->Dispatch((mv_desc.Width + 7) / 8, (mv_desc.Height + 7) / 8, 1);
             compute_state.Restore(native_device_context);
             graphics_state.Restore(native_device_context);
+            game_device_data.mv_filled = true;
          }
       }
    }
@@ -1095,18 +1177,16 @@ class Persona5Strikers final : public Game
             const DXGI_FORMAT mv_format = (g_mv_half_float ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R32G32_FLOAT);
             if (desc.Width != depth_size.x || desc.Height != depth_size.y || desc.Format != mv_format)
             {
-               game_device_data.mv_texture.reset();
-               game_device_data.mv_rtv.reset();
-               game_device_data.mv_uav.reset();
+               game_device_data.ReleaseMotionVectorTarget();
                D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support = {mv_format};
                const bool typed_uav_load = SUCCEEDED(native_device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &support, sizeof(support))) && (support.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
                desc = {.Width = depth_size.x, .Height = depth_size.y, .MipLevels = 1, .ArraySize = 1, .Format = mv_format, .SampleDesc = {.Count = 1, .Quality = 0}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | (typed_uav_load ? D3D11_BIND_UNORDERED_ACCESS : 0u)};
                if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.mv_texture)) || FAILED(native_device->CreateRenderTargetView(game_device_data.mv_texture.get(), nullptr, &game_device_data.mv_rtv)))
                {
-                  game_device_data.mv_texture.reset();
-                  game_device_data.mv_rtv.reset();
+                  game_device_data.ReleaseMotionVectorTarget();
                   return false;
                }
+               native_device->CreateShaderResourceView(game_device_data.mv_texture.get(), nullptr, &game_device_data.mv_srv);
                if (typed_uav_load)
                {
                   native_device->CreateUnorderedAccessView(game_device_data.mv_texture.get(), nullptr, &game_device_data.mv_uav);
@@ -1382,7 +1462,7 @@ public:
    {
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool
-      Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, {"gtao_enable", &g_gtao_enable}, {"smaa_predication", &g_smaa_predication}, {"post_output_resolution", &g_post_output_resolution}, {"mv_globals_filter", &g_mv_globals_filter}, { "mv_half_float",
+      Mcp::RegisterToggles({{"hide_ui", &g_hide_ui}, {"gtao_enable", &g_gtao_enable}, {"smaa_predication", &g_smaa_predication}, {"smaa_t2x", &g_smaa_t2x}, {"post_output_resolution", &g_post_output_resolution}, {"mv_globals_filter", &g_mv_globals_filter}, { "mv_half_float",
                                &g_mv_half_float }});
       Mcp::RegisterCounter("mv.tiebreak_collisions", &g_mv_tiebreak_collisions_last_frame);
       Mcp::RegisterCounters({{"jitter.draws", &g_jitter_draws_last_frame}, {"jitter.skipped_no_vb", &g_jitter_skipped_no_vb_last_frame}, { "jitter.skipped_unpatched",
@@ -1397,7 +1477,7 @@ public:
             {
                // As the "Performance Test" combo
                if (value != 0.0 && !IsSRActive(device_data))
-                  return std::string("Needs DLSS or FSR");
+                  return std::string("Needs DLSS, FSR or XeSS");
                Perf::g_test = int(value);
                return std::string();
             } }});
@@ -1411,7 +1491,7 @@ public:
          MCP_GAME_TEXTURE("sr.output", sr_upscaled_output)});
 #endif
       std::vector<ShaderDefineData> game_shader_defines_data = {
-         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (reference)\n1 - HDR: LUT grade extended above mid gray + PsychoV31 display map", 1},
+         {"TONEMAP_TYPE", '1', true, false, "0 - SDR: Vanilla (reference)\n1 - HDR: LUT grade extended above mid gray + C-infinity rolloff display map", 1},
          {"XE_GTAO_QUALITY", '3', true, false, "XeGTAO quality (slice count)\n0 - Low\n1 - Medium\n2 - High\n3 - Very High\n4 - Ultra", 4},
       };
       shader_defines_data.append_range(game_shader_defines_data);
@@ -1439,6 +1519,12 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Motion Vector Fill CS"), ShaderDefinition{"Luma_P5S_MotionVectorFill", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S SMAA Predication CS"), ShaderDefinition{"Luma_P5S_SMAAPredication", reshade::api::pipeline_subobject_type::compute_shader});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S SMAA Finalize PS"), ShaderDefinition{"Luma_P5S_SMAAFinalize", reshade::api::pipeline_subobject_type::pixel_shader});
+      native_shaders_definitions.emplace(CompileTimeStringHash("P5S SMAA T2x Blending Weight Calculation PS"),
+         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_blending_weight_calculation_ps", {{"SMAA_T2X", "1"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("P5S SMAA T2x Neighborhood Blending PS"),
+         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_neighborhood_blending_ps", {{"SMAA_T2X", "1"}}});
+      native_shaders_definitions.emplace(CompileTimeStringHash("P5S SMAA T2x Resolve PS"),
+         ShaderDefinition{"Luma_SMAA_impl", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "smaa_resolve_ps", {{"SMAA_T2X", "1"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Draw White PS"), ShaderDefinition{"Luma_DrawColor_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"COLOR", "float4(1.0, 1.0, 1.0, 1.0)"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S Draw Black PS"), ShaderDefinition{"Luma_DrawColor_PS", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, nullptr, {{"COLOR", "float4(0.0, 0.0, 0.0, 0.0)"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("P5S UI Peak Clamp PS"), ShaderDefinition{"Luma_P5S_UIPeakClamp", reshade::api::pipeline_subobject_type::pixel_shader});
@@ -1467,11 +1553,12 @@ public:
       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(OnExecuteSecondaryCommandList);
    }
 
-   // Draws the composite, then SMAA on its canvas (swapchain, upscaled canvas, or without DLSS/FSR below render scale 1 its own target,
+   // Draws the composite, then SMAA on its canvas (swapchain, upscaled canvas, or without the upscaler below render scale 1 its own target,
    // which the game stretches onto the swapchain) before the UI: gamma encode of the canvas, predication, SMAA (blending the gamma copy
-   // in linear light) into the canvas; with RCAS, SMAA into the scratch and finalize (RCAS, decode, dither) into the canvas. With "smaa"
-   // false (DLSS/FSR antialiased) only RCAS: gamma encode, finalize. If anything is missing (shaders compiling, unexpected target) the
-   // composite is left alone and the vanilla FXAA runs (not after DLSS/FSR).
+   // in linear light) into the canvas; with RCAS, SMAA into the scratch and finalize (RCAS, decode, dither) into the canvas. SMAA T2x
+   // instead draws SMAA into the jitter phase's linear frame, then resolves it with the previous phase's into the canvas (the scratch with
+   // RCAS). With "smaa" false (the upscaler antialiased) only RCAS: gamma encode, finalize. If anything is missing (shaders compiling, unexpected target) the
+   // composite is left alone and the vanilla FXAA runs (not after the upscaler).
    static DrawOrDispatchOverrideType DrawCompositeWithSMAAAndRCAS(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool* updated_cbuffers, const std::function<void()>& original_draw_dispatch_func, bool smaa)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -1513,8 +1600,7 @@ public:
       }
       else if ((canvas_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0)
       {
-         D3D11_SHADER_RESOURCE_VIEW_DESC canvas_srv_desc = {.Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D};
-         canvas_srv_desc.Texture2D.MipLevels = 1;
+         const D3D11_SHADER_RESOURCE_VIEW_DESC canvas_srv_desc = {.Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D, .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1}};
          native_device->CreateShaderResourceView(canvas_texture.get(), &canvas_srv_desc, &canvas_srv);
       }
       const bool sharpen = cb_luma_global_settings.GameSettings.RCASSharpness > 0.f;
@@ -1529,8 +1615,7 @@ public:
       if (GetViewTextureSize(game_device_data.smaa_gamma_srv.get()) != uint2{canvas_desc.Width, canvas_desc.Height})
       {
          game_device_data.ReleaseSMAACopies();
-         game_device_data.smaa_predication_srv.reset();
-         game_device_data.smaa_predication_uav.reset();
+         game_device_data.ReleaseSMAAPredication();
          scratch_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
          com_ptr<ID3D11Texture2D> gamma_texture;
          if (FAILED(native_device->CreateTexture2D(&scratch_desc, nullptr, &gamma_texture)) || FAILED(native_device->CreateShaderResourceView(gamma_texture.get(), nullptr, &game_device_data.smaa_gamma_srv)) || FAILED(native_device->CreateUnorderedAccessView(gamma_texture.get(), nullptr, &game_device_data.smaa_gamma_uav)))
@@ -1542,9 +1627,7 @@ public:
       }
       if (!scratch)
       {
-         game_device_data.smaa_scratch_texture.reset();
-         game_device_data.smaa_scratch_srv.reset();
-         game_device_data.smaa_scratch_rtv.reset();
+         game_device_data.ReleaseSMAAScratch();
       }
       else if (!game_device_data.smaa_scratch_texture)
       {
@@ -1552,9 +1635,7 @@ public:
          if (FAILED(native_device->CreateTexture2D(&scratch_desc, nullptr, &game_device_data.smaa_scratch_texture)) || FAILED(native_device->CreateShaderResourceView(game_device_data.smaa_scratch_texture.get(), nullptr, &game_device_data.smaa_scratch_srv)) || FAILED(native_device->CreateRenderTargetView(game_device_data.smaa_scratch_texture.get(), nullptr, &game_device_data.smaa_scratch_rtv)))
          {
             // Retried next frame
-            game_device_data.smaa_scratch_texture.reset();
-            game_device_data.smaa_scratch_srv.reset();
-            game_device_data.smaa_scratch_rtv.reset();
+            game_device_data.ReleaseSMAAScratch();
             return DrawOrDispatchOverrideType::None;
          }
       }
@@ -1567,8 +1648,7 @@ public:
          com_ptr<ID3D11Texture2D> predication_texture;
          if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &predication_texture)) || FAILED(native_device->CreateUnorderedAccessView(predication_texture.get(), nullptr, &game_device_data.smaa_predication_uav)) || FAILED(native_device->CreateShaderResourceView(predication_texture.get(), nullptr, &game_device_data.smaa_predication_srv)))
          {
-            game_device_data.smaa_predication_uav.reset();
-            game_device_data.smaa_predication_srv.reset();
+            game_device_data.ReleaseSMAAPredication();
          }
       }
 
@@ -1588,6 +1668,41 @@ public:
          {
             depth_srv.reset();
          }
+      }
+
+      // SMAA T2x: SMAA into this scene frame's linear target with the velocity, then the resolve with the previous one. It needs the scene
+      // frame's motion vectors from the fill, at the canvas size (not the menus' composites, nor a letterbox's), once per scene frame.
+      // Without them this frame is 1x and the next one doesn't jitter.
+      ID3D11PixelShader* const t2x_weight_ps = FindShader(device_data.native_pixel_shaders, "P5S SMAA T2x Blending Weight Calculation PS"_h);
+      ID3D11PixelShader* const t2x_blend_ps = FindShader(device_data.native_pixel_shaders, "P5S SMAA T2x Neighborhood Blending PS"_h);
+      ID3D11PixelShader* const t2x_resolve_ps = FindShader(device_data.native_pixel_shaders, "P5S SMAA T2x Resolve PS"_h);
+      com_ptr<ID3D11ShaderResourceView> mv_srv;
+      if (smaa && game_device_data.t2x_active && game_device_data.mv_filled)
+      {
+         const std::shared_lock lock(game_device_data.mv_mutex);
+         mv_srv = game_device_data.mv_srv;
+      }
+      const uint2 canvas_size = {canvas_desc.Width, canvas_desc.Height};
+      const uint32_t t2x_frame_index = game_device_data.t2x_phase_frame;
+      bool t2x = mv_srv && game_device_data.t2x_frame != t2x_frame_index && t2x_weight_ps && t2x_blend_ps && t2x_resolve_ps && GetViewTextureSize(mv_srv.get()) == canvas_size;
+      const int t2x_current = int(t2x_frame_index & 1);
+      bool t2x_history = game_device_data.t2x_frames[0] && game_device_data.t2x_frame + 1 == t2x_frame_index;
+      if (t2x && GetViewTextureSize(game_device_data.t2x_frame_srvs[0].get()) != canvas_size)
+      {
+         t2x_history = false;
+         game_device_data.ReleaseT2xFrames();
+         const D3D11_TEXTURE2D_DESC desc = {.Width = canvas_desc.Width, .Height = canvas_desc.Height, .MipLevels = 1, .ArraySize = 1, .Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .SampleDesc = {.Count = 1, .Quality = 0}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET};
+         for (int i = 0; i < 2; i++)
+         {
+            if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &game_device_data.t2x_frames[i])) ||
+                FAILED(native_device->CreateRenderTargetView(game_device_data.t2x_frames[i].get(), nullptr, &game_device_data.t2x_frame_rtvs[i])) ||
+                FAILED(native_device->CreateShaderResourceView(game_device_data.t2x_frames[i].get(), nullptr, &game_device_data.t2x_frame_srvs[i])))
+            {
+               game_device_data.ReleaseT2xFrames();
+               break;
+            }
+         }
+         t2x = game_device_data.t2x_frames[0].get() != nullptr;
       }
 
       // The replaced composite reads the Luma cbuffers, which Core binds only after this callback; they stay bound for SMAA and finalize.
@@ -1632,11 +1747,36 @@ public:
          ID3D11RenderTargetView* const rtv = canvas_rtv.get();
          native_device_context->OMSetRenderTargets(1, &rtv, canvas_dsv.get());
       }
+      if (t2x)
+      {
+         // CustomData4: the subsample indices of the scene frame's jitter phase, 0 if it didn't jitter. Only after the composite, which
+         // reads it as a 3D layer's scene UV scale.
+         const float subsample_indices = (game_device_data.t2x_phase >= 0 ? float(game_device_data.t2x_phase + 1) : 0.f);
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::vertex | reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaData, canvas_desc.Width, canvas_desc.Height, depth_srv ? 2.f : 1.f, subsample_indices);
+      }
 
-      // Without RCAS, SMAA writes (and dithers) the canvas directly; finalize would only decode
+      // Without RCAS, SMAA (or T2x's resolve) writes (and dithers) the canvas directly; finalize would only decode
       if (smaa)
       {
-         DrawSMAA(native_device, native_device_context, device_data, sharpen ? game_device_data.smaa_scratch_rtv.get() : canvas_rtv.get(), game_device_data.smaa_gamma_srv.get(), game_device_data.smaa_gamma_srv.get(), depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr);
+         ID3D11RenderTargetView* const smaa_output_rtv = (sharpen ? game_device_data.smaa_scratch_rtv.get() : canvas_rtv.get());
+         const SMAAT2xPasses t2x_passes = {.blending_weight_calculation_ps = t2x_weight_ps, .neighborhood_blending_ps = t2x_blend_ps, .velocity = mv_srv.get()};
+         DrawSMAA(native_device, native_device_context, device_data, (t2x ? game_device_data.t2x_frame_rtvs[t2x_current].get() : smaa_output_rtv), game_device_data.smaa_gamma_srv.get(), game_device_data.smaa_gamma_srv.get(), depth_srv ? game_device_data.smaa_predication_srv.get() : nullptr, nullptr, (t2x ? &t2x_passes : nullptr));
+         if (t2x)
+         {
+            // The resolve: t0 this frame, t1 the previous one or this one again without a history, t2 the motion vectors, s0 linear and
+            // s1 point; LumaData still bound
+            DrawStateStack<DrawStateStackType::FullGraphics> resolve_state;
+            resolve_state.Cache(native_device_context, device_data.uav_max_count);
+            // D3D11 binds a view of a resource still bound for output as null
+            native_device_context->OMSetRenderTargets(0, nullptr, nullptr);
+            ID3D11ShaderResourceView* const resolve_srvs[2] = {game_device_data.t2x_frame_srvs[t2x_history ? (t2x_current ^ 1) : t2x_current].get(), mv_srv.get()};
+            native_device_context->PSSetShaderResources(1, 2, resolve_srvs);
+            ID3D11SamplerState* const resolve_samplers[2] = {device_data.sampler_state_linear.get(), device_data.sampler_state_point.get()};
+            native_device_context->PSSetSamplers(0, 2, resolve_samplers);
+            DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, device_data.native_vertex_shaders.at("Copy VS"_h).get(), t2x_resolve_ps, game_device_data.t2x_frame_srvs[t2x_current].get(), smaa_output_rtv, canvas_desc.Width, canvas_desc.Height, false);
+            resolve_state.Restore(native_device_context);
+            game_device_data.t2x_frame = t2x_frame_index;
+         }
       }
 
       // Development builds may also draw a debug view
@@ -1721,9 +1861,7 @@ public:
          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
          com_ptr<ID3D11Texture2D> depth_mips_texture;
          bool ok = SUCCEEDED(native_device->CreateTexture2D(&desc, nullptr, &depth_mips_texture)) && SUCCEEDED(native_device->CreateShaderResourceView(depth_mips_texture.get(), nullptr, &game_device_data.gtao_depth_mips_srv));
-         D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
-         uav_desc.Format = desc.Format;
-         uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+         D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {.Format = desc.Format, .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D};
          for (UINT mip = 0; ok && mip < 5; mip++)
          {
             uav_desc.Texture2D.MipSlice = mip;
@@ -1752,7 +1890,7 @@ public:
       if (!game_device_data.gtao_final_uav)
          return false;
 
-      // DLSS/FSR accumulate the lit scene the AO feeds: cycle the noise and denoise once (Intel's XeGTAO.h with TAA); without
+      // The upscaler accumulates the lit scene the AO feeds: cycle the noise and denoise once (Intel's XeGTAO.h with TAA); without
       // them a moving pattern would boil, so it stays frozen and denoises twice
       const bool temporal = IsSRActive(device_data);
       const float knobs[8] = {g_gtao_final_value_power, float(normal_input_scale), g_gtao_radius_override, float(g_gtao_debug_view), 1.f / float(width), 1.f / float(height), temporal ? float(cb_luma_global_settings.FrameIndex % 64) : 0.f, 0.f};
@@ -1814,7 +1952,7 @@ public:
 
    // For the game's "FinishCommandList" (command list, then deferred context) and "ExecuteCommandList" (immediate context, then command
    // list, before it runs). A list finished after a split is the scene's remainder: on its execution the split's first part runs, then
-   // DLSS/FSR writes the scene its post process reads.
+   // The upscaler writes the scene its post process reads.
    static void OnExecuteSecondaryCommandList(reshade::api::command_list* cmd_list, reshade::api::command_list* secondary_cmd_list)
    {
       DeviceData* const device_data = GetDeviceData(cmd_list->get_device());
@@ -1918,6 +2056,8 @@ public:
          // The motion vectors are UV deltas, previous minus current
          settings_data.mvs_x_scale = float(desc.Width);
          settings_data.mvs_y_scale = float(desc.Height);
+         // For every upscaler, FSR too (the siblings turn it off for FSR): the scene isn't pre-exposed (the game's exposure is in the
+         // composite, after the upscaler) and there is no exposure texture, so a fixed exposure of 1 would leave HDR highlights ghosting
          settings_data.auto_exposure = true;
          settings_data.render_preset = dlss_render_preset;
          sr_implementations[device_data->sr_type]->UpdateSettings(sr_instance_data, native_device_context.get(), settings_data);
@@ -2036,7 +2176,7 @@ public:
    }
 
    // Upscaling: 3D layers outside the scene frame (main menu and pause screen characters, outlines, translucents) draw through a render
-   // resolution viewport into output sized targets, then a stretch (0x99A76DC2) scales that corner over the target, bypassing DLSS/FSR.
+   // resolution viewport into output sized targets, then a stretch (0x99A76DC2) scales that corner over the target, bypassing the upscaler.
    // Their draws get the whole target instead, and the stretch copies 1:1. Rescaled to match: the quads' texture coordinates (from their
    // vertices) and the lit pixel shaders' light cluster index (pixel position * "fClstScl" / 64). False if not such a draw (it then runs
    // untouched).
@@ -2356,8 +2496,7 @@ public:
             D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = source_desc;
             srv_desc.Texture2D = {mip, 1};
             native_device->CreateShaderResourceView(target->texture.get(), &srv_desc, &target->mip_srvs[mip]);
-            D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {srv_desc.Format, D3D11_RTV_DIMENSION_TEXTURE2D};
-            rtv_desc.Texture2D.MipSlice = mip;
+            const D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {.Format = srv_desc.Format, .ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D, .Texture2D = {.MipSlice = mip}};
             native_device->CreateRenderTargetView(target->texture.get(), &rtv_desc, &target->mip_rtvs[mip]);
          }
          if (!target->mip_srvs[mip] || !target->mip_rtvs[mip])
@@ -2443,7 +2582,7 @@ public:
    {
       auto& game_device_data = GetGameDeviceData(device_data);
       const bool can_draw = original_draw_dispatch_func && *original_draw_dispatch_func;
-      const bool sr_mesh_draw = can_draw && IsSRActive(device_data) && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex;
+      const bool mv_mesh_draw = can_draw && IsMotionVectorActive(device_data) && (stages & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex;
 
       // Before the UI's swapchain checks, which from now on see the letterboxed target instead (this draw and the bars aren't UI)
       if (original_shader_hashes.Contains(letterbox_hash, reshade::api::shader_stage::pixel))
@@ -2482,7 +2621,7 @@ public:
          }
       }
 
-      if (sr_mesh_draw)
+      if (mv_mesh_draw)
       {
 #if DEVELOPMENT
          // Includes recording the draw itself (patched or not)
@@ -2563,7 +2702,7 @@ public:
          game_device_data.layer_drawn = true;
          game_device_data.layer_targets_created = true;
       }
-      if (sr_mesh_draw && DrawLayerAtOutputResolution(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func))
+      if (mv_mesh_draw && IsSRActive(device_data) && DrawLayerAtOutputResolution(native_device, native_device_context, cmd_list_data, device_data, original_shader_hashes, *original_draw_dispatch_func))
          return DrawOrDispatchOverrideType::Replaced;
 
       // The exposure histogram reads a layer stretch target's render resolution corner by pixel: give it the target downscaled to render
@@ -2631,7 +2770,7 @@ public:
          }
       }
 
-      // DLSS/FSR before the scene's first post pass: split its command list here, the upscaler runs between the parts
+      // The upscaler before the scene's first post pass: split its command list here, the upscaler runs between the parts
       if (game_device_data.sr_split_ready && native_device_context == game_device_data.mv_scene_context && IsSRActive(device_data) && original_shader_hashes.Contains(post_process_start_shader_hashes))
       {
          game_device_data.sr_split_ready = false;
@@ -2673,11 +2812,7 @@ public:
             }
             if (output_desc.Width != output_size.x || output_desc.Height != output_size.y)
             {
-               game_device_data.sr_upscaled_output.reset();
-               game_device_data.sr_upscaled_output_rtv.reset();
-               game_device_data.sr_upscaled_output_srv.reset();
-               game_device_data.sr_upscaled_canvas_rtv.reset();
-               game_device_data.sr_upscaled_canvas_srv.reset();
+               game_device_data.ReleaseUpscaledOutput();
                output_desc = {.Width = output_size.x, .Height = output_size.y, .MipLevels = 1, .ArraySize = 1, .Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .SampleDesc = {.Count = 1, .Quality = 0}, .Usage = D3D11_USAGE_DEFAULT, .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS};
                bool created = SUCCEEDED(native_device->CreateTexture2D(&output_desc, nullptr, &game_device_data.sr_upscaled_output)) && SUCCEEDED(native_device->CreateRenderTargetView(game_device_data.sr_upscaled_output.get(), nullptr, &game_device_data.sr_upscaled_output_rtv)) && SUCCEEDED(native_device->CreateShaderResourceView(game_device_data.sr_upscaled_output.get(), nullptr, &game_device_data.sr_upscaled_output_srv));
                output_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -2686,8 +2821,7 @@ public:
                // Retried next frame (the size check sees no output); meanwhile the upscaler runs at render resolution and the game stretches it
                if (!created)
                {
-                  game_device_data.sr_upscaled_output.reset();
-                  game_device_data.sr_upscaled_canvas_srv.reset();
+                  game_device_data.ReleaseUpscaledOutput();
                }
 #if DEVELOPMENT
                reshade::log::message(created ? reshade::log::level::info : reshade::log::level::warning, std::format("[P5S SR] upscaling {}x{} -> {}x{}{}", scene_desc.Width, scene_desc.Height, output_size.x, output_size.y, created ? "" : " failed").c_str());
@@ -2702,14 +2836,8 @@ public:
          // their other users (post, composite, stretch) record on this context, as the scene of every frame, so they already ran.
          else if (game_device_data.sr_upscaled_output)
          {
-            game_device_data.post_targets.clear();
-            game_device_data.post_views.clear();
-            game_device_data.post_sizes = {};
-            game_device_data.sr_upscaled_output.reset();
-            game_device_data.sr_upscaled_output_rtv.reset();
-            game_device_data.sr_upscaled_output_srv.reset();
-            game_device_data.sr_upscaled_canvas_rtv.reset();
-            game_device_data.sr_upscaled_canvas_srv.reset();
+            game_device_data.ReleasePostTargets();
+            game_device_data.ReleaseUpscaledOutput();
          }
          // The upgraded scene: motion vector sized, not multisampled
          if (split.depth && native_device_context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED && scene_desc.Width == mv_size.x && scene_desc.Height == mv_size.y && scene_desc.SampleDesc.Count == 1 && (scene_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || scene_desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS) && SUCCEEDED(native_device_context->FinishCommandList(TRUE, &split.partial)))
@@ -2767,7 +2895,7 @@ public:
             const uint32_t refusal = (reasons != 0 ? reasons : 32u); // 32: "FinishCommandList" failed
             if ((game_device_data.sr_split_refusals_logged.fetch_or(refusal) & refusal) != refusal)
             {
-               reshade::log::message(reshade::log::level::warning, std::format("[P5S SR] a scene frame runs without DLSS/FSR (reasons {:#x}: 1 no depth, 2 immediate context, 4 size, 8 multisampled, 16 not upgraded to fp16, 32 command list): scene {}x{} format {} samples {}, motion vectors {}x{}, output {}x{}", refusal, scene_desc.Width, scene_desc.Height, int(scene_desc.Format), scene_desc.SampleDesc.Count, mv_size.x, mv_size.y, output_size.x, output_size.y).c_str());
+               reshade::log::message(reshade::log::level::warning, std::format("[P5S SR] a scene frame runs without the upscaler (reasons {:#x}: 1 no depth, 2 immediate context, 4 size, 8 multisampled, 16 not upgraded to fp16, 32 command list): scene {}x{} format {} samples {}, motion vectors {}x{}, output {}x{}", refusal, scene_desc.Width, scene_desc.Height, int(scene_desc.Format), scene_desc.SampleDesc.Count, mv_size.x, mv_size.y, output_size.x, output_size.y).c_str());
             }
          }
       }
@@ -2816,13 +2944,16 @@ public:
             const std::unique_lock lock_smaa(game_device_data.smaa_mutex);
             if (cb_luma_global_settings.FrameIndex - game_device_data.smaa_frame > smaa_idle_release_frames)
             {
-               game_device_data.smaa_predication_srv.reset();
-               game_device_data.smaa_predication_uav.reset();
+               game_device_data.ReleaseSMAAPredication();
                ReleaseSMAAIntermediates(device_data);
             }
             if (cb_luma_global_settings.FrameIndex - game_device_data.smaa_copies_frame > smaa_idle_release_frames)
             {
                game_device_data.ReleaseSMAACopies();
+            }
+            if (game_device_data.t2x_frames[0] && cb_luma_global_settings.FrameIndex - game_device_data.t2x_frame > smaa_idle_release_frames)
+            {
+               game_device_data.ReleaseT2xFrames();
             }
          }
          if (!can_draw)
@@ -2946,7 +3077,7 @@ public:
             state.Restore(native_device_context);
             return DrawOrDispatchOverrideType::Replaced;
          }
-         // SMAA not with DLSS/FSR (not even on composites they skip, like the pause screen's), RCAS after either
+         // SMAA not with the upscaler (not even on composites it skips, like the pause screen's), RCAS after either
          if (cb_luma_global_settings.GameSettings.SMAAEnable > 0.5f && !IsSRActive(device_data) && !sr_antialiased)
             return DrawCompositeWithSMAAAndRCAS(native_device, native_device_context, cmd_list_data, device_data, &updated_cbuffers, *original_draw_dispatch_func, true);
          if (sr_antialiased && cb_luma_global_settings.GameSettings.RCASSharpness > 0.f)
@@ -3065,72 +3196,69 @@ public:
             // under it; this reads the UI pixel shaders' b0 "nStageNum", t0/s0 and TEXCOORD1 and assumes a source alpha factor), else only
             // the never displayed alpha (white). After it, subtracts are floored at 0 (dialogue bubbles reached -1.5) with a black pixel
             // shader and a MAX blend, and additive UI is clamped to the display's peak (vanilla clipped at 1) with a MIN blend.
-            if (can_draw)
+            if (!can_draw)
+               return DrawOrDispatchOverrideType::None;
+            com_ptr<ID3D11BlendState> blend_state;
+            FLOAT blend_factor[4];
+            UINT sample_mask;
+            native_device_context->OMGetBlendState(&blend_state, blend_factor, &sample_mask);
+            D3D11_BLEND_DESC blend_desc = {};
+            if (blend_state)
             {
-               com_ptr<ID3D11BlendState> blend_state;
-               FLOAT blend_factor[4];
-               UINT sample_mask;
-               native_device_context->OMGetBlendState(&blend_state, blend_factor, &sample_mask);
-               D3D11_BLEND_DESC blend_desc = {};
-               if (blend_state)
-               {
-                  blend_state->GetDesc(&blend_desc);
-               }
-               const D3D11_RENDER_TARGET_BLEND_DESC& rt_blend = blend_desc.RenderTarget[0];
-               const auto subtracts = [](D3D11_BLEND_OP op)
-               { return op == D3D11_BLEND_OP_SUBTRACT || op == D3D11_BLEND_OP_REV_SUBTRACT; };
-               const auto reads_destination_alpha = [](D3D11_BLEND blend)
-               { return blend == D3D11_BLEND_DEST_ALPHA || blend == D3D11_BLEND_INV_DEST_ALPHA || blend == D3D11_BLEND_SRC_ALPHA_SAT; };
-               const bool subtracts_colors = rt_blend.BlendEnable && subtracts(rt_blend.BlendOp);
-               const bool subtracts_alpha = rt_blend.BlendEnable && subtracts(rt_blend.BlendOpAlpha);
-               const bool clamp_alpha = subtracts_alpha || (rt_blend.BlendEnable && (reads_destination_alpha(rt_blend.SrcBlend) || reads_destination_alpha(rt_blend.DestBlend) || reads_destination_alpha(rt_blend.SrcBlendAlpha) || reads_destination_alpha(rt_blend.DestBlendAlpha)));
-               const bool adds_colors = rt_blend.BlendEnable && rt_blend.BlendOp == D3D11_BLEND_OP_ADD && rt_blend.DestBlend == D3D11_BLEND_ONE;
-               if (subtracts_colors || clamp_alpha || adds_colors)
-               {
-                  com_ptr<ID3D11PixelShader> white_pixel_shader;
-                  com_ptr<ID3D11PixelShader> coverage_pixel_shader;
-                  com_ptr<ID3D11PixelShader> black_pixel_shader;
-                  com_ptr<ID3D11PixelShader> peak_pixel_shader;
-                  {
-                     const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
-                     white_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S Draw White PS"_h);
-                     coverage_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S UI Coverage Clamp PS"_h);
-                     black_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S Draw Black PS"_h);
-                     peak_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S UI Peak Clamp PS"_h);
-                  }
-                  // Index 0 all channels, 1 alpha only
-                  const int channels = (subtracts_colors ? 0 : 1);
-                  if (white_pixel_shader && coverage_pixel_shader && black_pixel_shader && peak_pixel_shader && game_device_data.ui_min_blend_states[0] && game_device_data.ui_min_blend_states[1] && game_device_data.ui_max_blend_states[channels])
-                  {
-                     com_ptr<ID3D11PixelShader> pixel_shader;
-                     native_device_context->PSGetShader(&pixel_shader, nullptr, nullptr);
-                     const auto draw = [&](ID3D11PixelShader* draw_pixel_shader, ID3D11BlendState* draw_blend_state)
-                     {
-                        native_device_context->PSSetShader(draw_pixel_shader, nullptr, 0);
-                        native_device_context->OMSetBlendState(draw_blend_state, blend_factor, sample_mask);
-                        (*original_draw_dispatch_func)();
-                     };
-                     if (subtracts_colors || clamp_alpha)
-                     {
-                        draw(subtracts_colors ? coverage_pixel_shader.get() : white_pixel_shader.get(), game_device_data.ui_min_blend_states[channels].get());
-                     }
-                     draw(pixel_shader.get(), blend_state.get());
-                     if (subtracts_colors || subtracts_alpha)
-                     {
-                        draw(black_pixel_shader.get(), game_device_data.ui_max_blend_states[channels].get());
-                     }
-                     if (adds_colors)
-                     {
-                        SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
-                        updated_cbuffers = true;
-                        draw(peak_pixel_shader.get(), game_device_data.ui_min_blend_states[0].get());
-                     }
-                     native_device_context->PSSetShader(pixel_shader.get(), nullptr, 0);
-                     native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask);
-                     return DrawOrDispatchOverrideType::Replaced;
-                  }
-               }
+               blend_state->GetDesc(&blend_desc);
             }
+            const D3D11_RENDER_TARGET_BLEND_DESC& rt_blend = blend_desc.RenderTarget[0];
+            const auto subtracts = [](D3D11_BLEND_OP op)
+            { return op == D3D11_BLEND_OP_SUBTRACT || op == D3D11_BLEND_OP_REV_SUBTRACT; };
+            const auto reads_destination_alpha = [](D3D11_BLEND blend)
+            { return blend == D3D11_BLEND_DEST_ALPHA || blend == D3D11_BLEND_INV_DEST_ALPHA || blend == D3D11_BLEND_SRC_ALPHA_SAT; };
+            const bool subtracts_colors = rt_blend.BlendEnable && subtracts(rt_blend.BlendOp);
+            const bool subtracts_alpha = rt_blend.BlendEnable && subtracts(rt_blend.BlendOpAlpha);
+            const bool clamp_alpha = subtracts_alpha || (rt_blend.BlendEnable && (reads_destination_alpha(rt_blend.SrcBlend) || reads_destination_alpha(rt_blend.DestBlend) || reads_destination_alpha(rt_blend.SrcBlendAlpha) || reads_destination_alpha(rt_blend.DestBlendAlpha)));
+            const bool adds_colors = rt_blend.BlendEnable && rt_blend.BlendOp == D3D11_BLEND_OP_ADD && rt_blend.DestBlend == D3D11_BLEND_ONE;
+            if (!subtracts_colors && !clamp_alpha && !adds_colors)
+               return DrawOrDispatchOverrideType::None;
+            com_ptr<ID3D11PixelShader> white_pixel_shader;
+            com_ptr<ID3D11PixelShader> coverage_pixel_shader;
+            com_ptr<ID3D11PixelShader> black_pixel_shader;
+            com_ptr<ID3D11PixelShader> peak_pixel_shader;
+            {
+               const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
+               white_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S Draw White PS"_h);
+               coverage_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S UI Coverage Clamp PS"_h);
+               black_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S Draw Black PS"_h);
+               peak_pixel_shader = FindShader(device_data.native_pixel_shaders, "P5S UI Peak Clamp PS"_h);
+            }
+            // Index 0 all channels, 1 alpha only
+            const int channels = (subtracts_colors ? 0 : 1);
+            if (!white_pixel_shader || !coverage_pixel_shader || !black_pixel_shader || !peak_pixel_shader || !game_device_data.ui_min_blend_states[0] || !game_device_data.ui_min_blend_states[1] || !game_device_data.ui_max_blend_states[channels])
+               return DrawOrDispatchOverrideType::None;
+            com_ptr<ID3D11PixelShader> pixel_shader;
+            native_device_context->PSGetShader(&pixel_shader, nullptr, nullptr);
+            const auto draw = [&](ID3D11PixelShader* draw_pixel_shader, ID3D11BlendState* draw_blend_state)
+            {
+               native_device_context->PSSetShader(draw_pixel_shader, nullptr, 0);
+               native_device_context->OMSetBlendState(draw_blend_state, blend_factor, sample_mask);
+               (*original_draw_dispatch_func)();
+            };
+            if (subtracts_colors || clamp_alpha)
+            {
+               draw(subtracts_colors ? coverage_pixel_shader.get() : white_pixel_shader.get(), game_device_data.ui_min_blend_states[channels].get());
+            }
+            draw(pixel_shader.get(), blend_state.get());
+            if (subtracts_colors || subtracts_alpha)
+            {
+               draw(black_pixel_shader.get(), game_device_data.ui_max_blend_states[channels].get());
+            }
+            if (adds_colors)
+            {
+               SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+               updated_cbuffers = true;
+               draw(peak_pixel_shader.get(), game_device_data.ui_min_blend_states[0].get());
+            }
+            native_device_context->PSSetShader(pixel_shader.get(), nullptr, 0);
+            native_device_context->OMSetBlendState(blend_state.get(), blend_factor, sample_mask);
+            return DrawOrDispatchOverrideType::Replaced;
          }
       }
 
@@ -3191,8 +3319,8 @@ public:
 
    // Keeps the game's render scale at the slider's value, live: after writing the setting, a WM_SIZE for the current size makes the game
    // rebuild its targets now (it does on any resize, e.g. alt-tab). Changing the option in the game's menu (the same setting) is undone,
-   // also live. Without DLSS/FSR the game stretches its composite (SMAA runs before). With them the main menu ("menu") renders at 100%
-   // (no DLSS/FSR there, so the background would be stretched), kept in the setting for the whole menu stay: P5StrikersFix rebuilds at
+   // also live. Without the upscaler the game stretches its composite (SMAA runs before). With it the main menu ("menu") renders at 100%
+   // (no upscaler there, so the background would be stretched), kept in the setting for the whole menu stay: P5StrikersFix rebuilds at
    // any value written back, so the options menu shows (and saves) 100% there. The same WM_SIZE also rebuilds on "targets_rebuild".
    static void UpdateRenderScale(Persona5StrikersGameDeviceData* game_device_data, bool menu)
    {
@@ -3231,29 +3359,40 @@ public:
       game_device_data.sr_drew = device_data.has_drawn_sr.load();
       game_device_data.sr_active = LatchSRFrame(device_data);
       game_device_data.mv_presents++;
-      // DLSS/FSR off (None, or suppressed): Core freed the upscaler and its output, ours go too, recreated by the next scene frame with
-      // them on. Not at once: the scene and post record on worker threads that read "sr_active" per draw, so a frame recorded across
-      // the latch may still use them; past a few presents none does.
-      if (game_device_data.sr_active)
+      game_device_data.mv_filled = false;
+      const bool t2x_was_active = game_device_data.t2x_active;
+      game_device_data.t2x_active = cb_luma_global_settings.GameSettings.SMAAEnable > 0.5f && g_smaa_t2x && !game_device_data.sr_active;
+      const bool t2x_stopped = t2x_was_active && !game_device_data.t2x_active;
+      if (t2x_stopped)
+      {
+         const std::unique_lock lock(game_device_data.smaa_mutex);
+         game_device_data.ReleaseT2xFrames();
+      }
+      // The upscaler off (None, or suppressed): Core freed it and its output, ours go too, recreated by the next scene frame with it
+      // on. Not at once: the scene and post record on worker threads that read "sr_active" per draw, so a frame recorded across
+      // the latch may still use them; past a few presents none does. The motion vectors stay while SMAA T2x uses them, and go as many
+      // presents after it stops.
+      if (game_device_data.sr_active || t2x_stopped)
       {
          game_device_data.sr_inactive_presents = 0;
       }
       else if (++game_device_data.sr_inactive_presents == sr_release_presents)
       {
+         if (!game_device_data.t2x_active)
          {
-            const std::unique_lock lock(game_device_data.mv_mutex);
-            game_device_data.mv_texture.reset();
-            game_device_data.mv_rtv.reset();
-            game_device_data.mv_uav.reset();
+            {
+               const std::unique_lock lock(game_device_data.mv_mutex);
+               game_device_data.ReleaseMotionVectorTarget();
+            }
+            game_device_data.mv_scene_depth.reset();
+            game_device_data.mv_scene_depth_id = nullptr;
+            game_device_data.mv_scene_depth_srv.reset();
+            game_device_data.mv_frame_depth.reset();
+            game_device_data.mv_previous_resources.clear();
+            game_device_data.mv_previous_globals_buffers.clear();
+            game_device_data.mv_jitter_buffer.reset();
+            game_device_data.mv_fill_buffer.reset();
          }
-         game_device_data.mv_scene_depth.reset();
-         game_device_data.mv_scene_depth_id = nullptr;
-         game_device_data.mv_scene_depth_srv.reset();
-         game_device_data.mv_frame_depth.reset();
-         game_device_data.mv_previous_resources.clear();
-         game_device_data.mv_previous_globals_buffers.clear();
-         game_device_data.mv_jitter_buffer.reset();
-         game_device_data.mv_fill_buffer.reset();
          {
             const std::lock_guard lock(game_device_data.sr_mutex);
             game_device_data.sr_split = {};
@@ -3261,18 +3400,12 @@ public:
             game_device_data.sr_pending_splits.clear();
          }
          game_device_data.sr_upscaling_context = nullptr;
-         game_device_data.sr_upscaled_output.reset();
+         game_device_data.ReleaseUpscaledOutput();
          game_device_data.sr_drawn_output.reset();
-         game_device_data.sr_upscaled_output_rtv.reset();
-         game_device_data.sr_upscaled_output_srv.reset();
-         game_device_data.sr_upscaled_canvas_rtv.reset();
-         game_device_data.sr_upscaled_canvas_srv.reset();
          game_device_data.post_redirect = false;
          game_device_data.post_scene.reset();
          game_device_data.post_scene_rtv.reset();
-         game_device_data.post_targets.clear();
-         game_device_data.post_views.clear();
-         game_device_data.post_sizes = {};
+         game_device_data.ReleasePostTargets();
       }
       // A letterboxed target's aspect ratio (e.g. 2.4 at 3840x1600) isn't the swapchain's: the targets made after a rebuild are upgraded
       // at it too (the scene, for the upscaling, and the target itself, for HDR)
@@ -3319,7 +3452,7 @@ public:
       }
       {
          // The main menu after 30 presents (loading screens and fades between keep the game's scale), until the scene draws again. Scene
-         // frames are only seen with DLSS/FSR (motion vectors start them), the only time 100% matters.
+         // frames are only seen with the upscaler (motion vectors start them), the only time 100% matters.
          const bool render_resolution_composite = game_device_data.render_resolution_composite.exchange(false);
          if (game_device_data.scene_drawn.exchange(false) || !IsSRActive(device_data))
          {
@@ -3336,9 +3469,10 @@ public:
          const bool menu = game_device_data.menu_presents >= 30;
          UpdateRenderScale(&game_device_data, menu);
       }
-      // A mip sharper under DLSS/FSR, which resolves the detail over its jittered frames (Core applies it to anisotropic samplers)
+      // A mip sharper under the upscaler (none more with XeSS at native resolution), which resolves the detail over its jittered frames (Core
+      // applies it to anisotropic samplers)
       const auto heights = game_device_data.sr_heights.load();
-      SetTextureMipLodBias(nullptr, device_data, (IsSRActive(device_data) ? SR::GetMipLODBias(heights.render, heights.output) : 0.f));
+      SetTextureMipLodBias(nullptr, device_data, (IsSRActive(device_data) ? SR::GetMipLODBias(device_data.sr_type, heights.render, heights.output) : 0.f));
 #if DEVELOPMENT
       // "Performance Test": the finished timestamp sets, averaged into a log line every 120 frames (the first 60 after a mode change or
       // a pause skipped)
@@ -3379,7 +3513,7 @@ public:
             stats.composite.Add(1000.0 * double(end - start) / double(disjoint.Frequency));
          }
          window.Finish(measuring, [&]
-            { reshade::log::message(reshade::log::level::info, std::format("[P5S Perf] mode=\"{}\" sr={} render={}p output={}p gpu scene avg/max={:.3f}/{:.3f} ms gpu sr avg/max={:.3f}/{:.3f} ms gpu game composite avg/max={:.3f}/{:.3f} ms ({} samples) cpu hooks={:.3f} ms/frame globals filter={} samples={}/{} disjoint={}", perf_test_modes[Perf::g_test], device_data.sr_type == SR::Type::FSR ? "FSR" : "DLSS", game_device_data.sr_heights.load().render, game_device_data.sr_heights.load().output, stats.scene.Average(), stats.scene.max_ms, stats.sr.Average(), stats.sr.max_ms, stats.composite.Average(), stats.composite.max_ms, stats.composite.samples, window.HookMs(), game_device_data.mv_filtered_globals_buffer_count.load(), stats.scene.samples, window.frames, window.disjoint).c_str()); });
+            { reshade::log::message(reshade::log::level::info, std::format("[P5S Perf] mode=\"{}\" sr={} render={}p output={}p gpu scene avg/max={:.3f}/{:.3f} ms gpu sr avg/max={:.3f}/{:.3f} ms gpu game composite avg/max={:.3f}/{:.3f} ms ({} samples) cpu hooks={:.3f} ms/frame globals filter={} samples={}/{} disjoint={}", perf_test_modes[Perf::g_test], SR::GetTypeName(device_data.sr_type), game_device_data.sr_heights.load().render, game_device_data.sr_heights.load().output, stats.scene.Average(), stats.scene.max_ms, stats.sr.Average(), stats.sr.max_ms, stats.composite.Average(), stats.composite.max_ms, stats.composite.samples, window.HookMs(), game_device_data.mv_filtered_globals_buffer_count.load(), stats.scene.samples, window.frames, window.disjoint).c_str()); });
       }
 #endif
    }
@@ -3388,6 +3522,7 @@ public:
    {
       auto& settings = cb_luma_global_settings.GameSettings;
       reshade::get_config_value(nullptr, NAME, "SMAAEnable", settings.SMAAEnable);
+      reshade::get_config_value(nullptr, NAME, "SMAAT2x", g_smaa_t2x);
       reshade::get_config_value(nullptr, NAME, "RCASSharpness", settings.RCASSharpness);
       reshade::get_config_value(nullptr, NAME, "Exposure", settings.Exposure);
       reshade::get_config_value(nullptr, NAME, "ColorGradingIntensity", settings.ColorGradingIntensity);
@@ -3415,16 +3550,19 @@ public:
          }
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          {
-            ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR or stretched by the game.\nReplaces the game's own option.");
+            ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR/XeSS or stretched by the game.\nReplaces the game's own option.");
          }
          DrawResetButton(g_render_scale, 10, "RenderScale");
          ImGui::EndDisabled();
       }
-      constexpr const char* smaa_tooltip = "Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off; not used with DLSS/FSR).";
-      // DLSS/FSR replace SMAA: shown off, the saved choice kept for when they're turned off
+      constexpr const char* smaa_tooltip = "Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off; not used with DLSS/FSR/XeSS).";
+      // The upscaler replaces SMAA: shown off, the saved choice kept for when it's turned off
       DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &settings.SMAAEnable, default_luma_global_game_settings.SMAAEnable, smaa_tooltip, IsSRActive(device_data));
+      ImGui::BeginDisabled(settings.SMAAEnable <= 0.5f);
+      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS/FSR/XeSS.", IsSRActive(device_data));
+      ImGui::EndDisabled();
       ImGui::BeginDisabled(settings.SMAAEnable <= 0.5f && !IsSRActive(device_data));
-      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &settings.RCASSharpness, default_luma_global_game_settings.RCASSharpness, 0.f, 1.f, "Sharpening applied on top of SMAA or DLSS/FSR (0 = off).");
+      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &settings.RCASSharpness, default_luma_global_game_settings.RCASSharpness, 0.f, 1.f, "Sharpening applied on top of SMAA or DLSS/FSR/XeSS (0 = off).");
       ImGui::EndDisabled();
 
       ImGui::SeparatorText("Grade");
@@ -3490,7 +3628,7 @@ public:
       ImGui::Checkbox("Post Process at Output Resolution", &g_post_output_resolution);
       if (ImGui::IsItemHovered())
       {
-         ImGui::SetTooltip("Below a 100%% render scale, runs DOF and bloom after DLSS/FSR at the output resolution (bloom with the iterations the game adds there).\nOff: the previous way, at the render resolution on the upscaled frame scaled down. Not saved.");
+         ImGui::SetTooltip("Below a 100%% render scale, runs DOF and bloom after the upscaler at the output resolution (bloom with the iterations the game adds there).\nOff: the previous way, at the render resolution on the upscaled frame scaled down. Not saved.");
       }
 
       ImGui::SeparatorText("Performance");
@@ -3499,7 +3637,7 @@ public:
       ImGui::EndDisabled();
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
-         ImGui::SetTooltip("Sets the render scale for the mode and logs \"[P5S Perf]\" to ReShade.log every 120 frames: the GPU time of the scene (from its first depth draw to the split,\nthe motion vector draws included, and any GPU idle between the game's command lists) and of DLSS/FSR (timestamps, so the 60 fps cap doesn't matter), and the CPU time in the motion vector hooks.\nThe difference between DLAA and \"DLAA Without Motion Vector Draws\" is their cost (that mode's image is unjittered, with camera-only motion vectors).\nNeeds DLSS or FSR. Keep the camera still, set the GPU to maximum performance in the driver (a capped GPU downclocks). Not saved.");
+         ImGui::SetTooltip("Sets the render scale for the mode and logs \"[P5S Perf]\" to ReShade.log every 120 frames: the GPU time of the scene (from its first depth draw to the split,\nthe motion vector draws included, and any GPU idle between the game's command lists) and of the upscaler (timestamps, so the 60 fps cap doesn't matter), and the CPU time in the motion vector hooks.\nThe difference between DLAA and \"DLAA Without Motion Vector Draws\" is their cost (that mode's image is unjittered, with camera-only motion vectors).\nNeeds DLSS, FSR or XeSS. Keep the camera still, set the GPU to maximum performance in the driver (a capped GPU downclocks). Not saved.");
       }
    }
 #endif
@@ -3509,7 +3647,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Persona 5 Strikers\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR, DLSS or FSR 3 upscaling, and replaces the game's FXAA with SMAA and its SSAO with XeGTAO.\n"
+         "It adds HDR, DLSS, FSR or XeSS upscaling, and replaces the game's FXAA with SMAA and its SSAO with XeGTAO.\n"
          "Enable Ambient Occlusion in the game's graphic settings for XeGTAO to apply; SMAA works either way.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
@@ -3554,7 +3692,7 @@ public:
                   "\nRenoDX (HDR tonemap method)"
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"
-                  "\nAMD FidelityFX (RCAS + FSR 3)"
+                  "\nAMD FidelityFX (RCAS + FSR)"
                   "\nNVIDIA NGX (DLSS)");
    }
 };
@@ -3577,7 +3715,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       // A letterboxed target's aspect ratio joins once seen (see "letterbox_hash" and "OnPresent"), none before
       texture_format_upgrades_2d_size_filters = (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::CustomAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px;
       texture_format_upgrades_2d_custom_aspect_ratios = {};
-      // For the DLSS/FSR mip bias (see "OnPresent")
+      // For the upscaler's mip bias (see "OnPresent")
       enable_samplers_upgrade = true;
 
 #if DEVELOPMENT
