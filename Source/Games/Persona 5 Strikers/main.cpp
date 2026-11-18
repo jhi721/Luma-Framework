@@ -88,7 +88,7 @@ namespace
    int g_render_scale = 10;
 
    bool g_gtao_enable = true;
-   constexpr UINT gtao_knobs_cb_slot = 9; // "register(b9)" in Luma_P5S_XeGTAO.hlsl; b11 is core DrawBloom's
+   constexpr UINT gtao_knobs_cb_slot = 9; // "register(b9)" in "Luma_P5S_XeGTAO.hlsl"; b11 is Core DrawBloom's
    float g_gtao_final_value_power = 1.f;  // DEV/TEST calibration knobs, not persisted
    float g_gtao_radius_override = 0.f;    // > 0 overrides the native radius (centimetres)
 
@@ -291,8 +291,8 @@ struct Persona5StrikersGameDeviceData final : public GameDeviceData
    };
    std::unordered_map<uint32_t, GlobalsLayout> mv_globals_layouts;
    // The scene records on one deferred context: after its first post pass, the next scene depth draw (depth prepass, else G-buffer)
-   // starts a frame and clears the target
-   // Atomics: every context's depth draws check them (shadows, other passes) before touching the scene's state
+   // starts a frame and clears the target. Atomics, as every context's depth draws (shadows, other passes) check them before touching
+   // the scene's state.
    std::atomic<bool> mv_frame_ended = true;
    com_ptr<ID3D11Resource> mv_scene_depth;                       // The G-buffer's depth, which the forward redraws share
    std::atomic<ID3D11Resource*> mv_scene_depth_id = nullptr;     // "mv_scene_depth", for other contexts to compare
@@ -1557,8 +1557,8 @@ public:
    // which the game stretches onto the swapchain) before the UI: gamma encode of the canvas, predication, SMAA (blending the gamma copy
    // in linear light) into the canvas; with RCAS, SMAA into the scratch and finalize (RCAS, decode, dither) into the canvas. SMAA T2x
    // instead draws SMAA into the jitter phase's linear frame, then resolves it with the previous phase's into the canvas (the scratch with
-   // RCAS). With "smaa" false (the upscaler antialiased) only RCAS: gamma encode, finalize. If anything is missing (shaders compiling, unexpected target) the
-   // composite is left alone and the vanilla FXAA runs (not after the upscaler).
+   // RCAS). With "smaa" false (the upscaler antialiased) only RCAS: gamma encode, finalize. If anything is missing (shaders compiling,
+   // unexpected target) the composite is left alone and the vanilla FXAA runs (not after the upscaler).
    static DrawOrDispatchOverrideType DrawCompositeWithSMAAAndRCAS(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, bool* updated_cbuffers, const std::function<void()>& original_draw_dispatch_func, bool smaa)
    {
       auto& game_device_data = GetGameDeviceData(device_data);
@@ -1952,7 +1952,7 @@ public:
 
    // For the game's "FinishCommandList" (command list, then deferred context) and "ExecuteCommandList" (immediate context, then command
    // list, before it runs). A list finished after a split is the scene's remainder: on its execution the split's first part runs, then
-   // The upscaler writes the scene its post process reads.
+   // the upscaler writes the scene its post process reads.
    static void OnExecuteSecondaryCommandList(reshade::api::command_list* cmd_list, reshade::api::command_list* secondary_cmd_list)
    {
       DeviceData* const device_data = GetDeviceData(cmd_list->get_device());
