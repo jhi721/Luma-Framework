@@ -33,10 +33,12 @@ namespace D3D12CommandSignatures
    struct Call
    {
       std::optional<Signature> signature; // None if it was created before the hook
+      ID3D12CommandSignature* native_signature = nullptr;
       ID3D12Resource* argument_buffer = nullptr;
       uint64_t argument_offset = 0;
       UINT max_count = 0;
       ID3D12Resource* count_buffer = nullptr;
+      uint64_t count_offset = 0;
    };
    inline thread_local std::optional<Call> current_call;
 
@@ -123,7 +125,7 @@ namespace D3D12CommandSignatures
 
    inline void STDMETHODCALLTYPE ExecuteIndirectDetour(ID3D12GraphicsCommandList* list, ID3D12CommandSignature* signature, UINT max_count, ID3D12Resource* argument_buffer, UINT64 argument_offset, ID3D12Resource* count_buffer, UINT64 count_offset)
    {
-      Call call = {.argument_buffer = argument_buffer, .argument_offset = argument_offset, .max_count = max_count, .count_buffer = count_buffer};
+      Call call = {.native_signature = signature, .argument_buffer = argument_buffer, .argument_offset = argument_offset, .max_count = max_count, .count_buffer = count_buffer, .count_offset = count_offset};
       {
          const std::shared_lock lock(signatures_mutex);
          if (const auto it = signatures.find(reinterpret_cast<uint64_t>(signature)); it != signatures.end())
