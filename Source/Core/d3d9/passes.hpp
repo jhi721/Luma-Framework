@@ -55,7 +55,11 @@ namespace D3D9Passes
       std::span<const uint8_t> smaa_t2x_blending_weight_calculation_ps, smaa_t2x_neighborhood_blending_ps, smaa_t2x_resolve_ps;
       std::span<const uint8_t> depth_edges_cs;
       std::span<const uint8_t> luma_taa_cs;
+      int luma_taa_quality = 2; // TAA_QUALITY of "luma_taa_cs": its history is 2x2 the render size from High (TAA_HISTORY_2X)
       std::span<const uint8_t> gtao_prefilter_cs, gtao_main_cs, gtao_denoise_cs, gtao_denoise_final_cs;
+      // Optional (empty = that GtaoParams option fails the run): GT-VBAO's main pass ("gtvbao_main_pass_cs"), its 1 slice variant
+      // under the history (GTVBAO_SLICE_COUNT=1.0) and the AO history ("temporal_pass_cs")
+      std::span<const uint8_t> gtvbao_main_cs, gtvbao_temporal_main_cs, gtao_temporal_cs;
    };
 
    // "Run()" passes over the canvas, in order (each skipped when off).
@@ -91,16 +95,30 @@ namespace D3D9Passes
       bool reset = false;
    };
 
-   // Bayonetta's XeGTAO (Shaders/Bayonetta/Luma_Bayonetta_XeGTAO.hlsl, main.cpp
-   // RunXeGTAO without the history and GT-VBAO) from the shared depth
-   // ("SetDepth()": the prepass' "1 - z/w") into the shared R32F `output` of its
-   // size. `camera` = rows 0..27 of the shader's b4: the prepass VS's affine view
-   // (3 rows) at `affine_row` and its view projection (4 rows) at `matrix_row`.
+   // Bayonetta's XeGTAO (Shaders/Bayonetta/Luma_Bayonetta_XeGTAO.hlsl, the
+   // dgVoodoo mod's RunXeGTAO) from the shared depth ("SetDepth()": the prepass'
+   // "1 - z/w") into the shared R32F `output` of its size. `camera` = rows 0..27
+   // of the shader's b4: the prepass VS's affine view (3 rows) at `affine_row`
+   // and its view projection (4 rows) at `matrix_row`. The defaults run XeGTAO
+   // alone, without the history.
    struct GtaoParams
    {
       float camera[28 * 4] = {};
       uint32_t affine_row = 0, matrix_row = 0;
       float final_value_power = 0.55f, depth_scale = 1, radius_override = 0;
+      bool gtvbao = false; // GT-VBAO's main pass in place of XeGTAO's (its own final_value_power, the dgVoodoo mod's 0.35)
+      // CB::GTAOKnobs: the shaders' DEVELOPMENT debug views (1 depth gradient, 2 normals, 3 AO x8, 4 edges), shown alone by the apply
+      // PS's GTAO_DEBUG_VIEW variant; the noise layer (frame % 64 with the history, else 0: a moving pattern boils without one)
+      float debug_view = 0, noise_index = 0;
+      // The AO history ("temporal_pass_cs", Includes/XeGTAOTemporal.hlsl) between the main pass and the denoise, 0 = off. It reads
+      // this frame's motion vectors from the shared motion texture ("SetMotion()", the AO's size): object motion where a patched
+      // draw wrote one, MOTION_VECTOR_MARKER elsewhere (the shader gives those the camera motion). `reprojection` = current clip
+      // space to the previous frame's (column vectors), its rows; `jitter_ndc` = this frame's projection jitter. `history_reset`
+      // restarts it (a cut, or no run last frame); a run without it, or a switch between XeGTAO and GT-VBAO, restarts it too.
+      float history_weight = 0;
+      bool history_reset = false;
+      float reprojection[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+      float jitter_ndc[2] = {};
    };
 
    // A fullscreen pass: root constants at "constants_register", one SRV at t0,
@@ -152,7 +170,8 @@ namespace D3D9Passes
       com_ptr<ID3D12RootSignature> root;
       com_ptr<ID3D12PipelineState> pipeline;
       ComPtr<ID3D12Resource> color, depth, motion, output, result;
-      ComPtr<ID3D12Resource> history[2], locks[2]; // 2x2 history (High)
+      ComPtr<ID3D12Resource> history[2], locks[2];
+      UINT history_scale = 2; // 2x2 history from High (LumaTAA::history_2x_quality), the render size below
       uint32_t history_index = 0;
       bool history_valid = false;
    };
@@ -171,20 +190,27 @@ namespace D3D9Passes
    constexpr UINT TAA_SRVS = 8, TAA_UAVS = 4;
 
    // XeGTAO: b4 = the camera rows (root CBV into `camera`, a slot per
-   // recording), b9 = CB::GTAOKnobs as root constants, one SRV table (t0) and
-   // one UAV table (u0-u4), s0 point clamp. The depth mips and the working AO are
-   // NON_PIXEL_SHADER_RESOURCE outside a run, `result` (copied into the shared
-   // output) UNORDERED_ACCESS; the input is the SMAA predication's shared depth.
+   // recording), b9 = CB::GTAOKnobs and b10 = CB::GTAOTemporalConstants as root
+   // constants, one SRV table (t0-t3) and one UAV table (u0-u4), s0 point clamp.
+   // The depth mips, the working AO and the history are NON_PIXEL_SHADER_RESOURCE
+   // outside a run, `result` (copied into the shared output) UNORDERED_ACCESS;
+   // the inputs are the SMAA predication's shared depth and T2x's shared motion.
    struct Gtao
    {
       com_ptr<ID3D12RootSignature> root;
       com_ptr<ID3D12PipelineState> prefilter, main, denoise, denoise_final;
-      ComPtr<ID3D12Resource> camera; // upload, D3D12Passes::MAX_FRAMES slots
+      com_ptr<ID3D12PipelineState> gtvbao_main, gtvbao_temporal_main, temporal; // null without their shaders
+      ComPtr<ID3D12Resource> camera;                                            // upload, D3D12Passes::MAX_FRAMES slots
       void* camera_mapped = nullptr;
       uint32_t camera_slot = 0;
       ComPtr<ID3D12Resource> mips, working[2], result, output;
+      // The AO history, R16G16_FLOAT (AO, view Z), ping-ponged, made by the first
+      // run with it; `history_index` = the one written last
+      ComPtr<ID3D12Resource> history[2];
+      uint32_t history_index = 0;
+      bool history_valid = false, history_gtvbao = false;
    };
-   constexpr UINT GTAO_DEPTH_MIPS = 5, GTAO_CAMERA_SLOT_BYTES = 512;
+   constexpr UINT GTAO_DEPTH_MIPS = 5, GTAO_CAMERA_SLOT_BYTES = 512, GTAO_SRVS = 4;
 
    struct PassDevice
    {
@@ -382,9 +408,10 @@ namespace D3D9Passes
       return true;
    }
 
-   inline bool CreateTaa(std::span<const uint8_t> cs)
+   inline bool CreateTaa(std::span<const uint8_t> cs, int quality)
    {
       Taa& taa = g_pass.taa;
+      taa.history_scale = (quality >= 2 ? 2 : 1);
       const D3D12_DESCRIPTOR_RANGE1 ranges[] = {
          {.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
             .NumDescriptors = TAA_SRVS,
@@ -426,7 +453,7 @@ namespace D3D9Passes
       constexpr D3D12_DESCRIPTOR_RANGE_FLAGS volatile_range = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
       const D3D12_DESCRIPTOR_RANGE1 srv_range = {
          .RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-         .NumDescriptors = 1,
+         .NumDescriptors = GTAO_SRVS,
          .Flags = volatile_range};
       const D3D12_DESCRIPTOR_RANGE1 uav_range = {
          .RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
@@ -441,6 +468,8 @@ namespace D3D9Passes
             .DescriptorTable = {.NumDescriptorRanges = 1, .pDescriptorRanges = &srv_range}},
          {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
             .DescriptorTable = {.NumDescriptorRanges = 1, .pDescriptorRanges = &uav_range}},
+         {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            .Constants = {.ShaderRegister = 10, .Num32BitValues = sizeof(CB::GTAOTemporalConstants) / 4}},
       };
       const D3D12_STATIC_SAMPLER_DESC sampler = {
          .Filter = D3D12_FILTER_MIN_MAG_MIP_POINT,
@@ -456,18 +485,28 @@ namespace D3D9Passes
                .pParameters = parameters,
                .NumStaticSamplers = 1,
                .pStaticSamplers = &sampler}});
-      const std::tuple<std::span<const uint8_t>, com_ptr<ID3D12PipelineState>*> pipelines[] = {
-         {shaders.gtao_prefilter_cs, std::addressof(gtao.prefilter)},
-         {shaders.gtao_main_cs, std::addressof(gtao.main)},
-         {shaders.gtao_denoise_cs, std::addressof(gtao.denoise)},
-         {shaders.gtao_denoise_final_cs, std::addressof(gtao.denoise_final)}};
-      for (const auto& [cs, pipeline] : pipelines)
+      // The optional ones fail only when given
+      struct Pipeline
+      {
+         std::span<const uint8_t> cs;
+         com_ptr<ID3D12PipelineState>* pipeline = nullptr;
+         bool required = false;
+      };
+      const Pipeline pipelines[] = {
+         {.cs = shaders.gtao_prefilter_cs, .pipeline = std::addressof(gtao.prefilter), .required = true},
+         {.cs = shaders.gtao_main_cs, .pipeline = std::addressof(gtao.main), .required = true},
+         {.cs = shaders.gtao_denoise_cs, .pipeline = std::addressof(gtao.denoise), .required = true},
+         {.cs = shaders.gtao_denoise_final_cs, .pipeline = std::addressof(gtao.denoise_final), .required = true},
+         {.cs = shaders.gtvbao_main_cs, .pipeline = std::addressof(gtao.gtvbao_main)},
+         {.cs = shaders.gtvbao_temporal_main_cs, .pipeline = std::addressof(gtao.gtvbao_temporal_main)},
+         {.cs = shaders.gtao_temporal_cs, .pipeline = std::addressof(gtao.temporal)}};
+      for (const auto& [cs, pipeline, required] : pipelines)
       {
          if (!cs.empty() && gtao.root)
          {
             *pipeline = D3D12Passes::CreateComputePipeline(g_pass.device.Get(), gtao.root.get(), {cs.data(), cs.size()});
          }
-         if (!*pipeline)
+         if (!*pipeline && (required || !cs.empty()))
          {
             return Fail("XeGTAO pipelines", E_FAIL);
          }
@@ -741,7 +780,7 @@ namespace D3D9Passes
          return Fail("D3D12Passes::Create", E_FAIL);
       }
       return CreatePipeline(&g_pass.display_map, shaders.compose_vs, shaders.display_map_ps, 13, sizeof(CB::LumaGlobalSettingsPadded) / 4) &&
-             CreatePipeline(&g_pass.rcas, shaders.compose_vs, shaders.rcas_ps, 0, 4) && CreateSmaa(shaders) && CreateTaa(shaders.luma_taa_cs) &&
+             CreatePipeline(&g_pass.rcas, shaders.compose_vs, shaders.rcas_ps, 0, 4) && CreateSmaa(shaders) && CreateTaa(shaders.luma_taa_cs, shaders.luma_taa_quality) &&
              CreateGtao(shaders);
    }
 
@@ -905,7 +944,7 @@ namespace D3D9Passes
          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
       for (int i = 0; i < 2; ++i)
       {
-         taa.history[i] = CreateTexture(D3D12_HEAP_TYPE_DEFAULT, desc.Width * 2, desc.Height * 2, DXGI_FORMAT_R16G16B16A16_FLOAT,
+         taa.history[i] = CreateTexture(D3D12_HEAP_TYPE_DEFAULT, desc.Width * taa.history_scale, desc.Height * taa.history_scale, DXGI_FORMAT_R16G16B16A16_FLOAT,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
          taa.locks[i] = CreateTexture(D3D12_HEAP_TYPE_DEFAULT, desc.Width, desc.Height, DXGI_FORMAT_R32_UINT,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -965,7 +1004,7 @@ namespace D3D9Passes
          .inv_render_resolution = {1 / width, 1 / height},
          .motion_vector_scale = {width, height}, // UV delta -> pixels
          .depth_near_far = {params.near_plane, params.far_plane},
-         .flags = (params.reset || !taa.history_valid) ? TAA_FLAG_RESET : 0u,
+         .flags = ((params.reset || !taa.history_valid) ? TAA_FLAG_RESET : 0u),
          .jitter = {-params.jitter[0], -params.jitter[1]},
          .output_resolution = {width, height},
          .inv_output_resolution = {1 / width, 1 / height}};
@@ -1010,11 +1049,12 @@ namespace D3D9Passes
       Gtao& gtao = g_pass.gtao;
       for (ComPtr<ID3D12Resource>* texture :
          {std::addressof(gtao.output), std::addressof(gtao.mips), std::addressof(gtao.working[0]), std::addressof(gtao.working[1]),
-            std::addressof(gtao.result)})
+            std::addressof(gtao.result), std::addressof(gtao.history[0]), std::addressof(gtao.history[1])})
       {
          D3D12Passes::Retire(&g_pass.context, texture->Get());
          texture->Reset();
       }
+      gtao.history_valid = false;
       if (!output)
       {
          return true;
@@ -1046,11 +1086,14 @@ namespace D3D9Passes
       return (gtao.mips && gtao.working[0] && gtao.working[1] && gtao.result) ? true : Fail("XeGTAO scratch", E_OUTOFMEMORY);
    }
 
-   // The prefilter (5 depth mips), the main pass, both denoise passes (the last
-   // one into `result`), then the copy into the shared output. Descriptors: SRVs
-   // 0 depth, 1 mips, 2-3 working; UAVs 4-8 mips, 9-10 working, 11 result (a UAV
-   // table spans 5 from its start, within the frame's 16). As "Run()": false =
-   // nothing submitted.
+   // The prefilter (5 depth mips), the main pass (XeGTAO's or GT-VBAO's), the
+   // history when asked (working 0 into working 1 and the history), both denoise
+   // passes from wherever the AO is (the last one into `result`), then the copy
+   // into the shared output. Descriptors: SRVs 0 working 0, 1 the previous
+   // history, 2 motion, 3 depth (the history's t0-t3), 4 mips, 5 working 1; UAVs
+   // 6 working 0, 7 working 1, 8 the next history (the history's u0-u1), 9
+   // result, 11-15 mips (a table spans 4 SRVs / 5 UAVs from its start, within
+   // the frame's 16). As "Run()": false = nothing submitted.
    inline bool RunGtao(uint64_t value, const GtaoParams& params)
    {
       Gtao& gtao = g_pass.gtao;
@@ -1059,6 +1102,41 @@ namespace D3D9Passes
           depth->GetDesc().Height != gtao.output->GetDesc().Height)
       {
          return Fail("no XeGTAO depth / output of one size", E_FAIL);
+      }
+      const D3D12_RESOURCE_DESC desc = gtao.output->GetDesc();
+      const UINT width = UINT(desc.Width), height = desc.Height;
+      if (params.history_weight > 0 && !gtao.temporal)
+      {
+         return Fail("no XeGTAO history pipeline", E_FAIL);
+      }
+      // Without this frame's motion vectors of the AO's size the history skips
+      // the run (and restarts at the next)
+      ID3D12Resource* const motion = g_pass.smaa.motion.Get();
+      const bool temporal = params.history_weight > 0 && motion && motion->GetDesc().Width == desc.Width &&
+                            motion->GetDesc().Height == desc.Height;
+      if (temporal && !gtao.history[0])
+      {
+         for (ComPtr<ID3D12Resource>& history : gtao.history)
+         {
+            history = CreateTexture(D3D12_HEAP_TYPE_DEFAULT, desc.Width, desc.Height, DXGI_FORMAT_R16G16_FLOAT,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+         }
+         gtao.history_valid = false;
+         if (!gtao.history[0] || !gtao.history[1])
+         {
+            gtao.history[0].Reset();
+            gtao.history[1].Reset();
+            return Fail("XeGTAO history", E_OUTOFMEMORY);
+         }
+      }
+      ID3D12PipelineState* main = gtao.main.get();
+      if (params.gtvbao)
+      {
+         main = ((temporal && gtao.gtvbao_temporal_main) ? gtao.gtvbao_temporal_main.get() : gtao.gtvbao_main.get());
+         if (!main)
+         {
+            return Fail("no GT-VBAO pipeline", E_FAIL);
+         }
       }
       const std::optional<D3D12Passes::Recording> recording = D3D12Passes::Begin(&g_pass.context);
       if (!recording)
@@ -1092,34 +1170,49 @@ namespace D3D9Passes
             .Texture2D = {.MipSlice = mip}};
          device->CreateUnorderedAccessView(resource, nullptr, &view, cpu(index));
       };
-      srv(0, depth, 1);
-      srv(1, gtao.mips.Get(), GTAO_DEPTH_MIPS);
-      srv(2, gtao.working[0].Get(), 1);
-      srv(3, gtao.working[1].Get(), 1);
+      const uint32_t previous = gtao.history_index, next = previous ^ 1u;
+      srv(0, gtao.working[0].Get(), 1);
+      srv(3, depth, 1);
+      srv(4, gtao.mips.Get(), GTAO_DEPTH_MIPS);
+      srv(5, gtao.working[1].Get(), 1);
+      uav(6, gtao.working[0].Get(), 0);
+      uav(7, gtao.working[1].Get(), 0);
+      uav(9, gtao.result.Get(), 0);
       for (UINT mip = 0; mip < GTAO_DEPTH_MIPS; ++mip)
       {
-         uav(4 + mip, gtao.mips.Get(), mip);
+         uav(11 + mip, gtao.mips.Get(), mip);
       }
-      uav(9, gtao.working[0].Get(), 0);
-      uav(10, gtao.working[1].Get(), 0);
-      uav(11, gtao.result.Get(), 0);
+      if (temporal)
+      {
+         srv(1, gtao.history[previous].Get(), 1);
+         srv(2, motion, 1);
+         uav(8, gtao.history[next].Get(), 0);
+      }
 
       // Begin never hands out a frame still on the GPU and at most MAX_FRAMES are
       // in flight, so the slot of MAX_FRAMES runs ago is free
       const UINT64 slot = UINT64(gtao.camera_slot++ % D3D12Passes::MAX_FRAMES) * GTAO_CAMERA_SLOT_BYTES;
       memcpy(static_cast<char*>(gtao.camera_mapped) + slot, params.camera, sizeof(params.camera));
-      const D3D12_RESOURCE_DESC desc = gtao.output->GetDesc();
-      const UINT width = UINT(desc.Width), height = desc.Height;
       const CB::GTAOKnobs knobs = {
          .final_value_power = params.final_value_power,
          .depth_scale = params.depth_scale,
          .radius_override = params.radius_override,
+         .debug_view = params.debug_view,
          .viewport_pixel_size = {1.0f / width, 1.0f / height},
+         .noise_index = params.noise_index,
          .camera_affine_row = float(params.affine_row),
          .camera_matrix_row = float(params.matrix_row)};
+      // Not across a switch between XeGTAO and GT-VBAO either (their AO differs)
+      const bool history_valid = temporal && gtao.history_valid && !params.history_reset && gtao.history_gtvbao == params.gtvbao;
+      CB::GTAOTemporalConstants temporal_constants = {};
+      static_assert(sizeof(temporal_constants.reprojection) == sizeof(params.reprojection));
+      memcpy(&temporal_constants.reprojection, params.reprojection, sizeof(params.reprojection));
+      temporal_constants.jitter_ndc = {params.jitter_ndc[0], params.jitter_ndc[1]};
+      temporal_constants.history_weight = (history_valid ? params.history_weight : 0.0f);
       list->SetComputeRootSignature(gtao.root.get());
       list->SetComputeRootConstantBufferView(0, gtao.camera->GetGPUVirtualAddress() + slot);
       list->SetComputeRoot32BitConstants(1, sizeof(knobs) / 4, &knobs, 0);
+      list->SetComputeRoot32BitConstants(4, sizeof(temporal_constants) / 4, &temporal_constants, 0);
       D3D12Passes::Transition(list, depth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
       // A pass from SRV `source` into UAV table `target`; `written` goes
       // UNORDERED_ACCESS around it (the result stays there)
@@ -1138,16 +1231,41 @@ namespace D3D9Passes
             D3D12Passes::Transition(list, written, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
          }
       };
-      pass(gtao.prefilter.get(), 0, 4, gtao.mips.Get(), (width + 15) / 16, (height + 15) / 16);
-      pass(gtao.main.get(), 1, 9, gtao.working[0].Get(), (width + 7) / 8, (height + 7) / 8);
-      pass(gtao.denoise.get(), 2, 10, gtao.working[1].Get(), (width + 15) / 16, (height + 7) / 8);
-      pass(gtao.denoise_final.get(), 3, 11, nullptr, (width + 15) / 16, (height + 7) / 8);
+      pass(gtao.prefilter.get(), 3, 11, gtao.mips.Get(), (width + 15) / 16, (height + 15) / 16);
+      pass(main, 4, 6, gtao.working[0].Get(), (width + 7) / 8, (height + 7) / 8);
+      // The denoise reads working 0, or working 1 after the history
+      UINT denoise_source = 0;
+      if (temporal)
+      {
+         ID3D12Resource* const history = gtao.history[next].Get();
+         D3D12Passes::Transition(list, motion, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         D3D12Passes::Transition(list, history, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+         pass(gtao.temporal.get(), 0, 7, gtao.working[1].Get(), (width + 7) / 8, (height + 7) / 8);
+         D3D12Passes::Transition(list, history, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         D3D12Passes::Transition(list, motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+         denoise_source = 1;
+      }
+      const UINT working_srvs[2] = {0, 5}, working_uavs[2] = {6, 7};
+      pass(gtao.denoise.get(), working_srvs[denoise_source], working_uavs[denoise_source ^ 1], gtao.working[denoise_source ^ 1].Get(),
+         (width + 15) / 16, (height + 7) / 8);
+      pass(gtao.denoise_final.get(), working_srvs[denoise_source ^ 1], 9, nullptr, (width + 15) / 16, (height + 7) / 8);
       D3D12Passes::Transition(list, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
       D3D12Passes::Transition(list, gtao.result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
       D3D12Passes::Transition(list, gtao.output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
       list->CopyResource(gtao.output.Get(), gtao.result.Get());
       D3D12Passes::Transition(list, gtao.output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
       D3D12Passes::Transition(list, gtao.result.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      return SubmitBetween(value);
+      if (!SubmitBetween(value))
+      {
+         gtao.history_valid = false;
+         return false;
+      }
+      gtao.history_valid = temporal;
+      if (temporal)
+      {
+         gtao.history_index = next;
+         gtao.history_gtvbao = params.gtvbao;
+      }
+      return true;
    }
 } // namespace D3D9Passes

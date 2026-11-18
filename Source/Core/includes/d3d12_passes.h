@@ -1,6 +1,6 @@
 #pragma once
 
-#if DX12
+// Not gated by "DX12": it uses no Core state, so a D3D9 build can run it on a D3D12 device of its own.
 
 // Luma's own GPU work at present on D3D12 (the display composition, later the passes of phase 5b): a command list of Luma's, run by
 // "ExecuteCommandLists" on the native present queue inside ReShade's present event. ReShade's immediate command list can't take it: it only
@@ -258,5 +258,3 @@ namespace D3D12Passes
       list->ResourceBarrier(1, &barrier);
    }
 } // namespace D3D12Passes
-
-#endif // DX12

@@ -20,6 +20,7 @@ namespace SR
 	// GPU PCI vendor ids, for what an upscaler runs or what "Auto" picks
 	constexpr uint32_t vendor_id_amd = 0x1002;
 	constexpr uint32_t vendor_id_intel = 0x8086;
+	constexpr uint32_t vendor_id_nvidia = 0x10DE;
 
 	// The objects of an API. DLSS, FSR and XeSS have a D3D12 path, which a D3D11 build can host too (its D3D12 implementations live in
 	// "unity_build_d3d12.cpp", see "sr_bridge/D3D12SR.h").

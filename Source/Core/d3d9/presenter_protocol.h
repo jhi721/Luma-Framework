@@ -18,7 +18,7 @@
 // frame <n> <source 0 scene|1 canvas> <mode> <paper white> <decode gamma>
 //       <sync interval> <overlay 0|1> <test flags> <follow window 0|1> <width>
 //       <height> <latency wait 0|1> <block 0|1> <probe count> <x0> <y0> ..
-//       <x3> <y3> <gpu wait 0|1> <colour refresh>
+//       <x3> <y3> <gpu wait 0|1> <colour refresh> [<hdr10plus 0|1>]
 //   gpu wait 1: the D3D9 queue signals "in" n after writing the textures, the
 //   presenter's queue waits for it; the presenter's queue signals "out" n after
 //   its reads and the D3D9 queue waits for that before writing them again (no
@@ -31,13 +31,19 @@
 //   counter; a change re-applies SetColorSpace1 (display changed). test flags:
 //   1 no encode, 2 no BT.2020 matrix (mutations), 8 present clamp of the canvas
 //   to max(snapshot, 1), 16 the snapshot holds this frame's ResetRender.
+//   hdr10plus (version 3, optional, default 0): 1 engages HDR10+ GAMING through
+//   NVAPI while the output mode is HDR (scRGB or HDR10), re-applied on a new
+//   swapchain or colour refresh; 1 -> 0 sets the display back to HDR10 (nvapi.hpp).
+// Reflex is not on the pipe: the presenter publishes its D3D12 device
+// (D3D9NvApi::PublishReflexDevice) and the add-on's thread runs Core's Reflex on
+// it around its own present (nvapi.hpp).
 // EOF: the thread exits 0. Any failure: error text in the stats, exit 1. The
 // add-on's watchdog signals "out" to UINT64_MAX when the thread ends or hangs,
 // so no D3D9 GPU wait outlives it.
 #pragma once
 #include <cstdint>
 
-constexpr int PRESENTER_VERSION = 2;
+constexpr int PRESENTER_VERSION = 3;
 
 struct PresenterStats
 {

@@ -27,6 +27,7 @@
 #include <d3d9.h>
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
@@ -36,10 +37,14 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <set>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -48,11 +53,15 @@
 
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
+#include <source/com_ptr.hpp> // display.hpp
 
 #include "../includes/globals.h"
 #include "../includes/minhook.h"
+#include "../includes/super_resolution.h"
 #include "../sr_bridge/SRBridgeProtocol.h"
+#include "../utils/display.hpp"
 #include "kmt_sync.h"
+#include "nvapi.hpp"
 #include "passes.hpp"
 #include "presenter.hpp"
 #include "presenter_protocol.h"
@@ -74,6 +83,18 @@ extern "C" __declspec(dllexport) const char* WEBSITE = &Globals::WEBSITE[0];
 #endif
 
 #include "../includes/settings_widgets.h" // After "NAME"
+
+// core.hpp's icons (ReShade's ImGui font), for the overlay and the games' About
+#ifndef ICON_FK_OK
+#define ICON_FK_CANCEL reinterpret_cast<const char*>(u8"")
+#define ICON_FK_OK reinterpret_cast<const char*>(u8"")
+#define ICON_FK_PLUS reinterpret_cast<const char*>(u8"")
+#define ICON_FK_MINUS reinterpret_cast<const char*>(u8"")
+#define ICON_FK_REFRESH reinterpret_cast<const char*>(u8"")
+#define ICON_FK_SEARCH reinterpret_cast<const char*>(u8"")
+#define ICON_FK_WARNING reinterpret_cast<const char*>(u8"")
+#define ICON_FK_FILE_CODE reinterpret_cast<const char*>(u8"")
+#endif
 
 using namespace reshade::api;
 using reshade::addon_event;
@@ -116,6 +137,14 @@ public:
    {
    }
    virtual void OnBindPipeline(pipeline_stage stages, pipeline pipeline)
+   {
+   }
+   // "ReloadShaders()" gave the pipelines of this replaced CRC a new replacement ("out.reloaded_ps"): the game's own copies of them follow
+   virtual void OnReplacementReloaded(uint32_t crc, std::span<const uint8_t> bytecode)
+   {
+   }
+   // "ReloadShaders()" ran (DEVELOPMENT): drop the game's own shaders so they compile again on their next use
+   virtual void OnShadersReloaded()
    {
    }
    virtual void OnBindRenderTargets(device* device, uint32_t count, const resource_view* rtvs, resource_view depth_stencil)
@@ -187,6 +216,12 @@ public:
    virtual void PrintImGuiAbout()
    {
    }
+#if DEVELOPMENT
+   // After "OnInit()": the game's knobs, counters, textures and setting keys for the MCP tools (mcp.hpp's "McpD3D9::Register*()")
+   virtual void RegisterDevValues()
+   {
+   }
+#endif
 };
 
 inline D3D9Game* d3d9_game = nullptr; // Set by "CoreMain()"
@@ -233,6 +268,9 @@ struct Output
    // game's velocity writers into targets the upgrade makes fp16; env
    // D9N_VELOCITY_PS adds CRCs)
    std::set<uint32_t> velocity_crcs;
+   // Unreplaced PS whose whole oC0 is saturated (UI drawn into targets the
+   // upgrade makes fp16, which relied on the UNORM clamp)
+   std::set<uint32_t> saturate_crcs;
    // Output clamp patches by original CRC (empty: refused)
    std::unordered_map<uint32_t, std::vector<uint32_t>> clamped_ps;
    // The hand-off draw's viewport: the scene rect on the canvas
@@ -249,7 +287,17 @@ struct Output
    // CRC32 -> replacement bytecode: the scan of Shaders/<Game> and, in
    // DEVELOPMENT, the env lists (loaded first, so they win)
    std::map<uint32_t, std::vector<uint8_t>> replacements;
+   // The last scan's files that failed to compile: CRC -> compiler output (MCP "shader_list")
+   std::map<uint32_t, std::string> replacement_errors;
    bool shaders_scanned = false;
+   // "ReloadShaders()": our own PS of a changed replacement, bound by "DrawCommon()" in place of the pipelines created with the old one
+   // (ReShade cannot recreate the game's pipelines); "ps_overridden": it is on the device until the game binds another pipeline
+   std::map<uint32_t, IDirect3DPixelShader9*> reloaded_ps;
+   bool ps_overridden = false;
+   // "luma_bypassed": the game's bytecode of each replaced CRC with its output clamp, as an unreplaced PS gets it (kept by
+   // "OnCreatePipeline()"), and its PS, made at its first bypassed draw
+   std::map<uint32_t, std::vector<uint32_t>> original_ps_code;
+   std::map<uint32_t, IDirect3DPixelShader9*> original_ps;
    // The game's copy PS of the scene into the back buffer (its s0 is the
    // hand-off source; env D9N_HANDOFF_PS adds CRCs)
    std::set<uint32_t> handoff_crcs;
@@ -268,6 +316,16 @@ struct Output
 static Output out;
 static uint32_t g_logical_width = 0, g_logical_height = 0;
 static float g_decode_gamma = 0.0f;
+// The SDR transfer function the composition decodes a transfer-encoded hand-off with ("g_decode_gamma" > 0), core.hpp's
+// GAMMA_CORRECTION_TYPE 0 (sRGB) or 1 (gamma 2.2: "g_decode_gamma"); sent as decode_gamma -1 for sRGB (Luma_D3D9_Compose.hlsl)
+inline int gamma_correction_type = 1;
+// HDR10+ GAMING through NVAPI in HDR output (the frame line's field, nvapi.hpp; ignored without ENABLE_NVAPI), saved as "HDR10PlusGaming".
+// On by default, as core.hpp always engages it on an HDR display.
+inline bool hdr10plus_gaming = true;
+#if ENABLE_REFLEX
+// core.hpp's "ReflexMode": Core's Reflex on the presenter's D3D12 device around the game's present (nvapi.hpp)
+inline Reflex::Mode reflex_mode = Reflex::Mode::On;
+#endif
 static effect_runtime* g_runtime_d3d9 = nullptr;
 // Proxy lifecycle: the D3D9 device/swapchain served (bound at the first
 // present), failure and flip-chain history.
@@ -283,6 +341,8 @@ static IDXGIFactory1* g_factory =
 static bool g_mode_unsupported[3] = {};
 static RECT g_last_window_rect = {};
 static bool g_d3d9_latency_done = false;
+// The game asked for exclusive fullscreen, which "OnCreateSwapchain()" made windowed: "OnInitSwapchain()" makes its window borderless
+static bool g_borderless_pending = false;
 
 // Presenter: the in-process D3D12 output device (presenter.hpp) on its own
 // thread (presenter_protocol.h lines over a pipe). `process` is that thread.
@@ -312,15 +372,43 @@ struct Helper
 };
 static Helper hp;
 
-// SR bridge (env D9N_SR=dlss|fsr|xess, helper mode on GPU sync):
-// Luma-Upscaler.exe next to the add-on runs the upscaler at 1x (DLAA / native
-// AA) on the shared scene RT (SRBridgeProtocol.h); once ready its output
-// replaces the scene in the presenter's "textures" line. ponytail: zero motion,
-// flat depth, no jitter or render scale until the game side has them; a hung
-// (alive, stalled) upscaler is not killed, only an exited one releases the D3D9
-// GPU wait.
+// Super Resolution, as core.hpp's settings ("SRUserType", "DLSSRenderPreset", "LumaTAAQuality"; DEVELOPMENT env D9N_SR=dlss|fsr|xess and
+// D9N_LUMA_TAA=1 over them), applied live at the next present by "ApplySuperResolution()": the SR bridge's upscaler
+// ("g_sr_upscaler", SRBridgeProtocol::Upscaler, -1: none), which Luma-Upscaler.exe next to the add-on runs on the game's shared
+// textures once the presenter's GPU sync is up (the game starts it, "OnStartUpscaler()"), or Luma TAA on the pass device
+// ("state.luma_taa").
+inline SR::UserType sr_user_type = SR::UserType::Auto;
+inline unsigned int dlss_render_preset = 0; // NVSDK_NGX_DLSS_Hint_Render_Preset_* (0: the default), for the game's start line
+inline int luma_taa_quality = 2;            // TAA_QUALITY of the pass device's Luma TAA (LumaTAA::quality_names)
+inline int sr_fsr_version = 0;              // The start line's FSR major version: 3 for "FSR 3", 0 (the newest) for "FSR 4"
 static int g_sr_upscaler = -1;
+static unsigned int g_sr_started_preset = 0; // "dlss_render_preset" when "g_sr_upscaler" was applied
+static bool g_sr_apply_pending = true;
 static D3D9SR::Bridge sr;
+
+// The SR bridge's upscaler of a user type (-1: none, Luma TAA or Auto)
+static int BridgeUpscaler(SR::UserType user_type)
+{
+   switch (user_type)
+   {
+   case SR::UserType::DLSS:
+      return SRBridgeProtocol::kDlss;
+   case SR::UserType::FSR:
+   case SR::UserType::FSR3:
+      return SRBridgeProtocol::kFsr;
+   case SR::UserType::XeSS:
+      return SRBridgeProtocol::kXess;
+   default:
+      return -1;
+   }
+}
+
+// ReShade's effects toggle (its key) bypasses Luma as core.hpp's ("ForceToggleShaders()"): the presenter shows the game as it draws
+// without Luma, only with the create-time output clamps. The game's own pixel shaders draw in place of the replacements ("DrawCommon()"),
+// the samplers keep the game's filtering, ResetRender's passes don't run and the game's hooks skip their own work.
+inline bool luma_bypassed = false;
+// "luma_bypassed" changed since the last present event: the game's "OnPresent()" restarts its temporal histories, then it is cleared
+inline bool bypass_changed = false;
 
 // The offline harness' mutations (MUT_*, each restores one old behaviour so its check must fail); never set outside DEVELOPMENT
 inline bool Mutated(int32_t bit)
@@ -395,15 +483,28 @@ inline void ApplyDisplaySettings()
    state.map_ui_paper_white_nits = cb_luma_global_settings.UIPaperWhite;
 }
 
-// Display settings (ini, core.hpp's names): peak white 1000, paper white 203 for both the scene and the UI by default
+// The display's peak white (its DXGI output's MaxLuminance, core.hpp's "default_user_peak_white"), once "QueryDisplay()" read it
+static float g_display_peak_white = default_peak_white;
+// "ScenePeakWhite" is unset or saved as 0: it follows "g_display_peak_white"
+static bool g_peak_white_default = true;
+// "UseOSReferenceWhiteLevel": both paper whites are the OS SDR white level, which the overlay's paper white sets (core.hpp's)
+inline bool use_os_reference_white_level = false;
+
+// Display settings (ini, core.hpp's names): the display's peak white (1000 until it is known), paper white 203 for both the scene and the
+// UI by default
 inline void LoadDisplaySettings()
 {
-   cb_luma_global_settings.ScenePeakWhite = default_peak_white;
    cb_luma_global_settings.ScenePaperWhite = default_paper_white;
    cb_luma_global_settings.UIPaperWhite = default_paper_white;
-   reshade::get_config_value(nullptr, NAME, "ScenePeakWhite", cb_luma_global_settings.ScenePeakWhite);
+   g_peak_white_default = !reshade::get_config_value(nullptr, NAME, "ScenePeakWhite", cb_luma_global_settings.ScenePeakWhite) ||
+                          cb_luma_global_settings.ScenePeakWhite <= 0.f;
+   if (g_peak_white_default)
+   {
+      cb_luma_global_settings.ScenePeakWhite = g_display_peak_white;
+   }
    reshade::get_config_value(nullptr, NAME, "ScenePaperWhite", cb_luma_global_settings.ScenePaperWhite);
    reshade::get_config_value(nullptr, NAME, "UIPaperWhite", cb_luma_global_settings.UIPaperWhite);
+   reshade::get_config_value(nullptr, NAME, "UseOSReferenceWhiteLevel", use_os_reference_white_level);
    ApplyDisplaySettings();
 }
 // The back buffer redirect into the fp16 canvas is on and has not been given
@@ -478,8 +579,11 @@ inline std::filesystem::path ShadersRoot()
    GetModuleFileNameW(nullptr, executable, MAX_PATH);
    std::filesystem::path root = std::filesystem::path(executable).parent_path() / Globals::MOD_NAME;
 #if DEVELOPMENT && defined(SOLUTION_DIR)
+   // "CompileShader()"'s cache folder alone is no shader root
    std::error_code error;
-   if (!std::filesystem::is_directory(root, error) || std::filesystem::is_empty(root, error))
+   const bool has_shaders = std::ranges::any_of(std::filesystem::directory_iterator(root, error), [](const std::filesystem::directory_entry& entry)
+      { return entry.path().filename() != L"cache"; });
+   if (!has_shaders)
    {
       root = std::filesystem::path(SOLUTION_DIR) / "Shaders";
    }
@@ -522,14 +626,36 @@ struct IncludeFromIncluder final : ID3DInclude
    }
 };
 
+// What "CompileShader()" did on this thread since its caller last reset or read it: the replacement scan and "ReloadShaders()" run on
+// the game's thread, "OpenPassDevice()" on its own.
+struct ShaderCompileReport
+{
+   uint32_t from_cache = 0, compiled = 0;
+   std::string errors;
+};
+inline thread_local ShaderCompileReport compile_report;
+
 // fxc (D3DCompileFromFile, includes relative to the including file) of "file"'s "entry" with "defines" ("NAME" or "NAME=VALUE"); SM3
-// targets as the offline harness builds them (/Gec /O3). Empty on failure (logged).
+// targets as the offline harness builds them (/Gec /O3). Empty on failure (logged, and in "compile_report.errors"). Every compile also
+// gets the build's DEVELOPMENT and TEST (set when DEVELOPMENT is), as core.hpp's shader defines.
+// Cached in Luma/cache next to the add-on, as <stem>.<entry>.<target>.<variant>.<key>.cso: the variant (file path, defines, flags) keeps
+// one file per compiled permutation (SMAA and SMAA T2x share entry points), the key (FNV-1a 64 of the variant, the preprocessed source
+// with every include, the entry and the target) changes with any edit; a compile replaces the variant's older keys.
 // ponytail: D3DCompiler_47.dll from the system, not Shader::CompileShaderFromFile: that compiles SM3 at D3DCOMPILE_OPTIMIZATION_LEVEL0,
 // not the /O3 the ports were verified at (sm3_equiv.py), and needs core.hpp's prelude (Hash::MD5, InitShaderCompiler); switch with an
 // optimization level parameter, for its bundled D3DCompiler_47_x32.dll on Wine.
 inline std::vector<uint8_t> CompileShader(const std::filesystem::path& file, const char* entry, const char* target,
-   const std::vector<std::string>& defines)
+   const std::vector<std::string>& file_defines)
 {
+   std::vector<std::string> defines = file_defines;
+   // TEST may be undefined here (core.hpp, which defaults it, isn't included)
+#if DEVELOPMENT
+   defines.insert(defines.end(), {"DEVELOPMENT=1", "TEST=1"});
+#elif defined(TEST) && TEST
+   defines.insert(defines.end(), {"DEVELOPMENT=0", "TEST=1"});
+#else
+   defines.insert(defines.end(), {"DEVELOPMENT=0", "TEST=0"});
+#endif
    std::vector<std::string> names, values;
    for (const std::string& define : defines)
    {
@@ -548,20 +674,113 @@ inline std::vector<uint8_t> CompileShader(const std::filesystem::path& file, con
    ID3DBlob* errors = nullptr;
    IncludeFromIncluder include; // Not an aggregate (virtual), so no designated initializer
    include.root_folder = file.parent_path();
+   // The pass device's shaders compile on their own thread (see "PassEnsureOpen()")
+   static std::shared_mutex compile_mutex;
+   const std::unique_lock lock(compile_mutex);
+   const auto fnv1a = [](uint64_t* hash, const void* data, size_t size)
+   {
+      for (size_t i = 0; i < size; ++i)
+      {
+         *hash = (*hash ^ static_cast<const uint8_t*>(data)[i]) * 1099511628211ull;
+      }
+   };
+   uint64_t variant = 14695981039346656037ull;
+   fnv1a(&variant, file.native().data(), file.native().size() * sizeof(wchar_t));
+   for (const std::string& define : defines)
+   {
+      fnv1a(&variant, define.c_str(), define.size() + 1);
+   }
+   fnv1a(&variant, &flags, sizeof(flags));
+   const std::filesystem::path cache_folder = std::filesystem::path(ModuleFilePath(L"")).parent_path() / Globals::MOD_NAME / "cache";
+   std::filesystem::path cache_file;
+   std::wstring cache_prefix;
+   {
+      std::ifstream stream(file, std::ios::binary);
+      const std::string source{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+      ID3DBlob* preprocessed = nullptr;
+      // Unreadable or not preprocessable: no cache, the compile reports why
+      if (stream && SUCCEEDED(D3DPreprocess(source.data(), source.size(), file.filename().string().c_str(), macros.data(), &include,
+                       &preprocessed, nullptr)))
+      {
+         uint64_t key = variant;
+         fnv1a(&key, preprocessed->GetBufferPointer(), preprocessed->GetBufferSize());
+         fnv1a(&key, entry, strlen(entry) + 1);
+         fnv1a(&key, target, strlen(target) + 1);
+         wchar_t suffix[96] = L"";
+         swprintf_s(suffix, L".%hs.%hs.%08X.", entry, target, static_cast<uint32_t>(variant));
+         cache_prefix = file.stem().wstring() + suffix;
+         swprintf_s(suffix, L"%016llX.cso", static_cast<unsigned long long>(key));
+         cache_file = cache_folder / (cache_prefix + suffix);
+      }
+      Free(&preprocessed);
+   }
+   if (!cache_file.empty())
+   {
+      std::ifstream stream(cache_file, std::ios::binary);
+      std::vector<uint8_t> cached{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+      if (!cached.empty())
+      {
+         ++compile_report.from_cache;
+         return cached;
+      }
+   }
    const HRESULT hr = D3DCompileFromFile(file.c_str(), macros.data(), &include, entry, target, flags, 0, &code, &errors);
    std::vector<uint8_t> bytecode;
    if (SUCCEEDED(hr))
    {
       const auto* bytes = static_cast<const uint8_t*>(code->GetBufferPointer());
       bytecode.assign(bytes, bytes + code->GetBufferSize());
+      ++compile_report.compiled;
    }
    else
    {
+      const char* error_text = (errors ? static_cast<const char*>(errors->GetBufferPointer()) : "");
       Log("d9native: shader %ls (%s %s) failed to compile 0x%08X: %.1000s", file.c_str(), entry, target, static_cast<uint32_t>(hr),
-         errors ? static_cast<const char*>(errors->GetBufferPointer()) : "");
+         error_text);
+      compile_report.errors += file.filename().string() + " (" + entry + " " + target + "): " + error_text + "\n";
    }
    Free(&code);
    Free(&errors);
+   if (bytecode.empty() || cache_file.empty())
+   {
+      return bytecode;
+   }
+   // Written beside, then renamed: a torn write never becomes a cache hit
+   std::error_code error;
+   std::filesystem::create_directories(cache_folder, error);
+   std::filesystem::path written = cache_file;
+   written += L".tmp";
+   {
+      std::ofstream stream(written, std::ios::binary | std::ios::trunc);
+      stream.write(reinterpret_cast<const char*>(bytecode.data()), static_cast<std::streamsize>(bytecode.size()));
+      if (!stream)
+      {
+         error = std::make_error_code(std::errc::io_error);
+      }
+   }
+   if (!error)
+   {
+      std::filesystem::rename(written, cache_file, error);
+   }
+   if (error)
+   {
+      static bool logged = false;
+      if (!logged)
+      {
+         logged = true;
+         Log("d9native: shader cache %ls not writable (%s), shaders compile at every launch", cache_folder.c_str(), error.message().c_str());
+      }
+      std::filesystem::remove(written, error);
+      return bytecode;
+   }
+   for (const std::filesystem::directory_entry& older : std::filesystem::directory_iterator(cache_folder, error))
+   {
+      const std::wstring name = older.path().filename().wstring();
+      if (name.starts_with(cache_prefix) && name.ends_with(L".cso") && older.path() != cache_file)
+      {
+         std::filesystem::remove(older.path(), error);
+      }
+   }
    return bytecode;
 }
 
@@ -585,13 +804,19 @@ inline std::vector<uint8_t> LoadShader(const wchar_t* cso, const std::string& fi
    return CompileShader(ShadersRoot() / file, entry, target, all_defines);
 }
 
-// Every Shaders/<Game>/<Name>_0x<CRC32>.ps_3_0.hlsl ("main") into "out.replacements" under its CRC32 (of the game's bytecode), unless a
-// DEVELOPMENT list already replaces it.
-inline void ScanReplacementShaders()
+#if DEVELOPMENT
+inline std::map<uint32_t, std::filesystem::path> replacement_files; // The scan's files by CRC (MCP "shader_list")
+#endif
+
+// Every Shaders/<Game>/<Name>_0x<CRC32>.ps_3_0.hlsl ("main") into "replacements" under its CRC32 (of the game's bytecode), unless it
+// already has one (out.replacements: a DEVELOPMENT list's).
+inline void ScanReplacementShaders(std::map<uint32_t, std::vector<uint8_t>>* replacements)
 {
    constexpr std::wstring_view suffix = L".ps_3_0.hlsl";
    const std::filesystem::path folder = ShadersRoot() / d3d9_game->shaders_folder;
+   const uint32_t from_cache = compile_report.from_cache, fresh = compile_report.compiled;
    size_t found = 0, compiled = 0;
+   out.replacement_errors.clear();
    std::error_code error;
    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(folder, error))
    {
@@ -603,17 +828,26 @@ inline void ScanReplacementShaders()
       }
       ++found;
       const uint32_t crc = wcstoul(name.substr(crc_at, 8).c_str(), nullptr, 16);
-      if (out.replacements.contains(crc))
+#if DEVELOPMENT
+      replacement_files[crc] = entry.path();
+#endif
+      if (replacements->contains(crc))
       {
          continue;
       }
+      const size_t errors_before = compile_report.errors.size();
       if (std::vector<uint8_t> code = CompileShader(entry.path(), "main", "ps_3_0", d3d9_game->shader_defines); !code.empty())
       {
-         out.replacements[crc] = std::move(code);
+         (*replacements)[crc] = std::move(code);
          ++compiled;
       }
+      else
+      {
+         out.replacement_errors[crc] = compile_report.errors.substr(errors_before);
+      }
    }
-   Log("d9native: %zu of %zu replacement pixel shaders compiled from %ls", compiled, found, folder.c_str());
+   Log("d9native: %zu of %zu replacement pixel shaders ready from %ls (%u from cache, %u compiled)", compiled, found, folder.c_str(),
+      compile_report.from_cache - from_cache, compile_report.compiled - fresh);
 }
 
 struct Observe
@@ -744,6 +978,314 @@ static float HalfToFloat(uint16_t half)
    return sign ? -value : value;
 }
 
+#if DEVELOPMENT
+// ---- MCP capture (mcp.hpp's tools): readbacks, the frame trace and the read of a draw's target ----
+
+// A D3D9 format as Scripts/luma_mcp.py decodes it: its DXGI id (0: none)
+struct D3D9FormatInfo
+{
+   D3DFORMAT format = D3DFMT_UNKNOWN;
+   uint32_t bytes_per_pixel = 0;
+   uint32_t dxgi_format = 0;
+   const char* name = "UNKNOWN";
+   const char* note = nullptr; // Where the DXGI layout differs
+};
+
+inline constexpr D3D9FormatInfo d3d9_formats[] = {
+   {D3DFMT_A16B16G16R16F, 8, DXGI_FORMAT_R16G16B16A16_FLOAT, "R16G16B16A16_FLOAT"},
+   {D3DFMT_A32B32G32R32F, 16, DXGI_FORMAT_R32G32B32A32_FLOAT, "R32G32B32A32_FLOAT"},
+   {D3DFMT_A8R8G8B8, 4, DXGI_FORMAT_B8G8R8A8_UNORM, "B8G8R8A8_UNORM"},
+   {D3DFMT_X8R8G8B8, 4, DXGI_FORMAT_B8G8R8X8_UNORM, "B8G8R8X8_UNORM"},
+   {D3DFMT_A8B8G8R8, 4, DXGI_FORMAT_R8G8B8A8_UNORM, "R8G8B8A8_UNORM"},
+   {D3DFMT_R32F, 4, DXGI_FORMAT_R32_FLOAT, "R32_FLOAT"},
+   {D3DFMT_G16R16F, 4, DXGI_FORMAT_R16G16_FLOAT, "R16G16_FLOAT"},
+   {D3DFMT_G32R32F, 8, DXGI_FORMAT_R32G32_FLOAT, "R32G32_FLOAT"},
+   {D3DFMT_R16F, 2, DXGI_FORMAT_R16_FLOAT, "R16_FLOAT"},
+   {D3DFMT_A2B10G10R10, 4, DXGI_FORMAT_R10G10B10A2_UNORM, "R10G10B10A2_UNORM"},
+   {D3DFMT_A2R10G10B10, 4, DXGI_FORMAT_R10G10B10A2_UNORM, "R10G10B10A2_UNORM", "D3DFMT_A2R10G10B10 has red in the high bits: the decoded red and blue are swapped"},
+   {D3DFMT_G16R16, 4, DXGI_FORMAT_R16G16_UNORM, "R16G16_UNORM"},
+   {D3DFMT_A16B16G16R16, 8, DXGI_FORMAT_R16G16B16A16_UNORM, "R16G16B16A16_UNORM"},
+   {D3DFMT_L8, 1, DXGI_FORMAT_R8_UNORM, "R8_UNORM"},
+   {D3DFMT_A8, 1, DXGI_FORMAT_A8_UNORM, "A8_UNORM"},
+   {D3DFMT_D24S8, 4, DXGI_FORMAT_D24_UNORM_S8_UINT, "D24_UNORM_S8_UINT", "D3DFMT_D24S8 has the depth in the high 24 bits: the decoded depth and stencil are wrong"},
+};
+
+inline D3D9FormatInfo FindD3D9Format(D3DFORMAT format)
+{
+   const auto info = std::ranges::find(d3d9_formats, format, &D3D9FormatInfo::format);
+   return info != std::end(d3d9_formats) ? *info : D3D9FormatInfo{.format = format};
+}
+
+// Rows of "bytes_per_pixel * width" bytes, or of the locked pitch for a format without one
+struct D3D9Readback
+{
+   UINT width = 0, height = 0, row_pitch = 0;
+   D3DFORMAT format = D3DFMT_UNKNOWN;
+   std::vector<char> bytes;
+};
+
+// Level "mip" of a texture, or a surface, through a SYSTEMMEM copy (a multisampled one resolved first). Stalls the game's thread.
+static bool ReadD3D9Resource(IDirect3DDevice9* native, IDirect3DResource9* resource, UINT mip, D3D9Readback* readback, std::string* error)
+{
+   Microsoft::WRL::ComPtr<IDirect3DSurface9> surface;
+   switch (resource->GetType())
+   {
+   case D3DRTYPE_TEXTURE:
+      if (FAILED(static_cast<IDirect3DTexture9*>(resource)->GetSurfaceLevel(mip, &surface)))
+      {
+         *error = std::format("The texture has no mip {}", mip);
+         return false;
+      }
+      break;
+   case D3DRTYPE_SURFACE:
+      surface = static_cast<IDirect3DSurface9*>(resource);
+      break;
+   default:
+      *error = "Only 2D textures and surfaces can be read back";
+      return false;
+   }
+   D3DSURFACE_DESC desc = {};
+   surface->GetDesc(&desc);
+   Microsoft::WRL::ComPtr<IDirect3DSurface9> resolved, copy;
+   IDirect3DSurface9* lockable = surface.Get();
+   HRESULT hr = S_OK;
+   if (desc.MultiSampleType != D3DMULTISAMPLE_NONE)
+   {
+      hr = native->CreateRenderTarget(desc.Width, desc.Height, desc.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &resolved, nullptr);
+      if (SUCCEEDED(hr))
+      {
+         hr = native->StretchRect(surface.Get(), nullptr, resolved.Get(), nullptr, D3DTEXF_NONE);
+      }
+      lockable = resolved.Get();
+      desc.Usage |= D3DUSAGE_RENDERTARGET;
+   }
+   if (SUCCEEDED(hr) && desc.Pool == D3DPOOL_DEFAULT)
+   {
+      if ((desc.Usage & D3DUSAGE_RENDERTARGET) == 0)
+      {
+         *error = std::format("A DEFAULT pool {} that isn't a render target (D3DFMT {}, usage 0x{:X}) can't be read back on D3D9",
+            (desc.Usage & D3DUSAGE_DEPTHSTENCIL) ? "depth stencil" : "resource", uint32_t(desc.Format), uint32_t(desc.Usage));
+         return false;
+      }
+      hr = native->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &copy, nullptr);
+      if (SUCCEEDED(hr))
+      {
+         hr = native->GetRenderTargetData(lockable, copy.Get());
+      }
+      lockable = copy.Get();
+   }
+   D3DLOCKED_RECT mapped = {};
+   if (SUCCEEDED(hr))
+   {
+      hr = lockable->LockRect(&mapped, nullptr, D3DLOCK_READONLY);
+   }
+   if (SUCCEEDED(hr))
+   {
+      const uint32_t bytes_per_pixel = FindD3D9Format(desc.Format).bytes_per_pixel;
+      readback->width = desc.Width;
+      readback->height = desc.Height;
+      readback->format = desc.Format;
+      readback->row_pitch = (bytes_per_pixel ? desc.Width * bytes_per_pixel : UINT(mapped.Pitch));
+      readback->bytes.resize(size_t(readback->row_pitch) * desc.Height);
+      for (UINT y = 0; y < desc.Height; ++y)
+      {
+         memcpy(readback->bytes.data() + size_t(y) * readback->row_pitch, static_cast<const char*>(mapped.pBits) + size_t(y) * mapped.Pitch,
+            readback->row_pitch);
+      }
+      lockable->UnlockRect();
+   }
+   else
+   {
+      *error = std::format("Readback of a {}x{} D3DFMT {} surface failed (0x{:08X})", desc.Width, desc.Height, uint32_t(desc.Format), uint32_t(hr));
+   }
+   return SUCCEEDED(hr);
+}
+
+struct McpTraceTexture
+{
+   uint64_t handle = 0;
+   UINT width = 0, height = 0;
+   D3DFORMAT format = D3DFMT_UNKNOWN;
+};
+
+// One captured event: a draw ("shader"), a copy, a clear, a Luma pass ("custom") or the present
+struct McpTraceEntry
+{
+   const char* type = "shader";
+   const char* name = ""; // What ran, for the non draw entries
+   uint32_t hash = 0, instance = 0;
+   bool replaced = false, reloaded = false, rt0_is_back_buffer = false, cancelled = false;
+   McpTraceTexture rt0;
+   std::array<McpTraceTexture, 4> ps_textures;
+   D3DVIEWPORT9 viewport = {};
+   uint32_t vertex_count = 0;
+   uint64_t source = 0, destination = 0;
+   std::string note;
+};
+
+// Counters whose change during a draw's hooks names what Luma did to it (its trace note)
+struct McpNoteCounter
+{
+   const char* note = "";
+   uint32_t D9NState::* counter = nullptr;
+};
+inline constexpr McpNoteCounter mcp_note_counters[] = {
+   {"hidden_ui", &D9NState::hidden_ui_draws},
+   {"gtao", &D9NState::gtao_runs},
+   {"gtao_fallback", &D9NState::gtao_fallbacks},
+   {"luma_bloom", &D9NState::bloom_draws},
+   {"bloom_composite", &D9NState::bloom_composites},
+   {"kernel_c194", &D9NState::kernel_pushes},
+   {"mv_prepass", &D9NState::mv_draws_prepass},
+   {"mv", &D9NState::mv_draws_patched},
+   {"jitter_only", &D9NState::mv_draws_jitter_only},
+   {"unpatched", &D9NState::mv_draws_unpatched},
+   {"blended", &D9NState::mv_draws_blended},
+};
+
+// A read of the "instance"th draw of "hash" in a frame, right after it: its RT "slot" (or its PS texture with "srv"), read at the next
+// event ("McpReadPending()")
+struct PendingRead
+{
+   bool armed = false, srv = false;
+   uint32_t hash = 0, instance = 0, slot = 0, mip = 0;
+   IDirect3DResource9* resource = nullptr; // AddRef-ed
+   bool done = false;
+   D3D9Readback readback;
+   std::string error;
+};
+
+// Armed by mcp.hpp's tools. "McpActive()" is all the draw path tests while nothing is armed.
+struct McpCapture
+{
+   bool tracing = false;                   // Recording this frame's entries
+   std::vector<McpTraceEntry> entries;     // The frame being recorded, then the last capture
+   std::map<uint32_t, uint32_t> instances; // Draws per PS CRC in this frame
+   std::array<uint32_t, std::size(mcp_note_counters)> counters = {};
+   PendingRead read;
+};
+inline McpCapture mcp_capture;
+
+inline bool McpActive()
+{
+   return mcp_capture.tracing || mcp_capture.read.armed || mcp_capture.read.resource;
+}
+
+inline std::array<uint32_t, std::size(mcp_note_counters)> McpNoteCounters()
+{
+   std::array<uint32_t, std::size(mcp_note_counters)> counters = {};
+   for (size_t i = 0; i < counters.size(); ++i)
+   {
+      counters[i] = state.*mcp_note_counters[i].counter;
+   }
+   return counters;
+}
+
+inline void McpTraceEvent(const char* type, const char* name, uint64_t source = 0, uint64_t destination = 0)
+{
+   if (mcp_capture.tracing)
+   {
+      mcp_capture.entries.push_back({.type = type, .name = name, .source = source, .destination = destination});
+   }
+}
+
+// The armed draw's target, read now that the draw is done (at the next event: draw, copy, clear or present)
+inline void McpReadPending(IDirect3DDevice9* native)
+{
+   mcp_capture.read.readback = {};
+   mcp_capture.read.error.clear();
+   ReadD3D9Resource(native, mcp_capture.read.resource, mcp_capture.read.mip, &mcp_capture.read.readback, &mcp_capture.read.error);
+   mcp_capture.read.done = true;
+   Free(&mcp_capture.read.resource);
+}
+
+inline McpTraceTexture McpTextureInfo(uint64_t handle)
+{
+   McpTraceTexture info = {.handle = handle};
+   auto* resource = reinterpret_cast<IDirect3DResource9*>(handle);
+   D3DSURFACE_DESC desc = {};
+   const bool described = resource && ((resource->GetType() == D3DRTYPE_TEXTURE && SUCCEEDED(static_cast<IDirect3DTexture9*>(resource)->GetLevelDesc(0, &desc))) ||
+                                         (resource->GetType() == D3DRTYPE_SURFACE && SUCCEEDED(static_cast<IDirect3DSurface9*>(resource)->GetDesc(&desc))));
+   if (described)
+   {
+      info.width = desc.Width;
+      info.height = desc.Height;
+      info.format = desc.Format;
+   }
+   return info;
+}
+
+// After the draw's hooks ("cancelled": the game's hook drew instead, or hid it): its trace entry, and the armed read's target
+inline void McpAfterDraw(IDirect3DDevice9* native, uint32_t vertex_count, bool cancelled)
+{
+   const uint32_t instance = mcp_capture.instances[out.bound_ps_crc]++;
+   if (mcp_capture.tracing)
+   {
+      McpTraceEntry entry = {.hash = out.bound_ps_crc,
+         .instance = instance,
+         .replaced = out.matched_bound,
+         .reloaded = out.ps_overridden,
+         .rt0_is_back_buffer = out.rt0_is_back_buffer,
+         .cancelled = cancelled,
+         .vertex_count = vertex_count};
+      // The target the draw wrote, after Luma's redirects (canvas, Luma Bloom)
+      IDirect3DSurface9* rt0 = nullptr;
+      if (SUCCEEDED(native->GetRenderTarget(0, &rt0)))
+      {
+         entry.rt0 = McpTextureInfo(reinterpret_cast<uint64_t>(rt0));
+         Free(&rt0);
+      }
+      for (size_t i = 0; i < entry.ps_textures.size(); ++i)
+      {
+         entry.ps_textures[i] = McpTextureInfo(out.ps_textures[i]);
+      }
+      native->GetViewport(&entry.viewport);
+      const auto counters = McpNoteCounters();
+      for (size_t i = 0; i < counters.size(); ++i)
+      {
+         if (counters[i] != mcp_capture.counters[i])
+         {
+            entry.note += (entry.note.empty() ? "" : " ");
+            entry.note += mcp_note_counters[i].note;
+         }
+      }
+      if (cancelled)
+      {
+         entry.note += (entry.note.empty() ? "" : " ");
+         entry.note += "skipped_by_luma";
+      }
+      mcp_capture.entries.push_back(std::move(entry));
+   }
+   if (mcp_capture.read.armed && out.bound_ps_crc == mcp_capture.read.hash && instance == mcp_capture.read.instance)
+   {
+      mcp_capture.read.armed = false;
+      if (mcp_capture.read.srv)
+      {
+         mcp_capture.read.resource = reinterpret_cast<IDirect3DResource9*>(out.ps_textures[mcp_capture.read.slot]);
+         if (mcp_capture.read.resource)
+         {
+            mcp_capture.read.resource->AddRef();
+         }
+      }
+      else
+      {
+         IDirect3DSurface9* target = nullptr;
+         native->GetRenderTarget(mcp_capture.read.slot, &target);
+         mcp_capture.read.resource = target;
+      }
+      if (!mcp_capture.read.resource)
+      {
+         mcp_capture.read.done = true;
+         mcp_capture.read.error = std::format("The draw had nothing bound at {} {}", mcp_capture.read.srv ? "s" : "RT", mcp_capture.read.slot);
+      }
+   }
+}
+#else
+inline void McpTraceEvent(const char*, const char*, uint64_t = 0, uint64_t = 0)
+{
+}
+#endif
+
 static bool g_force_canvas_fail = false; // D9N_FORCE_FAIL=canvas (test)
 
 // The output device must be on the D3D9 device's adapter (shared surfaces do
@@ -765,51 +1307,6 @@ static bool D3D9AdapterLuid(device* host, LUID* luid)
    Free(&d3d_ex);
    Free(&d3d);
    return have_luid;
-}
-
-// SDR white level of a monitor in nits (DISPLAYCONFIG_SDR_WHITE_LEVEL, 1000 =
-// 80 nits). 80 when unavailable.
-static float QuerySdrWhiteNits(HMONITOR monitor, int32_t* hr)
-{
-   *hr = E_FAIL;
-   MONITORINFOEXW info = {};
-   info.cbSize = sizeof(info);
-   UINT32 path_count = 0, mode_count = 0;
-   if (!GetMonitorInfoW(monitor, &info) ||
-       GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count,
-          &mode_count) != ERROR_SUCCESS)
-   {
-      return 80.0f;
-   }
-   std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
-   std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
-   if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(),
-          &mode_count, modes.data(), nullptr) != ERROR_SUCCESS)
-   {
-      return 80.0f;
-   }
-   for (UINT32 i = 0; i < path_count; ++i)
-   {
-      DISPLAYCONFIG_SOURCE_DEVICE_NAME source = {};
-      source.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(source),
-         paths[i].sourceInfo.adapterId, paths[i].sourceInfo.id};
-      if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
-          wcscmp(source.viewGdiDeviceName, info.szDevice) != 0)
-      {
-         continue;
-      }
-      DISPLAYCONFIG_SDR_WHITE_LEVEL white = {};
-      white.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
-         sizeof(white), paths[i].targetInfo.adapterId,
-         paths[i].targetInfo.id};
-      if (DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS &&
-          white.SDRWhiteLevel > 0)
-      {
-         *hr = S_OK;
-         return static_cast<float>(white.SDRWhiteLevel) / 1000.0f * 80.0f;
-      }
-   }
-   return 80.0f;
 }
 
 // HDR state of the output with the largest intersection with the window (not
@@ -862,8 +1359,14 @@ static void QueryDisplay(HWND hwnd)
       {
          actual_hdr =
             desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-         state.sdr_white_nits =
-            QuerySdrWhiteNits(desc1.Monitor, &state.sdr_white_hr);
+         // The OS SDR white level of that output, 80 nits when unavailable
+         state.sdr_white_nits = 80.0f;
+         state.sdr_white_hr = (Display::GetSDRWhiteLevel(nullptr, state.sdr_white_nits, desc1.Monitor) ? S_OK : E_FAIL);
+         // Also outside HDR, as core.hpp's "Display::GetHDRMaxLuminance()"
+         if (desc1.MaxLuminance > 0.f)
+         {
+            g_display_peak_white = desc1.MaxLuminance;
+         }
       }
       output6->Release();
    }
@@ -875,6 +1378,25 @@ static void QueryDisplay(HWND hwnd)
        "%.1f nits (query hr 0x%08X)",
       state.display_hdr, actual_hdr, state.force_display_hdr,
       state.sdr_white_nits, static_cast<uint32_t>(state.sdr_white_hr));
+   // The display settings that follow the display (the harness keeps its fixed inputs): the default peak white, the paper whites linked
+   // to the OS SDR white level (the link drops, unsaved, where the level can't be read, as core.hpp's)
+   if (OfflineHarness())
+   {
+      return;
+   }
+   if (g_peak_white_default)
+   {
+      cb_luma_global_settings.ScenePeakWhite = g_display_peak_white;
+   }
+   if (use_os_reference_white_level && SUCCEEDED(state.sdr_white_hr))
+   {
+      cb_luma_global_settings.ScenePaperWhite = cb_luma_global_settings.UIPaperWhite = state.sdr_white_nits;
+   }
+   else
+   {
+      use_os_reference_white_level = false;
+   }
+   ApplyDisplaySettings();
 }
 
 // Requested mode, minus modes the swapchain refused, minus HDR modes on an
@@ -1081,7 +1603,13 @@ struct PassState
    UINT ao_width = 0, ao_height = 0;
    uint64_t value = 0;
    uint32_t last_present = UINT32_MAX; // one run per frame
+   // "OpenPassDevice()" off the game's thread: its fxc compiles took the game's thread ~20 s at the first pass
+   std::future<bool> opening;
    bool open = false, gave_up = false;
+   // The compile inputs of the last open ("luma_taa_quality", the game's "gtao_defines"), kept by "PassStop()": "PassEnsureOpen()"
+   // reopens on a change
+   int taa_quality = 2;
+   std::vector<std::string> gtao_defines;
 };
 static PassState g_pass;
 
@@ -1115,18 +1643,22 @@ static void PassDestroyTextures(device* device)
 
 static void PassStop(device* device)
 {
+   if (g_pass.opening.valid())
+   {
+      g_pass.opening.wait();
+   }
    PassDestroyTextures(device);
    D3D9Passes::Close();
    KmtDestroyFence(&g_pass.in);
    KmtDestroyFence(&g_pass.out);
    KmtRelease(&g_pass.sync);
-   g_pass = {.gave_up = g_pass.gave_up};
+   g_pass = {.gave_up = g_pass.gave_up, .taa_quality = g_pass.taa_quality, .gtao_defines = std::move(g_pass.gtao_defines)};
    state.pass_open = 0;
 }
 
 // Pass device and fences once per device (one attempt).
 // The compose shaders (Luma_D3D9_Compose.hlsl): the presenter's composition and the pass device's fullscreen triangle. Loaded on the game's
-// thread (fxc is not thread safe), read by the presenter's Init.
+// thread, read by the presenter's Init and the pass device's thread.
 inline std::vector<uint8_t> compose_vs, compose_ps;
 
 inline void EnsureComposeShaders()
@@ -1141,19 +1673,21 @@ inline void EnsureComposeShaders()
    }
 }
 
-// The pass device on the D3D9 adapter with the KMT fences of "g_pass", its shaders loaded now (Shaders/Global and the game's passes)
-inline bool OpenPassDevice(LUID luid)
+// The pass device on the D3D9 adapter with the KMT fences of "g_pass", its shaders loaded now (Shaders/Global and the game's passes),
+// Luma TAA's at "taa_quality", XeGTAO's with "gtao_defines" (copies: the game's thread may change its own meanwhile)
+inline bool OpenPassDevice(LUID luid, int taa_quality, std::vector<std::string> gtao_defines)
 {
-   EnsureComposeShaders();
+   compile_report = {}; // std::async may run it on a pool thread of an earlier open
    const std::string game = std::string(d3d9_game->shaders_folder) + "/";
    const std::string smaa = game + d3d9_game->smaa_file, gtao = game + d3d9_game->gtao_file;
-   const auto gtao_with = [](std::initializer_list<std::string> defines)
+   const auto gtao_with = [&gtao_defines](std::initializer_list<std::string> defines)
    {
-      std::vector<std::string> all_defines = d3d9_game->gtao_defines;
+      std::vector<std::string> all_defines = gtao_defines;
       all_defines.insert(all_defines.end(), defines);
       return all_defines;
    };
-   // Only read while "Open()" creates the pipelines
+   // Only read while "Open()" creates the pipelines. GT-VBAO's and the AO history's are optional: empty (a failed compile) never fails the
+   // open, only a run with the GtaoParams option that needs it
    const std::vector<uint8_t> display_map_ps = LoadShader(L"display_map_ps.cso", game + d3d9_game->display_map_file, "main", "ps_5_0"),
                               rcas_ps = LoadShader(L"rcas_ps.cso", "Global/Luma_RCAS_PS.hlsl", "sharpen_ps", "ps_5_0"),
                               smaa_edge_detection_vs = LoadShader(L"smaa_edge_detection_vs.cso", smaa, "smaa_edge_detection_vs", "vs_5_0"),
@@ -1172,12 +1706,19 @@ inline bool OpenPassDevice(LUID luid)
                                  "smaa_neighborhood_blending_ps", "ps_5_0", {"SMAA_T2X=1"}),
                               smaa_t2x_resolve_ps = LoadShader(L"smaa_t2x_resolve_ps.cso", smaa, "smaa_resolve_ps", "ps_5_0", {"SMAA_T2X=1"}),
                               depth_edges_cs = LoadShader(L"depth_edges_cs.cso", game + d3d9_game->depth_edges_file, "main", "cs_5_0"),
-                              luma_taa_cs = LoadShader(L"luma_taa_cs.cso", "Global/Luma_TAA_CS.hlsl", "main", "cs_5_0", {"TAA_QUALITY=2"}),
+                              luma_taa_cs = LoadShader(L"luma_taa_cs.cso", "Global/Luma_TAA_CS.hlsl", "main", "cs_5_0",
+                                 {std::format("TAA_QUALITY={}", taa_quality)}),
                               gtao_prefilter_cs = LoadShader(L"gtao_prefilter_cs.cso", gtao, "prefilter_depths16x16_cs", "cs_5_0", gtao_with({})),
                               gtao_main_cs = LoadShader(L"gtao_main_cs.cso", gtao, "main_pass_cs", "cs_5_0", gtao_with({})),
                               gtao_denoise_cs = LoadShader(L"gtao_denoise_cs.cso", gtao, "denoise_pass_cs", "cs_5_0", gtao_with({"XE_GTAO_FINAL_APPLY=0"})),
                               gtao_denoise_final_cs = LoadShader(L"gtao_denoise_final_cs.cso", gtao, "denoise_pass_cs", "cs_5_0",
-                                 gtao_with({"XE_GTAO_FINAL_APPLY=1", "XE_GTAO_FINAL_OUTPUT_TYPE=float"}));
+                                 gtao_with({"XE_GTAO_FINAL_APPLY=1", "XE_GTAO_FINAL_OUTPUT_TYPE=float"})),
+                              gtvbao_main_cs = LoadShader(L"gtvbao_main_cs.cso", gtao, "gtvbao_main_pass_cs", "cs_5_0", gtao_with({})),
+                              gtvbao_temporal_main_cs = LoadShader(L"gtvbao_temporal_main_cs.cso", gtao, "gtvbao_main_pass_cs", "cs_5_0",
+                                 gtao_with({"GTVBAO_SLICE_COUNT=1.0"})),
+                              gtao_temporal_cs = LoadShader(L"gtao_temporal_cs.cso", gtao, "temporal_pass_cs", "cs_5_0", gtao_with({}));
+   Log("d9native: pass device shaders: %u from cache, %u compiled, %s", compile_report.from_cache, compile_report.compiled,
+      compile_report.errors.empty() ? "no errors" : "errors above");
    return D3D9Passes::Open(luid, g_pass.in.nt, g_pass.out.nt,
       {.compose_vs = compose_vs,
          .display_map_ps = display_map_ps,
@@ -1193,26 +1734,53 @@ inline bool OpenPassDevice(LUID luid)
          .smaa_t2x_resolve_ps = smaa_t2x_resolve_ps,
          .depth_edges_cs = depth_edges_cs,
          .luma_taa_cs = luma_taa_cs,
+         .luma_taa_quality = taa_quality,
          .gtao_prefilter_cs = gtao_prefilter_cs,
          .gtao_main_cs = gtao_main_cs,
          .gtao_denoise_cs = gtao_denoise_cs,
-         .gtao_denoise_final_cs = gtao_denoise_final_cs});
+         .gtao_denoise_final_cs = gtao_denoise_final_cs,
+         .gtvbao_main_cs = gtvbao_main_cs,
+         .gtvbao_temporal_main_cs = gtvbao_temporal_main_cs,
+         .gtao_temporal_cs = gtao_temporal_cs});
 }
 
 static bool PassEnsureOpen(device* device)
 {
+   // A changed compile input reopens the device with it, and retries one that failed
+   if (luma_taa_quality != g_pass.taa_quality || d3d9_game->gtao_defines != g_pass.gtao_defines)
+   {
+      if (g_pass.open || g_pass.opening.valid())
+      {
+         PassStop(device);
+      }
+      g_pass.gave_up = false;
+   }
    if (g_pass.gave_up)
    {
       return false;
    }
    if (!g_pass.open)
    {
-      LUID luid = {};
-      g_pass.open = D3D9AdapterLuid(device, &luid) &&
-                    KmtSelect(&g_pass.sync, KmtGeneration(device)) &&
-                    KmtCreateSharedFence(&g_pass.sync, &g_pass.in) &&
-                    KmtCreateSharedFence(&g_pass.sync, &g_pass.out) &&
-                    OpenPassDevice(luid);
+      // The passes are skipped until the device is open
+      if (!g_pass.opening.valid())
+      {
+         LUID luid = {};
+         if (D3D9AdapterLuid(device, &luid) && KmtSelect(&g_pass.sync, KmtGeneration(device)) &&
+             KmtCreateSharedFence(&g_pass.sync, &g_pass.in) && KmtCreateSharedFence(&g_pass.sync, &g_pass.out))
+         {
+            EnsureComposeShaders(); // its globals are also the presenter's
+            g_pass.taa_quality = luma_taa_quality;
+            g_pass.gtao_defines = d3d9_game->gtao_defines;
+            g_pass.opening = std::async(std::launch::async, OpenPassDevice, luid, g_pass.taa_quality, g_pass.gtao_defines);
+         }
+      }
+      // The harness checks the passes from its first frames
+      if (!OfflineHarness() && g_pass.opening.valid() &&
+          g_pass.opening.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+      {
+         return false;
+      }
+      g_pass.open = g_pass.opening.valid() && g_pass.opening.get();
       if (!g_pass.open)
       {
          Log("d9native: D3D12 passes not available (%s, kmt %s 0x%08X)",
@@ -1381,6 +1949,7 @@ static void RunPasses(device* device)
        !KmtWaitObject(&g_pass.sync, g_pass.out.object, value))
    {
       ++state.pass_failures;
+      McpTraceEvent("custom", "luma_passes_failed");
       Log("d9native: ResetRender passes failed (copy 0x%08X flush 0x%08X, %s, "
           "kmt %s 0x%08X)",
          uint32_t(copy_hr), uint32_t(flush_hr), D3D9Passes::Error(),
@@ -1394,6 +1963,8 @@ static void RunPasses(device* device)
          nullptr, canvas, nullptr, D3DTEXF_NONE);
    }
    ++state.pass_runs;
+   // Display map, SMAA and RCAS on the canvas
+   McpTraceEvent("custom", "luma_passes", out.canvas.handle, out.canvas.handle);
    state.predication_runs += params.predication ? 1 : 0;
    d3d9_game->OnPassesRan(params);
    state.t2x_runs += params.t2x ? 1 : 0;
@@ -1422,17 +1993,30 @@ static void TakeSnapshot(device* device)
 // and snapshot, or a movie draw's snapshot.
 static void FlushCanvasDraw(device* device)
 {
+#if DEVELOPMENT
+   // Every event after a draw comes through here first: an armed read gets the draw's result, before the passes below change the canvas
+   if (mcp_capture.read.resource)
+   {
+      McpReadPending(NativeOf(device));
+   }
+#endif
    if (out.reset_render_pending)
    {
       out.reset_render_pending = false;
-      RunPasses(device);
+      // Under "luma_bypassed" the canvas reaches the composition as the game drew it (SDR at paper white, as without the display map)
+      if (!luma_bypassed)
+      {
+         RunPasses(device);
+      }
       ++state.reset_renders;
       TakeSnapshot(device);
+      McpTraceEvent("custom", "reset_render_passes_and_snapshot", out.canvas.handle, out.canvas.handle);
    }
    else if (out.video_pending)
    {
       out.video_pending = false;
       TakeSnapshot(device);
+      McpTraceEvent("custom", "video_snapshot", out.canvas.handle, out.snapshot.handle);
    }
 }
 
@@ -1981,7 +2565,7 @@ static void SamplerApply(IDirect3DDevice9* native, DWORD sampler)
 {
    const SamplerShadow& game = samplers.shadow[sampler];
    const bool upgrade =
-      !Mutated(MUT_NO_SAMPLER_UPGRADE) && game.mip == D3DTEXF_LINEAR &&
+      !luma_bypassed && !Mutated(MUT_NO_SAMPLER_UPGRADE) && game.mip == D3DTEXF_LINEAR &&
       (game.min == D3DTEXF_ANISOTROPIC ||
          (game.min == D3DTEXF_LINEAR && game.mag == D3DTEXF_LINEAR));
    float bias;
@@ -2033,7 +2617,7 @@ static HRESULT STDMETHODCALLTYPE HookSetSamplerState(IDirect3DDevice9* self,
    return hr;
 }
 
-// At present: the bias for the next frame from whether the SR ran in this one
+// At present: the bias for the next frame from whether the SR ran in this one, and the upgrade back or off after a "luma_bypassed" change
 static void SamplerUpdateBias(IDirect3DDevice9* native)
 {
    const float bias = (native == samplers.native &&
@@ -2042,7 +2626,7 @@ static void SamplerUpdateBias(IDirect3DDevice9* native)
                          ? -1.0f
                          : 0.0f;
    state.lod_bias = bias;
-   if (bias == samplers.bias || !state.sampler_upgrade || !samplers.original)
+   if ((bias == samplers.bias && !(bypass_changed && native == samplers.native)) || !state.sampler_upgrade || !samplers.original)
    {
       samplers.bias = bias;
       return;
@@ -2079,6 +2663,29 @@ static void OnInitSwapchain(swapchain* swapchain, bool resize)
    }
    UpdateGeometry(swapchain);
    g_d3d9_latency_done = false;
+   // core.hpp's "CenterWindowAndRemoveBorders()" (the old dgVoodoo mods' force_borderless): no title bar or borders, centred on its
+   // monitor, never bigger than it. Async: the window's thread may be waiting on this one.
+   if (g_borderless_pending)
+   {
+      g_borderless_pending = false;
+      const HWND hwnd = static_cast<HWND>(swapchain->get_hwnd());
+      MONITORINFO monitor = {.cbSize = sizeof(monitor)};
+      RECT window = {};
+      if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor) && GetWindowRect(hwnd, &window))
+      {
+         LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+         style &= ~static_cast<LONG_PTR>(WS_OVERLAPPEDWINDOW | WS_BORDER | WS_THICKFRAME | WS_DLGFRAME);
+         SetWindowLongPtrW(hwnd, GWL_STYLE, style | WS_POPUP | WS_VISIBLE);
+         const LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style & ~static_cast<LONG_PTR>(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE));
+         const RECT& screen = monitor.rcMonitor;
+         const LONG screen_width = screen.right - screen.left, screen_height = screen.bottom - screen.top;
+         const LONG width = std::min(window.right - window.left, screen_width), height = std::min(window.bottom - window.top, screen_height);
+         SetWindowPos(hwnd, nullptr, screen.left + (screen_width - width) / 2, screen.top + (screen_height - height) / 2, width, height,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS);
+         Log("d9native: exclusive fullscreen -> borderless window %ldx%ld", width, height);
+      }
+   }
    if (!resize)
    {
       return;
@@ -2109,7 +2716,22 @@ static void OnDestroySwapchain(swapchain* swapchain, bool resize)
    out.back_buffer = {0};
    if (!resize)
    {
+      // They go with the device; "out.replacements" keeps their bytecode for the next one
+      for (auto& [crc, shader] : out.reloaded_ps)
+      {
+         Free(&shader);
+      }
+      out.reloaded_ps.clear();
+      for (auto& [crc, shader] : out.original_ps)
+      {
+         Free(&shader);
+      }
+      out.original_ps.clear();
+      out.ps_overridden = false;
       StopHelper();
+#if ENABLE_REFLEX
+      D3D9NvApi::ShutdownReflex(); // The presenter (its device) is gone
+#endif
       PassStop(device);
       g_pass.gave_up = false;
       Free(&g_factory);
@@ -2127,6 +2749,13 @@ static void OnInitDevice(device* device)
       return;
    }
    KmtEndD3D9Device(device);
+#if ENABLE_NVAPI
+   // Display::NVAPI::Init() is not thread safe: on the game's thread, before the presenter starts; the presenter's calls then return at once
+   if (!OfflineHarness())
+   {
+      Display::NVAPI::Init();
+   }
+#endif
    samplers.native = reinterpret_cast<IDirect3DDevice9*>(device->get_native());
    samplers.shadow = {};
    samplers.bias = 0;
@@ -2331,10 +2960,6 @@ static bool OnCreateDevice(device_api api, uint32_t& api_version)
    {
       state.smaa_t2x = atoi(text) != 0;
    }
-   if (ReadSetting("LUMA_TAA", text, sizeof(text)))
-   {
-      state.luma_taa = atoi(text) != 0;
-   }
    // ResetRender display map and the present clamp; DEVELOPMENT env D9N_PAPER_WHITE (scRGB scale of the composition) over the UI paper
    // white's
    LoadDisplaySettings();
@@ -2375,7 +3000,7 @@ static bool OnCreateDevice(device_api api, uint32_t& api_version)
    if (!out.shaders_scanned)
    {
       out.shaders_scanned = true;
-      ScanReplacementShaders();
+      ScanReplacementShaders(&out.replacements);
    }
    Log("d9native: create_device D3D9 -> D3D9Ex. luma=(%g %g %g %g) "
        "paper_white=%g dump_every_s=%g (F10 = one-shot dump)",
@@ -2447,6 +3072,7 @@ static bool OnCreateSwapchain(device_api api, swapchain_desc& desc, void*)
       desc.fullscreen_state = false;
       desc.fullscreen_refresh_rate = 0;
       state.windowed_forced = 1;
+      g_borderless_pending = !OfflineHarness();
       changed = true;
    }
    if (DevelopmentEnv(L"D9N_MIN_BB", nullptr, 0) != 0)
@@ -2458,6 +3084,16 @@ static bool OnCreateSwapchain(device_api api, swapchain_desc& desc, void*)
       changed = true;
    }
    return changed;
+}
+
+// The create-time output clamp of a PS by CRC: of every unreplaced PS, and of a replaced CRC's original ("luma_bypassed")
+static Sm3MvPatch::OutputClamp OutputClampMode(uint32_t crc)
+{
+   if (out.velocity_crcs.contains(crc))
+      return Sm3MvPatch::OutputClamp::Unorm8;
+   if (out.saturate_crcs.contains(crc))
+      return Sm3MvPatch::OutputClamp::Saturate;
+   return Sm3MvPatch::OutputClamp::Blend;
 }
 
 static bool OnCreatePipeline(device* device, pipeline_layout, uint32_t count,
@@ -2498,31 +3134,43 @@ static bool OnCreatePipeline(device* device, pipeline_layout, uint32_t count,
       {
          state.seen_ps_crc[state.seen_ps_count++] = crc;
       }
+      const bool output_clamp = state.output_clamp && !Mutated(MUT_NO_OUTPUT_CLAMP);
       const auto replacement = out.replacements.find(crc);
       if (replacement != out.replacements.end())
       {
+         if (auto [original, inserted] = out.original_ps_code.try_emplace(crc); inserted)
+         {
+            const auto* code = static_cast<const uint32_t*>(shader->code);
+            const size_t token_count = shader->code_size / 4;
+            std::string error;
+            if (!output_clamp || !Sm3MvPatch::PatchOutputClamp(code, token_count, OutputClampMode(crc), &original->second, &error))
+            {
+               if (output_clamp)
+               {
+                  Log("d9native: the original of replaced PS %08X keeps its output unclamped: %s", crc, error.c_str());
+               }
+               original->second.assign(code, code + token_count);
+            }
+         }
          shader->code = replacement->second.data();
          shader->code_size = replacement->second.size();
          out.pending_replaced = true;
          continue;
       }
-      if (!state.output_clamp || Mutated(MUT_NO_OUTPUT_CLAMP))
+      if (!output_clamp)
       {
          continue;
       }
       auto [patch, inserted] = out.clamped_ps.try_emplace(crc);
       if (inserted)
       {
-         const bool velocity = out.velocity_crcs.contains(crc);
          std::string error;
          if (Sm3MvPatch::PatchOutputClamp(
                 static_cast<const uint32_t*>(shader->code),
-                shader->code_size / 4,
-                velocity ? Sm3MvPatch::OutputClamp::Unorm8
-                         : Sm3MvPatch::OutputClamp::Blend,
-                &patch->second, &error))
+                shader->code_size / 4, OutputClampMode(crc), &patch->second, &error))
          {
-            ++(velocity ? state.ps_clamped_velocity : state.ps_clamped_blend);
+            // Saturate counts as blend: both keep the game's RT format contract
+            ++(out.velocity_crcs.contains(crc) ? state.ps_clamped_velocity : state.ps_clamped_blend);
          }
          else
          {
@@ -2573,7 +3221,29 @@ static void OnBindPipeline(command_list* cmd_list, pipeline_stage stages,
       out.matched_bound = out.matched_pipelines.contains(pipeline.handle);
       const auto crc = out.pipeline_crc.find(pipeline.handle);
       out.bound_ps_crc = crc == out.pipeline_crc.end() ? 0 : crc->second;
+      out.ps_overridden = false;
    }
+}
+
+// The PS "DrawCommon()" binds over the bound replaced pipeline's: the game's own under "luma_bypassed", else its reloaded replacement
+// ("ReloadShaders()"). Null: the pipeline's own.
+inline IDirect3DPixelShader9* OverridePixelShader()
+{
+   if (!out.matched_bound)
+   {
+      return nullptr;
+   }
+   const std::map<uint32_t, IDirect3DPixelShader9*>& shaders = (luma_bypassed ? out.original_ps : out.reloaded_ps);
+   const auto shader = shaders.find(out.bound_ps_crc);
+   return shader != shaders.end() ? shader->second : nullptr;
+}
+
+// The pixel shader the bound pipeline "game_ps" stands for ("OverridePixelShader()" when there is one). The game's hooks restore this one
+// after binding their own.
+inline IDirect3DPixelShader9* BoundPixelShader(uint64_t game_ps)
+{
+   IDirect3DPixelShader9* shader = OverridePixelShader();
+   return shader ? shader : reinterpret_cast<IDirect3DPixelShader9*>(game_ps);
 }
 
 // RT0 is the real back buffer without any bind event (device creation, Reset):
@@ -2705,6 +3375,30 @@ static bool DrawCommon(command_list* cmd_list, uint32_t vertex_count,
       return false;
    }
    FlushCanvasDraw(device);
+   // Before the game's hooks, which may bind their own PS for this draw and restore "BoundPixelShader()"
+   if (out.matched_bound && !out.ps_overridden)
+   {
+      // One attempt per CRC: a failed create leaves the replacement drawing
+      if (luma_bypassed && !out.original_ps.contains(out.bound_ps_crc))
+      {
+         IDirect3DPixelShader9*& original = out.original_ps[out.bound_ps_crc];
+         if (const auto code = out.original_ps_code.find(out.bound_ps_crc); code != out.original_ps_code.end())
+         {
+            NativeOf(device)->CreatePixelShader(reinterpret_cast<const DWORD*>(code->second.data()), &original);
+         }
+      }
+      if (IDirect3DPixelShader9* shader = OverridePixelShader())
+      {
+         NativeOf(device)->SetPixelShader(shader);
+         out.ps_overridden = true;
+      }
+   }
+#if DEVELOPMENT
+   if (McpActive())
+   {
+      mcp_capture.counters = McpNoteCounters();
+   }
+#endif
    d3d9_game->OnDrawBegin(device, vertex_count, first_vertex, vertex_offset);
    if (out.implicit_rt0_pending)
    {
@@ -2721,7 +3415,14 @@ static bool DrawCommon(command_list* cmd_list, uint32_t vertex_count,
       ++state.injected_draws;
       ++obs.matched_draws[out.bound_ps_crc];
    }
-   if (d3d9_game->OnDraw(cmd_list))
+   const bool cancelled = d3d9_game->OnDraw(cmd_list);
+#if DEVELOPMENT
+   if (McpActive())
+   {
+      McpAfterDraw(NativeOf(device), vertex_count, cancelled);
+   }
+#endif
+   if (cancelled)
    {
       return true;
    }
@@ -2776,6 +3477,7 @@ static bool OnClearDepthStencil(command_list* cmd_list, resource_view,
    if (OurDevice(cmd_list->get_device()))
    {
       d3d9_game->OnClear(NativeOf(cmd_list->get_device()));
+      McpTraceEvent("clear", "clear_depth_stencil");
    }
    return false;
 }
@@ -2896,6 +3598,7 @@ static bool OnCopyTextureRegion(command_list* cmd_list, resource source,
       return false;
    }
    FlushCanvasDraw(device);
+   McpTraceEvent("copy", "copy_texture_region", source.handle, destination.handle);
    d3d9_game->OnCopyTextureRegion(device, source, destination, source_box,
       destination_box);
    const bool from_back_buffer = source.handle == out.back_buffer.handle,
@@ -2941,6 +3644,7 @@ static bool OnCopyResource(command_list* cmd_list, resource source,
       return false;
    }
    FlushCanvasDraw(device);
+   McpTraceEvent("copy", "copy_resource", source.handle, destination.handle);
    const bool from_back_buffer = source.handle == out.back_buffer.handle &&
                                  state.bb_src_redirect,
               to_back_buffer = destination.handle == out.back_buffer.handle;
@@ -2973,6 +3677,10 @@ static bool OnClearRenderTarget(command_list* cmd_list, resource_view rtv,
    {
       d3d9_game->OnClear(NativeOf(device));
       FlushCanvasDraw(device);
+      if (rtv.handle)
+      {
+         McpTraceEvent("clear", "clear_render_target", 0, device->get_resource_from_view(rtv).handle);
+      }
    }
    if (!OurDevice(device) || !Redirecting() || !out.canvas_surface ||
        !rtv.handle ||
@@ -3047,26 +3755,15 @@ static bool OnResolveTextureRegion(
 static void DumpHandoff(IDirect3DDevice9* native, const char* reason)
 {
    const resource source = out.handoff_canvas ? out.canvas : out.shared_rt;
-   IDirect3DSurface9 *surface = nullptr, *readback = nullptr;
-   D3DSURFACE_DESC desc = {};
-   D3DLOCKED_RECT mapped = {};
-   const bool ok =
-      source.handle &&
-      SUCCEEDED(reinterpret_cast<IDirect3DTexture9*>(source.handle)
-            ->GetSurfaceLevel(0, &surface)) &&
-      SUCCEEDED(surface->GetDesc(&desc)) &&
-      SUCCEEDED(native->CreateOffscreenPlainSurface(
-         desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &readback,
-         nullptr)) &&
-      SUCCEEDED(native->GetRenderTargetData(surface, readback)) &&
-      SUCCEEDED(readback->LockRect(&mapped, nullptr, D3DLOCK_READONLY));
-   Free(&surface);
-   if (!ok)
+   D3D9Readback readback;
+   std::string error;
+   if (!source.handle ||
+       !ReadD3D9Resource(native, reinterpret_cast<IDirect3DResource9*>(source.handle), 0, &readback, &error))
    {
-      Free(&readback);
-      Log("d9native: dump (%s) failed", reason);
+      Log("d9native: dump (%s) failed %s", reason, error.c_str());
       return;
    }
+   const UINT width = readback.width, height = readback.height;
    const uint32_t number = ++obs.dump_count;
    wchar_t name[64];
    swprintf_s(name, L"d9native_dump_%u.bin", number);
@@ -3075,16 +3772,15 @@ static void DumpHandoff(IDirect3DDevice9* native, const char* reason)
    double sum[4] = {}, min_value[4] = {1e30, 1e30, 1e30, 1e30},
           max_value[4] = {-1e30, -1e30, -1e30, -1e30};
    uint64_t above_one = 0, non_finite = 0;
-   for (UINT y = 0; y < desc.Height; ++y)
+   if (bin)
+   {
+      fwrite(readback.bytes.data(), 1, readback.bytes.size(), bin);
+   }
+   for (UINT y = 0; y < height; ++y)
    {
       const auto* row = reinterpret_cast<const uint16_t*>(
-         static_cast<const uint8_t*>(mapped.pBits) +
-         static_cast<size_t>(y) * mapped.Pitch);
-      if (bin)
-      {
-         fwrite(row, 8, desc.Width, bin);
-      }
-      for (UINT x = 0; x < desc.Width; ++x)
+         readback.bytes.data() + static_cast<size_t>(y) * readback.row_pitch);
+      for (UINT x = 0; x < width; ++x)
       {
          for (int c = 0; c < 4; ++c)
          {
@@ -3101,8 +3797,6 @@ static void DumpHandoff(IDirect3DDevice9* native, const char* reason)
          }
       }
    }
-   readback->UnlockRect();
-   readback->Release();
    if (bin)
    {
       fclose(bin);
@@ -3115,14 +3809,14 @@ static void DumpHandoff(IDirect3DDevice9* native, const char* reason)
       fprintf(json,
          "{\"width\":%u,\"height\":%u,\"format\":\"R16G16B16A16_FLOAT\","
          "\"bytes_per_pixel\":8,\"frame\":%u,\"reason\":\"%s\"}\n",
-         desc.Width, desc.Height, obs.frames, reason);
+         width, height, obs.frames, reason);
       fclose(json);
    }
-   const double pixels = static_cast<double>(desc.Width) * desc.Height;
+   const double pixels = static_cast<double>(width) * height;
    Log("d9native: dump #%u (%s) %ux%u frame %u: min/max/mean R %.4f/%.4f/%.4f G "
        "%.4f/%.4f/%.4f B %.4f/%.4f/%.4f A %.4f/%.4f/%.4f "
        "rgb_values>1.0=%llu nan_or_inf=%llu",
-      number, reason, desc.Width, desc.Height, obs.frames, min_value[0],
+      number, reason, width, height, obs.frames, min_value[0],
       max_value[0], sum[0] / pixels, min_value[1], max_value[1],
       sum[1] / pixels, min_value[2], max_value[2], sum[2] / pixels,
       min_value[3], max_value[3], sum[3] / pixels, above_one, non_finite);
@@ -3241,9 +3935,9 @@ static void SendHelperFrame(device* device)
    char line[320];
    snprintf(line, sizeof(line),
       "frame %llu %d %d %g %g %d %d %d %d %u %u %d %d %d %d %d %d %d %d "
-      "%d %d %d %d %u\n",
+      "%d %d %d %d %u %d\n",
       n, hp.pending_canvas ? 1 : 0, mode, state.paper_white,
-      g_decode_gamma, state.sync_interval, overlay ? 1 : 0,
+      ((g_decode_gamma > 0.f && gamma_correction_type == 0) ? -1.f : g_decode_gamma), state.sync_interval, overlay ? 1 : 0,
       (Mutated(MUT_NO_ENCODE) ? 1 : 0) | (Mutated(MUT_NO_BT2020) ? 2 : 0) |
          (state.present_clamp && hp.pending_canvas ? 8 : 0) |
          (out.snapshot_valid ? 16 : 0) |
@@ -3251,7 +3945,7 @@ static void SendHelperFrame(device* device)
       state.follow_window ? 1 : 0, state.width, state.height,
       latency_wait ? 1 : 0, state.helper_block ? 1 : 0,
       std::clamp<int>(state.probe_count, 0, 4), xy[0], xy[1], xy[2], xy[3],
-      xy[4], xy[5], xy[6], xy[7], gpu ? 1 : 0, state.color_refreshes);
+      xy[4], xy[5], xy[6], xy[7], gpu ? 1 : 0, state.color_refreshes, (hdr10plus_gaming && !OfflineHarness()) ? 1 : 0);
    out.snapshot_valid = false;
    const double wait_start = NowMs();
    if (!SendHelper(line))
@@ -3467,6 +4161,116 @@ static void HelperPresent(command_queue* queue, swapchain* swapchain,
    }
 }
 
+#if DEVELOPMENT
+// Recompiles every runtime compiled shader (the cache skips the unchanged files) and puts the changes in place: the replacements now, the
+// pass device at its next "PassEnsureOpen()", the compose shaders with a new presenter at the next present. Returns the compile errors
+// (empty: none); the pass device's go to the log only (it compiles on its own thread). At the present event, before the hand-off.
+static std::string ReloadShaders(device* device)
+{
+   compile_report = {};
+   if (g_pass.open || g_pass.opening.valid())
+   {
+      PassStop(device);
+   }
+   g_pass.gave_up = false; // also retries a pass device that failed
+   // No pass device open reads them now, the presenter only in its Init
+   StopHelper();
+   compose_vs.clear();
+   compose_ps.clear();
+   EnsureComposeShaders();
+   // ponytail: a file also replaces a DEVELOPMENT list's CRC here (the lists are the offline harness', which never reloads)
+   std::map<uint32_t, std::vector<uint8_t>> replacements;
+   ScanReplacementShaders(&replacements);
+   size_t changed = 0;
+   for (auto& [crc, code] : replacements)
+   {
+      std::vector<uint8_t>& current = out.replacements[crc];
+      if (current == code)
+      {
+         continue;
+      }
+      const bool created_before = !current.empty();
+      current = std::move(code);
+      ++changed;
+      // A CRC new to the scan only replaces the pipelines created from now on
+      if (!created_before)
+      {
+         continue;
+      }
+      IDirect3DPixelShader9* shader = nullptr;
+      if (const HRESULT hr = NativeOf(device)->CreatePixelShader(reinterpret_cast<const DWORD*>(current.data()), &shader); FAILED(hr))
+      {
+         compile_report.errors += std::format("PS {:08X}: CreatePixelShader 0x{:08X}\n", crc, static_cast<uint32_t>(hr));
+         continue;
+      }
+      IDirect3DPixelShader9*& reloaded = out.reloaded_ps[crc];
+      Free(&reloaded);
+      reloaded = shader;
+      d3d9_game->OnReplacementReloaded(crc, current);
+   }
+   // A file removed or failing to compile keeps its last good replacement until a restart: dropping it would leave the game's copies
+   // ("OnReplacementReloaded()") on the reloaded bytecode
+   d3d9_game->OnShadersReloaded();
+   out.ps_overridden = false;
+   Log("d9native: shaders reloaded (%zu replacements changed, errors: %.1000s)", changed,
+      compile_report.errors.empty() ? "none" : compile_report.errors.c_str());
+   return compile_report.errors;
+}
+
+inline bool reload_shaders_requested = false; // the overlay's button
+inline std::string reload_shaders_errors;     // the last reload's
+
+#include "mcp.hpp"
+#endif
+
+// The Super Resolution settings into the SR bridge or the pass device, live. Another upscaler, FSR version or DLSS preset stops the
+// running bridge ("EnsureHelper()" starts the new one), another Luma TAA quality reopens the pass device (its shader is compiled with
+// it). At the present event, outside the frame the upscaler runs in.
+static void ApplySuperResolution(device* device)
+{
+   g_sr_apply_pending = false;
+   SR::UserType user_type = sr_user_type;
+   if (user_type == SR::UserType::Auto)
+   {
+      // core.hpp's "GetSRAutoType()" order by the D3D9 adapter's vendor (the bridge's support is only known once its upscaler exists)
+      D3DADAPTER_IDENTIFIER9 adapter = {};
+      D3DDEVICE_CREATION_PARAMETERS creation = {};
+      if (IDirect3D9* d3d = nullptr; SUCCEEDED(NativeOf(device)->GetCreationParameters(&creation)) && SUCCEEDED(NativeOf(device)->GetDirect3D(&d3d)))
+      {
+         d3d->GetAdapterIdentifier(creation.AdapterOrdinal, 0, &adapter);
+         d3d->Release();
+      }
+      switch (adapter.VendorId)
+      {
+      case SR::vendor_id_nvidia:
+         user_type = SR::UserType::DLSS;
+         break;
+      case SR::vendor_id_intel:
+         user_type = SR::UserType::XeSS;
+         break;
+      default:
+         user_type = SR::UserType::FSR;
+         break;
+      }
+   }
+   const int upscaler = BridgeUpscaler(user_type);
+   const int fsr_version = (user_type == SR::UserType::FSR3 ? 3 : 0);
+   const unsigned int preset = (upscaler == SRBridgeProtocol::kDlss ? dlss_render_preset : 0);
+   if (upscaler != g_sr_upscaler || fsr_version != sr_fsr_version || preset != g_sr_started_preset)
+   {
+      if (sr.process)
+      {
+         Log("d9native: SR bridge %d stopped for upscaler %d (FSR %d, DLSS preset %u)", g_sr_upscaler, upscaler, fsr_version, preset);
+         StopUpscaler();
+      }
+      sr.gave_up = false;
+   }
+   g_sr_upscaler = upscaler;
+   sr_fsr_version = fsr_version;
+   g_sr_started_preset = preset;
+   state.luma_taa = (user_type == SR::UserType::LumaTAA);
+}
+
 // (4) Hand-off to the presenter. ReShade has no hook to skip the D3D9 Present
 // that follows (see NOTES.md).
 static void OnPresent(command_queue* queue, swapchain* swapchain, const rect*,
@@ -3490,6 +4294,7 @@ static void OnPresent(command_queue* queue, swapchain* swapchain, const rect*,
    }
    d3d9_game->OnPresent(device);
    SamplerUpdateBias(NativeOf(device));
+   bypass_changed = false; // Both above saw it
    const bool msaa = out.msaa_resolved && !Mutated(MUT_NO_MSAA_DETECT);
    if (msaa && !state.msaa_active)
    {
@@ -3508,6 +4313,19 @@ static void OnPresent(command_queue* queue, swapchain* swapchain, const rect*,
       UpdateGeometry(swapchain);
       Log("d9native: bound to the first presenting D3D9 swapchain %p (device %p)",
          swapchain, device);
+   }
+#if DEVELOPMENT
+   // Not in the overlay's own callback: that runs between the hand-off and its frame line
+   if (reload_shaders_requested)
+   {
+      reload_shaders_requested = false;
+      reload_shaders_errors = ReloadShaders(device);
+   }
+   McpD3D9::Drain(device);
+#endif
+   if (g_sr_apply_pending)
+   {
+      ApplySuperResolution(device);
    }
    if (!g_d3d9_latency_done)
    {
@@ -3529,10 +4347,29 @@ static void OnPresent(command_queue* queue, swapchain* swapchain, const rect*,
       state.present_event_end_ms = NowMs();
       return;
    }
+#if ENABLE_REFLEX
+   // Before the frame line (sent here or at reshade_present)
+   if (!OfflineHarness())
+   {
+      D3D9NvApi::OnGamePresent();
+   }
+#endif
    PollDisplay(static_cast<HWND>(swapchain->get_hwnd()));
    HelperPresent(queue, swapchain, event_start);
    state.present_event_end_ms = NowMs();
 }
+
+#if ENABLE_REFLEX
+// After the game's D3D9 present returned: Reflex's sleep and the next frame's markers, as core.hpp's "OnFinishPresent()"
+static void OnFinishPresent(command_queue*, swapchain* swapchain)
+{
+   if (swapchain != g_swapchain || OfflineHarness())
+   {
+      return;
+   }
+   D3D9NvApi::OnGameFinishPresent(static_cast<HWND>(swapchain->get_hwnd()), reflex_mode);
+}
+#endif
 
 // ---- ReShade overlay / effects (PROXY_PARITY P1) ----
 // One effect runtime: the D3D9 one. ReShade does not wrap the presenter's
@@ -3603,6 +4440,22 @@ static void OnReshadePresent(effect_runtime* runtime)
    }
 }
 
+// ReShade's effects toggle key (only the key raises this): Luma's bypass, "luma_bypassed". With "state.overlay_fix" the D3D9 runtime's
+// effects stay off (they would draw into the hidden back buffer), so every press toggles and the change is vetoed.
+static bool OnReShadeSetEffectsState(effect_runtime* runtime, bool enabled)
+{
+   if (runtime != g_runtime_d3d9)
+   {
+      return false;
+   }
+   const bool bypassed = (state.overlay_fix ? !luma_bypassed : !enabled);
+   bypass_changed |= (bypassed != luma_bypassed);
+   luma_bypassed = bypassed;
+   out.ps_overridden = false;
+   Log("d9native: Luma %s (ReShade effects toggle)", luma_bypassed ? "bypassed" : "on");
+   return state.overlay_fix != 0;
+}
+
 #if DEVELOPMENT
 extern "C" __declspec(dllexport) D9NState* D9N_Get()
 {
@@ -3610,36 +4463,337 @@ extern "C" __declspec(dllexport) D9NState* D9N_Get()
 }
 #endif
 
-// ReShade's add-on overlay: the display settings, then the game's
-inline void DrawOverlay(effect_runtime*)
+// ReShade's add-on overlay, as core.hpp's: the Settings tab (Super Resolution, the display settings, then the game's) and the About tab
+inline void DrawOverlay(effect_runtime* runtime)
 {
-   static constexpr const char* output_names[] = {"scRGB (HDR)", "HDR10", "SDR (sRGB)"};
-   static constexpr const char* output_keys[] = {"scrgb", "hdr10", "srgb"};
-   int output = std::clamp<int>(state.output_mode_request, OUTPUT_SCRGB, OUTPUT_SRGB);
-   if (ImGui::Combo("Output", &output, output_names, int(std::size(output_names))))
+   if (!ImGui::BeginTabBar("##TabBar", ImGuiTabBarFlags_None))
    {
-      state.output_mode_request = output;
-      reshade::set_config_value(nullptr, NAME, "OUTPUT", output_keys[output]);
+      return;
    }
-   if (ImGui::IsItemHovered())
+   if (ImGui::BeginTabItem("Settings"))
    {
-      ImGui::SetTooltip("The output swapchain's format and colour space. The HDR ones fall back to SDR on a display without HDR.");
+      if (luma_bypassed)
+      {
+         ImGui::TextColored(ImVec4(1.f, 0.8f, 0.f, 1.f), "Luma bypassed (ReShade effects toggle)");
+      }
+      // core.hpp's items of the x86 SR bridge ("FSR" is FSR 4 there) and Luma TAA
+      static constexpr std::pair<const char*, SR::UserType> sr_items[] = {{"None", SR::UserType::None}, {"Auto", SR::UserType::Auto},
+         {"DLSS", SR::UserType::DLSS}, {"FSR 3", SR::UserType::FSR3}, {"FSR 4", SR::UserType::FSR}, {"XeSS", SR::UserType::XeSS},
+         {"Luma TAA", SR::UserType::LumaTAA}};
+      std::string sr_preview = "None";
+      for (const auto& [name, type] : sr_items)
+      {
+         if (type == sr_user_type)
+         {
+            sr_preview = name;
+         }
+      }
+      // What Auto picked (core.hpp's "Auto (DLSS)")
+      if (sr_user_type == SR::UserType::Auto && g_sr_upscaler >= 0)
+      {
+         static constexpr const char* upscaler_names[] = {"DLSS", "FSR", "XeSS"}; // SRBridgeProtocol::Upscaler
+         sr_preview = std::format("Auto ({})", upscaler_names[g_sr_upscaler]);
+      }
+      if (ImGui::BeginCombo("Super Resolution", sr_preview.c_str()))
+      {
+         for (const auto& [name, type] : sr_items)
+         {
+            const bool selected = (type == sr_user_type);
+            if (ImGui::Selectable(name, selected))
+            {
+               sr_user_type = type;
+               reshade::set_config_value(nullptr, NAME, "SRUserType", int(sr_user_type));
+               g_sr_apply_pending = true;
+            }
+            if (selected)
+            {
+               ImGui::SetItemDefaultFocus();
+            }
+         }
+         ImGui::EndCombo();
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("This replaces the game's native AA.\nA tick will appear here when it's engaged and a warning will appear if it failed.\n\nSome Super Resolution techniques might only be supported on specific hardware.");
+      }
+      if (sr_user_type == SR::UserType::None)
+      {
+         ImGui::SameLine();
+         ImGui::PushID("Super Resolution Enabled");
+         if (ImGui::SmallButton(ICON_FK_UNDO))
+         {
+            sr_user_type = SR::UserType::Auto;
+            reshade::set_config_value(nullptr, NAME, "SRUserType", int(sr_user_type));
+            g_sr_apply_pending = true;
+         }
+         ImGui::PopID();
+      }
+      else
+      {
+         // The game's MSAA keeps every upscaler off
+         const bool taa = state.luma_taa != 0;
+         const bool engaged = !state.msaa_active && (taa ? state.pass_open != 0 : sr.ready);
+         const bool failed = state.msaa_active || (taa ? g_pass.gave_up : (sr.gave_up && !sr.process));
+         if (engaged || failed)
+         {
+            ImGui::SameLine();
+            ImGui::PushID("Super Resolution Active");
+            ImGui::BeginDisabled();
+            ImGui::SmallButton(engaged ? ICON_FK_OK : ICON_FK_WARNING);
+            ImGui::EndDisabled();
+            ImGui::PopID();
+         }
+         else
+         {
+            bool placeholder = false;
+            DrawResetButton<bool, false>(placeholder, placeholder, "Super Resolution");
+         }
+      }
+      if (g_sr_upscaler == SRBridgeProtocol::kDlss)
+      {
+         // core.hpp's presets (NVSDK_NGX_DLSS_Hint_Render_Preset_*)
+         static constexpr std::pair<const char*, unsigned int> dlss_presets[] = {{"Default", 0}, {"E (CNN)", 5}, {"F (CNN)", 6}, {"J", 10},
+            {"K", 11}, {"L", 12}, {"M", 13}};
+         const char* dlss_preview = "Default";
+         for (const auto& [name, value] : dlss_presets)
+         {
+            if (value == dlss_render_preset)
+            {
+               dlss_preview = name;
+            }
+         }
+         if (ImGui::BeginCombo("DLSS Preset", dlss_preview))
+         {
+            for (const auto& [name, value] : dlss_presets)
+            {
+               const bool selected = (value == dlss_render_preset);
+               if (ImGui::Selectable(name, selected))
+               {
+                  dlss_render_preset = value;
+                  reshade::set_config_value(nullptr, NAME, "DLSSRenderPreset", int(dlss_render_preset));
+                  g_sr_apply_pending = true;
+               }
+               if (selected)
+               {
+                  ImGui::SetItemDefaultFocus();
+               }
+            }
+            ImGui::EndCombo();
+         }
+      }
+      if (state.luma_taa)
+      {
+         static constexpr const char* taa_quality_names[] = {"Low", "Medium", "High"}; // LumaTAA::quality_names
+         if (ImGui::SliderInt("Luma TAA Quality", &luma_taa_quality, 0, int(std::size(taa_quality_names)) - 1, taa_quality_names[luma_taa_quality],
+                ImGuiSliderFlags_NoInput))
+         {
+            reshade::set_config_value(nullptr, NAME, "LumaTAAQuality", luma_taa_quality);
+            g_sr_apply_pending = true;
+         }
+         if (ImGui::IsItemHovered())
+         {
+            ImGui::SetTooltip("Low: the fastest, for weaker GPUs.\nMedium: sharper in motion, for a little more than the cost of Low.\nHigh: sharper textures and steadier in motion, but over twice as heavy as Low and uses more video memory.");
+         }
+      }
+
+      static constexpr const char* output_names[] = {"scRGB (HDR)", "HDR10", "SDR (sRGB)"};
+      static constexpr const char* output_keys[] = {"scrgb", "hdr10", "srgb"};
+      int output = std::clamp<int>(state.output_mode_request, OUTPUT_SCRGB, OUTPUT_SRGB);
+      if (ImGui::Combo("Output", &output, output_names, int(std::size(output_names))))
+      {
+         state.output_mode_request = output;
+         reshade::set_config_value(nullptr, NAME, "OUTPUT", output_keys[output]);
+      }
+      if (ImGui::IsItemHovered())
+      {
+         ImGui::SetTooltip("The output swapchain's format and colour space. The HDR ones fall back to SDR on a display without HDR.");
+      }
+      // Saved as 0 while it is the display's (core.hpp's)
+      float& peak_white = cb_luma_global_settings.ScenePeakWhite;
+      bool display_changed = ImGui::SliderFloat("Scene Peak White", &peak_white, 400.f, 10000.f, "%.f");
+      if (ImGui::IsItemDeactivatedAfterEdit())
+      {
+         g_peak_white_default = (peak_white == g_display_peak_white);
+         reshade::set_config_value(nullptr, NAME, "ScenePeakWhite", g_peak_white_default ? 0.f : peak_white);
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("Set this to the brightest nits value your display (TV/Monitor) can emit.\nDirectly calibrating in Windows is suggested.");
+      }
+      if (DrawResetButton<float, false>(peak_white, g_display_peak_white, "ScenePeakWhite"))
+      {
+         g_peak_white_default = true;
+         reshade::set_config_value(nullptr, NAME, "ScenePeakWhite", 0.f);
+         display_changed = true;
+      }
+      const HWND hwnd = static_cast<HWND>(runtime->get_hwnd());
+      float& paper_white = cb_luma_global_settings.ScenePaperWhite;
+      // The OS SDR white level follows a committed paper white edit, not every step of a drag
+      bool os_white_committed = false;
+      if (ImGui::Checkbox("Link to OS Reference White Level", &use_os_reference_white_level))
+      {
+         // Windows 11 accepts 80 to 480 nits
+         if (use_os_reference_white_level && !Display::SetSDRWhiteLevel(hwnd, std::clamp(paper_white, 80.f, 480.f)))
+         {
+            use_os_reference_white_level = false;
+         }
+         reshade::set_config_value(nullptr, NAME, "UseOSReferenceWhiteLevel", use_os_reference_white_level);
+         display_changed = true;
+         os_white_committed = true;
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("Links Luma's HDR Paper White value to the Windows SDR content brightness slider (Reference/Diffuse White Level).\nThis makes the game cursor brightness match the one of the game.");
+      }
+      // Grouped with its reset button, so the item queries below are the slider's (or the reset's)
+      ImGui::BeginGroup();
+      const bool paper_white_changed = DrawSettingSlider(use_os_reference_white_level ? "Paper White" : "Scene Paper White", "ScenePaperWhite", &paper_white, default_paper_white,
+         srgb_white_level, use_os_reference_white_level ? 480.f : 500.f,
+         "The \"average\" brightness of the game scene.\nChange this to your liking, just don't get too close to the peak white.\nHigher does not mean better (especially if you struggle to read UI text), the brighter the image is, the lower the dynamic range (contrast) is.\nThe in game settings brightness is best left at default.",
+         "%.0f");
+      ImGui::EndGroup();
+      display_changed |= paper_white_changed;
+      // The reset button, or the end of a drag or typed edit
+      os_white_committed |= (paper_white_changed && !ImGui::IsItemActive()) || ImGui::IsItemDeactivatedAfterEdit();
+      if (paper_white > peak_white)
+      {
+         ImGui::SameLine();
+         if (ImGui::SmallButton(ICON_FK_WARNING))
+         {
+            paper_white = default_paper_white;
+            reshade::set_config_value(nullptr, NAME, "ScenePaperWhite", paper_white);
+            display_changed = true;
+            os_white_committed = true;
+         }
+         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         {
+            ImGui::SetTooltip("Your Paper White setting is greater than your Peak White setting, the image will either look bad or broken.");
+         }
+      }
+      if (use_os_reference_white_level)
+      {
+         // One paper white, the OS one
+         if (os_white_committed)
+         {
+            Display::SetSDRWhiteLevel(hwnd, paper_white);
+         }
+         cb_luma_global_settings.UIPaperWhite = paper_white;
+      }
+      else
+      {
+         display_changed |= DrawSettingSlider("UI Paper White", "UIPaperWhite", &cb_luma_global_settings.UIPaperWhite, default_paper_white,
+            srgb_white_level, 500.f,
+            "The peak brightness of the User Interface (with the exception of the 2D cursor, which is driven by the Windows SDR White Level).\nHigher does not mean better, change this to your liking.",
+            "%.0f");
+      }
+      if (display_changed)
+      {
+         ApplyDisplaySettings();
+      }
+      // Only for a transfer-encoded hand-off
+      static constexpr const char* gamma_correction_names[] = {"sRGB", "Gamma 2.2"};
+      ImGui::BeginDisabled(g_decode_gamma <= 0.f);
+      if (ImGui::Combo("Gamma Correction", &gamma_correction_type, gamma_correction_names, int(std::size(gamma_correction_names))))
+      {
+         reshade::set_config_value(nullptr, NAME, "GammaCorrectionType", gamma_correction_type);
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("Emulates a specific SDR transfer function.\nThis is best left to Gamma 2.2 unless you have crushed blacks or overly saturated colors.");
+      }
+      if (DrawResetButton<int, false>(gamma_correction_type, 1, "GammaCorrectionType"))
+      {
+         reshade::set_config_value(nullptr, NAME, "GammaCorrectionType", gamma_correction_type);
+      }
+      ImGui::EndDisabled();
+#if ENABLE_NVAPI
+      if (EffectiveMode() != OUTPUT_SRGB)
+      {
+         DrawSettingCheckbox("HDR10+ GAMING", "HDR10PlusGaming", &hdr10plus_gaming, true,
+            "Engages HDR10+ GAMING on NVIDIA GPUs (HDR10 when the display doesn't support it), which generally makes Samsung displays more accurate.");
+      }
+#endif
+#if ENABLE_REFLEX
+      // Hidden without Reflex (no presenter yet, or not an NVIDIA GPU and driver)
+      if (const Reflex::DeviceData* const reflex = D3D9NvApi::GetReflexData(); reflex && reflex->state != Reflex::State::Unsupported)
+      {
+         const bool reflex_elsewhere = reflex->state > Reflex::State::Running;
+         static constexpr const char* reflex_modes[] = {"Off", "On", "On + Boost"}; // core.hpp's
+         ImGui::BeginDisabled(reflex_elsewhere);
+         if (ImGui::BeginCombo("NVIDIA Reflex Low Latency", reflex_elsewhere ? Reflex::state_names[int(reflex->state)] : reflex_modes[int(reflex_mode)]))
+         {
+            for (int i = 0; i < int(std::size(reflex_modes)); i++)
+            {
+               const bool selected = (i == int(reflex_mode));
+               if (ImGui::Selectable(reflex_modes[i], selected))
+               {
+                  reflex_mode = Reflex::Mode(i);
+                  reshade::set_config_value(nullptr, NAME, "ReflexMode", i);
+               }
+               if (selected)
+               {
+                  ImGui::SetItemDefaultFocus();
+               }
+            }
+            ImGui::EndCombo();
+         }
+         ImGui::EndDisabled();
+         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         {
+            ImGui::SetTooltip("%s", reflex_elsewhere ? "The game or another tool (e.g. Display Commander) runs NVIDIA Reflex, or NVIDIA Smooth Motion is on: Luma leaves it to them."
+                                                     : "NVIDIA Reflex reduces system latency and increases PC responsiveness.\n\"On + Boost\" can slightly increase GPU power draw.");
+         }
+      }
+#endif
+
+      d3d9_game->DrawImGuiSettings();
+#if DEVELOPMENT
+      static const std::string reload_shaders_error_name = std::string("Reload Shaders ") + ICON_FK_WARNING;
+      if (ImGui::Button(reload_shaders_errors.empty() ? "Reload Shaders" : reload_shaders_error_name.c_str()))
+      {
+         reload_shaders_requested = true;
+      }
+      if (ImGui::IsItemHovered())
+      {
+         ImGui::SetTooltip("Recompiles the changed shaders at the next frame: the replacements, the D3D12 passes and the presenter's composition.");
+      }
+      if (!reload_shaders_errors.empty())
+      {
+         ImGui::TextWrapped("%s", reload_shaders_errors.c_str());
+      }
+#endif
+      ImGui::EndTabItem();
    }
-   bool display_changed = DrawSettingSlider("Peak White", "ScenePeakWhite", &cb_luma_global_settings.ScenePeakWhite, default_peak_white,
-      srgb_white_level, 10000.f, "The display's peak brightness in nits.", "%.0f");
-   display_changed |= DrawSettingSlider("Scene Paper White", "ScenePaperWhite", &cb_luma_global_settings.ScenePaperWhite, default_paper_white,
-      srgb_white_level, 500.f, "The scene's brightness of white in nits.", "%.0f");
-   display_changed |= DrawSettingSlider("UI Paper White", "UIPaperWhite", &cb_luma_global_settings.UIPaperWhite, default_paper_white,
-      srgb_white_level, 500.f, "The UI's brightness of white in nits.", "%.0f");
-   if (display_changed)
-   {
-      ApplyDisplaySettings();
-   }
-   d3d9_game->DrawImGuiSettings();
-   if (ImGui::CollapsingHeader("About"))
+   if (ImGui::BeginTabItem("About"))
    {
       d3d9_game->PrintImGuiAbout();
+      ImGui::NewLine();
+      ImGui::Text("Version: %u", Globals::VERSION);
+      const char* development_state = "Finished";
+      switch (Globals::DEVELOPMENT_STATE)
+      {
+      case Globals::ModDevelopmentState::NonFunctional:
+         development_state = "Non Functional";
+         break;
+      case Globals::ModDevelopmentState::WorkInProgress:
+         development_state = "Work in Progress";
+         break;
+      case Globals::ModDevelopmentState::Playable:
+         development_state = "Playable";
+         break;
+      default:
+         break;
+      }
+      ImGui::Text("Development State: %s", development_state);
+#if TEST
+      ImGui::Text("TEST Enabled");
+#endif
+#if DEVELOPMENT
+      ImGui::Text("DEVELOPMENT Enabled");
+#endif
+      ImGui::EndTabItem();
    }
+   ImGui::EndTabBar();
 }
 
 // The add-on's DllMain for a native D3D9 game: registers the ReShade events and the overlay, reads Core's settings, then runs
@@ -3679,10 +4833,14 @@ inline BOOL CoreMain(HMODULE module, DWORD reason, D3D9Game* game)
       reshade::register_event<addon_event::resolve_texture_region>(OnResolveTextureRegion);
       reshade::register_event<addon_event::init_device>(OnInitDevice);
       reshade::register_event<addon_event::present>(OnPresent);
+#if ENABLE_REFLEX
+      reshade::register_event<addon_event::finish_present>(OnFinishPresent);
+#endif
       reshade::register_event<addon_event::init_effect_runtime>(OnInitEffectRuntime);
       reshade::register_event<addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
       reshade::register_event<addon_event::reshade_open_overlay>(OnOpenOverlay);
       reshade::register_event<addon_event::reshade_present>(OnReshadePresent);
+      reshade::register_event<addon_event::reshade_set_effects_state>(OnReShadeSetEffectsState);
       reshade::register_overlay(nullptr, DrawOverlay);
       state.hdr_fallback = state.latency_enabled = state.latency_wait_enabled = 1;
       state.force_display_hdr = -1;
@@ -3697,22 +4855,72 @@ inline BOOL CoreMain(HMODULE module, DWORD reason, D3D9Game* game)
          state.injected[2] = 0.25f;
          state.paper_white = 0.5f;
       }
+      // core.hpp's settings, or the offline harness' env (also the game's in DEVELOPMENT): no SR unless D9N_SR or D9N_LUMA_TAA
       char text[8] = "";
-      if (ReadSetting("SR", text, sizeof(text)))
+      const bool sr_env = DevelopmentEnv("D9N_SR", text, sizeof(text)) > 0;
+      if (sr_env || OfflineHarness())
       {
-         g_sr_upscaler = !_stricmp(text, "dlss")   ? SRBridgeProtocol::kDlss
-                         : !_stricmp(text, "fsr")  ? SRBridgeProtocol::kFsr
-                         : !_stricmp(text, "xess") ? SRBridgeProtocol::kXess
-                                                   : -1;
+         sr_user_type = (!_stricmp(text, "dlss")   ? SR::UserType::DLSS
+                         : !_stricmp(text, "fsr")  ? SR::UserType::FSR
+                         : !_stricmp(text, "xess") ? SR::UserType::XeSS
+                                                   : SR::UserType::None);
+         if (DevelopmentEnv("D9N_LUMA_TAA", text, sizeof(text)) && text[0] != '0')
+         {
+            sr_user_type = SR::UserType::LumaTAA;
+         }
       }
+      else
+      {
+         int sr_user_type_i = int(sr_user_type);
+         reshade::get_config_value(nullptr, NAME, "SRUserType", sr_user_type_i);
+         sr_user_type = SR::UserType(std::clamp(sr_user_type_i, int(SR::UserType::None), int(SR::UserType::FSR3)));
+         int dlss_render_preset_i = 0;
+         reshade::get_config_value(nullptr, NAME, "DLSSRenderPreset", dlss_render_preset_i);
+         dlss_render_preset = static_cast<unsigned int>(std::max(dlss_render_preset_i, 0));
+         reshade::get_config_value(nullptr, NAME, "LumaTAAQuality", luma_taa_quality);
+         luma_taa_quality = std::clamp(luma_taa_quality, 0, 2);
+         reshade::get_config_value(nullptr, NAME, "GammaCorrectionType", gamma_correction_type);
+         gamma_correction_type = std::clamp(gamma_correction_type, 0, 1);
+#if ENABLE_NVAPI
+         reshade::get_config_value(nullptr, NAME, "HDR10PlusGaming", hdr10plus_gaming);
+#endif
+#if ENABLE_REFLEX
+         int reflex_mode_i = int(reflex_mode);
+         reshade::get_config_value(nullptr, NAME, "ReflexMode", reflex_mode_i);
+         reflex_mode = Reflex::Mode(std::clamp(reflex_mode_i, int(Reflex::Mode::Off), int(Reflex::Mode::Boost)));
+#endif
+      }
+      // Auto is resolved by the first present's "ApplySuperResolution()", the others now (the game's "OnInit()" reads them)
+      g_sr_upscaler = BridgeUpscaler(sr_user_type);
+      state.luma_taa = (sr_user_type == SR::UserType::LumaTAA);
       state.overlay_fix = !ReadSetting("OVERLAY_FIX", text, sizeof(text)) || text[0] != '0';
       game->OnInit();
+#if DEVELOPMENT
+      // Not for the offline harness: its process would show up as a game in luma_list_games
+      if (!OfflineHarness())
+      {
+         McpD3D9::RegisterDevValues();
+         McpPipe::Start(Globals::GAME_NAME);
+      }
+#endif
       break;
    }
    case DLL_PROCESS_DETACH:
+#if DEVELOPMENT
+      McpPipe::Abandon(); // "AddonUninit()" stopped it, unless the process is exiting
+#endif
       reshade::unregister_overlay(nullptr, DrawOverlay);
       reshade::unregister_addon(module);
       break;
    }
    return TRUE;
 }
+
+#if DEVELOPMENT && !defined(RESHADE_EXTERNS)
+// ReShade calls this before it unloads the add-on, outside the loader lock: the MCP pipe threads can be joined here (see
+// "McpPipe::Shutdown()"), unlike at DLL_PROCESS_DETACH
+extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE reshade_module)
+{
+   McpPipe::Shutdown();
+}
+#endif

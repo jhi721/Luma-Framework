@@ -56,6 +56,11 @@ Tangent FitTangent(sampler2D table)
    return tangent;
 }
 
+float Apply(Tangent tangent, float x, float curved)
+{
+   return x > tangent.pivot ? (tangent.value + tangent.slope * (x - tangent.pivot)) : curved;
+}
+
 float3 Apply(Tangent tangent, float3 x, float3 curved)
 {
    return x > tangent.pivot ? (tangent.value + tangent.slope * (x - tangent.pivot)) : curved;

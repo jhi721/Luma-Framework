@@ -25,6 +25,7 @@
 #include <wrl/client.h>
 
 #include "../includes/cbuffers.h"
+#include "nvapi.hpp"
 #include "presenter_protocol.h"
 
 #pragma comment(lib, "dxguid.lib") // CLSID_D3D12DeviceFactory
@@ -130,6 +131,7 @@ namespace D3D9Presenter
       UINT requested_width = 0, requested_height = 0; // last frame line's size
       bool latency = false;
       bool needs_resize = false; // a failed Present: same-size ResizeBuffers
+      bool hdr10plus = false;    // HDR10+ GAMING asked of NVAPI (frame line)
 
       void Idle()
       {
@@ -403,6 +405,7 @@ namespace D3D9Presenter
          UINT width, height;
          int latency_wait, block, probe_count, probe_xy[8];
          int gpu_wait, color_refresh;
+         int hdr10plus; // 0 before PRESENTER_VERSION 3
       };
 
       void Present(const Frame& f)
@@ -431,6 +434,7 @@ namespace D3D9Presenter
          {
             return; // minimized: nothing to present, the frame still completes
          }
+         bool display_changed = false; // HDR10+ is re-applied, as Core does on a new swapchain
          if (!swapchain || f.mode != mode || (f.latency_wait != 0) != latency)
          {
             if (!CreateSwapchain(f.mode, w, h, f.latency_wait != 0))
@@ -438,6 +442,7 @@ namespace D3D9Presenter
                return;
             }
             needs_resize = false;
+            display_changed = true;
          }
          else if (w != width || h != height || needs_resize)
          {
@@ -449,7 +454,18 @@ namespace D3D9Presenter
             // The add-on saw the display change (IsCurrent() FALSE): re-apply.
             color_refresh = f.color_refresh;
             stats->color_space_hr = swapchain->SetColorSpace1(kModes[mode].color_space);
+            display_changed = true;
          }
+#if ENABLE_NVAPI
+         // HDR outputs only (the add-on picks them on an HDR display, Core's gate)
+         if (const bool hdr10plus_wanted = f.hdr10plus != 0 && mode != 2;
+            hdr10plus_wanted != hdr10plus || (hdr10plus_wanted && display_changed))
+         {
+            const bool ok = D3D9NvApi::SetHdr10Plus(hwnd, hdr10plus_wanted);
+            PLog("d9present: HDR10+ GAMING %s: %s\n", hdr10plus_wanted ? "on" : "off", ok ? "ok" : "failed");
+            hdr10plus = hdr10plus_wanted;
+         }
+#endif
          if (latency_handle)
          {
             ++stats->latency_waits;
@@ -688,6 +704,20 @@ namespace D3D9Presenter
       const long long hang_at = atoll(hang_text); // 0 = off
       presenter.Init(reinterpret_cast<HWND>(static_cast<uintptr_t>(hwnd)), luid, compose_vs, compose_ps);
       PLog("d9present: ready, hwnd 0x%llX, LUID %08lX:%08lX\n", hwnd, luid.HighPart, luid.LowPart);
+#if ENABLE_REFLEX
+      // Unpublished before "presenter" releases the device, also when Fail() unwinds
+      const struct ReflexPublication
+      {
+         explicit ReflexPublication(ID3D12Device* device)
+         {
+            D3D9NvApi::PublishReflexDevice(device);
+         }
+         ~ReflexPublication()
+         {
+            D3D9NvApi::PublishReflexDevice(nullptr);
+         }
+      } reflex_publication(presenter.device.Get());
+#endif
       while (fgets(line, sizeof(line), in))
       {
          if (unsigned long long handles[4] = {};
@@ -703,16 +733,17 @@ namespace D3D9Presenter
             continue;
          }
          Presenter::Frame f = {};
-         if (sscanf_s(line,
+         // 24 fields: a version 2 line (the appended fields keep their 0 default)
+         if (const int fields = sscanf_s(line,
                 "frame %llu %d %d %f %f %d %d %d %d %u %u %d %d %d %d %d %d "
-                "%d %d %d %d %d %d %d",
+                "%d %d %d %d %d %d %d %d",
                 &f.n, &f.source, &f.mode, &f.paper_white, &f.decode_gamma,
                 &f.sync_interval, &f.overlay, &f.test_flags, &f.follow,
                 &f.width, &f.height, &f.latency_wait, &f.block, &f.probe_count,
                 &f.probe_xy[0], &f.probe_xy[1], &f.probe_xy[2], &f.probe_xy[3],
                 &f.probe_xy[4], &f.probe_xy[5], &f.probe_xy[6], &f.probe_xy[7],
-                &f.gpu_wait, &f.color_refresh) != 24 ||
-             f.mode < 0 || f.mode > 2)
+                &f.gpu_wait, &f.color_refresh, &f.hdr10plus);
+            (fields != 24 && fields != 25) || f.mode < 0 || f.mode > 2)
          {
             Fail("bad line: %s", line);
          }

@@ -5,18 +5,26 @@
 // scene's alpha. All the textures are the target's size; pixels from VPOS,
 // point sampled.
 
+#ifndef GTAO_DEBUG_VIEW
+#define GTAO_DEBUG_VIEW 0 // 1: the visibility alone (XeGTAO's debug views, GtaoParams::debug_view), not multiplied by the scene
+#endif
+
 sampler2D scene : register(s0);
 sampler2D prepass_depth : register(s2);
 sampler2D ambient_visibility
-    : register(s3);         // XeGTAO's R32F output (d9passes.cpp)
+    : register(s3);         // XeGTAO's R32F output (passes.hpp)
 float4 size : register(c0); // width, height
 
 float4 main(float2 vpos : VPOS) : COLOR0
 {
    const float4 uv = float4((floor(vpos) + 0.5) / size.xy, 0.0, 0.0);
    const float4 color = tex2Dlod(scene, uv);
+#if GTAO_DEBUG_VIEW
+   return float4(tex2Dlod(ambient_visibility, uv).rrr, color.a);
+#else
    const float visibility = (tex2Dlod(prepass_depth, uv).r >= 0.005)
                                 ? tex2Dlod(ambient_visibility, uv).r
                                 : 1.0;
    return float4(color.rgb * visibility, color.a);
+#endif
 }

@@ -1,7 +1,7 @@
 #pragma once
 
 // Runs Core's D3D12 super resolution implementations (DLSS, FSR, XeSS) on their own D3D12 device and queue, on textures and fences a D3D11 game
-// shares by NT handle. Used by the x64 "SR Bridge Helper" (the 32-bit games' SR bridge, a separate process) and by an x64 D3D11 mod's
+// shares by NT handle (a native D3D9Ex game: its render targets by KMT handle, which "OpenSharedHandle()" takes too, and D3DKMT fences by NT handle). Used by the x64 "SR Bridge Helper" (the 32-bit games' SR bridge, a separate process) and by an x64 D3D11 mod's
 // in-process host (same process, handles from the game's own devices). Per frame: the queue waits for "in", moves the textures from COMMON
 // to the "DrawData" states, draws, moves them back and signals "out".
 // Include it from a D3D12 translation unit (the helper, "unity_build_d3d12.cpp"): it needs d3d12.h and the D3D12 implementations' types.
@@ -269,6 +269,7 @@ namespace SRRunner
       Gpu& gpu;
       std::unique_ptr<Impl> impl;
       SR::InstanceData* data = nullptr;
+      ComPtr<ID3D12Resource> output_copy_source; // When the shared output has no UAV access (see "OpenInputs()")
       std::unique_ptr<Profile> profile;
 
       // Opens the game's shared textures ("SRBridgeProtocol::Resource" order, 0: none) and its fences "in" and "out" on this device. Returns the error, empty if fine.
@@ -289,10 +290,23 @@ namespace SRRunner
             return "inputs or fences";
          }
 
+         // A native D3D9Ex game shares render targets (by KMT handle), which have no UAV access: the upscaler writes its own copy, copied
+         // to the shared output after each draw
+         D3D12_RESOURCE_DESC output_desc = textures[kOutput]->GetDesc();
+         if (!(output_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+         {
+            output_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            const D3D12_HEAP_PROPERTIES heap = {.Type = D3D12_HEAP_TYPE_DEFAULT};
+            if (FAILED(gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &output_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&output_copy_source))))
+            {
+               return "output copy source";
+            }
+         }
+
          // The textures are in COMMON between frames (shared across APIs), and the upscalers expect the "DrawData" states
          for (int i = 0; i < kCount; i++)
          {
-            if (!textures[i])
+            if (!textures[i] || (i == kOutput && output_copy_source))
             {
                continue;
             }
@@ -305,7 +319,7 @@ namespace SRRunner
             barriers_after.push_back(barrier);
          }
          draw = {
-            .output_color = textures[kOutput].Get(),
+            .output_color = (output_copy_source ? output_copy_source.Get() : textures[kOutput].Get()),
             .source_color = textures[kColor].Get(),
             .motion_vectors = textures[kMotion].Get(),
             .depth_buffer = textures[kDepth].Get(),
@@ -376,6 +390,23 @@ namespace SRRunner
          draw.user_sharpness = frame.sharpness;
          const bool drawn = impl->Draw(data, list, draw);
          list->ResourceBarrier(UINT(barriers_after.size()), barriers_after.data());
+         if (output_copy_source)
+         {
+            ID3D12Resource* const shared_output = textures[SRBridgeProtocol::kOutput].Get();
+            D3D12_RESOURCE_BARRIER copy_barriers[2] = {
+               {.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                  .Transition = {.pResource = output_copy_source.Get(), .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, .StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, .StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE}},
+               {.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                  .Transition = {.pResource = shared_output, .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, .StateBefore = D3D12_RESOURCE_STATE_COMMON, .StateAfter = D3D12_RESOURCE_STATE_COPY_DEST}},
+            };
+            list->ResourceBarrier(2, copy_barriers);
+            list->CopyResource(shared_output, output_copy_source.Get());
+            for (D3D12_RESOURCE_BARRIER& barrier : copy_barriers)
+            {
+               std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+            }
+            list->ResourceBarrier(2, copy_barriers);
+         }
          if (profile)
          {
             profile->Mark(list, 2);

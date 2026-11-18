@@ -1194,12 +1194,15 @@ namespace Sm3MvPatch
    // upgraded fp16 targets don't clamp what the 8-bit ones did): every oC0 write
    // goes to a free temp, the tail writes oC0 from it. Blend (BLEND_INPUT): rgb
    // >= 0, alpha in [0, 1]. Unorm8 (the velocity target): saturate and round to
-   // the 8-bit step. The constants go to c222 (under the motion vector patch's
-   // c223, over the game's and the injected c208 block).
+   // the 8-bit step. Saturate (an 8-bit UNORM target's clamp, DXBC's
+   // ClampOutput0 with every channel in [0, 1]): rgba in [0, 1], no rounding.
+   // The constants go to c222 (under the motion vector patch's c223, over the
+   // game's and the injected c208 block).
    enum class OutputClamp
    {
       Blend,
-      Unorm8
+      Unorm8,
+      Saturate
    };
    constexpr int kClampRegister = 222;
 
@@ -1267,8 +1270,9 @@ namespace Sm3MvPatch
       if (!mask)
          return fail("no oC0 write");
       constexpr uint32_t kSaturate = 1u << 20;
-      if (mode == OutputClamp::Blend)
+      switch (mode)
       {
+      case OutputClamp::Blend:
          if (mask & 7)
          {
             ins(Op::MAX, {Dst(COLOROUT, 0, mask & 7), Src(TEMP, value),
@@ -1278,9 +1282,11 @@ namespace Sm3MvPatch
          {
             ins(Op::MOV, {Dst(COLOROUT, 0, 8) | kSaturate, Src(TEMP, value)});
          }
-      }
-      else
-      {
+         break;
+      case OutputClamp::Saturate:
+         ins(Op::MOV, {Dst(COLOROUT, 0, mask) | kSaturate, Src(TEMP, value)});
+         break;
+      case OutputClamp::Unorm8:
          ins(Op::MOV, {Dst(TEMP, value, mask) | kSaturate, Src(TEMP, value)});
          ins(Op::MAD, {Dst(TEMP, value, mask), Src(TEMP, value),
                          Src(CONSTF, kClampRegister, Rep(1)),
@@ -1290,6 +1296,7 @@ namespace Sm3MvPatch
                          Src(TEMP, fraction, 0xE4, 1)});
          ins(Op::MUL, {Dst(COLOROUT, 0, mask), Src(TEMP, value),
                          Src(CONSTF, kClampRegister, Rep(3))});
+         break;
       }
       o.push_back(0x0000FFFF);
 

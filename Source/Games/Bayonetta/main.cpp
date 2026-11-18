@@ -63,6 +63,28 @@ static float g_gtao_depth_scale =
 static float g_gtao_radius_override =
    0.f; // > 0 overrides the shader's EFFECT_RADIUS (view units after the depth
         // scale)
+// GT-VBAO's visibility bitmask main pass instead of XeGTAO's horizons, with its own darkness dial (about 0.18 matched the game's SSAO
+// where XeGTAO's 0.3 did, NOTES.md)
+static bool g_gtvbao_enable = false;
+static float g_gtvbao_final_value_power = 0.35f;
+// XE_GTAO_QUALITY of the pass device's XeGTAO (slice count, 0 Low .. 4 Ultra); a change ("gtao_defines") reopens the pass device at its
+// next use
+static int g_gtao_quality = 3;
+static std::vector<std::string> GtaoDefines()
+{
+   return {"XE_GTAO_QUALITY=" + std::to_string(g_gtao_quality)};
+}
+// The XeGTAO and GT-VBAO darkness dials' range (sliders and dev values)
+constexpr float GTAO_FINAL_VALUE_POWER_MIN = 0.1f;
+constexpr float GTAO_FINAL_VALUE_POWER_MAX = 4.5f;
+#if DEVELOPMENT
+static int g_gtao_debug_view = 0; // 0 off, 1 depth gradient, 2 normals, 3 AO x8, 4 edges (the shader's debug blocks are DEVELOPMENT only)
+// The AO history's weight under an upscaler (see "RunGtao"), 0 turns it off
+static float g_gtao_history_weight = 0.9f;
+#else
+constexpr int g_gtao_debug_view = 0;
+constexpr float g_gtao_history_weight = 0.9f;
+#endif
 // Read in the SM3 ports through the Luma block ("UpdateLumaRows"), the display
 // map and the composition (Core's state)
 constexpr CB::LumaGameSettings DEFAULT_GAME_SETTINGS = {
@@ -585,14 +607,17 @@ struct Mv
                      *probe_raw = nullptr;
    IDirect3DVertexShader9* vs_quad = nullptr;
    IDirect3DPixelShader9 *ps_fill = nullptr, *ps_marker = nullptr,
-                         *ps_copy = nullptr, *ps_gtao = nullptr;
+                         *ps_copy = nullptr, *ps_gtao = nullptr,
+                         *ps_gtao_debug = nullptr; // GTAO_DEBUG_VIEW 1: XeGTAO's debug views alone
    bool shaders_tried = false, vtf_checked = false, disabled = false;
+   bool ps_gtao_tried = false, ps_gtao_debug_tried = false; // One load per variant until "MvFreeShaders()"
    // XeGTAO's camera (Bayonetta's TakePrepassCamera): the last depth prepass
    // draw's c0..c27 as rows 0..27 of the shader's b4 (dgVoodoo's b4 has them at
    // 20..47), so its rows are the D3D9 registers; the frame it was taken in
    float gtao_camera[28 * 4] = {};
    uint32_t gtao_affine_row = 0, gtao_matrix_row = 0;
    uint32_t gtao_camera_frame = UINT32_MAX;
+   uint32_t gtao_frame = UINT32_MAX; // The last frame XeGTAO ran in (its history restarts after a frame without it)
    // Frame
    uint32_t frame_index = 0, scene_frame = 0;
    bool open = false, ended = false, sr_ran = false, sr_ran_last = false;
@@ -723,8 +748,7 @@ static void MvRestoreGame(IDirect3DDevice9* native)
    }
    if (mv.applied_ps)
    {
-      native->SetPixelShader(
-         reinterpret_cast<IDirect3DPixelShader9*>(mv.game_ps));
+      native->SetPixelShader(BoundPixelShader(mv.game_ps));
       mv.applied_ps = false;
    }
    if (mv.applied_rt1)
@@ -823,6 +847,7 @@ static void MvSetPointClamp(IDirect3DDevice9* native, DWORD sampler,
 
 // One-time: the four pass shaders (Luma_Bayonetta_MotionVectorFill_SM3.hlsl,
 // Luma_Bayonetta_RGBCopy_SM3.hlsl).
+// Reloaded through "OnShadersReloaded()", as is the GTAO apply PS.
 static bool MvLoadShaders(IDirect3DDevice9* native)
 {
    if (mv.shaders_tried)
@@ -974,6 +999,18 @@ static bool MvEnsureVtf(IDirect3DDevice9* native, UINT rows)
    return SUCCEEDED(hr);
 }
 
+// The pass shaders and the GTAO apply PS, loaded again at their next use
+static void MvFreeShaders()
+{
+   Free(&mv.vs_quad);
+   Free(&mv.ps_fill);
+   Free(&mv.ps_marker);
+   Free(&mv.ps_copy);
+   Free(&mv.ps_gtao);
+   Free(&mv.ps_gtao_debug);
+   mv.shaders_tried = mv.ps_gtao_tried = mv.ps_gtao_debug_tried = false;
+}
+
 static void MvDestroy(device* host)
 {
    IDirect3DDevice9* native = host ? NativeOf(host) : nullptr;
@@ -990,12 +1027,7 @@ static void MvDestroy(device* host)
    mv.previous.clear();
    Free(&mv.block);
    MvFreeTargets(native);
-   Free(&mv.vs_quad);
-   Free(&mv.ps_fill);
-   Free(&mv.ps_marker);
-   Free(&mv.ps_copy);
-   Free(&mv.ps_gtao);
-   mv.shaders_tried = false;
+   MvFreeShaders();
    mv.last_w = mv.last_h = 0;
    mv.disabled = mv.vtf_checked && !state.mv_vtf_ok;
 }
@@ -1302,8 +1334,7 @@ static void MvApplyState(IDirect3DDevice9* native, const MvShader& vertex,
    {
       if (mv.applied_ps)
       {
-         native->SetPixelShader(
-            reinterpret_cast<IDirect3DPixelShader9*>(mv.game_ps));
+         native->SetPixelShader(BoundPixelShader(mv.game_ps));
          mv.applied_ps = false;
       }
       if (mv.applied_rt1)
@@ -1456,12 +1487,14 @@ static void MvEndScene(device* host, IDirect3DDevice9* native)
           !KmtWaitObject(&g_pass.sync, g_pass.out.object, value))
       {
          ++state.pass_failures;
+         McpTraceEvent("custom", "luma_taa_failed");
          Log("d9native: Luma TAA failed (%s, kmt %s 0x%08X)", D3D9Passes::Error(),
             g_pass.sync.first_error_call,
             static_cast<uint32_t>(g_pass.sync.first_error));
          return;
       }
       ++state.taa_runs;
+      McpTraceEvent("custom", "luma_taa");
       state.taa_resets += reset ? 1 : 0;
       mv.sr_ran = true;
       MvCopyBack(native);
@@ -1479,6 +1512,7 @@ static void MvEndScene(device* host, IDirect3DDevice9* native)
       .vert_fov = float(camera.vert_fov)};
    if (!D3D9SR::RunFrame(&sr, &frame))
    {
+      McpTraceEvent("custom", "sr_dispatch_failed");
       Log("d9native: SR bridge frame %llu failed (%s 0x%08X), stopped", frame.n,
          sr.sync.first_error_call, static_cast<uint32_t>(sr.sync.first_error));
       StopUpscaler();
@@ -1486,6 +1520,7 @@ static void MvEndScene(device* host, IDirect3DDevice9* native)
    }
    ++state.sr_frames;
    ++state.sr_mid_frames;
+   McpTraceEvent("custom", "sr_dispatch");
    state.sr_frame_jitter[0] = mv.jitter[0];
    state.sr_frame_jitter[1] = mv.jitter[1];
    state.sr_frame_reset = frame.reset;
@@ -1860,18 +1895,25 @@ static bool RunGtao(device* device)
    {
       return false;
    }
-   if (!mv.ps_gtao)
+   const bool debug_view = g_gtao_debug_view > 0;
+   IDirect3DPixelShader9*& apply_ps = (debug_view ? mv.ps_gtao_debug : mv.ps_gtao);
+   bool& apply_ps_tried = (debug_view ? mv.ps_gtao_debug_tried : mv.ps_gtao_tried);
+   // A failed compile isn't retried every frame, only after a reload
+   if (!apply_ps_tried)
    {
+      apply_ps_tried = true;
       const std::vector<uint8_t> code =
-         LoadShader(L"gtao_apply.ps_3_0.cso",
-            "Bayonetta/Luma_Bayonetta_GTAOApply_SM3.hlsl", "main",
-            "ps_3_0");
-      if (code.empty() ||
-          FAILED(native->CreatePixelShader(
-             reinterpret_cast<const DWORD*>(code.data()), &mv.ps_gtao)))
+         LoadShader(debug_view ? L"gtao_apply_debug.ps_3_0.cso" : L"gtao_apply.ps_3_0.cso",
+            "Bayonetta/Luma_Bayonetta_GTAOApply_SM3.hlsl", "main", "ps_3_0",
+            debug_view ? std::vector<std::string>{"GTAO_DEBUG_VIEW=1"} : std::vector<std::string>{});
+      if (!code.empty())
       {
-         return false;
+         native->CreatePixelShader(reinterpret_cast<const DWORD*>(code.data()), &apply_ps);
       }
+   }
+   if (!apply_ps)
+   {
+      return false;
    }
    if (g_pass.ao_width != desc.Width || g_pass.ao_height != desc.Height)
    {
@@ -1906,12 +1948,48 @@ static bool RunGtao(device* device)
    }
    else
    {
+      // The AO history under an upscaler only, on this frame's motion so far (the open scene's RT1: object motion where a patched
+      // draw wrote one, the marker elsewhere) copied into the shared motion texture, which the fill overwrites at the scene's end
+      bool history = (sr.ready || state.luma_taa) && g_gtao_history_weight > 0.f && mv.open && !mv.ended && mv.ps_copy &&
+                     mv.motion_rt && mv.kmt[0] && mv.tex_w == desc.Width && mv.tex_h == desc.Height;
+      if (history)
+      {
+         PassScope scope(native);
+         IDirect3DSurface9* motion = nullptr;
+         mv.textures[0]->GetSurfaceLevel(0, &motion);
+         native->SetRenderTarget(1, nullptr);
+         native->SetRenderTarget(0, motion);
+         native->SetDepthStencilSurface(nullptr);
+         MvSetPointClamp(native, 0, mv.motion_rt);
+         const float size[4] = {float(mv.tex_w), float(mv.tex_h), 0, 0};
+         native->SetPixelShaderConstantF(0, size, 1);
+         MvDrawQuad(native, mv.tex_w, mv.tex_h, mv.ps_copy);
+         Free(&motion);
+         if (g_pass.motion != mv.kmt[0])
+         {
+            g_pass.motion = (D3D9Passes::SetMotion(mv.kmt[0]) ? mv.kmt[0] : nullptr);
+         }
+         history = g_pass.motion != nullptr;
+      }
       D3D9Passes::GtaoParams params = {.affine_row = mv.gtao_affine_row,
          .matrix_row = mv.gtao_matrix_row,
-         .final_value_power = g_gtao_final_value_power,
+         .final_value_power = (g_gtvbao_enable ? g_gtvbao_final_value_power : g_gtao_final_value_power),
          .depth_scale = g_gtao_depth_scale,
-         .radius_override = g_gtao_radius_override};
+         .radius_override = g_gtao_radius_override,
+         .gtvbao = g_gtvbao_enable,
+         .debug_view = float(g_gtao_debug_view),
+         .noise_index = (history ? float(mv.frame_index % 64) : 0.f),
+         .history_weight = (history ? g_gtao_history_weight : 0.f),
+         .history_reset = !mv.previous_valid || mv.gtao_frame + 1 != mv.frame_index,
+         .jitter_ndc = {mv.jitter_ndc[0], mv.jitter_ndc[1]}};
       memcpy(params.camera, mv.gtao_camera, sizeof(params.camera));
+      for (int row = 0; row < 4; ++row)
+      {
+         for (int column = 0; column < 4; ++column)
+         {
+            params.reprojection[row * 4 + column] = float(mv.reprojection.m[row][column]);
+         }
+      }
       out.query9->Issue(D3DISSUE_END);
       const uint64_t value = ++g_pass.value;
       if (FAILED(out.query9->GetData(nullptr, 0, D3DGETDATA_FLUSH)) ||
@@ -1923,6 +2001,7 @@ static bool RunGtao(device* device)
          Log("d9native: XeGTAO failed (%s)", D3D9Passes::Error());
          return false;
       }
+      mv.gtao_frame = mv.frame_index;
    }
    PassScope scope(native);
    MvSetPointClamp(native, 0, scene);
@@ -1930,8 +2009,9 @@ static bool RunGtao(device* device)
    MvSetPointClamp(native, 3, ao);
    const float size[4] = {float(desc.Width), float(desc.Height), 0, 0};
    native->SetPixelShaderConstantF(0, size, 1);
-   MvDrawQuad(native, desc.Width, desc.Height, mv.ps_gtao);
+   MvDrawQuad(native, desc.Width, desc.Height, apply_ps);
    ++state.gtao_runs;
+   McpTraceEvent("custom", "gtao");
    return true;
 }
 // The MV module's render-size motion, depth, output and color textures shared
@@ -1948,7 +2028,11 @@ static void StartUpscaler(device* device)
                    D3D9SR::Open(&sr, KmtGeneration(device)) &&
                    MvCheckVtf(native) && MvEnsureTextures(native, width, height);
    // Render = output size, hdr, unjittered motion (the patched PS writes it),
-   // motion scale = render size (UV delta), DLSS preset 0, FSR newest.
+   // motion scale = render size (UV delta). DLSS's auto exposure; FSR's clips
+   // highlights (FSR-Best-Practices FIN-3), so it runs at exposure 1. DLAA on
+   // scene-referred HDR input takes preset J or K, never L or M
+   // (DLSS-Best-Practices PRE-4): "Default" picks K (11), so NVIDIA can't
+   // change it over the air; an explicit choice is kept.
    // Textures: color motion depth, no reactive / transparency / exposure,
    // output.
    if (!ok ||
@@ -1958,8 +2042,11 @@ static void StartUpscaler(device* device)
              .output_width = width,
              .output_height = height,
              .hdr = true,
+             .auto_exposure = g_sr_upscaler != SRBridgeProtocol::kFsr,
              .motion_scale_x = float(width),
-             .motion_scale_y = float(height)},
+             .motion_scale_y = float(height),
+             .dlss_preset = int(dlss_render_preset != 0 ? dlss_render_preset : 11u),
+             .fsr_version = sr_fsr_version},
           {mv.kmt[3], mv.kmt[0], mv.kmt[1], nullptr, nullptr,
              nullptr, mv.kmt[2]}))
    {
@@ -2070,7 +2157,7 @@ static void BloomMirrorCopy(device* device, resource source, resource dest,
    const subresource_box* dest_box)
 {
    if (source.handle != bloom.target || !bloom.texture || !state.luma_bloom ||
-       Mutated(MUT_NO_LUMA_BLOOM))
+       luma_bypassed || Mutated(MUT_NO_LUMA_BLOOM))
    {
       return;
    }
@@ -2135,7 +2222,7 @@ static bool BloomDraw(device* device, float rows[3][4])
    {
       return false;
    }
-   const bool enabled = state.luma_bloom && !Mutated(MUT_NO_LUMA_BLOOM);
+   const bool enabled = state.luma_bloom && !luma_bypassed && !Mutated(MUT_NO_LUMA_BLOOM);
    IDirect3DDevice9* native = NativeOf(device);
    const uint64_t source = out.ps_textures[0];
    if (!source || !out.rt0.handle)
@@ -2258,6 +2345,7 @@ static bool BloomDraw(device* device, float rows[3][4])
    rows[2][2] = rows[1][0] / float(target_desc.texture.width * bloom.scale);
    rows[2][3] = rows[1][1] / float(target_desc.texture.height * bloom.scale);
    ++state.bloom_draws;
+   McpTraceEvent("custom", "luma_bloom");
    return true;
 }
 
@@ -2301,14 +2389,20 @@ static void ApplySettings()
    ShadowMap::Apply();
 }
 
-// The Luma block's settings rows (Includes/Luma_Block_sm3.hlsli): c208.x the
-// grade's gamma encoded exposure gain, c209.z the bloom intensity, c214 the
-// movies' AutoHDR and its peak relative to the UI paper white (1 in SDR: an
-// identity). Per present: the display mode can change under the game.
+// The Luma block's settings rows (Includes/Luma_Block_sm3.hlsli): c208 the
+// grade's transfer-encoded exposure gain, its intensity (1 = vanilla, always
+// written: 0 is an intensity) and its HDR path (TONEMAP_TYPE 1, in "OnInit",
+// on an HDR display mode), c209.z the bloom intensity, c214 the movies'
+// AutoHDR and its peak relative to the UI paper white (1 in SDR: an
+// identity). Per present: the display mode can change under the game. Inert
+// under "luma_bypassed": the game's own grades draw then.
 static void UpdateLumaRows()
 {
    const CB::LumaGameSettings& settings = cb_luma_global_settings.GameSettings;
+   const bool hdr = EffectiveMode() != OUTPUT_SRGB;
    state.injected[0] = std::pow(settings.Exposure, 1.f / 2.2f);
+   state.injected[1] = settings.ColorGradingIntensity;
+   state.injected[2] = (hdr ? 1.f : 0.f);
    state.injected[4 * (209 - INJECT_BASE_REGISTER) + 2] =
       settings.BloomIntensity;
    float* const c214 = state.injected + 4 * (214 - INJECT_BASE_REGISTER);
@@ -2316,12 +2410,11 @@ static void UpdateLumaRows()
    const float video_peak =
       std::lerp(srgb_white_level, 250.f, settings.VideoAutoHDRBoost) /
       srgb_white_level;
-   c214[1] = (EffectiveMode() == OUTPUT_SRGB
-                 ? 1.f
-                 : std::max(std::min(video_peak,
-                               cb_luma_global_settings.ScenePeakWhite /
-                                  cb_luma_global_settings.UIPaperWhite),
-                      1.f));
+   c214[1] = (hdr ? std::max(std::min(video_peak,
+                                cb_luma_global_settings.ScenePeakWhite /
+                                   cb_luma_global_settings.UIPaperWhite),
+                       1.f)
+                  : 1.f);
 }
 
 class Bayonetta final : public D3D9Game
@@ -2336,15 +2429,25 @@ public:
       display_map_file = "Luma_Bayonetta_DisplayMap.hlsl";
       smaa_file = "Luma_SMAA_impl.hlsl";
       depth_edges_file = "Luma_Bayonetta_DepthEdges.hlsl";
-      // XeGTAO at the dgVoodoo mod's quality; the final denoise writes R32F,
-      // which D3D9 can share
+      // XeGTAO at the chosen quality ("XeGTAO Quality", the dgVoodoo mod's
+      // advanced define); the final denoise writes R32F, which D3D9 can share
       gtao_file = "Luma_Bayonetta_XeGTAO.hlsl";
-      gtao_defines = {"XE_GTAO_QUALITY=3"};
+      if (!OfflineHarness())
+      {
+         reshade::get_config_value(nullptr, NAME, "GTAOQuality", g_gtao_quality);
+         g_gtao_quality = std::clamp(g_gtao_quality, 0, 4);
+      }
+      gtao_defines = GtaoDefines();
       // ponytail: ResetRender = the frame's first hand-off copy into the canvas,
       // without the D3D11 mod's opaque-blend test
       out.handoff_crcs.insert(std::begin(kHandoffPs), std::end(kHandoffPs));
       out.video_crcs.insert(std::begin(kVideoPs), std::end(kVideoPs));
       out.velocity_crcs.insert(std::begin(kVelocityPs), std::end(kVelocityPs));
+      // The old mod's canvas UI clamp (BAYONETTA_PARITY.md "TOK UI clamp"): idshader* and HwShader* UI PS that
+      // overshoot 1 once their target is fp16
+      out.saturate_crcs = {0x71EEA0A8, 0x00E292BD, 0xE14F8261, 0x0D39EA9E, 0x834AB455, 0x489680FE, 0xE216D71E,
+         0x186D092D, 0x74DD20F6, 0xA3BCCE79, 0xB8CDE205, 0x735B0BC2, 0xBF42633C, 0x368CF889, 0x43AA62C8, 0x4F7114E1,
+         0x085B47D2, 0xBD99E5E8, 0x8A6C4B76, 0xBC0FCE3A, 0x8B655F18, 0x741266F1, 0x6C31FC9D, 0xA32E28C7, 0x41A1D13C};
       development_crc_lists = {{"D9N_SCENE_POST_PS", &mv.post_crcs},
          {"D9N_KERNEL_PS", &bay.kernel_crcs},
          {"D9N_SSAO_PS", &bay.ssao_crcs},
@@ -2381,6 +2484,7 @@ public:
          reshade::get_config_value(nullptr, NAME, "RCASSharpness",
             g_rcas_sharpness);
          reshade::get_config_value(nullptr, NAME, "GTAOEnable", g_gtao_enable);
+         reshade::get_config_value(nullptr, NAME, "GTVBAOEnable", g_gtvbao_enable);
          reshade::get_config_value(nullptr, NAME, "FixHighResolutionEffects",
             g_resolution_scaled_effects);
          reshade::get_config_value(nullptr, NAME, "FixFramePacing",
@@ -2404,6 +2508,8 @@ public:
             settings.Saturation);
          reshade::get_config_value(nullptr, NAME, "HighlightsDesaturation",
             settings.HighlightsDesaturation);
+         reshade::get_config_value(nullptr, NAME, "ColorGradingIntensity",
+            settings.ColorGradingIntensity);
          reshade::get_config_value(nullptr, NAME, "BloomIntensity",
             settings.BloomIntensity);
          FrameLimiter::Install();
@@ -2506,6 +2612,46 @@ public:
       }
    }
 
+   void OnShadersReloaded() override
+   {
+      MvFreeShaders();
+   }
+
+   // The MV copies of the replaced pipelines of "crc" ("MvInitPipeline()" patched the create-time replacement), patched again from the
+   // reloaded one
+   void OnReplacementReloaded(uint32_t crc, std::span<const uint8_t> bytecode) override
+   {
+      if (!g_mv || !g_device)
+      {
+         return;
+      }
+      std::vector<uint32_t> patched;
+      std::string error;
+      if (!Sm3MvPatch::PatchPixelShader(reinterpret_cast<const uint32_t*>(bytecode.data()), bytecode.size() / 4, &patched, &error))
+      {
+         Log("d9native: MV patch refused the reloaded PS %08X: %s", crc, error.c_str());
+         patched.clear();
+      }
+      for (auto& [handle, entry] : mv.shaders)
+      {
+         // A VS pipeline's CRC there is 0
+         if (entry.vs || !out.pipeline_crc.contains(handle) || out.pipeline_crc.at(handle) != crc || !out.matched_pipelines.contains(handle))
+         {
+            continue;
+         }
+         if (entry.ps)
+         {
+            Free(&entry.ps);
+            --state.mv_shaders_live;
+         }
+         if (!patched.empty() &&
+             SUCCEEDED(NativeOf(g_device)->CreatePixelShader(reinterpret_cast<const DWORD*>(patched.data()), &entry.ps)))
+         {
+            ++state.mv_shaders_live;
+         }
+      }
+   }
+
    void OnBindRenderTargets(device* device, uint32_t count,
       const resource_view* rtvs,
       resource_view depth_stencil) override
@@ -2556,7 +2702,8 @@ public:
       int32_t vertex_offset) override
    {
       BloomRestore(NativeOf(device));
-      if (g_mv)
+      // Under "luma_bypassed" no scene opens: the game's VS and PS draw (no jitter, no RT1), no camera, no SR
+      if (g_mv && !luma_bypassed)
       {
          MvOnDraw(device, count, first, vertex_offset);
       }
@@ -2598,8 +2745,8 @@ public:
             (state.inject_base + 1) * 4, 12, rows);
       }
       // Fix High Resolution Effects for the unreplaced kernels (route C): their
-      // c194 is the kernel size for this draw only.
-      if (!Mutated(MUT_NO_HOST_CONSTS) && state.kernel_720 &&
+      // c194 is the kernel size for this draw only (the game's own under "luma_bypassed").
+      if (!luma_bypassed && !Mutated(MUT_NO_HOST_CONSTS) && state.kernel_720 &&
           bay.kernel_crcs.contains(out.bound_ps_crc))
       {
          cmd_list->push_constants(shader_stage::pixel, pipeline_layout{0}, 5,
@@ -2620,18 +2767,19 @@ public:
       {
          bay.depth_texture = out.ps_textures[2];
          bay.depth_present = state.presents;
-         if (state.gtao)
+         if (state.gtao && !luma_bypassed)
          {
             if (RunGtao(device))
             {
                return true;
             }
             ++state.gtao_fallbacks;
+            McpTraceEvent("custom", "gtao_fallback");
          }
       }
       // HideUI: every draw into the canvas after this frame's ResetRender is the
       // UI, except the movies
-      if (state.hide_ui && !Mutated(MUT_NO_HIDE_UI) && out.rt0_is_back_buffer &&
+      if (state.hide_ui && !luma_bypassed && !Mutated(MUT_NO_HIDE_UI) && out.rt0_is_back_buffer &&
           Redirecting() && out.last_reset_render == state.presents &&
           !out.video_crcs.contains(out.bound_ps_crc))
       {
@@ -2762,6 +2910,12 @@ public:
       {
          MvOnPresent(device);
       }
+      // A "luma_bypassed" change restarts every history: the next scene has no previous camera, so the SR frame resets and Luma TAA
+      // and XeGTAO restart; SMAA T2x restarts as no bypassed frame resolved
+      if (bypass_changed)
+      {
+         mv.camera_valid = mv.previous_valid = false;
+      }
    }
 
    void DrawImGuiSettings() override
@@ -2838,6 +2992,11 @@ public:
             DEFAULT_GAME_SETTINGS.HighlightsDesaturation, 0.f, 1.f,
             "How far the brightest sources fade to neutral white, "
             "HDR only (0 = keep color at any brightness).");
+      // c208.y in Grade_*
+      DrawSettingSlider("Color Grading Intensity", "ColorGradingIntensity",
+         &settings.ColorGradingIntensity,
+         DEFAULT_GAME_SETTINGS.ColorGradingIntensity, 0.f, 1.f,
+         "Strength of the game's own color grading (1 = vanilla, 0 = neutral).");
 
       ImGui::SeparatorText("Bloom");
       changed |= DrawSettingCheckbox(
@@ -2855,13 +3014,37 @@ public:
          "XeGTAO Enable", "GTAOEnable", &g_gtao_enable, true,
          "Replaces the game's SSAO with XeGTAO (cleaner, more accurate ambient "
          "occlusion; requires SSAO enabled in the game's options).");
+      // Read in "RunGtao" at each run
+      DrawSettingCheckbox("GT-VBAO Enable", "GTVBAOEnable", &g_gtvbao_enable, false,
+         "Replaces XeGTAO's occlusion with GT-VBAO (less dark halo around thin "
+         "objects). Needs XeGTAO Enable.",
+         !g_gtao_enable, false);
+      ImGui::BeginDisabled(!g_gtao_enable);
+      if (ImGui::Combo("XeGTAO Quality", &g_gtao_quality,
+             "Low\0Medium\0High\0Very High\0Ultra\0"))
+      {
+         reshade::set_config_value(nullptr, NAME, "GTAOQuality", g_gtao_quality);
+         gtao_defines = GtaoDefines();
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("XeGTAO's slice count (Very High = the default). "
+                           "Recompiles its shaders when changed.");
+      }
+      ImGui::EndDisabled();
 #if DEVELOPMENT || TEST
       ImGui::BeginDisabled(!g_gtao_enable);
-      ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, 0.1f,
-         4.5f, "%.2f");
+      ImGui::SliderFloat("GTAO Final Value Power", &g_gtao_final_value_power, GTAO_FINAL_VALUE_POWER_MIN,
+         GTAO_FINAL_VALUE_POWER_MAX, "%.2f");
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
          ImGui::SetTooltip("XeGTAO's darkness dial (higher = darker AO).");
+      }
+      ImGui::SliderFloat("GT-VBAO Final Value Power", &g_gtvbao_final_value_power,
+         GTAO_FINAL_VALUE_POWER_MIN, GTAO_FINAL_VALUE_POWER_MAX, "%.2f");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("GT-VBAO's darkness dial (higher = darker AO).");
       }
       ImGui::SliderFloat("GTAO Depth Scale", &g_gtao_depth_scale, 0.01f, 200.f,
          "%.2f", ImGuiSliderFlags_Logarithmic);
@@ -2877,6 +3060,23 @@ public:
          ImGui::SetTooltip("0 = the shader's EFFECT_RADIUS; > 0 overrides it (view "
                            "units after the depth scale).");
       }
+#if DEVELOPMENT // The shader's debug blocks are DEVELOPMENT only
+      ImGui::Combo("GTAO Debug View", &g_gtao_debug_view,
+         "Off\0Depth gradient\0Normals\0AO x8\0Edges\0");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("Shows XeGTAO's diagnostics instead of the scene. Depth "
+                           "gradient dead or flat, or blocky normals = a wrong "
+                           "input; AO x8 = broad over-occlusion.");
+      }
+      ImGui::SliderFloat("GTAO History Weight", &g_gtao_history_weight, 0.f, 0.98f,
+         "%.2f");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("The AO history's weight under DLSS/FSR/XeSS or Luma TAA "
+                           "(0 = off).");
+      }
+#endif
       ImGui::EndDisabled();
 #endif
 
@@ -2944,6 +3144,50 @@ public:
          ApplySettings();
       }
    }
+
+#if DEVELOPMENT
+   // The knobs Core's state doesn't mirror (read where they are used, so live), the motion vector, bloom and depth textures
+   void RegisterDevValues() override
+   {
+      McpD3D9::RegisterValue("smaa_pred_tolerance", "float", &g_smaa_pred_tolerance, 0.002, 0.2);
+      McpD3D9::RegisterValue("gtao_final_value_power", "float", &g_gtao_final_value_power, GTAO_FINAL_VALUE_POWER_MIN, GTAO_FINAL_VALUE_POWER_MAX);
+      McpD3D9::RegisterValue("gtao_depth_scale", "float", &g_gtao_depth_scale, 0.001, 1000);
+      McpD3D9::RegisterValue("gtao_radius_override", "float", &g_gtao_radius_override, 0, 5);
+      McpD3D9::RegisterValue("gtvbao_final_value_power", "float", &g_gtvbao_final_value_power, GTAO_FINAL_VALUE_POWER_MIN, GTAO_FINAL_VALUE_POWER_MAX);
+      McpD3D9::RegisterValue("gtao_history_weight", "float", &g_gtao_history_weight, 0, 0.98);
+      McpD3D9::RegisterValue("gtao_debug_view", "int", &g_gtao_debug_view, 0, 4);
+      McpD3D9::RegisterValue("gtvbao_enable", "toggle", &g_gtvbao_enable, 0, 1);
+      // The VS / PS patches are made as the game creates its shaders
+      McpD3D9::RegisterCounter("mv", &g_mv, "Create time: restart to change");
+      CB::LumaGameSettings& settings = cb_luma_global_settings.GameSettings;
+      // Into the Luma block's rows at every present ("UpdateLumaRows")
+      McpD3D9::RegisterValue("exposure", "float", &settings.Exposure, 0, 2);
+      McpD3D9::RegisterValue("bloom_intensity", "float", &settings.BloomIntensity, 0, 2);
+      McpD3D9::RegisterValue("video_autohdr_enable", "float", &settings.VideoAutoHDREnable, 0, 1);
+      McpD3D9::RegisterValue("video_autohdr_boost", "float", &settings.VideoAutoHDRBoost, 0, 1);
+      McpD3D9::RegisterCounter("frame_limiter_late_frames", &FrameLimiter::late_frames);
+      McpD3D9::RegisterCounter("frame_limiter_resyncs", &FrameLimiter::resyncs);
+      McpD3D9::RegisterCounter("frame_limiter_adopted_deadlines", &FrameLimiter::adopted_deadlines);
+      // The shared SR textures (motion, depth, output, color) and our motion RT1
+      for (const auto& [name, index] : {std::pair{"mv_motion", 0}, {"mv_depth", 1}, {"mv_output", 2}, {"mv_color", 3}})
+      {
+         McpD3D9::RegisterTexture(name, [index]
+            { return static_cast<IDirect3DResource9*>(mv.textures[index]); });
+      }
+      McpD3D9::RegisterTexture("mv_motion_rt", []
+         { return static_cast<IDirect3DResource9*>(mv.motion_rt); });
+      McpD3D9::RegisterTexture("bloom_texture", []
+         { return static_cast<IDirect3DResource9*>(bloom.texture); });
+      // The game's R32F depth prepass (the SSAO draw's s2), valid in the frame it was drawn
+      McpD3D9::RegisterTexture("depth_prepass", []
+         { return reinterpret_cast<IDirect3DResource9*>(bay.depth_texture); });
+      McpD3D9::setting_keys.insert(McpD3D9::setting_keys.end(), {"GTAO", "HIDE_UI", "KERNEL_720", "LUMA_BLOOM", "MV", "GTAOQuality",
+                                                                   "SMAAEnable", "SMAAT2x", "SMAAPredication", "SMAAPredicationTolerance", "RCASSharpness", "GTAOEnable", "GTVBAOEnable",
+                                                                   "FixHighResolutionEffects", "FixFramePacing", "60FPSCutscenes", "LumaBloomEnable", "HighResolutionShadows", "Dithering",
+                                                                   "VideoAutoHDREnable", "VideoAutoHDRBoost", "Exposure", "Contrast", "Saturation", "HighlightsDesaturation", "ColorGradingIntensity",
+                                                                   "BloomIntensity"});
+   }
+#endif
 
    void PrintImGuiAbout() override
    {

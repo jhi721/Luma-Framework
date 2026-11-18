@@ -9,6 +9,13 @@
 
 // x = encoded gain on g_MatrialColor: pow(Exposure, 1 / 2.2), 1 = vanilla
 // (Grade_*, CentreAverage)
+// y = ColorGradingIntensity (Grade_*; 1 = vanilla, 0 = no curve, saturation
+// or gradient). The host must write it: 0 is a valid intensity, not "unset".
+// z = 1 when the grades take the HDR path (TONEMAP_TYPE >= 1 and HDR display
+// mode, as the D3D11 mod's condition), else 0
+// w = unused (0)
+// z = 0 with y = 1 runs the blob's math unchanged; anything else runs the Luma
+// path (smoothed curve, clamps of the 8-bit target, HDR tangent if z = 1).
 float4 g_LumaGrade : register(c208);
 
 // x = copy mode (0 vanilla, 2 bloom composite, 3 composite with a lerp blend),
