@@ -8,6 +8,7 @@
 // SMAA replaces the game's FXAA (see "OnDrawOrDispatch()"), RCAS sharpens its output
 #define ENABLE_SMAA 1
 #define ENABLE_RCAS 1
+#define ENABLE_LUMA_TAA 1
 // SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
 #define SMAA_SMOOTH_U_SHAPES 0
 // Luma Bloom replaces the glow pyramid (see "DrawLumaBloom()")
