@@ -1297,6 +1297,8 @@ namespace Mcp
       DeviceData* device_data = nullptr; // Its "readback.captures" are the GPU copies, read back at present
 #endif
       bool draw_succeeded;
+      float jitter_x; // What this draw gave the upscaler: its readback lands some presents later, so the history can't be matched to the textures
+      float jitter_y;
    };
    std::atomic<bool> sr_capture_armed = false;
    std::mutex s_mutex_sr_capture;
@@ -1394,6 +1396,8 @@ namespace Mcp
                   copy_texture(i);
          }
          captured.draw_succeeded = inner->Draw(data, command_list, draw_data);
+         captured.jitter_x = draw_data.jitter_x;
+         captured.jitter_y = draw_data.jitter_y;
 #if DX11 // D3D12: the SR pass isn't a trace entry yet
          QueueInjectedPassTrace(command_list, "Luma Super Resolution", draw_data.output_color);
 #endif
@@ -2032,7 +2036,9 @@ namespace Mcp
          }
          for (uint32_t slot = 0; slot < TraceDrawCallData::rtvs_size && !producer; slot++)
          {
-            if (entry.IsRTVValid(slot) && entry.rt_hash[slot] == resource && reads_mip(entry.rt_view[slot]))
+            // A pipeline can leave a bound render target out with a zero write mask, a G-buffer's motion vectors during lighting for example
+            const bool is_masked = entry.type == TraceDrawCallData::TraceDrawCallType::Shader && entry.blend_desc.RenderTarget[entry.blend_desc.IndependentBlendEnable ? slot : 0].RenderTargetWriteMask == 0;
+            if (entry.IsRTVValid(slot) && entry.rt_hash[slot] == resource && reads_mip(entry.rt_view[slot]) && !is_masked)
             {
                producer = i;
                target->kind = Kind::RenderTarget;
@@ -2908,7 +2914,7 @@ namespace Mcp
       }
       auto& w = job->result;
 #if DX11
-      w.Field("draw_succeeded", captured->draw_succeeded).Key("textures").BeginArray();
+      w.Field("draw_succeeded", captured->draw_succeeded).Field("jitter_x", captured->jitter_x).Field("jitter_y", captured->jitter_y).Key("textures").BeginArray();
       for (const auto& [name, texture] : captured->textures)
       {
          w.BeginObject().Field("name", name);
@@ -2964,7 +2970,7 @@ namespace Mcp
       }
       if (pending && ++job->frames < readback_max_gpu_frames)
          return false;
-      w.Field("draw_succeeded", captured->draw_succeeded).Key("textures").BeginArray();
+      w.Field("draw_succeeded", captured->draw_succeeded).Field("jitter_x", captured->jitter_x).Field("jitter_y", captured->jitter_y).Key("textures").BeginArray();
       for (D3D12Readback::Capture& capture : readback.captures)
       {
          w.BeginObject().Field("name", capture.name);
