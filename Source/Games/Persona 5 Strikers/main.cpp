@@ -3550,19 +3550,19 @@ public:
          }
          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          {
-            ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR/XeSS or stretched by the game.\nReplaces the game's own option.");
+            ImGui::SetTooltip("The resolution the game renders at, upscaled by DLSS/FSR/XeSS or Luma TAA, or stretched by the game.\nReplaces the game's own option.");
          }
          DrawResetButton(g_render_scale, 10, "RenderScale");
          ImGui::EndDisabled();
       }
-      constexpr const char* smaa_tooltip = "Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off; not used with DLSS/FSR/XeSS).";
+      constexpr const char* smaa_tooltip = "Replaces the game's FXAA with SMAA (works with the game's anti-aliasing setting on or off; not used with DLSS/FSR/XeSS or Luma TAA).";
       // The upscaler replaces SMAA: shown off, the saved choice kept for when it's turned off
       DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &settings.SMAAEnable, default_luma_global_game_settings.SMAAEnable, smaa_tooltip, IsSRActive(device_data));
       ImGui::BeginDisabled(settings.SMAAEnable <= 0.5f);
-      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS/FSR/XeSS.", IsSRActive(device_data));
+      DrawSettingCheckbox("SMAA T2x", "SMAAT2x", &g_smaa_t2x, false, "Smoother edges and less shimmering, by blending each frame with the previous one.\nCan look slightly softer in motion. Not used with DLSS/FSR/XeSS or Luma TAA.", IsSRActive(device_data));
       ImGui::EndDisabled();
       ImGui::BeginDisabled(settings.SMAAEnable <= 0.5f && !IsSRActive(device_data));
-      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &settings.RCASSharpness, default_luma_global_game_settings.RCASSharpness, 0.f, 1.f, "Sharpening applied on top of SMAA or DLSS/FSR/XeSS (0 = off).");
+      DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &settings.RCASSharpness, default_luma_global_game_settings.RCASSharpness, 0.f, 1.f, "Sharpening applied on top of anti-aliasing (0 = off).");
       ImGui::EndDisabled();
 
       ImGui::SeparatorText("Grade");
@@ -3647,7 +3647,7 @@ public:
       ImGui::PushTextWrapPos(0.f);
       ImGui::Text(
          "Luma for \"Persona 5 Strikers\" is developed by DristoforColumb and is open source and free.\n"
-         "It adds HDR, DLSS, FSR or XeSS upscaling, and replaces the game's FXAA with SMAA and its SSAO with XeGTAO.\n"
+         "It adds HDR, DLSS, FSR, XeSS or Luma TAA upscaling, and replaces the game's FXAA with SMAA (with T2x) and its SSAO with XeGTAO.\n"
          "Enable Ambient Occlusion in the game's graphic settings for XeGTAO to apply; SMAA works either way.\n"
          "Do NOT run another HDR mod (e.g. RenoDX) alongside it.\n"
          "Thanks to the Luma team and contributors.\n"
@@ -3690,10 +3690,12 @@ public:
                   "\nReShade"
                   "\nImGui"
                   "\nRenoDX (HDR tonemap method)"
+                  "\nMacLeod-Boynton hue emulation (RenoDX)"
                   "\nSMAA (Iryoku)"
                   "\nXeGTAO (Intel)"
                   "\nAMD FidelityFX (RCAS + FSR)"
-                  "\nNVIDIA NGX (DLSS)");
+                  "\nNVIDIA NGX (DLSS)"
+                  "\nIntel XeSS");
    }
 };
 
