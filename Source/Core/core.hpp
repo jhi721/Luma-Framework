@@ -9318,6 +9318,33 @@ namespace
       }
    }
 
+   // "*target" (a texture of "pass", in "state" between draws) at "width" x "height", made again (the old one retired) at another size. With
+   // "pass->mutex" held. "*created": whether it was made now. "levels": its mips
+   bool EnsureD3D12GamePassTarget(DeviceData::GamePassD3D12* pass, reshade::api::resource* target, reshade::api::device* device, uint64_t present_count, uint32_t width, uint32_t height, reshade::api::format format, reshade::api::resource_usage usage, reshade::api::resource_usage state, const wchar_t* name, bool* created = nullptr, uint16_t levels = 1)
+   {
+      if (target->handle != 0)
+      {
+         const reshade::api::resource_desc desc = device->get_resource_desc(*target);
+         if (desc.texture.width == width && desc.texture.height == height)
+         {
+            return true;
+         }
+         RetireD3D12GamePassResource(pass, present_count, target);
+      }
+      const reshade::api::resource_desc desc(width, height, 1, levels, format, 1, reshade::api::memory_heap::gpu_only, usage);
+      // Destroyed with the device otherwise
+      const bool made = device->create_resource(desc, nullptr, state, target);
+      if (made)
+      {
+         reinterpret_cast<ID3D12Resource*>(target->handle)->SetName(name);
+      }
+      if (created)
+      {
+         *created = made;
+      }
+      return made;
+   }
+
    // Destroys and clears "views" (they only hold CPU descriptors, which the tables and the bindings copied), then retires "resources" (see "RetireD3D12GamePassResource()")
    void RetireD3D12GamePassTextures(DeviceData::GamePassD3D12* pass, reshade::api::device* device, uint64_t present_count, std::initializer_list<reshade::api::resource*> resources, std::initializer_list<reshade::api::resource_view*> views)
    {

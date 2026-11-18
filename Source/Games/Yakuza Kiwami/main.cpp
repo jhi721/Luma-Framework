@@ -1108,37 +1108,10 @@ struct YakuzaKiwamiDeviceData final : public GameDeviceData
       }
    } rigid_draws;
 
-   // "*target" (a texture of "pass", in "state" between draws) at "width" x "height", made again (the old one retired) at another size. With
-   // "pass->mutex" held. "*created": whether it was made now. "levels": its mips
-   static bool EnsurePassTarget(DeviceData::GamePassD3D12* pass, reshade::api::resource* target, reshade::api::device* device, uint64_t present_count, uint32_t width, uint32_t height, reshade::api::format format, reshade::api::resource_usage usage, reshade::api::resource_usage state, const wchar_t* name, bool* created = nullptr, uint16_t levels = 1)
-   {
-      if (target->handle != 0)
-      {
-         const reshade::api::resource_desc desc = device->get_resource_desc(*target);
-         if (desc.texture.width == width && desc.texture.height == height)
-         {
-            return true;
-         }
-         RetireD3D12GamePassResource(pass, present_count, target);
-      }
-      const reshade::api::resource_desc desc(width, height, 1, levels, format, 1, reshade::api::memory_heap::gpu_only, usage);
-      // Destroyed with the device otherwise
-      const bool made = device->create_resource(desc, nullptr, state, target);
-      if (made)
-      {
-         reinterpret_cast<ID3D12Resource*>(target->handle)->SetName(name);
-      }
-      if (created)
-      {
-         *created = made;
-      }
-      return made;
-   }
-
    // The predication target at "width" x "height". With "predication_pass.mutex" held
    bool EnsurePredicationTarget(reshade::api::device* device, uint64_t present_count, uint32_t width, uint32_t height)
    {
-      return EnsurePassTarget(&predication_pass, &predication, device, present_count, width, height, reshade::api::format::r8_unorm, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR SMAA Predication");
+      return EnsureD3D12GamePassTarget(&predication_pass, &predication, device, present_count, width, height, reshade::api::format::r8_unorm, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR SMAA Predication");
    }
 };
 
@@ -1494,7 +1467,7 @@ public:
          if (is_depth_copy_draw)
          {
             std::unique_lock lock(game_device_data.copy_pass.mutex);
-            if (game_device_data.EnsurePassTarget(&game_device_data.copy_pass, &game_device_data.depth_copy, device, present_count, width, height, reshade::api::format::r32_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR DLAA Depth"))
+            if (EnsureD3D12GamePassTarget(&game_device_data.copy_pass, &game_device_data.depth_copy, device, present_count, width, height, reshade::api::format::r32_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR DLAA Depth"))
             {
                const reshade::api::resource target = game_device_data.depth_copy;
                lock.unlock();
@@ -1634,7 +1607,7 @@ public:
             reshade::api::device* const device = cmd_list_data.cmd_list->get_device();
             const reshade::api::resource_desc scene_desc = device->get_resource_desc(scene);
             std::unique_lock lock(game_device_data.bloom_apply_pass.mutex);
-            if (game_device_data.EnsurePassTarget(&game_device_data.bloom_apply_pass, &game_device_data.glow_scene_copy, device, device_data.present_count.load(std::memory_order_relaxed), scene_desc.texture.width, scene_desc.texture.height, scene_desc.texture.format, reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR Glow Scene Copy") &&
+            if (EnsureD3D12GamePassTarget(&game_device_data.bloom_apply_pass, &game_device_data.glow_scene_copy, device, device_data.present_count.load(std::memory_order_relaxed), scene_desc.texture.width, scene_desc.texture.height, scene_desc.texture.format, reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR Glow Scene Copy") &&
                 device->get_resource_desc(game_device_data.glow_scene_copy).texture.format == scene_desc.texture.format)
             {
                const reshade::api::resource scene_copy = game_device_data.glow_scene_copy;
@@ -1746,15 +1719,15 @@ public:
                {
                   const std::unique_lock lock(game_device_data.t2x_pass.mutex);
                   bool created_frames[2] = {};
-                  if (game_device_data.EnsurePassTarget(&game_device_data.t2x_pass, &game_device_data.t2x_frames[0], device, present_count, target_desc.texture.width, target_desc.texture.height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR SMAA T2x Frame 0", &created_frames[0]) &&
-                      game_device_data.EnsurePassTarget(&game_device_data.t2x_pass, &game_device_data.t2x_frames[1], device, present_count, target_desc.texture.width, target_desc.texture.height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR SMAA T2x Frame 1", &created_frames[1]))
+                  if (EnsureD3D12GamePassTarget(&game_device_data.t2x_pass, &game_device_data.t2x_frames[0], device, present_count, target_desc.texture.width, target_desc.texture.height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR SMAA T2x Frame 0", &created_frames[0]) &&
+                      EnsureD3D12GamePassTarget(&game_device_data.t2x_pass, &game_device_data.t2x_frames[1], device, present_count, target_desc.texture.width, target_desc.texture.height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR SMAA T2x Frame 1", &created_frames[1]))
                   {
                      // "DrawFullscreenPassD3D12()" takes the pass' mutex. A target retired meanwhile lives on until the lists recorded with it ran.
                      history_valid = !created_frames[0] && !created_frames[1] && game_device_data.t2x_drawn_present.load(std::memory_order_relaxed) + 1 == present_count;
                      // RCAS can't read the target it writes: the resolve goes to a third frame first
                      if (g_rcas_sharpness > 0.f)
                      {
-                        game_device_data.EnsurePassTarget(&game_device_data.t2x_pass, &game_device_data.t2x_frames[2], device, present_count, target_desc.texture.width, target_desc.texture.height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR SMAA T2x Resolved");
+                        EnsureD3D12GamePassTarget(&game_device_data.t2x_pass, &game_device_data.t2x_frames[2], device, present_count, target_desc.texture.width, target_desc.texture.height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR SMAA T2x Resolved");
                      }
                      frames = game_device_data.t2x_frames;
                   }
@@ -2089,12 +2062,12 @@ public:
       reshade::api::resource object_motion_vectors = {};
       {
          const std::unique_lock lock(game_device_data->motion_vector_pass.mutex);
-         if (game_device_data->EnsurePassTarget(&game_device_data->motion_vector_pass, &game_device_data->motion_vectors, device, present_count, width, height, reshade::api::format::r16g16_float, render_target_and_shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR DLAA Motion Vectors"))
+         if (EnsureD3D12GamePassTarget(&game_device_data->motion_vector_pass, &game_device_data->motion_vectors, device, present_count, width, height, reshade::api::format::r16g16_float, render_target_and_shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR DLAA Motion Vectors"))
          {
             motion_vectors = game_device_data->motion_vectors;
          }
          bool object_motion_created = false;
-         if (g_object_motion_vectors && game_device_data->EnsurePassTarget(&game_device_data->motion_vector_pass, &game_device_data->object_motion_vectors, device, present_count, width, height, reshade::api::format::r16g16_float, render_target_and_shader_resource, reshade::api::resource_usage::render_target, L"Luma YKR DLAA Object Motion Vectors", &object_motion_created))
+         if (g_object_motion_vectors && EnsureD3D12GamePassTarget(&game_device_data->motion_vector_pass, &game_device_data->object_motion_vectors, device, present_count, width, height, reshade::api::format::r16g16_float, render_target_and_shader_resource, reshade::api::resource_usage::render_target, L"Luma YKR DLAA Object Motion Vectors", &object_motion_created))
          {
             object_motion_vectors = game_device_data->object_motion_vectors;
             game_device_data->object_motion_vectors_handle.store(object_motion_vectors.handle, std::memory_order_relaxed);
@@ -2174,8 +2147,8 @@ public:
       {
          const std::unique_lock lock(game_device_data->color_pass.mutex);
          bool output_created = false;
-         if (game_device_data->EnsurePassTarget(&game_device_data->color_pass, &game_device_data->decoded_scene, device, present_count, width, height, reshade::api::format::r16g16b16a16_float, render_target_and_shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR DLAA Decoded Scene") &&
-             game_device_data->EnsurePassTarget(&game_device_data->color_pass, &game_device_data->dlaa_output, device, present_count, width, height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access, L"Luma YKR DLAA Output", &output_created))
+         if (EnsureD3D12GamePassTarget(&game_device_data->color_pass, &game_device_data->decoded_scene, device, present_count, width, height, reshade::api::format::r16g16b16a16_float, render_target_and_shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR DLAA Decoded Scene") &&
+             EnsureD3D12GamePassTarget(&game_device_data->color_pass, &game_device_data->dlaa_output, device, present_count, width, height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access, L"Luma YKR DLAA Output", &output_created))
          {
             decoded_scene = game_device_data->decoded_scene;
             output = game_device_data->dlaa_output;
@@ -2386,14 +2359,14 @@ public:
       constexpr reshade::api::resource_usage unordered_access_and_shader_resource = reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::shader_resource;
       constexpr reshade::api::resource_usage at_rest = reshade::api::resource_usage::shader_resource;
       bool history_created[2] = {};
-      if (!game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_depth, device, present_count, width, height, reshade::api::format::r32_float, render_target_and_shader_resource, at_rest, L"Luma YKR XeGTAO Depth") ||
-          !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_normals, device, present_count, width, height, reshade::api::format::r8g8b8a8_unorm, render_target_and_shader_resource, at_rest, L"Luma YKR XeGTAO Normals") ||
-          !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_depth_mips, device, present_count, width, height, reshade::api::format::r32_float, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Depth Mips", nullptr, gtao_depth_mip_count) ||
-          !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_working[0], device, present_count, width, height, reshade::api::format::r8g8_unorm, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Working 0") ||
-          !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_working[1], device, present_count, width, height, reshade::api::format::r8g8_unorm, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Working 1") ||
-          !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_final, device, present_count, width, height, reshade::api::format::r8_unorm, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Final") ||
-          (history_active && (!game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_history[0], device, present_count, width, height, reshade::api::format::r16g16_float, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO History 0", &history_created[0]) ||
-                                !game_device_data->EnsurePassTarget(&pass, &game_device_data->gtao_history[1], device, present_count, width, height, reshade::api::format::r16g16_float, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO History 1", &history_created[1]))))
+      if (!EnsureD3D12GamePassTarget(&pass, &game_device_data->gtao_depth, device, present_count, width, height, reshade::api::format::r32_float, render_target_and_shader_resource, at_rest, L"Luma YKR XeGTAO Depth") ||
+          !EnsureD3D12GamePassTarget(&pass, &game_device_data->gtao_normals, device, present_count, width, height, reshade::api::format::r8g8b8a8_unorm, render_target_and_shader_resource, at_rest, L"Luma YKR XeGTAO Normals") ||
+          !EnsureD3D12GamePassTarget(&pass, &game_device_data->gtao_depth_mips, device, present_count, width, height, reshade::api::format::r32_float, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Depth Mips", nullptr, gtao_depth_mip_count) ||
+          !EnsureD3D12GamePassTarget(&pass, &game_device_data->gtao_working[0], device, present_count, width, height, reshade::api::format::r8g8_unorm, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Working 0") ||
+          !EnsureD3D12GamePassTarget(&pass, &game_device_data->gtao_working[1], device, present_count, width, height, reshade::api::format::r8g8_unorm, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Working 1") ||
+          !EnsureD3D12GamePassTarget(&pass, &game_device_data->gtao_final, device, present_count, width, height, reshade::api::format::r8_unorm, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO Final") ||
+          (history_active && (!EnsureD3D12GamePassTarget(&pass, &game_device_data->gtao_history[0], device, present_count, width, height, reshade::api::format::r16g16_float, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO History 0", &history_created[0]) ||
+                                !EnsureD3D12GamePassTarget(&pass, &game_device_data->gtao_history[1], device, present_count, width, height, reshade::api::format::r16g16_float, unordered_access_and_shader_resource, at_rest, L"Luma YKR XeGTAO History 1", &history_created[1]))))
       {
          static std::atomic_flag logged;
          if (!logged.test_and_set())
@@ -2567,7 +2540,7 @@ public:
       reshade::api::resource input = {};
       {
          const std::unique_lock lock(game_device_data->bloom_fold_pass.mutex);
-         if (game_device_data->EnsurePassTarget(&game_device_data->bloom_fold_pass, &game_device_data->bloom_input, device, device_data.present_count.load(std::memory_order_relaxed), level0_desc.texture.width, level0_desc.texture.height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR Bloom Input"))
+         if (EnsureD3D12GamePassTarget(&game_device_data->bloom_fold_pass, &game_device_data->bloom_input, device, device_data.present_count.load(std::memory_order_relaxed), level0_desc.texture.width, level0_desc.texture.height, reshade::api::format::r16g16b16a16_float, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource, L"Luma YKR Bloom Input"))
          {
             input = game_device_data->bloom_input;
          }
