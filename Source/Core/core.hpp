@@ -218,8 +218,6 @@ using NativeCommandList = ID3D11DeviceContext;
 
 #if !DX12
 #define DX11 1
-#elif ENABLE_LUMA_TAA
-#error "Luma TAA is D3D11 only"
 #endif
 // Luma passes recorded in the middle of the game's D3D12 command lists (RCAS, SMAA, bloom, the texture copy conversion) and the viewports they scale for clones of other sizes:
 // release builds track the graphics state they replace too, to bind it again after them (see "D3D12State::RestoreGraphics()"). On for every D3D12 build, as the copy conversion and
@@ -322,7 +320,6 @@ using NativeCommandList = ID3D11DeviceContext;
 #if DX11
 #include "includes/shader_warmup.h"
 #endif
-#include "taa/LumaTAA.hpp" // see "ENABLE_LUMA_TAA"
 
 #if DX12 && defined(__d3d11_h__)
 #error "A D3D11 header reached a D3D12 build, gate its include with \"DX11\""
@@ -861,6 +858,8 @@ namespace
       { CompileTimeStringHash("Unclip LUT 1D"), { "Luma_UnclipLUT1D", reshade::api::pipeline_subobject_type::compute_shader } },
 #endif
 
+#endif // DX11
+
 #if ENABLE_LUMA_TAA // See "LumaTAA::resolve_shader_hashes"
          {CompileTimeStringHash("Luma TAA Low CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "0"}}}},
          {CompileTimeStringHash("Luma TAA Medium CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "1"}}}},
@@ -869,7 +868,6 @@ namespace
          {CompileTimeStringHash("Luma TAA Medium Upscale CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "1"}, {"TAA_UPSCALE", "1"}}}},
          {CompileTimeStringHash("Luma TAA High Upscale CS"), {"Luma_TAA_CS", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"TAA_QUALITY", "2"}, {"TAA_UPSCALE", "1"}}}},
 #endif
-#endif // DX11
    };
 
    // TODO: make the data in these a unique ptr for easier handling, and the shader binary data contained inside of "CachedShader" too.
@@ -3961,13 +3959,10 @@ namespace
             device_data.sr_implementations_instances[sr_implementation.first] = nullptr; // Create an empty element
             // We always do this, which will force the SR dll to load, but it should be fast enough to not bother users from other vendors
             sr_implementation.second->Init(device_data.sr_implementations_instances[sr_implementation.first], native_device, native_adapter.get());
-#if ENABLE_LUMA_TAA
-            // It draws with this device's Luma native shaders
-            if (sr_implementation.first == SR::Type::LumaTAA && device_data.sr_implementations_instances[sr_implementation.first])
+            if (device_data.sr_implementations_instances[sr_implementation.first])
             {
-               static_cast<LumaTAA::TAAInstanceData*>(device_data.sr_implementations_instances[sr_implementation.first])->device_data = &device_data;
+               device_data.sr_implementations_instances[sr_implementation.first]->device_data = &device_data;
             }
-#endif
 
             if (device_data.sr_implementations_instances[sr_implementation.first] && !device_data.sr_implementations_instances[sr_implementation.first]->is_supported)
             {
@@ -11093,6 +11088,8 @@ namespace
    }
 #endif // ENABLE_SWAPCHAIN_PROXY
 #endif // DX12
+
+#include "taa/LumaTAA.hpp" // see "ENABLE_LUMA_TAA" (after "CreateD3D12NativePipeline()", which it uses)
 
    void OnPresent(
       reshade::api::command_queue* queue,

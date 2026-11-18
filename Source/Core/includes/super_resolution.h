@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <vector>
 
+struct DeviceData;
 struct ID3D11Device;
 struct ID3D11DeviceContext;
 struct ID3D11Resource;
@@ -283,6 +284,8 @@ namespace SR
 	struct InstanceData
 	{
 		bool							is_supported = false;
+		// Its device's data, for an implementation that draws with Luma's native shaders. Set by Core right after "Init()".
+		DeviceData*					device_data = nullptr;
 
 		bool							supports_dynamic_resolution = true;
 		// Whether it supports an input resolution lower than an output one. As opposite to matching resolutions (AA only). None of them support downscaling as of now.

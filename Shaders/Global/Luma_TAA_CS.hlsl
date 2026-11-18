@@ -350,15 +350,15 @@ float ToHalfRange(float value)
 }
 float3 ToHalfRange(float3 color)
 {
-   return ((abs(color) <= FLT16_MAX) ? color : ((abs(color) <= FLT_MAX) ? (sign(color) * FLT16_MAX) : 0.0));
+   return select(abs(color) <= FLT16_MAX, color, select(abs(color) <= FLT_MAX, sign(color) * FLT16_MAX, 0.0));
 }
 
 // Moves "history" along the segment towards "target" until it is inside the box (Playdead "clip_aabb").
 float3 ClipToBox(float3 history, float3 target, float3 box_min, float3 box_max)
 {
    const float3 delta = history - target;
-   const float3 limit = ((delta > 0.0) ? (box_max - target) : (box_min - target));
-   const float3 scale = ((abs(delta) > 1e-8) ? saturate(limit / delta) : 1.0);
+   const float3 limit = select(delta > 0.0, box_max - target, box_min - target);
+   const float3 scale = select(abs(delta) > 1e-8, saturate(limit / delta), 1.0);
    return target + delta * min3(scale);
 }
 
