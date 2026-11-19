@@ -19,12 +19,15 @@
 // Left vanilla: rl_hdr_07 0xFEE7D6DC (no technique name, not seen; its Debug_bloom_buffer / Debug_lummap switches mark a
 // debug view) and the whole rl_hdr_prince family (never loaded by the exe).
 //
-// Scene peak and gamut containment are PsychoV31's; nothing after it re-clamps.
+// The scene peak is the C-infinity max-channel rolloff's, which keeps RGB ratios (hue and purity stay the LUT's); nothing before it
+// clamps to the peak and only the dither runs after it.
 
 // clang-format off
 // ORDER IS LOAD-BEARING - the game-local Common defines the settings struct before the shared includes.
 #include "Includes/Common.hlsl"
-#include "../Includes/PsychoV31.hlsl"
+#include "../Includes/CInfinityRolloff.hlsl" // Tonemap::CInfinityRollOff::MaxChannel (the display map)
+#include "../Includes/Reinhard.hlsl" // Reinhard::ReinhardPiecewise (highlights desaturation reference)
+#include "../Includes/MacLeodBoynton.hlsl" // MacLeodBoynton::HueAndPurityEmulationBT2020
 // clang-format on
 
 #ifndef TONEMAP_TYPE
@@ -99,16 +102,42 @@ float3 SR4_SampleLUT(float3 index)
    return lerp(lut0, lut1, index.b * 31.0 - slice);
 }
 
-// Linear HDR (1.0 = paper white) -> the gamma-encoded post-process space, via PsychoV31 to the user's peak.
+// Linear BT.709 HDR (1.0 = paper white) -> the gamma-encoded post-process space, rolled off to the user's peak.
 float3 SR4_DisplayMap(float3 hdrLinear, float2 uv)
 {
    hdrLinear = IsNaN_Strict(hdrLinear) ? 0.0 : hdrLinear; // NaN -> 0; "x != x" can be compiled away
    hdrLinear = max(hdrLinear, 0.0);
-   // See "PsychoVDisplayMap".
-   float3 encoded = SR4_EncodeOutput(PsychoVDisplayMap(hdrLinear,
-                                                       LumaSettings.GameSettings.Contrast,
-                                                       LumaSettings.GameSettings.Saturation,
-                                                       LumaSettings.GameSettings.HighlightDechroma));
+   // Highlights Desaturation: only the whitening (MacLeod-Boynton chrominance) of a per-channel Reinhard (ceiling 5, shoulder 1.5:
+   // identity below it), as P5S; the hue stays the LUT's. Skipped below the shoulder.
+   [branch] if (LumaSettings.GameSettings.HighlightDechroma > 0.0)
+   {
+      const float3 color2020 = BT709_To_BT2020(hdrLinear);
+      [branch] if (max3(color2020) > 1.5)
+      {
+         // fxc flags the early return of "MacLeodBoynton::SolvePurity()" as an uninitialized result (X4000)
+#pragma warning(push)
+#pragma warning(disable : 4000)
+         hdrLinear = BT2020_To_BT709(MacLeodBoynton::HueAndPurityEmulationBT2020(color2020, Reinhard::ReinhardPiecewise(color2020, 5.0, 1.5),
+                                                                                 0.0, LumaSettings.GameSettings.HighlightDechroma));
+#pragma warning(pop)
+      }
+   }
+   // Contrast (a power of relative luminance around mid gray) and a scale of the RGB distance from relative luminance: the rolloff
+   // doesn't take them
+   const float contrast = LumaSettings.GameSettings.Contrast;
+   [branch] if (contrast != 1.0)
+   {
+      hdrLinear *= pow(max(GetLuminance(hdrLinear, CS_BT709), FLT_MIN) / MidGray, contrast - 1.0);
+   }
+   [branch] if (LumaSettings.GameSettings.Saturation != 1.0)
+   {
+      hdrLinear = Saturation(hdrLinear, LumaSettings.GameSettings.Saturation, CS_BT709);
+   }
+   // Max-channel rolloff to the peak (strength 1, as the sibling mods: paper white stays within 1%). The peak can't go below paper
+   // white (the rolloff needs it above its 0.18 anchor).
+   const float paperWhite = max(LumaSettings.GamePaperWhiteNits, 1.0);
+   hdrLinear = Tonemap::CInfinityRollOff::MaxChannel(hdrLinear, max(LumaSettings.PeakWhiteNits, paperWhite) / paperWhite, 0.18, 1.0);
+   float3 encoded = SR4_EncodeOutput(hdrLinear);
    // Anti-banding dither, one step of the output quantizer: the 8-bit code in SDR, 10-bit BT.2020 PQ in HDR. The
    // composition scales this image by UIPaperWhite, so that is the PQ scale.
    [branch] if (LumaSettings.GameSettings.Dithering > 0.5)
@@ -118,11 +147,11 @@ float3 SR4_DisplayMap(float3 hdrLinear, float2 uv)
    return encoded;
 }
 
-// The pass result: the vanilla SDR reference (TONEMAP_TYPE 0, SDR displays), or the HDR recovery of it through PsychoV31.
+// The pass result: the vanilla SDR reference (TONEMAP_TYPE 0, SDR displays), or the HDR recovery of it through the display map.
 float4 SR4_Output(float3 vanillaLinear, float recoveryGain, float2 uv, float alpha)
 {
 #if TONEMAP_TYPE >= 1
-   // SDR displays keep the vanilla reference (see "PsychoVDisplayMap")
+   // SDR displays keep the vanilla reference
    [branch] if (LumaSettings.DisplayMode == 1)
    {
       return float4(SR4_DisplayMap(vanillaLinear * recoveryGain, uv), alpha);

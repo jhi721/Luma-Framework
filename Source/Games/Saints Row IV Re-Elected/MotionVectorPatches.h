@@ -30,6 +30,9 @@ namespace MotionVectorPatches
    constexpr uint32_t previous_position_register = 15;
    // Past the game's targets (the G-buffer writes 2-3, the material pass 1, only 2 shaders reach o3), within SM4's 8
    constexpr uint32_t target_slot = 4;
+   // FSR's and Luma TAA's masks, written by the blended forward draws ("PatchPixelShaderReactive"): past the motion vector target
+   // (no game pixel shader writes o4 or above)
+   constexpr uint32_t reactive_slot = 5;
 
    // For Core's patches ("motion_vector_patch.h")
    constexpr MotionVectorPatch::Layout layout = {object_slot, previous_slots, jitter_slot, resource_slots, previous_resources_slot,
@@ -49,9 +52,10 @@ namespace MotionVectorPatches
    //   viewport UV plus 0.9 texel, the next instruction the texel from rB ("IR_Pixel_Steps.zw", the render size under the sub-rect).
    //   rB is then only compared with the samples' UVs over the full texture as distance weights, all zero from sub-rect UVs (black),
    //   so after that texel instruction rB = (rB - 0.9 * cb4[9].xy) * cb9[0].zw + 0.9 * cb4[9].xy.
-   // Empty if nothing matched ("no screen uv") or unpatchable (e.g. no constant buffer declaration to copy for the jitter buffer's).
+   // Empty if nothing matched ("no screen uv", and "*no_screen_uv" set: not applicable rather than a failure) or unpatchable (e.g. no
+   // constant buffer declaration to copy for the jitter buffer's).
    constexpr uint32_t no_texture = 0;
-   inline std::vector<uint8_t> PatchScreenUVPixelShader(const uint8_t* code, size_t size, uint32_t texture_slots, std::string* error)
+   inline std::vector<uint8_t> PatchScreenUVPixelShader(const uint8_t* code, size_t size, uint32_t texture_slots, std::string* error, bool* no_screen_uv)
    {
       std::vector<Chunk> chunks;
       if (!ReadChunks(code, size, &chunks))
@@ -77,7 +81,7 @@ namespace MotionVectorPatches
       const auto is_ndc_to_uv = [&](const Instruction& instruction)
       {
          const uint32_t* t = tokens.data() + instruction.begin;
-         return instruction.length == 15 && t[0] == (ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MAD) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(15)) &&
+         return instruction.length == 15 && t[0] == Opcode(D3D10_SB_OPCODE_MAD, 15) &&
                 t[1] == Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_xy) && t[3] == Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 0, 0) &&
                 t[5] == immediate && t[6] == std::bit_cast<uint32_t>(0.5f) && t[7] == std::bit_cast<uint32_t>(-0.5f) &&
                 t[10] == immediate && t[11] == std::bit_cast<uint32_t>(0.5f) && t[12] == std::bit_cast<uint32_t>(0.5f);
@@ -101,7 +105,7 @@ namespace MotionVectorPatches
             return 0;
          return operands[1];
       };
-      constexpr uint32_t mad = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MAD) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(13);
+      constexpr uint32_t mad = Opcode(D3D10_SB_OPCODE_MAD, 13);
       constexpr uint32_t mask_xyzw = D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL;
       constexpr uint32_t bias = std::bit_cast<uint32_t>(0.9f);
       const auto is_stipple_uv = [&](const Instruction& instruction)
@@ -113,8 +117,8 @@ namespace MotionVectorPatches
       const auto cb9_swizzle = [](uint32_t x, uint32_t y, uint32_t z, uint32_t w)
       { return ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE(x, y, z, w) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER) | ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(D3D10_SB_OPERAND_INDEX_2D) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, D3D10_SB_OPERAND_INDEX_IMMEDIATE32); };
       const uint32_t cb9_zw = cb9_swizzle(2, 3, 2, 2);
-      constexpr uint32_t mul = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MUL) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(8);
-      constexpr uint32_t min = ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MIN) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(8);
+      constexpr uint32_t mul = Opcode(D3D10_SB_OPCODE_MUL, 8);
+      constexpr uint32_t min = Opcode(D3D10_SB_OPCODE_MIN, 8);
       uint32_t scaled;
       std::vector<uint32_t> patched = CopyDeclarations(tokens, instructions, first_body, texture_slots == no_texture ? 0 : 1, &scaled, [&](size_t i)
          {
@@ -175,7 +179,10 @@ namespace MotionVectorPatches
          found = true;
       }
       if (!found)
+      {
+         *no_screen_uv = true;
          return (*error = "no screen uv", std::vector<uint8_t>());
+      }
       WriteProgram(&patched, program);
       return WriteChunks(chunks);
    }

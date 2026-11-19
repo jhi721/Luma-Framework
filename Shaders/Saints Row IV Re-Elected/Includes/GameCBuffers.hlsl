@@ -17,10 +17,10 @@ struct LumaGameSettings
    float VideoAutoHDRBoost;     // 0..1 highlight-expansion strength. 0 = peak at sRGB white (off), 1 = VIDEO_AUTO_HDR_PEAK_NITS.
    float BloomIntensity;        // 1 = vanilla. Scales the finals' bloom term, native or Luma.
    float Exposure;              // 1 = vanilla. Scales the finals' tinted scene and bloom.
-   float Saturation;            // 1 = vanilla. HDR path only.
+   float Saturation;            // 1 = vanilla. Scales the linear RGB residual from relative luminance before the display map. HDR path only.
    float ColorGradingIntensity; // 1 = vanilla LUT, 0 = its identity (the plain shoulder).
-   float Contrast;              // 1 = vanilla. PsychoV31's contrast (its cone response power). HDR path only.
-   float HighlightDechroma;     // 0 = off. PsychoV31 highlights desaturation (its "dechroma"). HDR path only.
+   float Contrast;              // 1 = vanilla. Power of relative luminance around mid gray, before the display map. HDR path only.
+   float HighlightDechroma;     // 0 = off. Whitening of highlights above 1.5 toward a per-channel Reinhard (MacLeod-Boynton). HDR path only.
    float VignetteIntensity;     // 1 = vanilla, 0 = none. Scales the finals' vignette darkening.
    float FilmGrainIntensity;    // 1 = vanilla, 0 = off. Scales both film grain layers of the finals.
 };

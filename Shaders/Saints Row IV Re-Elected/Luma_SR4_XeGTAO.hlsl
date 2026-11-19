@@ -85,7 +85,18 @@ float3 XeGTAO_LoadViewspaceNormal(uint2 pixCoord)
    return float3(e * (2.0 * sqrt(1.0 - f)), (2.0 * f - 1.0) * NORMAL_Z_SIGN);
 }
 
-#include "../Includes/XeGTAO.hlsl"
+// GT-VBAO ("gtvbao_main_pass_cs", main.cpp "g_gtvbao_enable", always in full resolution mode): BL GOTY's / MELE's settings, not
+// measured against this game's SSAO. 2 slices, 8 steps, a 0.2 radius back face; no FAST noise (no AO history here).
+#ifndef GTVBAO_SLICE_COUNT
+#define GTVBAO_SLICE_COUNT 2.0
+#endif
+#ifndef GTVBAO_STEP_COUNT
+#define GTVBAO_STEP_COUNT 8.0
+#endif
+#ifndef GTVBAO_THICKNESS
+#define GTVBAO_THICKNESS(effectRadius) (0.2 * (effectRadius))
+#endif
+#include "../Includes/GTVBAO.hlsl"
 
 #if XE_GTAO_FINAL_APPLY
 // Full resolution mode: tex0 = the denoised full-res AO term; the mean AO amount of each target pixel's block, as the final denoise
