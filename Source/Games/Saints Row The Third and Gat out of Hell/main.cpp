@@ -1046,7 +1046,7 @@ public:
       ImGui::SeparatorText("Anti-Aliasing");
 
       DrawSettingCheckbox("Luma MSAA Enable", "MSAAResolveEnable", &g_luma_msaa_enable, true, "Replaces the game's MSAA with an HDR-aware one (smoother edges on bright lights, sky, grass, foliage and fences; requires Anti-Aliasing enabled in the game's display settings).");
-      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own (most noticeable with Anti-Aliasing off or low in the game's display settings).");
+      DrawSettingCheckbox("SMAA Enable", "SMAAEnable", &g_smaa_enable, true, "Adds SMAA anti-aliasing on top of the game's own MSAA (or alone with it off).");
 
       ImGui::BeginDisabled(!g_smaa_enable);
       DrawSettingSlider("RCAS Sharpness", "RCASSharpness", &g_rcas_sharpness, 0.f, 0.f, 1.f, "Sharpening applied on top of SMAA (0 = off).");
