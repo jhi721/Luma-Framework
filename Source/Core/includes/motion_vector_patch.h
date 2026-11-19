@@ -586,6 +586,8 @@ namespace MotionVectorPatch
    // x / (1 + x) so HDR stays within 0-1) and y = 0 (an unwritten component is undefined; the max blend keeps what another draw
    // wrote), else (blended INV_SRC_ALPHA) x and y = a, reactivity (thresholded by the fill: water, fountains) and transparency &
    // composition (faint glass and haze). Empty if unpatchable.
+   // "PREMULTIPLIED" (blended ONE / INV_SRC_ALPHA, the color already multiplied by its coverage): x = max(a, max(r, g, b) tonemapped as
+   // "additive"'s), y = a, so glows whose alpha goes to 0 while their color still adds (Saints Row IV's particles) stay reactive.
    // "ALPHA_MOTION_VECTORS" (blended INV_SRC_ALPHA, the vertex shader patched too): the draw also writes its motion vector to
    // "target_slot" with a weight in w, for a blend state that blends that target like the color ("OnCreateBlendState"'s
    // "blend_alpha_blended_target"): opaque texels (a chain link fence's wires, Mirror's Edge) move with the draw and keep their history,
@@ -598,6 +600,7 @@ namespace MotionVectorPatch
       ALPHA,
       ADDITIVE,
       ALPHA_MOTION_VECTORS,
+      PREMULTIPLIED,
    };
 
    inline std::vector<uint8_t> PatchPixelShaderReactive(const uint8_t* code, size_t size, const Layout& layout, uint32_t reactive_slot, ReactiveMode mode, std::string* error)
@@ -607,6 +610,7 @@ namespace MotionVectorPatch
          return {};
       auto& [chunks, program, input_signature, output_signature, inputs, outputs, target, tokens, instructions, first_body] = shader;
       const bool additive = mode == ReactiveMode::ADDITIVE;
+      const bool premultiplied = mode == ReactiveMode::PREMULTIPLIED;
       const bool motion_vectors = mode == ReactiveMode::ALPHA_MOTION_VECTORS;
       const bool mask = reactive_slot != UINT32_MAX;
       // The game's other targets are written as they were (UE3's translucents also write o1.x, Mass Effect Legendary Edition); the
@@ -677,11 +681,14 @@ namespace MotionVectorPatch
       constexpr uint32_t immediate = ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
       constexpr uint32_t one = std::bit_cast<uint32_t>(1.f);
       std::vector<uint32_t> reactive = {mov, Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, D3D10_SB_OPERAND_4_COMPONENT_MASK_ALL), target.reg, Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 2, 3), color};
-      if (additive)
+      if (additive || premultiplied)
       {
-         // reactive.y = 0
-         reactive.insert(reactive.end(), {ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MOV) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(8), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, D3D10_SB_OPERAND_4_COMPONENT_MASK_Y), reactive_slot, immediate, 0, 0, 0, 0});
-         // scratch.x = max(r, g, b, 0), scratch.y = scratch.x + 1, reactive.x = saturate(scratch.x / scratch.y * a)
+         if (additive)
+         {
+            // reactive.y = 0
+            reactive.insert(reactive.end(), {Opcode(D3D10_SB_OPCODE_MOV, 8), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, D3D10_SB_OPERAND_4_COMPONENT_MASK_Y), reactive_slot, immediate, 0, 0, 0, 0});
+         }
+         // scratch.x = max(r, g, b, 0), scratch.y = scratch.x + 1, scratch.x /= scratch.y
          reactive.insert(reactive.end(), {
                                             max,
                                             Destination(D3D10_SB_OPERAND_TYPE_TEMP, mask_x),
@@ -724,7 +731,10 @@ namespace MotionVectorPatch
                                             scratch,
                                             Source(D3D10_SB_OPERAND_TYPE_TEMP, 1, 1, 1, 1),
                                             scratch,
-                                            ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_MUL) | ENCODE_D3D10_SB_INSTRUCTION_SATURATE(true) | ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(7),
+                                         });
+         // Additive: reactive.x = saturate(scratch.x * a); premultiplied: reactive.x = saturate(max(scratch.x, a)) (y = a below)
+         reactive.insert(reactive.end(), {
+                                            Opcode((additive ? D3D10_SB_OPCODE_MUL : D3D10_SB_OPCODE_MAX), 7, true),
                                             Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, mask_x),
                                             reactive_slot,
                                             Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 0, 0, 0),
@@ -768,7 +778,7 @@ namespace MotionVectorPatch
       }
       if (mask && !additive)
       {
-         reactive.insert(reactive.end(), {mov | ENCODE_D3D10_SB_INSTRUCTION_SATURATE(true), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, mask_xy), reactive_slot, Source(D3D10_SB_OPERAND_TYPE_TEMP, 3, 3, 3, 3), color});
+         reactive.insert(reactive.end(), {mov | ENCODE_D3D10_SB_INSTRUCTION_SATURATE(true), Destination(D3D10_SB_OPERAND_TYPE_OUTPUT, (premultiplied ? D3D10_SB_OPERAND_4_COMPONENT_MASK_Y : mask_xy)), reactive_slot, Source(D3D10_SB_OPERAND_TYPE_TEMP, 3, 3, 3, 3), color});
       }
       declarations.insert(declarations.end(), reactive.begin(), reactive.end());
       declarations.insert(declarations.end(), tokens.begin() + instructions.back().begin, tokens.end());
