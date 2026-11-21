@@ -4,7 +4,7 @@
 // mean flips across the focus curve every frame and the block flips between sharp and blurred after the upscaler (measured 0 <->
 // full blur on the edge of a window, aiming). Each pixel's amount (the gather's formula and constants) is blended into its history,
 // reprojected with the motion vectors and clamped to the current 3x3 range; the gather averages the history at its taps. BL GOTY's
-// DOF history (docs/DLAA-From-Scratch-Lessons.md, "Block-level screen terms flip under the jitter").
+// DOF history (docs/Super-Resolution/DLAA-From-Scratch-Lessons.md, "Block-level screen terms flip under the jitter").
 
 // clang-format off
 #include "Includes/GameCBuffers.hlsl"
