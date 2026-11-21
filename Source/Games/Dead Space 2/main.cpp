@@ -811,15 +811,15 @@ constexpr std::array<uint32_t, 582> light_pixel_shaders = {
    0xFFBDA2EA,
    0xFFDDEF5F,
 };
-// The passes after the scene (live traces), the first of which ends it (the fill and the upscaler run before it): the scene
-// copy for the uber post, the camera motion blur's downsample, the uber post permutations seen live, MarkerPatch's SMAA and FXAA and
-// the video. Without any of them the scene ends at the game's copy of it ("OverrideCopyResource").
 // The frame passes Luma replaces (or routes) by hash, see "OnDrawOrDispatch"
 constexpr uint32_t VIDEO_PS = 0xD49CB77E;             // VP6 video logs and videos (Video_0xD49CB77E)
 constexpr uint32_t MARKERPATCH_FXAA_PS = 0x0A91885E;  // FXAA_0x0A91885E
 constexpr uint32_t SMAA_NEIGHBORHOOD_PS = 0xBE49E10A; // MarkerPatch's SMAA neighborhood blending (SMAANeighborhood_0xBE49E10A)
 constexpr uint32_t PRESENT_BLIT_PS = 0x880A17D3;      // dgVoodoo's present blit (Present_0x880A17D3)
 constexpr uint32_t SSAA_DOWNSAMPLE_PS = 0x113CFB69;   // MarkerPatch's SSAA downsample (SSAADownsample_0x113CFB69)
+// The passes after the scene (live traces), the first of which ends it (the fill and the upscaler run before it): the scene
+// copy for the uber post, the camera motion blur's downsample, the uber post permutations seen live, MarkerPatch's SMAA and FXAA and
+// the video. Without any of them the scene ends at the game's copy of it ("OverrideCopyResource").
 const std::unordered_set<uint32_t> scene_end_pixel_shaders = {0x934360AD, 0xDE99AE79, 0x583C9562, 0xC76B708E, 0x8736599C, MARKERPATCH_FXAA_PS, VIDEO_PS};
 // MarkerPatch's SMAA edges and weights: skipped once an upscaler antialiased the frame or Luma's SMAA takes its slot (its neighborhood
 // blending still draws, for the display map, see "display_mapped")
@@ -844,7 +844,7 @@ static bool g_smaa_enable = true;
 static bool g_smaa_t2x = false;      // SMAA T2x: a two phase jitter and the previous frame, through the upscalers' motion vectors
 static float g_rcas_sharpness = 0.f; // RCAS on the upscaler's or SMAA's output, 0 = off
 #if DEVELOPMENT
-// Predication from the scene depth, and its plane-deviation tolerance (Luma_DS2_DepthEdges.hlsl)
+// Predication from the scene depth, and its plane-deviation tolerance ("Luma_DS2_DepthEdges.hlsl")
 static bool g_smaa_predication = true;
 static float g_smaa_pred_tolerance = 0.02f;
 #else
@@ -972,9 +972,9 @@ struct DeadSpace2GameDeviceData final : public GameDeviceData
    float pred_near_plane = 0.f;
 
    // ---- Luma SMAA (see "RunSMAA") ----
-   // MarkerPatch's SMAA neighborhood blending drew this frame ("markerpatch_smaa_drawn", read at present). "smaa_slot_a": this
-   // frame's SMAA runs in its slot, else at the scene's end. "aa_drawn": the upscaler or Luma's SMAA antialiased
-   // this frame (MarkerPatch's FXAA is then a copy).
+   // "markerpatch_smaa_drawn": MarkerPatch's SMAA neighborhood blending drew this frame (read at present). "smaa_slot_a": this
+   // frame's SMAA runs in its slot, else at the scene's end. "aa_drawn": the upscaler or Luma's SMAA antialiased this frame
+   // (MarkerPatch's FXAA is then a copy).
    bool markerpatch_smaa_drawn = false;
    bool smaa_slot_a = false;
    bool aa_drawn = false;
@@ -1227,7 +1227,7 @@ class DeadSpace2 final : public Game
       if (size.x == 0 || size.y == 0)
          return false;
 
-      // DrawSMAA looks its passes up with ".at()": a shader reload must not release them mid-chain (Sunset Overdrive)
+      // "DrawSMAA" looks its passes up with ".at()": a shader reload must not release them mid-chain (Sunset Overdrive)
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
       auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
       // All or nothing: skip SMAA this frame while any pass is missing (async load, live reload)
@@ -1283,7 +1283,7 @@ class DeadSpace2 final : public Game
          }
          pred_ok = pred_ok && gd.uav_pred && gd.srv_pred;
       }
-      // Unbinding the mask's UAV before DrawSMAA is what makes it readable: an SRV of a resource still bound as a UAV reads as null
+      // Unbinding the mask's UAV before "DrawSMAA" is what makes it readable: an SRV of a resource still bound as a UAV reads as null
       if (pred_ok)
       {
          ID3D11ShaderResourceView* const cs_srv = gd.scene_depth_srv.get();
@@ -1774,7 +1774,7 @@ public:
    {
       // The scene stays gamma encoded (1 = paper white) up to the swapchain copy. The HDR display map runs where the scene ends, before
       // the UI (see "display_mapped"), pre-scaled by Game/UI paper white (UI_DRAW_TYPE 2); the composition encodes scRGB.
-      // The vanilla gamma ramp (SetGammaRamp, the brightness slider) is not reproduced.
+      // The vanilla gamma ramp (the brightness slider) reaches the display map as "GammaRampExponent" (see "GammaRamp").
       GetShaderDefineData(POST_PROCESS_SPACE_TYPE_HASH).SetDefaultValue('0');
       GetShaderDefineData(EARLY_DISPLAY_ENCODING_HASH).SetDefaultValue('0');
       GetShaderDefineData(VANILLA_ENCODING_TYPE_HASH).SetDefaultValue('1'); // Gamma 2.2 in and out, as the other D3D9 games under the same wrapper
@@ -1815,7 +1815,7 @@ public:
       // edge-ness
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 Depth Edges CS"),
          ShaderDefinition{.file_name = "Luma_DS2_DepthEdges", .type = reshade::api::pipeline_subobject_type::compute_shader});
-      // SMAA T2x's own passes ("SMAA_T2X" in Luma_SMAA_impl.hlsl). The edge detection and the vertex shaders are 1x's.
+      // SMAA T2x's own passes ("SMAA_T2X" in "Luma_SMAA_impl.hlsl"). The edge detection and the vertex shaders are 1x's.
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 SMAA T2x Blending Weight Calculation PS"),
          ShaderDefinition{.file_name = "Luma_SMAA_impl", .type = reshade::api::pipeline_subobject_type::pixel_shader, .function_name = "smaa_blending_weight_calculation_ps", .defines_data = {{"SMAA_T2X", "1"}}});
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 SMAA T2x Neighborhood Blending PS"),
@@ -1908,7 +1908,7 @@ public:
       gd.mv_jitter_allowed = device_data.has_drawn_sr;
       gd.sr_active = LatchSRFrame(device_data);
       // Luma's SMAA gives way to an upscaler. It takes MarkerPatch's SMAA slot if that drew last frame, else the scene's end (with the
-      // motion vector path's scene tracking). T2x runs on the upscalers' motion vectors, not with SSAA (OpenScene refuses its scene);
+      // motion vector path's scene tracking). T2x runs on the upscalers' motion vectors, not with SSAA ("OpenScene" refuses its scene);
       // turned off, its frames go, and the motion vectors go as when no upscaler is picked.
       const bool markerpatch_smaa = std::exchange(gd.markerpatch_smaa_drawn, false);
       gd.ssaa_active = std::exchange(gd.ssaa_drawn, false);
@@ -2120,8 +2120,8 @@ public:
       {
          gd.uber_drawn = true;
       }
-      // Areas without the uber post end with depth of field or motion blur; their half and quarter resolution passes aren't the frame
-      // MarkerPatch's SSAA downsample (a replaced pass) writes the output sized frame the UI then draws on
+      // Areas without the uber post end with depth of field or motion blur; their half and quarter resolution passes aren't the frame.
+      // MarkerPatch's SSAA downsample (a replaced pass) writes the output sized frame the UI then draws on.
       const bool post = uber || pixel_shader_hash == SSAA_DOWNSAMPLE_PS || std::ranges::binary_search(post_pixel_shaders, pixel_shader_hash);
       if (is_immediate && post)
       {
@@ -2431,7 +2431,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       texture_format_upgrades_2d_size_filters = (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px;
 
       // The upscalers' mip bias (see "OnPresent") reaches only upgraded samplers. AF16x, as in the other dgVoodoo mods;
-      // force_upgrade_linear_samplers also gives the trilinear ones the bias (Core rewrites only anisotropic samplers otherwise, TW2).
+      // "force_upgrade_linear_samplers" also gives the trilinear ones the bias (Core rewrites only anisotropic samplers otherwise, TW2).
       enable_samplers_upgrade = true; // boot-time only (cannot be changed after device creation)
       samplers_upgrade_mode = 4;
       force_upgrade_linear_samplers = true;
@@ -2439,8 +2439,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 #if DEVELOPMENT
       // The gameplay uber post, LUT only, every frame
       forced_shader_names.emplace(Shader::Hash_StrToNum("583C9562"), "Uber Post (LUT only)");
-      // Live traces: the uber permutation and its post copy run only where the area's
-      // post-effect volume asks for an effect.
+      // The uber permutation and its post copy run only where the area's post-effect volume asks for an effect (live traces)
       forced_shader_names.emplace(Shader::Hash_StrToNum("C76B708E"), "Uber Post (DoF only)");
       forced_shader_names.emplace(Shader::Hash_StrToNum("934360AD"), "Scene Copy (uber input)");
       forced_shader_names.emplace(Shader::Hash_StrToNum("DE99AE79"), "Camera Motion Blur Downsample");
@@ -2452,8 +2451,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       forced_shader_names.emplace(Shader::Hash_StrToNum("5234894F"), "Deferred Material Apply");
       forced_shader_names.emplace(Shader::Hash_StrToNum("AC550A39"), "Deferred Material Apply");
       // MarkerPatch 3.3.1 (dinput8.dll, github.com/Wemino/MarkerPatch) draws its own passes and swaps some game shaders. Hashes mapped
-      // offline from its embedded bytecode; the SMAA ones confirmed live. dgVoodoo
-      // specializes vertex shaders on the input layout, so the VS hashes below can differ in game.
+      // offline from its embedded bytecode, the SMAA ones confirmed live. dgVoodoo specializes vertex shaders on the input layout, so
+      // the VS hashes below can differ in game.
       // ImprovedAntiAliasingMode 2 (default) and 4: SMAA in place of the game's EdgeAA pass
       forced_shader_names.emplace(Shader::Hash_StrToNum("8736599C"), "MarkerPatch SMAA Edge Detection");
       forced_shader_names.emplace(Shader::Hash_StrToNum("764C97BB"), "MarkerPatch SMAA Blending Weight");

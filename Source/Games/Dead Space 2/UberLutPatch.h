@@ -14,9 +14,9 @@
 
 #include "..\..\Core\includes\dxbc.h"
 
-// The uber post's LUT tail, in every one of its 517 permutations (1551 dgVoodoo translations, offline census): "mad c, x, 0.96875, 0.015625" -> the 32^3 LUT(s) (1 sample in 1536 translations, a weighted blend of 2 to 6 in 15)
-// -> "mad o.xyz, k, (lut - x), x" with k a cb4 component (LUT amount). x is gamma encoded; the LUT's CLAMP addressing clips it to
-// [0, 1], so vanilla lost everything above 1.
+// The uber post's LUT tail, in all 517 permutations (1551 dgVoodoo translations, checked offline): "mad c, x, 0.96875, 0.015625" ->
+// the 32^3 LUT(s) (1 sample in 1536 translations, a weighted blend of 2 to 6 in 15) -> "mad o.xyz, k, (lut - x), x" with k a cb4
+// component (LUT amount). x is gamma encoded; the LUT's CLAMP addressing clips it to [0, 1], so vanilla lost everything above 1.
 // Patched to MELE's max-channel wrap with a hard knee at 1:
 //   V = saturate(x) + k * (LUT(saturate(x)) - saturate(x))   the vanilla grade of the clipped color
 //   m = max(1, max3(x)),  G = p + k * (LUT(p) - p) with p = x / m   the grade of the color scaled into the cube

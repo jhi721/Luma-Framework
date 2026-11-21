@@ -1,5 +1,5 @@
 // SMAA's predication signal from the scene's hardware depth (D24, the motion vector fill's view of it): each tap linearized to view
-// depth, then the plane deviation edge-ness of "DepthEdges.hlsl" (The Witcher 2's). The engine's projection puts infinity at device
+// depth, then the plane deviation edge-ness of "DepthEdges.hlsl". The engine's projection puts infinity at device
 // depth A (~0.99), not 1, so the depth is rescaled by 1 / A first.
 
 #include "../Includes/DepthEdges.hlsl"

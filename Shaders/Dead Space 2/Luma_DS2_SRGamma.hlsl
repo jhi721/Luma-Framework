@@ -1,6 +1,5 @@
-// The scene is gamma 2.2 encoded (1 = SDR white, the values above it kept by the fp16 mirror), the upscalers' HDR mode takes linear
-// light (DLSS-Best-Practices COL-1, FSR-Best-Practices FIN-2): decoded before them, encoded back after. Mirrored, so negative
-// values survive the round trip.
+// The scene is gamma 2.2 encoded (1 = SDR white, the values above it kept by the fp16 mirror), while the upscalers' HDR mode takes
+// linear light: decoded before them, encoded back after. Mirrored, so negative values survive the round trip.
 
 #include "../Includes/Color.hlsl"
 
