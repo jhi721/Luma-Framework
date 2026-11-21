@@ -8581,6 +8581,8 @@ namespace
 #if DX12
       cmd_list_data.cmd_list = cmd_list;
 #endif
+      // "OnExecuteSecondaryCommandList" refreshes it, which never runs for a game that draws only on the immediate context
+      cmd_list_data.enable_chain_indirect_texture_format_upgrades = (uint)enable_chain_indirect_texture_format_upgrades;
 
 #if DX11 // D3D12 has no immediate command list for games, they are all equal (ReShade's own immediate list doesn't fire this)
 #if ENABLE_AUTO_CBUFFER_RESTORATION
@@ -22059,6 +22061,7 @@ namespace
 #if DX11
                         // Reset the state to avoid pollutation at least in the primary command list (safe during present), in the others it might matter a lot less because they are constantly reset
                         device_data.primary_command_list_data->ResetUpgradedViews();
+                        device_data.primary_command_list_data->enable_chain_indirect_texture_format_upgrades = (uint)enable_chain_indirect_texture_format_upgrades;
 #endif
                      }
                      ImGui::Checkbox("Ignore Indirect Upgraded Textures", &ignore_indirect_upgraded_textures);
