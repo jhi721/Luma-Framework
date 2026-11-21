@@ -61,7 +61,8 @@ void main(DGV_MAIN_SIGNATURE)
       }
    }
    o0 = float4(linear_to_sRGB_gamma(color.rgb, GCT_MIRROR), color.a);
-   // LumaData.CustomData3: Luma_DS2_DisplayMap already mapped the frame
+   // LumaData.CustomData3: the display map runs elsewhere (Luma_DS2_DisplayMap already ran, or runs later before the UI, or the present
+   // blit maps the frame): only frames with the uber post map here
    [branch] if (LumaData.CustomData3 == 0)
    {
       o0.rgb = DisplayMapCanvas(o0.rgb, v0.xy * cb4[8].xy);

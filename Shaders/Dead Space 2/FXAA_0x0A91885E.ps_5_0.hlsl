@@ -57,7 +57,8 @@ void main(DGV_MAIN_SIGNATURE)
       const FxaaTex unused = 0;
       color = FxaaPixelShader(pos, 0.0, unused, unused, unused, rcp_frame, 0.0, 0.0, 0.0, 0.5, 0.125, 0.0312, 0.0, 0.0, 0.0, 0.0).rgb;
    }
-   // LumaData.CustomData3: Luma_DS2_DisplayMap already mapped the frame
+   // LumaData.CustomData3: the display map runs elsewhere (Luma_DS2_DisplayMap already ran, or runs later before the UI, or the present
+   // blit maps the frame): only frames with the uber post map here
    [branch] if (LumaData.CustomData3 == 0)
    {
       color = DisplayMapCanvas(color, v0.xy * rcp_frame);

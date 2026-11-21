@@ -38,7 +38,19 @@ void main(DGV_MAIN_SIGNATURE_CENTROID)
    rgb = saturate(rgb);
    rgb = gamma_to_linear(rgb);
    rgb = VideoAutoHDR(rgb, LumaSettings.DisplayMode == 1 && LumaSettings.GameSettings.VideoAutoHDREnable > 0.5, LumaSettings.GameSettings.VideoAutoHDRBoost, LumaSettings.GamePaperWhiteNits);
-   rgb = linear_to_gamma(rgb * GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, true));
+   // LumaData.CustomData3 != 0: over the display mapped frame (UI side). Else an in-world monitor the display map later maps with the scene.
+   const bool ui_side = LumaData.CustomData3 != 0;
+   if (ui_side)
+   {
+      rgb = linear_to_gamma(rgb * GetUIPaperWhitePreScale(LumaSettings.GamePaperWhiteNits, LumaSettings.UIPaperWhiteNits, true));
+   }
+   else
+   {
+      rgb = linear_to_gamma(rgb);
+   }
 
-   o0 = float4(rgb, 1.0) * v2 * ApplyDgvMask(t0.Sample(s0_s, v5.xy), cb3[44], cb3[45]);
+   const float4 tint = v2 * ApplyDgvMask(t0.Sample(s0_s, v5.xy), cb3[44], cb3[45]);
+   // The unorm frame clamped the output before blending: the in-world monitors' tint above 1 clipped at 1 (keep the AutoHDR level,
+   // identical below 1), an alpha above 1 would make the inverse source alpha negative
+   o0 = float4(min(rgb * tint.rgb, max(rgb, 1.0)), saturate(tint.a));
 }

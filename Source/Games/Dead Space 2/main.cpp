@@ -927,16 +927,25 @@ struct DeadSpace2GameDeviceData final : public GameDeviceData
    // DLSS, FSR and XeSS run in the x64 helper of Core's SR bridge (the game is 32-bit, see "SRBridge.h"), Luma TAA in process.
    // An upscaler is picked and hasn't failed, latched at present for the whole frame
    bool sr_active = false;
-   // The HDR display map ran this frame, before the UI: in MarkerPatch's SMAA neighborhood or FXAA replacement, or "DrawDisplayMap".
-   // The present blit then doesn't map the frame again (Present_0x880A17D3). Immediate context only.
+   // The HDR display map ran this frame, before the UI: in MarkerPatch's SMAA neighborhood or FXAA replacement (uber frames only), or
+   // "DrawDisplayMap". The present blit then doesn't map the frame again (Present_0x880A17D3). Immediate context only.
    bool display_mapped = false;
    // The uber post drew this frame (a full screen pass): its LUT tail ("WrapUberLut") already carries the vanilla clip's hue turn, so
-   // the display map then takes no hue from its reference (LumaData.CustomData2, Includes/DisplayMap.hlsl). Immediate context only.
+   // the display map then takes no hue from its reference (LumaData.CustomData2, Includes/DisplayMap.hlsl). It also picks where the
+   // display map runs (see "scene_over"). Immediate context only.
    bool uber_drawn = false;
    // The last post pass' target (the frame: uber, depth of field or motion blur), and the copy of it "DrawDisplayMap" reads
    com_ptr<ID3D11Resource> post_target;
    com_ptr<ID3D11Texture2D> display_map_source;
    com_ptr<ID3D11ShaderResourceView> display_map_source_srv;
+   // The frame right after the display map (and a video log drawn after it): the present blit bounds what drew later by it, as the
+   // vanilla UNORM frame clamped those blends at 1 (Present_0x880A17D3). "ui_bound_pending" is the frame of a map (or video) drawn
+   // after we return, copied at the next immediate draw. Immediate context only.
+   com_ptr<ID3D11Texture2D> ui_bound;
+   com_ptr<ID3D11ShaderResourceView> ui_bound_srv;
+   com_ptr<ID3D11Resource> ui_bound_pending;
+   DXGI_FORMAT ui_bound_pending_format = DXGI_FORMAT_UNKNOWN;
+   bool ui_bound_valid = false;
    // The upscaler's output goes back into the scene without its alpha, drawn from this view of it
    com_ptr<ID3D11BlendState> sr_rgb_blend_state;
    com_ptr<ID3D11ShaderResourceView> sr_output_srv;
@@ -1703,6 +1712,41 @@ class DeadSpace2 final : public Game
       graphics_state.Restore(native_device_context);
    }
 
+   // Copies the frame into "ui_bound", whose view is in "view_format" (the render target view's: the frame may be typeless)
+   static void CaptureUiBound(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeadSpace2GameDeviceData* gd, ID3D11Resource* frame_resource, DXGI_FORMAT view_format)
+   {
+      com_ptr<ID3D11Texture2D> frame;
+      frame_resource->QueryInterface(&frame);
+      if (!frame)
+         return;
+      D3D11_TEXTURE2D_DESC frame_desc = {};
+      frame->GetDesc(&frame_desc);
+      D3D11_TEXTURE2D_DESC bound_desc = {};
+      D3D11_SHADER_RESOURCE_VIEW_DESC bound_srv_desc = {};
+      if (gd->ui_bound)
+      {
+         gd->ui_bound->GetDesc(&bound_desc);
+         gd->ui_bound_srv->GetDesc(&bound_srv_desc);
+      }
+      if (bound_desc.Width != frame_desc.Width || bound_desc.Height != frame_desc.Height || bound_desc.Format != frame_desc.Format || bound_srv_desc.Format != view_format)
+      {
+         gd->ui_bound.reset();
+         gd->ui_bound_srv.reset();
+         gd->ui_bound_valid = false;
+         const D3D11_TEXTURE2D_DESC desc = CD3D11_TEXTURE2D_DESC(frame_desc.Format, frame_desc.Width, frame_desc.Height, 1, 1, D3D11_BIND_SHADER_RESOURCE);
+         if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &gd->ui_bound)))
+            return;
+         const D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = CD3D11_SHADER_RESOURCE_VIEW_DESC(D3D11_SRV_DIMENSION_TEXTURE2D, view_format, 0, 1);
+         if (FAILED(native_device->CreateShaderResourceView(gd->ui_bound.get(), &srv_desc, &gd->ui_bound_srv)))
+         {
+            gd->ui_bound.reset();
+            return;
+         }
+      }
+      native_device_context->CopyResource(gd->ui_bound.get(), frame.get());
+      gd->ui_bound_valid = true;
+   }
+
    // The HDR display map in place on the frame ("target"), from a copy of it; see "Luma_DS2_DisplayMap.hlsl"
    static void DrawDisplayMap(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, ID3D11RenderTargetView* target)
    {
@@ -1724,6 +1768,9 @@ class DeadSpace2 final : public Game
       {
          gd.display_map_source->GetDesc(&source_desc);
       }
+      // The views are in the render target view's format (the frame may be typeless)
+      D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+      target->GetDesc(&rtv_desc);
       if (source_desc.Width != frame_desc.Width || source_desc.Height != frame_desc.Height || source_desc.Format != frame_desc.Format)
       {
          gd.display_map_source.reset();
@@ -1731,9 +1778,6 @@ class DeadSpace2 final : public Game
          const D3D11_TEXTURE2D_DESC desc = CD3D11_TEXTURE2D_DESC(frame_desc.Format, frame_desc.Width, frame_desc.Height, 1, 1, D3D11_BIND_SHADER_RESOURCE);
          if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &gd.display_map_source)))
             return;
-         // In the render target view's format (the frame may be typeless)
-         D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-         target->GetDesc(&rtv_desc);
          const D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = CD3D11_SHADER_RESOURCE_VIEW_DESC(D3D11_SRV_DIMENSION_TEXTURE2D, rtv_desc.Format, 0, 1);
          if (FAILED(native_device->CreateShaderResourceView(gd.display_map_source.get(), &srv_desc, &gd.display_map_source_srv)))
          {
@@ -1750,6 +1794,7 @@ class DeadSpace2 final : public Game
          gd.display_map_source_srv.get(), target, frame_desc.Width, frame_desc.Height);
       graphics_state.Restore(native_device_context);
       gd.display_mapped = true;
+      CaptureUiBound(native_device, native_device_context, &gd, frame.get(), rtv_desc.Format);
    }
 
 public:
@@ -1926,6 +1971,8 @@ public:
       gd.display_mapped = false;
       gd.uber_drawn = false;
       gd.post_target.reset();
+      gd.ui_bound_pending.reset();
+      gd.ui_bound_valid = false;
       gd.t2x_phase = -1;
       gd.mv_filled = false;
       const bool t2x_was_active = gd.t2x_active;
@@ -2106,6 +2153,25 @@ public:
       const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
       auto& gd = GetGameDeviceData(device_data);
       const uint32_t pixel_shader_hash = uint32_t(original_shader_hashes.pixel_shaders[0]);
+      // The previous draw (a display map or video log in its target, "ui_bound_pending") has executed by now
+      if (is_immediate && gd.ui_bound_pending)
+      {
+         CaptureUiBound(native_device, native_device_context, &gd, gd.ui_bound_pending.get(), gd.ui_bound_pending_format);
+         gd.ui_bound_pending.reset();
+      }
+      // This draw's target becomes "ui_bound" at the next immediate draw
+      const auto mark_ui_bound = [&]()
+      {
+         com_ptr<ID3D11RenderTargetView> rtv;
+         native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+         if (!rtv)
+            return;
+         D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+         rtv->GetDesc(&rtv_desc);
+         gd.ui_bound_pending.reset();
+         rtv->GetResource(&gd.ui_bound_pending);
+         gd.ui_bound_pending_format = rtv_desc.Format;
+      };
       // A game draw that can be drawn again with patched shaders (not Luma's, nor one whose shader Luma replaced: "is_custom_pass")
       const bool game_draw = !is_custom_pass && original_draw_dispatch_func && *original_draw_dispatch_func;
       // The scene rendered this frame (DLSS-Best-Practices BK-1): Core's SR icon then warns when the upscaler didn't draw (SSAA, another
@@ -2133,12 +2199,31 @@ public:
             rtv->GetResource(&gd.post_target);
          }
       }
-      // What draws over the scene (menus, RIG and pickup holograms, video logs) starts with the first game draw on the frame after the
-      // last post pass, or with the first APT draw on a screen sized target when no post pass drew (the pause menu stops them). Unless
-      // MarkerPatch's antialiasing slot (its SMAA edges and weights; the replaced passes are custom passes) mapped the frame there, the
-      // display map runs first, so those keep the UI paper white and the present blit doesn't map them with the scene.
-      const bool scene_over = (gd.post_target ? (!post && !markerpatch_smaa_pixel_shaders.contains(pixel_shader_hash))
-                                              : std::ranges::binary_search(apt_pixel_shaders, pixel_shader_hash));
+      // What draws over the scene starts here, and the display map runs first, so it keeps the UI paper white and the present blit
+      // doesn't map it with the scene (unless MarkerPatch's antialiasing slot already mapped the frame).
+      // With the uber post: the first game draw on the frame after the last post pass (menus, RIG and pickup holograms, video logs; not
+      // MarkerPatch's SMAA edges and weights, the replaced passes are custom passes), or the first APT draw on a screen sized target when
+      // no post pass drew (the pause menu stops them).
+      // Without it the engine still draws scene content after the post passes (additive particles, holograms, the in-world video
+      // monitor), so only the 2D UI starts it: the first APT draw, or a video drawn without depth test (full screen video or video log;
+      // the in-world monitor is depth tested). Frames with neither are mapped by the present blit.
+      bool scene_over = std::ranges::binary_search(apt_pixel_shaders, pixel_shader_hash);
+      if (gd.uber_drawn && gd.post_target)
+      {
+         scene_over = !post && !markerpatch_smaa_pixel_shaders.contains(pixel_shader_hash);
+      }
+      else if (!gd.uber_drawn && is_immediate && pixel_shader_hash == VIDEO_PS)
+      {
+         // A null state is D3D's default, depth tested
+         com_ptr<ID3D11DepthStencilState> depth_state;
+         native_device_context->OMGetDepthStencilState(&depth_state, nullptr);
+         D3D11_DEPTH_STENCIL_DESC depth_desc = {};
+         if (depth_state)
+         {
+            depth_state->GetDesc(&depth_desc);
+         }
+         scene_over = depth_state && !depth_desc.DepthEnable;
+      }
       if (is_immediate && scene_over && !gd.display_mapped && !is_custom_pass)
       {
          com_ptr<ID3D11RenderTargetView> rtv;
@@ -2148,8 +2233,9 @@ public:
          {
             rtv->GetResource(&target);
          }
+         // Without the uber post the UI may draw on an output sized target other than the last post pass'
          bool frame = target && target == gd.post_target;
-         if (target && !gd.post_target)
+         if (target && !frame && (!gd.post_target || !gd.uber_drawn))
          {
             const auto size = GetViewTextureSize(rtv.get());
             frame = size.x == uint32_t(device_data.output_resolution.x) && size.y == uint32_t(device_data.output_resolution.y);
@@ -2157,6 +2243,19 @@ public:
          if (frame)
          {
             DrawDisplayMap(native_device, native_device_context, cmd_list_data, device_data, rtv.get());
+         }
+      }
+      if (is_immediate && pixel_shader_hash == VIDEO_PS)
+      {
+         // LumaData.CustomData3: drawn over the mapped frame (UI side, pre-scaled for the UI paper white); else the in-world monitor
+         // of a frame without the uber post, mapped with the scene later. "updated_cbuffers" skips Core's own bind of the settings.
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, 0, 0, gd.display_mapped ? 1.f : 0.f);
+         updated_cbuffers = true;
+         // A video log over the mapped frame raises the bound: its AutoHDR goes above 1 by design
+         if (gd.display_mapped)
+         {
+            mark_ui_bound();
          }
       }
 
@@ -2262,16 +2361,22 @@ public:
          PatchedDraws::RestoreGameShader(native_device_context, &gd.mv.bound_vertex_shader);
          PatchedDraws::RestoreGameShader(native_device_context, &gd.mv.bound_pixel_shader);
       }
-      // The HDR display map, where the scene ends: in MarkerPatch's SMAA neighborhood or FXAA replacement (their antialiasing only runs
-      // when neither an upscaler nor Luma's SMAA did); else "DrawDisplayMap" before the UI, and the present blit for frames nothing mapped
+      // The HDR display map, where the scene ends: in MarkerPatch's SMAA neighborhood or FXAA replacement in uber frames (their
+      // antialiasing only runs when neither an upscaler nor Luma's SMAA did; without the uber post scene content still draws after them,
+      // see "scene_over"); else "DrawDisplayMap" before the UI, and the present blit for frames nothing mapped
       if (pixel_shader_hash == MARKERPATCH_FXAA_PS && is_immediate)
       {
-         // Both: "updated_cbuffers" skips Core's own bind of the settings, which the display map reads. LumaData.CustomData3: "DrawDisplayMap"
-         // already mapped the frame
+         // Both: "updated_cbuffers" skips Core's own bind of the settings, which the display map reads. LumaData.CustomData3: the display
+         // map runs elsewhere
+         const bool map_here = gd.uber_drawn && !gd.display_mapped;
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
-         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, gd.aa_drawn, gd.uber_drawn, gd.display_mapped ? 1.f : 0.f);
+         SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, gd.aa_drawn, gd.uber_drawn, map_here ? 0.f : 1.f);
          updated_cbuffers = true;
-         gd.display_mapped = true;
+         if (map_here)
+         {
+            mark_ui_bound();
+            gd.display_mapped = true;
+         }
 #if DEVELOPMENT
          gd.aa_stats.fxaa_copies += gd.aa_drawn;
 #endif
@@ -2301,12 +2406,30 @@ public:
             }
          }
          // The neighborhood replacement only display maps once MarkerPatch's blending weights were skipped (see below), whether or not our
-         // SMAA drew
+         // SMAA drew, and only in uber frames (LumaData.CustomData3: the display map runs elsewhere; the present blit doesn't read it)
+         // The present blit bounds what drew after the display map by "ui_bound" (t1, LumaData.CustomData4), drawn here to restore t1
+         const bool present_ui_bound = !neighborhood && is_immediate && gd.ui_bound_valid && original_draw_dispatch_func && *original_draw_dispatch_func;
+         const bool map_here = neighborhood && gd.uber_drawn && !gd.display_mapped;
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, neighborhood ? (device_data.has_drawn_sr || gd.smaa_slot_a) : gd.display_mapped, gd.uber_drawn,
-            gd.display_mapped ? 1.f : 0.f);
+            (neighborhood ? !map_here : gd.display_mapped) ? 1.f : 0.f, present_ui_bound ? 1.f : 0.f);
          updated_cbuffers = true;
-         gd.display_mapped = neighborhood;
+         if (map_here && is_immediate)
+         {
+            mark_ui_bound();
+         }
+         gd.display_mapped = neighborhood && (gd.display_mapped || gd.uber_drawn);
+         if (present_ui_bound)
+         {
+            com_ptr<ID3D11ShaderResourceView> previous_t1;
+            native_device_context->PSGetShaderResources(1, 1, &previous_t1);
+            ID3D11ShaderResourceView* const ui_bound_srv = gd.ui_bound_srv.get();
+            native_device_context->PSSetShaderResources(1, 1, &ui_bound_srv);
+            (*original_draw_dispatch_func)();
+            ID3D11ShaderResourceView* const previous_srv = previous_t1.get();
+            native_device_context->PSSetShaderResources(1, 1, &previous_srv);
+            return DrawOrDispatchOverrideType::Replaced;
+         }
          if (!smaa_drawn)
             return DrawOrDispatchOverrideType::None;
          gd.aa_drawn = true;
