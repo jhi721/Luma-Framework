@@ -4,6 +4,7 @@
 // e.g. to go back to gamma space. With "SMAA_REPROJECTION" (T2x) it runs on the resolve's output instead.
 // Define "SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR" 1 to let the neighborhood blend read the gamma encoded canvas (the edge
 // detection's input) and filter it in linear light, without a linear copy ("gamma_to_linear" must be included first).
+// "SMAA_NEIGHBORHOOD_DECODE(rgb)" replaces its decode (gamma 2.2 by default).
 
 #ifndef SMAA_CUSTOM_SL
 #define SMAA_CUSTOM_SL
@@ -24,6 +25,9 @@ SamplerState PointSampler : register(s1);
 #endif
 
 #if SMAA_NEIGHBORHOOD_GAMMA_IN_LINEAR
+#ifndef SMAA_NEIGHBORHOOD_DECODE
+#define SMAA_NEIGHBORHOOD_DECODE(rgb) gamma_to_linear(rgb, GCT_MIRROR)
+#endif
 // The blend averages the pixel with a neighbor through a bilinear fetch, which must happen in linear light: the fetch is done by
 // hand, the footprint's texels decoded before weighting (clamped as the linear sampler). The same as the hardware bilinear of a
 // linear copy, without the copy. An axis within the hardware's 8 bit filter weights of a texel center is on it: the interpolated
@@ -38,7 +42,7 @@ float4 SampleGammaInLinear(Texture2D tex, float2 coord)
    [branch] if (all(texel == nearest))
    {
       color = tex.Load(int3(clamp(int2(nearest), 0, last), 0));
-      color.rgb = gamma_to_linear(color.rgb, GCT_MIRROR);
+      color.rgb = SMAA_NEIGHBORHOOD_DECODE(color.rgb);
    }
    else
    {
@@ -48,7 +52,7 @@ float4 SampleGammaInLinear(Texture2D tex, float2 coord)
       [unroll] for (uint i = 0; i < 4; i++)
       {
          c[i] = tex.Load(int3(clamp(int2(base) + int2(i & 1, i >> 1), 0, last), 0));
-         c[i].rgb = gamma_to_linear(c[i].rgb, GCT_MIRROR);
+         c[i].rgb = SMAA_NEIGHBORHOOD_DECODE(c[i].rgb);
       }
       color = lerp(lerp(c[0], c[1], f.x), lerp(c[2], c[3], f.x), f.y);
    }
