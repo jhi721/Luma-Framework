@@ -75,7 +75,7 @@ namespace SceneMotionVectors
       // How many rows of each matrix a vertex shader must read to be of this kind (a position uses all 4 of a product, a view may
       // have 3)
       uint32_t rows_read = 4;
-      bool row_vectors = false; // The transpose (VIEW_PROJECTION only)
+      bool row_vectors = false; // The transpose (VIEW_PROJECTION and WORLD_VIEW_PROJECTION only)
       // The rows compared and swapped with the camera (VIEW_PROJECTION only): its matrix, and the rows after it that move with it
       // (UE3's camera position, which camera facing vertices read)
       uint32_t camera_rows = 4;
@@ -132,6 +132,8 @@ namespace SceneMotionVectors
       COUNT
    };
 
+   // An offline motion vector check reads a game's config above without the rest of core.hpp
+#ifndef SCENE_MOTION_VECTORS_CONFIG_ONLY
    using ConstantsCopy = PatchedDraws::ObjectConstants::Copy;
    using BoundStates = PatchedDraws::BoundStates<object_slot, jitter_slot>;
 
@@ -150,7 +152,8 @@ namespace SceneMotionVectors
       UINT translation_offset = 0;
       bool row_vector_transform = false; // Its tie-break's "row_vectors"
       CameraType camera_type = CameraType::VIEW_PROJECTION;
-      bool frame_camera = false; // Of the game's "frame_camera" kind
+      bool camera_row_vectors = false; // Its camera's "row_vectors"
+      bool frame_camera = false;       // Of the game's "frame_camera" kind
    };
 
    // Motion vector draws by draw key (shaders, buffers, arguments), with their tie-break transform and vc4. A draw takes the previous
@@ -283,7 +286,8 @@ namespace SceneMotionVectors
       // Previous frame constants of the motion vector draws (see "PatchedDraws::PreviousConstants")
       PatchedDraws::PreviousConstants previous_constants;
       PatchedDraws::FrameObjects<MotionVectorObject, PatchedDraws::KeyHash> objects;
-      // The frame's camera (vc4 of its first scene depth writing draw of the "frame_camera" kind) and the previous frame's
+      // The frame's camera (vc4 of its first scene depth writing draw of the "frame_camera" kind, or the game's "SetFrameCamera") and the
+      // previous frame's
       ConstantsCopy camera;
       ConstantsCopy previous_camera;
       // Current clip space to the previous frame's (column vectors), identity without a previous camera: the fill's, and the world view
@@ -522,7 +526,7 @@ namespace SceneMotionVectors
       static_assert(Game::frame_camera.type == CameraType::VIEW_PROJECTION || Game::frame_camera.type == CameraType::VIEW_AND_PROJECTION);
       static_assert(!Game::frame_camera.row_vectors || Game::frame_camera.type == CameraType::VIEW_PROJECTION);
       static_assert(std::ranges::all_of(Game::cameras, [](const Camera& camera)
-         { return camera.type == CameraType::VIEW_PROJECTION || (!camera.row_vectors && camera.camera_rows == 4); }));
+         { return camera.type == CameraType::VIEW_PROJECTION || ((!camera.row_vectors || camera.type == CameraType::WORLD_VIEW_PROJECTION) && camera.camera_rows == 4); }));
       if constexpr (Game::frame_camera.type == CameraType::VIEW_PROJECTION)
       {
          Math::Matrix44D matrix = ReadMatrix(constants, Game::frame_camera.row * 16);
@@ -534,6 +538,29 @@ namespace SceneMotionVectors
       }
       else
          return ReadMatrix(constants, Game::frame_camera.projection_row * 16) * ReadAffineMatrix(constants, Game::frame_camera.row * 16);
+   }
+
+   // The frame's camera, vc4 laid out as the "frame_camera" (from a scene draw, or from the game's CPU state for engines whose opaque
+   // draws carry only object products: Dead Space 2, call it after "BeginFrame"). False if "AcceptFrameCamera" refused it.
+   template <typename Game>
+   bool SetFrameCamera(State* state, ConstantsCopy camera)
+   {
+      if constexpr (requires { Game::AcceptFrameCamera(*camera); })
+      {
+         if (!camera || !Game::AcceptFrameCamera(*camera))
+            return false;
+      }
+      state->camera = std::move(camera);
+      // Previous clip space from the current: previous * inverse(current), in double (absolute world translation)
+      state->reprojection.SetIdentity();
+      if (state->previous_camera)
+      {
+         Math::Matrix44D current = ReadFrameViewProjection<Game>(*state->camera);
+         const Math::Matrix44D previous = ReadFrameViewProjection<Game>(*state->previous_camera);
+         current.Invert();
+         state->reprojection = previous * current;
+      }
+      return true;
    }
 
    // A game pixel shader's or the bound vertex shader's patched version (null if refused), patched from Core's bytecode copy on first
@@ -631,6 +658,7 @@ namespace SceneMotionVectors
                      if (!reads_matrix(camera.row, camera.rows_read) || (two_matrices && !reads_matrix(camera.projection_row, camera.rows_read)))
                         continue;
                      record.camera_type = camera.type;
+                     record.camera_row_vectors = camera.row_vectors;
                      record.camera_offset = camera.row * 16;
                      record.projection_offset = (two_matrices ? camera.projection_row * 16 : 0);
                      record.camera_size = camera.camera_rows * 16;
@@ -845,22 +873,7 @@ namespace SceneMotionVectors
       }
       if (!state->camera && takes_frame_camera)
       {
-         ConstantsCopy camera = SnapshotConstants(state, &entry, vertex_shader);
-         if constexpr (requires { Game::AcceptFrameCamera(*camera); })
-         {
-            if (!camera || !Game::AcceptFrameCamera(*camera))
-               return result;
-         }
-         state->camera = std::move(camera);
-         // Previous clip space from the current: previous * inverse(current), in double (absolute world translation)
-         state->reprojection.SetIdentity();
-         if (state->previous_camera)
-         {
-            Math::Matrix44D current = ReadFrameViewProjection<Game>(*state->camera);
-            const Math::Matrix44D previous = ReadFrameViewProjection<Game>(*state->previous_camera);
-            current.Invert();
-            state->reprojection = previous * current;
-         }
+         SetFrameCamera<Game>(state, SnapshotConstants(state, &entry, vertex_shader));
       }
       return result;
    }
@@ -872,6 +885,16 @@ namespace SceneMotionVectors
    bool DrawWithMotionVectors(State* state, ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, const CommandListData& cmd_list_data, DeviceData& device_data,
       const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, const std::function<void()>& draw, const com_ptr<ID3D11RenderTargetView> (&rtvs)[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT], ID3D11DepthStencilView* dsv)
    {
+      // These targets are created on the native device, so ReShade never reports their views to "OnInitResourceView": put in its
+      // cache, the texture upgrade chain (which looks at every bound target) finds them without a device call. Called outside
+      // "state->mutex". A game view later created at a released view's address overwrites the entry.
+      const auto track_view = [&](ID3D11View* view)
+      {
+         com_ptr<ID3D11Resource> resource;
+         view->GetResource(&resource);
+         const std::unique_lock device_lock(device_data.mutex);
+         device_data.resource_upgrades.original_views_to_original_resources[reinterpret_cast<uintptr_t>(view)] = reinterpret_cast<uintptr_t>(resource.get());
+      };
       // The scene target alone, plus the motion vector and mask targets the last patched draws left bound
       for (UINT slot = 1; slot < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; slot++)
       {
@@ -896,6 +919,7 @@ namespace SceneMotionVectors
          else
             return false;
       }();
+      bool created_target = false;
       if ((rtvs[0] != state->scene_rtv && (!second_scene_color || rtvs[0] != state->second_scene_rtv)) || dsv != state->accepted_dsv)
       {
          if (rtvs[0].get() == state->refused_rtv && dsv == state->refused_dsv)
@@ -950,6 +974,7 @@ namespace SceneMotionVectors
                state->rtv.reset();
                return Refuse(state, REJECT_CREATE);
             }
+            created_target = true;
             if (typed_uav_load)
             {
                native_device->CreateUnorderedAccessView(state->texture.get(), nullptr, &state->uav);
@@ -973,6 +998,10 @@ namespace SceneMotionVectors
             state->scene_rtv = rtvs[0];
          }
          state->accepted_dsv = dsv;
+      }
+      if (created_target)
+      {
+         track_view(state->rtv.get());
       }
 
       const auto& vertex_shader = GetPatchedVertexShader<Game>(state, native_device, cmd_list_data, device_data, original_shader_hashes.vertex_shaders[0]);
@@ -1009,6 +1038,7 @@ namespace SceneMotionVectors
          const FLOAT clear[4] = {clear_value, clear_value, 0.f, 0.f};
          native_device_context->ClearRenderTargetView(state->rtv.get(), clear);
          // The reactive masks: what the alpha blended draws write, from zero
+         bool created_reactive_target = false;
          if (Game::ReactiveMaskUsed(device_data) && !state->reactive_target)
          {
             D3D11_TEXTURE2D_DESC mv_desc;
@@ -1018,8 +1048,13 @@ namespace SceneMotionVectors
             if (SUCCEEDED(native_device->CreateTexture2D(&reactive_desc, nullptr, &state->reactive_target)) && SUCCEEDED(native_device->CreateRenderTargetView(state->reactive_target.get(), nullptr, &state->reactive_target_rtv)))
             {
                native_device->CreateShaderResourceView(state->reactive_target.get(), nullptr, &state->reactive_target_srv);
+               created_reactive_target = true;
             }
             state->sr_reactive_frame = cb_luma_global_settings.FrameIndex;
+         }
+         if (created_reactive_target)
+         {
+            track_view(state->reactive_target_rtv.get());
          }
          if (state->reactive_target_rtv)
          {
@@ -1166,8 +1201,12 @@ namespace SceneMotionVectors
                std::memcpy(state->camera_only_copy.data() + vertex_shader.camera_offset, state->previous_camera->data() + vertex_shader.camera_offset, vertex_shader.camera_size);
                break;
             case CameraType::WORLD_VIEW_PROJECTION:
-               WriteMatrix(&state->camera_only_copy, vertex_shader.camera_offset, state->reprojection * ReadMatrix(*constants, vertex_shader.camera_offset));
+            {
+               // Row vectors: clip = position * matrix, so the previous clip is clip * transpose(reprojection)
+               const Math::Matrix44D matrix = ReadMatrix(*constants, vertex_shader.camera_offset);
+               WriteMatrix(&state->camera_only_copy, vertex_shader.camera_offset, (vertex_shader.camera_row_vectors ? matrix * state->reprojection.GetTransposed() : state->reprojection * matrix));
                break;
+            }
             case CameraType::VIEW_AND_PROJECTION:
                std::memcpy(state->camera_only_copy.data() + vertex_shader.camera_offset, state->previous_camera->data() + vertex_shader.camera_offset, CAMERA_SIZE);
                std::memcpy(state->camera_only_copy.data() + vertex_shader.projection_offset, state->previous_camera->data() + vertex_shader.projection_offset, CAMERA_SIZE);
@@ -1482,4 +1521,5 @@ namespace SceneMotionVectors
       }
    }
 #endif
+#endif // SCENE_MOTION_VECTORS_CONFIG_ONLY
 } // namespace SceneMotionVectors
