@@ -36,6 +36,7 @@
   </PropertyGroup>
   <PropertyGroup>
     <UseDgVoodoo>true</UseDgVoodoo>
+    <UseDgVoodooLinux>true</UseDgVoodooLinux>
     <UseLumaSRBridge>true</UseLumaSRBridge>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />

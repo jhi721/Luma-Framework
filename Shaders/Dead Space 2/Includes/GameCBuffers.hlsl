@@ -12,9 +12,11 @@ namespace CB
 // User controls, drawn in DrawImGuiSettings (main.cpp). The display map ones are read where the scene ends (Includes/DisplayMap.hlsl).
 struct LumaGameSettings
 {
+   float Exposure;               // 1 = vanilla. Multiplier on the scene in linear, before the display map (SDR too, before its clip).
    float Contrast;               // 1 = vanilla. Power around mid gray on BT.709 relative luminance, before the HDR display map.
    float Saturation;             // 1 = vanilla. Scale of the RGB residual from BT.709 relative luminance ("Saturation()": lerp(Y, rgb, s)), before the HDR display map.
    float HighlightsDesaturation; // 0 = off. MacLeod-Boynton purity weight of the hue reference's whitening.
+   float ColorGradingIntensity;  // 1 = vanilla, 0 = no LUT. Scales the uber post's LUT amount (read by the patched uber, "WrapUberLut" in UberLutPatch.h).
    float Dithering;              // 0/1. Output dither against banding (8 bit SDR, 10 bit PQ HDR).
    float VideoAutoHDREnable;     // 0/1. PumboAutoHDR on the video logs (Video_0xD49CB77E.ps_5_0.hlsl).
    float VideoAutoHDRBoost;      // 0..1. Video peak = lerp(1, 250 / 80, boost) x the game paper white (PumboAutoHDR's nits are relative to 80), at most the display peak.
