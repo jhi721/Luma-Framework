@@ -1586,27 +1586,33 @@ constexpr uint32_t MARKERPATCH_FXAA_PS = 0x0A91885E;  // FXAA_0x0A91885E
 constexpr uint32_t SMAA_NEIGHBORHOOD_PS = 0xBE49E10A; // MarkerPatch's SMAA neighborhood blending (SMAANeighborhood_0xBE49E10A)
 constexpr uint32_t PRESENT_BLIT_PS = 0x880A17D3;      // dgVoodoo's present blit (Present_0x880A17D3)
 constexpr uint32_t SSAA_DOWNSAMPLE_PS = 0x113CFB69;   // MarkerPatch's SSAA downsample (SSAADownsample_0x113CFB69)
+constexpr uint32_t MARKERPATCH_SMAA_EDGES_PS = 0x8736599C;
+constexpr uint32_t MARKERPATCH_SMAA_WEIGHTS_PS = 0x764C97BB;
+constexpr uint32_t SCENE_COPY_PS = 0x934360AD; // The uber post's input
+constexpr uint32_t CAMERA_MOTION_BLUR_DOWNSAMPLE_PS = 0xDE99AE79;
+constexpr uint32_t UBER_LUT_ONLY_PS = 0x583C9562;
+constexpr uint32_t UBER_DOF_ONLY_PS = 0xC76B708E;
 // The passes after the scene (live traces), the first of which ends it (the fill and the upscaler run before it): the scene
 // copy for the uber post, the camera motion blur's downsample, the uber post permutations seen live, MarkerPatch's SMAA and FXAA and
 // the video. Without any of them the scene ends at the game's copy of it ("OverrideCopyResource").
-const std::unordered_set<uint32_t> scene_end_pixel_shaders = {0x934360AD, 0xDE99AE79, 0x583C9562, 0xC76B708E, 0x8736599C, MARKERPATCH_FXAA_PS, VIDEO_PS};
+const std::unordered_set<uint32_t> scene_end_pixel_shaders = {
+   SCENE_COPY_PS, CAMERA_MOTION_BLUR_DOWNSAMPLE_PS, UBER_LUT_ONLY_PS, UBER_DOF_ONLY_PS, MARKERPATCH_SMAA_EDGES_PS, MARKERPATCH_FXAA_PS, VIDEO_PS};
 // MarkerPatch's SMAA edges and weights: skipped once an upscaler antialiased the frame or Luma's SMAA takes its slot (its neighborhood
 // blending still draws, for the display map, see "display_mapped")
-const std::unordered_set<uint32_t> markerpatch_smaa_pixel_shaders = {0x8736599C, 0x764C97BB};
-// dgVoodoo 2.81.3 (the Linux zip, ps_4_0) translations of the passes keyed by one hash above, read as their 2.87 hash
-// (_tools/deadspace2/twins_v281.tsv: the same D3D9 blob and alpha test). The arrays hold both builds' hashes; the present blit is
-// the same bytecode in both.
+const std::unordered_set<uint32_t> markerpatch_smaa_pixel_shaders = {MARKERPATCH_SMAA_EDGES_PS, MARKERPATCH_SMAA_WEIGHTS_PS};
+// dgVoodoo 2.81.3 (the Linux zip, ps_4_0) translations of the passes keyed by one hash above, read as their 2.87 hash (the same D3D9
+// blob and alpha test). The arrays hold both builds' hashes; the present blit is the same bytecode in both.
 const std::unordered_map<uint32_t, uint32_t> pixel_shader_hashes_from_v281 = {
    {0x60E6C751, VIDEO_PS},
    {0xE492B3F0, MARKERPATCH_FXAA_PS},
    {0x93099EB5, SMAA_NEIGHBORHOOD_PS},
    {0xE05704FB, SSAA_DOWNSAMPLE_PS},
-   {0x89485C8E, 0x8736599C}, // MarkerPatch SMAA Edge Detection
-   {0xB3BD0218, 0x764C97BB}, // MarkerPatch SMAA Blending Weight
-   {0x137ED10E, 0x934360AD}, // Scene Copy (uber input)
-   {0x79098250, 0xDE99AE79}, // Camera Motion Blur Downsample
-   {0x1E9D8652, 0x583C9562}, // Uber Post (LUT only)
-   {0x5667D230, 0xC76B708E}, // Uber Post (DoF only)
+   {0x89485C8E, MARKERPATCH_SMAA_EDGES_PS},
+   {0xB3BD0218, MARKERPATCH_SMAA_WEIGHTS_PS},
+   {0x137ED10E, SCENE_COPY_PS},
+   {0x79098250, CAMERA_MOTION_BLUR_DOWNSAMPLE_PS},
+   {0x1E9D8652, UBER_LUT_ONLY_PS},
+   {0x5667D230, UBER_DOF_ONLY_PS},
 };
 
 #if DEVELOPMENT
@@ -1617,24 +1623,21 @@ static bool g_sr_reactive_enable = true;
 static float g_sr_reactive_scale = 1.f;      // The alpha blended draws' reactivity, scaled (AMD's default 1)
 static float g_sr_reactive_threshold = 0.5f; // Under it 0, over it 0.9 (Mass Effect 2007's and Mirror's Edge's); 0: the scaled reactivity, capped at 0.9
 static bool g_sr_reactive_debug_view = false;
+// Predication from the scene depth, and its plane-deviation tolerance ("Luma_DS2_DepthEdges.hlsl")
+static bool g_smaa_predication = true;
+static float g_smaa_pred_tolerance = 0.02f;
 #else
 constexpr bool g_mv_enable = false;
 constexpr bool g_mv_force_jitter = false;
 constexpr bool g_sr_reactive_enable = true;
 constexpr float g_sr_reactive_scale = 1.f;
 constexpr float g_sr_reactive_threshold = 0.5f;
+constexpr bool g_smaa_predication = true;
+constexpr float g_smaa_pred_tolerance = 0.02f;
 #endif
 static bool g_smaa_enable = true;
 static bool g_smaa_t2x = false;      // SMAA T2x: a two phase jitter and the previous frame, through the upscalers' motion vectors
 static float g_rcas_sharpness = 0.f; // RCAS on the upscaler's or SMAA's output, 0 = off
-#if DEVELOPMENT
-// Predication from the scene depth, and its plane-deviation tolerance ("Luma_DS2_DepthEdges.hlsl")
-static bool g_smaa_predication = true;
-static float g_smaa_pred_tolerance = 0.02f;
-#else
-constexpr bool g_smaa_predication = true;
-constexpr float g_smaa_pred_tolerance = 0.02f;
-#endif
 // SMAA's and T2x's resources and the reactive masks go after this many frames without their pass (MEM-11)
 constexpr uint32_t IDLE_RELEASE_FRAMES = 600;
 
@@ -1820,6 +1823,11 @@ struct DeadSpace2GameDeviceData final : public GameDeviceData
    com_ptr<ID3D11ShaderResourceView> t2x_frame_srvs[2];
    uint32_t t2x_frame = 0;
 
+   bool HasT2xHistory(uint32_t frame_index) const
+   {
+      return t2x_frames[0] && t2x_frame + 1 == frame_index;
+   }
+
    void ReleaseT2xFrames()
    {
       for (int i = 0; i < 2; i++)
@@ -1828,6 +1836,15 @@ struct DeadSpace2GameDeviceData final : public GameDeviceData
          t2x_frame_rtvs[i].reset();
          t2x_frame_srvs[i].reset();
       }
+   }
+
+   // The upscaler's input and our view of Core's output ("sr_output_color"), recreated at the next upscale
+   void ReleaseSRInputs()
+   {
+      sr_output_srv.reset();
+      sr_input.reset();
+      sr_input_srv.reset();
+      sr_input_rtv.reset();
    }
 
    // SMAA's own resources, apart from Core's ("ReleaseSMAAIntermediates"); recreated at their next use
@@ -2101,7 +2118,7 @@ class DeadSpace2 final : public Game
       auto* const t2x_resolve_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("DS2 SMAA T2x Resolve PS"));
       bool t2x = gd.t2x_active && gd.mv_filled && gd.mv.srv && t2x_weight_ps && t2x_blend_ps && t2x_resolve_ps && GetViewTextureSize(gd.mv.srv.get()) == size;
       const int t2x_current = int(frame_index & 1);
-      bool t2x_history = gd.t2x_frames[0] && gd.t2x_frame + 1 == frame_index;
+      bool t2x_history = gd.HasT2xHistory(frame_index);
       if (t2x && GetViewTextureSize(gd.t2x_frame_srvs[0].get()) != size)
       {
          t2x_history = false;
@@ -2205,7 +2222,7 @@ class DeadSpace2 final : public Game
       std::array<float, 2> jitter = (((sr_instance_data && gd.mv_jitter_allowed) || g_mv_force_jitter) ? GetSRJitter(device_data, sr_instance_data) : std::array<float, 2>{});
       // SMAA T2x: the sample offsets (0.25, 0.25) then (-0.25, -0.25) in y down pixels, for "SMAA.hlsl"'s T2x subsample indices 1 and
       // 2 (Mirror's Edge's). Only after a frame the resolve ran.
-      gd.t2x_phase = ((gd.t2x_active && gd.t2x_frames[0] && gd.t2x_frame + 1 == cb_luma_global_settings.FrameIndex) ? int(cb_luma_global_settings.FrameIndex & 1) : -1);
+      gd.t2x_phase = ((gd.t2x_active && gd.HasT2xHistory(cb_luma_global_settings.FrameIndex)) ? int(cb_luma_global_settings.FrameIndex & 1) : -1);
       if (gd.t2x_phase >= 0)
       {
          const float shift = (gd.t2x_phase == 0 ? -0.25f : 0.25f);
@@ -2233,7 +2250,7 @@ class DeadSpace2 final : public Game
       auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
       auto* const decode_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("DS2 SR Decode PS"));
       auto* const encode_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("DS2 SR Encode PS"));
-      if (!gd.mv.texture || !gd.mv.camera || !gd.mv.device_depth || !gd.mv.scene_color || !gd.mv.scene_rtv || !copy_vs || !decode_ps || !encode_ps)
+      if (!gd.mv.texture || !gd.mv.camera || !gd.mv.device_depth || !gd.mv.scene_color || !gd.mv.scene_rtv || !gd.sr_rgb_blend_state || !copy_vs || !decode_ps || !encode_ps)
          return false;
       com_ptr<ID3D11Texture2D> scene;
       if (FAILED(gd.mv.scene_color->QueryInterface(&scene)))
@@ -2262,10 +2279,7 @@ class DeadSpace2 final : public Game
       if (output_desc.Width != scene_desc.Width || output_desc.Height != scene_desc.Height || !gd.sr_input)
       {
          device_data.sr_output_color.reset();
-         gd.sr_output_srv.reset();
-         gd.sr_input.reset();
-         gd.sr_input_srv.reset();
-         gd.sr_input_rtv.reset();
+         gd.ReleaseSRInputs();
          output_desc = CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_R16G16B16A16_FLOAT, scene_desc.Width, scene_desc.Height, 1, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
          if (SUCCEEDED(SRBridge::CreateSharableTexture(native_device, output_desc, &device_data.sr_output_color)))
          {
@@ -2283,8 +2297,6 @@ class DeadSpace2 final : public Game
          device_data.sr_suppressed = true;
          return false;
       }
-      if (!gd.sr_rgb_blend_state)
-         return false;
 
       const SR::ViewProjectionCamera camera = SR::GetViewProjectionCamera(reinterpret_cast<const float*>(gd.mv.camera->data() + VIEW_PROJECTION_OFFSET), /* row_vectors */ true);
       const SR::SettingsData settings_data = {
@@ -2453,32 +2465,15 @@ class DeadSpace2 final : public Game
       {
          com_ptr<ID3D11Texture2D> scene;
          D3D11_TEXTURE2D_DESC scene_desc = {};
+         D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
          if (SUCCEEDED(gd.mv.scene_color->QueryInterface(&scene)))
          {
             scene->GetDesc(&scene_desc);
-         }
-         D3D11_TEXTURE2D_DESC snapshot_desc = {};
-         if (gd.tex_snapshot)
-         {
-            gd.tex_snapshot->GetDesc(&snapshot_desc);
-         }
-         if (scene && (snapshot_desc.Width != scene_desc.Width || snapshot_desc.Height != scene_desc.Height || snapshot_desc.Format != scene_desc.Format))
-         {
-            gd.tex_snapshot.reset();
-            gd.srv_snapshot.reset();
-            snapshot_desc = CD3D11_TEXTURE2D_DESC(scene_desc.Format, scene_desc.Width, scene_desc.Height, 1, 1, D3D11_BIND_SHADER_RESOURCE);
-            if (SUCCEEDED(native_device->CreateTexture2D(&snapshot_desc, nullptr, &gd.tex_snapshot)))
-            {
-               // In the render target view's format (the scene may be typeless)
-               D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-               gd.mv.scene_rtv->GetDesc(&rtv_desc);
-               const D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = CD3D11_SHADER_RESOURCE_VIEW_DESC(D3D11_SRV_DIMENSION_TEXTURE2D, rtv_desc.Format, 0, 1);
-               native_device->CreateShaderResourceView(gd.tex_snapshot.get(), &srv_desc, &gd.srv_snapshot);
-            }
+            gd.mv.scene_rtv->GetDesc(&rtv_desc);
          }
          auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
          auto* const copy_ps = FindShader(device_data.native_pixel_shaders, CompileTimeStringHash("Copy PS"));
-         if (scene && gd.srv_snapshot && copy_vs && copy_ps)
+         if (scene && copy_vs && copy_ps && EnsureFrameCopy(native_device, scene_desc, rtv_desc.Format, std::addressof(gd.tex_snapshot), std::addressof(gd.srv_snapshot)))
          {
             native_device_context->CopyResource(gd.tex_snapshot.get(), scene.get());
             if (RunSMAA(native_device, native_device_context, device_data, gd.srv_snapshot.get(), /* slot_a */ false))
@@ -2496,6 +2491,31 @@ class DeadSpace2 final : public Game
       graphics_state.Restore(native_device_context);
    }
 
+   // Keeps "texture" a copy target matching "frame_desc", with "srv" its view in "view_format" (the render target view's: the frame
+   // may be typeless); recreated on any change. False if either can't be created. Pass the members with std::addressof: com_ptr's
+   // operator& is the COM out parameter.
+   static bool EnsureFrameCopy(ID3D11Device* native_device, const D3D11_TEXTURE2D_DESC& frame_desc, DXGI_FORMAT view_format, com_ptr<ID3D11Texture2D>* texture,
+      com_ptr<ID3D11ShaderResourceView>* srv)
+   {
+      D3D11_TEXTURE2D_DESC copy_desc = {};
+      D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+      if (*texture && *srv)
+      {
+         (*texture)->GetDesc(&copy_desc);
+         (*srv)->GetDesc(&srv_desc);
+      }
+      if (copy_desc.Width == frame_desc.Width && copy_desc.Height == frame_desc.Height && copy_desc.Format == frame_desc.Format && srv_desc.Format == view_format)
+         return true;
+      srv->reset();
+      texture->reset();
+      copy_desc = CD3D11_TEXTURE2D_DESC(frame_desc.Format, frame_desc.Width, frame_desc.Height, 1, 1, D3D11_BIND_SHADER_RESOURCE);
+      srv_desc = CD3D11_SHADER_RESOURCE_VIEW_DESC(D3D11_SRV_DIMENSION_TEXTURE2D, view_format, 0, 1);
+      if (SUCCEEDED(native_device->CreateTexture2D(&copy_desc, nullptr, &(*texture))) && SUCCEEDED(native_device->CreateShaderResourceView(texture->get(), &srv_desc, &(*srv))))
+         return true;
+      texture->reset();
+      return false;
+   }
+
    // Copies the frame into "ui_bound", whose view is in "view_format" (the render target view's: the frame may be typeless)
    static void CaptureUiBound(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeadSpace2GameDeviceData* gd, ID3D11Resource* frame_resource, DXGI_FORMAT view_format)
    {
@@ -2505,30 +2525,11 @@ class DeadSpace2 final : public Game
          return;
       D3D11_TEXTURE2D_DESC frame_desc = {};
       frame->GetDesc(&frame_desc);
-      D3D11_TEXTURE2D_DESC bound_desc = {};
-      D3D11_SHADER_RESOURCE_VIEW_DESC bound_srv_desc = {};
-      if (gd->ui_bound)
+      gd->ui_bound_valid = EnsureFrameCopy(native_device, frame_desc, view_format, std::addressof(gd->ui_bound), std::addressof(gd->ui_bound_srv));
+      if (gd->ui_bound_valid)
       {
-         gd->ui_bound->GetDesc(&bound_desc);
-         gd->ui_bound_srv->GetDesc(&bound_srv_desc);
+         native_device_context->CopyResource(gd->ui_bound.get(), frame.get());
       }
-      if (bound_desc.Width != frame_desc.Width || bound_desc.Height != frame_desc.Height || bound_desc.Format != frame_desc.Format || bound_srv_desc.Format != view_format)
-      {
-         gd->ui_bound.reset();
-         gd->ui_bound_srv.reset();
-         gd->ui_bound_valid = false;
-         const D3D11_TEXTURE2D_DESC desc = CD3D11_TEXTURE2D_DESC(frame_desc.Format, frame_desc.Width, frame_desc.Height, 1, 1, D3D11_BIND_SHADER_RESOURCE);
-         if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &gd->ui_bound)))
-            return;
-         const D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = CD3D11_SHADER_RESOURCE_VIEW_DESC(D3D11_SRV_DIMENSION_TEXTURE2D, view_format, 0, 1);
-         if (FAILED(native_device->CreateShaderResourceView(gd->ui_bound.get(), &srv_desc, &gd->ui_bound_srv)))
-         {
-            gd->ui_bound.reset();
-            return;
-         }
-      }
-      native_device_context->CopyResource(gd->ui_bound.get(), frame.get());
-      gd->ui_bound_valid = true;
    }
 
    // The HDR display map in place on the frame ("target"), from a copy of it; see "Luma_DS2_DisplayMap.hlsl"
@@ -2547,28 +2548,10 @@ class DeadSpace2 final : public Game
          return;
       D3D11_TEXTURE2D_DESC frame_desc = {};
       frame->GetDesc(&frame_desc);
-      D3D11_TEXTURE2D_DESC source_desc = {};
-      if (gd.display_map_source)
-      {
-         gd.display_map_source->GetDesc(&source_desc);
-      }
-      // The views are in the render target view's format (the frame may be typeless)
       D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
       target->GetDesc(&rtv_desc);
-      if (source_desc.Width != frame_desc.Width || source_desc.Height != frame_desc.Height || source_desc.Format != frame_desc.Format)
-      {
-         gd.display_map_source.reset();
-         gd.display_map_source_srv.reset();
-         const D3D11_TEXTURE2D_DESC desc = CD3D11_TEXTURE2D_DESC(frame_desc.Format, frame_desc.Width, frame_desc.Height, 1, 1, D3D11_BIND_SHADER_RESOURCE);
-         if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &gd.display_map_source)))
-            return;
-         const D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = CD3D11_SHADER_RESOURCE_VIEW_DESC(D3D11_SRV_DIMENSION_TEXTURE2D, rtv_desc.Format, 0, 1);
-         if (FAILED(native_device->CreateShaderResourceView(gd.display_map_source.get(), &srv_desc, &gd.display_map_source_srv)))
-         {
-            gd.display_map_source.reset();
-            return;
-         }
-      }
+      if (!EnsureFrameCopy(native_device, frame_desc, rtv_desc.Format, std::addressof(gd.display_map_source), std::addressof(gd.display_map_source_srv)))
+         return;
       DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
       graphics_state.Cache(native_device_context, device_data.uav_max_count);
       native_device_context->CopyResource(gd.display_map_source.get(), frame.get());
@@ -2596,8 +2579,13 @@ public:
          return DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::SATURATE);
       if (std::ranges::binary_search(blend_input_pixel_shaders, uint32_t(shader_hash)))
          return DXBC::ClampOutput0(code, &size, DXBC::Output0Clamp::BLEND_INPUT);
-      // "Color Grading Intensity" in Luma's settings, bound on the uber's draws (see "OnDrawOrDispatch")
-      return WrapUberLut(code, &size, luma_settings_cbuffer_index, uint32_t(offsetof(CB::LumaGlobalSettings, GameSettings) + offsetof(CB::LumaGameSettings, ColorGradingIntensity)));
+      // Only the census' uber permutations: the structural match scans the whole program, too slow for every shader dgVoodoo
+      // translates mid-game. "Color Grading Intensity" and the display mode in Luma's settings, bound on the uber's draws (see
+      // "OnDrawOrDispatch")
+      if (!std::ranges::binary_search(uber_pixel_shaders, uint32_t(shader_hash)))
+         return nullptr;
+      return WrapUberLut(code, &size, luma_settings_cbuffer_index, uint32_t(offsetof(CB::LumaGlobalSettings, GameSettings) + offsetof(CB::LumaGameSettings, ColorGradingIntensity)),
+         uint32_t(offsetof(CB::LumaGlobalSettings, DisplayMode)));
    }
 
    void OnInit(bool async) override
@@ -2626,14 +2614,6 @@ public:
       default_luma_global_game_settings.VideoAutoHDRBoost = 0.5f;
       default_luma_global_game_settings.GammaRampExponent = 1.f;
       cb_luma_global_settings.GameSettings = default_luma_global_game_settings;
-#if DEVELOPMENT
-      // The display map's MacLeod-Boynton hue emulation (Includes/DisplayMap.hlsl), on by default; the shaders' dev setting reflection
-      // would reset it to 0
-      cb_luma_dev_settings_set_from_code = true;
-      cb_luma_dev_settings_names[0] = "Hue Shift";
-      cb_luma_dev_settings_default_value[0] = 1.f;
-      cb_luma_global_settings.DevSettings[0] = 1.f;
-#endif
       // "Hide Gameplay UI" (Core's "hide_ui" skips these draws; the present blit then maps the frame). APT only: holograms and video
       // logs stay
       shader_hashes_UI.pixel_shaders.insert(apt_pixel_shaders.begin(), apt_pixel_shaders.end());
@@ -2686,14 +2666,15 @@ public:
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
    {
       device_data.game = new DeadSpace2GameDeviceData;
+      auto& gd = GetGameDeviceData(device_data);
       // The upscaler's and the scene's end SMAA's output go back into the scene without its alpha (unknown use, not opaque)
       D3D11_BLEND_DESC blend_desc = CD3D11_BLEND_DESC(D3D11_DEFAULT);
       blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
-      native_device->CreateBlendState(&blend_desc, &GetGameDeviceData(device_data).sr_rgb_blend_state);
+      native_device->CreateBlendState(&blend_desc, &gd.sr_rgb_blend_state);
 #if DEVELOPMENT
       // For the MCP "luma_dev_values" tool: the last complete frame's counts
-      SceneMotionVectors::RegisterDevValues(GetGameDeviceData(device_data).mv, &device_data);
-      const auto& stats = GetGameDeviceData(device_data).last_aa_stats;
+      SceneMotionVectors::RegisterDevValues(gd.mv, &device_data);
+      const auto& stats = gd.last_aa_stats;
       Mcp::RegisterCounters({{"aa.smaa_slot_a", &stats.smaa_slot_a}, {"aa.smaa_slot_b", &stats.smaa_slot_b}, {"aa.t2x_resolves", &stats.t2x_resolves},
                                {"aa.fxaa_copies", &stats.fxaa_copies}, {"aa.markerpatch_smaa", &stats.markerpatch_smaa}, {"aa.ssaa", &stats.ssaa},
                                {"aa.smaa_slot_a_chosen", &stats.smaa_slot_a_chosen}, { "aa.t2x_active",
@@ -2804,10 +2785,7 @@ public:
       // upscaler is picked again (the helper takes seconds to start).
       if (device_data.sr_type == SR::Type::None && device_data.release_sr_resources.exchange(false))
       {
-         gd.sr_output_srv.reset();
-         gd.sr_input.reset();
-         gd.sr_input_srv.reset();
-         gd.sr_input_rtv.reset();
+         gd.ReleaseSRInputs();
          gd.sr_scene.reset();
          gd.sr_scene_srv.reset();
          if (!g_mv_enable && !gd.t2x_active && !smaa_scene_end)
@@ -2938,17 +2916,6 @@ public:
          DrawSettingSlider("Video HDR Boost", "VideoAutoHDRBoost", &gs.VideoAutoHDRBoost, gs_def.VideoAutoHDRBoost, 0.f, 1.f, "Video highlight strength (0 = off).");
       }
       DrawSettingCheckbox("Dithering", "Dithering", &gs.Dithering, gs_def.Dithering, "Reduces gradient banding.");
-#if DEVELOPMENT
-      bool hue_shift = cb_luma_global_settings.DevSettings[0] > 0.5f;
-      if (ImGui::Checkbox("Hue Shift", &hue_shift))
-      {
-         cb_luma_global_settings.DevSettings[0] = float(hue_shift);
-      }
-      if (ImGui::IsItemHovered())
-      {
-         ImGui::SetTooltip("The display map's MacLeod-Boynton hue emulation (per channel Reinhard reference), HDR only. Not saved.");
-      }
-#endif
 
       ImGui::SeparatorText("UI");
       DrawSettingCheckbox("Hide Gameplay UI", "HideUI", &hide_ui, false, "Disables the in-game UI.");
@@ -2994,7 +2961,8 @@ public:
          gd.ui_bound_pending_format = rtv_desc.Format;
       };
       // A game draw that can be drawn again with patched shaders (not Luma's, nor one whose shader Luma replaced: "is_custom_pass")
-      const bool game_draw = !is_custom_pass && original_draw_dispatch_func && *original_draw_dispatch_func;
+      const bool can_redraw = original_draw_dispatch_func && *original_draw_dispatch_func;
+      const bool game_draw = !is_custom_pass && can_redraw;
       // The scene rendered this frame (DLSS-Best-Practices BK-1): Core's SR icon then warns when the upscaler didn't draw (SSAA, another
       // exe build). Not on the video.
       const bool scene_end = scene_end_pixel_shaders.contains(pixel_shader_hash);
@@ -3219,7 +3187,7 @@ public:
             gd.markerpatch_smaa_drawn = true;
             native_device_context->PSGetShaderResources(0, 1, &frame_srv);
             // Not "game_draw": this pass is replaced, so it counts as a custom pass
-            ID3D11ShaderResourceView* const source_srv = ((gd.smaa_slot_a && original_draw_dispatch_func && *original_draw_dispatch_func && frame_srv) ? GetFrameView(native_device, &gd, frame_srv.get()) : nullptr);
+            ID3D11ShaderResourceView* const source_srv = ((gd.smaa_slot_a && can_redraw && frame_srv) ? GetFrameView(native_device, &gd, frame_srv.get()) : nullptr);
             if (source_srv)
             {
                DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
@@ -3234,11 +3202,11 @@ public:
          // The neighborhood replacement only display maps once MarkerPatch's blending weights were skipped (see below), whether or not our
          // SMAA drew, and only in uber frames (LumaData.CustomData3: the display map runs elsewhere; the present blit doesn't read it)
          // The present blit bounds what drew after the display map by "ui_bound" (t1, LumaData.CustomData4), drawn here to restore t1
-         const bool present_ui_bound = !neighborhood && is_immediate && gd.ui_bound_valid && original_draw_dispatch_func && *original_draw_dispatch_func;
+         const bool present_ui_bound = !neighborhood && is_immediate && gd.ui_bound_valid && can_redraw;
          const bool map_here = neighborhood && gd.uber_drawn && !gd.display_mapped;
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, neighborhood ? (device_data.has_drawn_sr || gd.smaa_slot_a) : gd.display_mapped, gd.uber_drawn,
-            (neighborhood ? !map_here : gd.display_mapped) ? 1.f : 0.f, present_ui_bound ? 1.f : 0.f);
+            map_here ? 0.f : 1.f, present_ui_bound ? 1.f : 0.f);
          updated_cbuffers = true;
          if (map_here && is_immediate)
          {
@@ -3368,13 +3336,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       texture_upgrade_formats = {
          reshade::api::format::r8g8b8a8_typeless, // dgVoodoo's D3D9 A8R8G8B8 surfaces: light buffer, scene and post copies, the canvas
       };
-      for (const uint32_t hash : light_pixel_shaders)
+      for (const std::span<const uint32_t> hashes : {std::span<const uint32_t>(light_pixel_shaders), std::span<const uint32_t>(apply_pixel_shaders)})
       {
-         auto_texture_format_upgrade_shader_hashes[hash] = {.rtv_slots = {0}};
-      }
-      for (const uint32_t hash : apply_pixel_shaders)
-      {
-         auto_texture_format_upgrade_shader_hashes[hash] = {.rtv_slots = {0}};
+         for (const uint32_t hash : hashes)
+         {
+            auto_texture_format_upgrade_shader_hashes[hash] = {.rtv_slots = {0}};
+         }
       }
       // "No1Px": dgVoodoo fills unused SRV slots with 1x1 placeholders, which pass the aspect filter
       texture_format_upgrades_2d_size_filters = (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainResolution | (uint32_t)TextureFormatUpgrades2DSizeFilters::SwapchainAspectRatio | (uint32_t)TextureFormatUpgrades2DSizeFilters::No1Px;
@@ -3387,13 +3354,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
 #if DEVELOPMENT
       // The gameplay uber post, LUT only, every frame
-      forced_shader_names.emplace(Shader::Hash_StrToNum("583C9562"), "Uber Post (LUT only)");
+      forced_shader_names.emplace(UBER_LUT_ONLY_PS, "Uber Post (LUT only)");
       // The uber permutation and its post copy run only where the area's post-effect volume asks for an effect (live traces)
-      forced_shader_names.emplace(Shader::Hash_StrToNum("C76B708E"), "Uber Post (DoF only)");
-      forced_shader_names.emplace(Shader::Hash_StrToNum("934360AD"), "Scene Copy (uber input)");
-      forced_shader_names.emplace(Shader::Hash_StrToNum("DE99AE79"), "Camera Motion Blur Downsample");
+      forced_shader_names.emplace(UBER_DOF_ONLY_PS, "Uber Post (DoF only)");
+      forced_shader_names.emplace(SCENE_COPY_PS, "Scene Copy (uber input)");
+      forced_shader_names.emplace(CAMERA_MOTION_BLUR_DOWNSAMPLE_PS, "Camera Motion Blur Downsample");
       forced_shader_names.emplace(Shader::Hash_StrToNum("87246FA1"), "Camera Motion Blur");
-      forced_shader_names.emplace(Shader::Hash_StrToNum("D49CB77E"), "Video (VP6, BT.601 limited)");
+      forced_shader_names.emplace(VIDEO_PS, "Video (VP6, BT.601 limited)");
       // Textured UI and overlays (RIG hologram, menus, MarkerPatch's achievements window), drawn after SMAA
       forced_shader_names.emplace(Shader::Hash_StrToNum("2A2C3104"), "UI");
       forced_shader_names.emplace(Shader::Hash_StrToNum("CBFBF98D"), "Deferred Sun Light (last light buffer pass)");
@@ -3403,13 +3370,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       // offline from its embedded bytecode, the SMAA ones confirmed live. dgVoodoo specializes vertex shaders on the input layout, so
       // the VS hashes below can differ in game.
       // ImprovedAntiAliasingMode 2 (default) and 4: SMAA in place of the game's EdgeAA pass
-      forced_shader_names.emplace(Shader::Hash_StrToNum("8736599C"), "MarkerPatch SMAA Edge Detection");
-      forced_shader_names.emplace(Shader::Hash_StrToNum("764C97BB"), "MarkerPatch SMAA Blending Weight");
-      forced_shader_names.emplace(Shader::Hash_StrToNum("BE49E10A"), "MarkerPatch SMAA Neighborhood Blending");
+      forced_shader_names.emplace(MARKERPATCH_SMAA_EDGES_PS, "MarkerPatch SMAA Edge Detection");
+      forced_shader_names.emplace(MARKERPATCH_SMAA_WEIGHTS_PS, "MarkerPatch SMAA Blending Weight");
+      forced_shader_names.emplace(SMAA_NEIGHBORHOOD_PS, "MarkerPatch SMAA Neighborhood Blending");
       // ImprovedAntiAliasingMode 1: FXAA in place of the EdgeAA pixel shaders (the game's own vertex shader)
-      forced_shader_names.emplace(Shader::Hash_StrToNum("0A91885E"), "MarkerPatch FXAA");
+      forced_shader_names.emplace(MARKERPATCH_FXAA_PS, "MarkerPatch FXAA");
       // ImprovedAntiAliasingMode 3 and 4: SSAA, the frame rendered at SSAAScale x the back buffer, then averaged into it
-      forced_shader_names.emplace(Shader::Hash_StrToNum("113CFB69"), "MarkerPatch SSAA Downsample");
+      forced_shader_names.emplace(SSAA_DOWNSAMPLE_PS, "MarkerPatch SSAA Downsample");
       // FixVertexNormals: replacements of game vertex shaders, so these draws lose their vanilla hashes
       forced_shader_names.emplace(Shader::Hash_StrToNum("7B1A4448"), "MarkerPatch Glass Reflection VS");
       forced_shader_names.emplace(Shader::Hash_StrToNum("202A858A"), "MarkerPatch Flashlight Overlay VS");

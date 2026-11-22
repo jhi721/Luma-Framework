@@ -7,8 +7,8 @@
 // Dead Space 2: MarkerPatch's SMAA 1x neighborhood blending (ImprovedAntiAliasingMode 2/4, dgVoodoo 2.87.6 -> ps_5_0 0xBE49E10A), the
 // frame's last pass before the UI (RIG holograms, menus, video logs draw into its output next). Transcribed from the translation, then
 // the HDR display map (Includes/DisplayMap.hlsl). MarkerPatch blends in linear (SRGBTEXTURE in, SRGBWRITEENABLE out): the fp16 mirrors
-// dropped that pair, so the sRGB decode and encode are done here. With an upscaler (LumaData.CustomData1 != 0) the frame is already
-// antialiased and the blending weights weren't drawn: only the display map runs.
+// dropped that pair, so the sRGB decode and encode are done here. With an upscaler or Luma's SMAA in this slot (LumaData.CustomData1
+// != 0, t0 is then Luma's output) the frame is already antialiased and the blending weights weren't drawn: only the display map runs.
 
 cbuffer cb3 : register(b3)
 {

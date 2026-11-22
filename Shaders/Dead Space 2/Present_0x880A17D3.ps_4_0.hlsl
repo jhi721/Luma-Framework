@@ -20,8 +20,10 @@ void main(float4 v0 : SV_POSITION0, float2 v1 : TEXCOORD0, out float4 o0 : SV_TA
       o0.rgb = IsNaN_Strict(o0.rgb) ? 0.0 : max(o0.rgb, 0.0);
       // HDR: vanilla blended the draws after the display map (additive particles, holograms) into its UNORM frame, clamped at 1 per
       // blend. For non-negative additive chains clamping the end result is the same; the bound keeps the scene's highlights.
-      [branch] if (LumaSettings.DisplayMode == 1 && LumaData.CustomData4 != 0)
+      [branch] if (LumaSettings.DisplayMode == 1)
       {
+         if (LumaData.CustomData4 == 0)
+            return;
          uint2 size0;
          uint2 size1;
          t0.GetDimensions(size0.x, size0.y);
@@ -30,11 +32,11 @@ void main(float4 v0 : SV_POSITION0, float2 v1 : TEXCOORD0, out float4 o0 : SV_TA
          const int2 coord = int2(v1 * size1 / size0);
          // One bound for all channels: per channel, white light over a scene highlight above 1 in only some channels turned pink
          const float3 bound = t1.Load(int3(coord, 0)).rgb;
-         o0.rgb = min(o0.rgb, max(max(bound.r, max(bound.g, bound.b)), 1.0));
+         o0.rgb = min(o0.rgb, max(max3(bound), 1.0));
       }
-      // SDR: the unorm swapchain clipped the UI drawn after the display map
-      if (LumaSettings.DisplayMode != 1)
+      else
       {
+         // SDR: the unorm swapchain clipped the UI drawn after the display map
          o0.rgb = saturate(o0.rgb);
       }
       return;

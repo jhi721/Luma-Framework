@@ -22,13 +22,14 @@
 //   m = max(1, max3(x)),  G = p + k * (LUT(p) - p) with p = x / m   the grade of the color scaled into the cube
 //   o = V * (Y(decode(G * m)) / Y(decode(V)))^(1/2.2)   decode = gamma 2.2, Y = BT.709 relative luminance
 // The output keeps the vanilla RGB ratios and takes the brightness of the scaled-back grade. Where max3(x) <= 1, G and V run the same
-// instructions on the same values, so o = V bit exactly.
+// instructions on the same values, so o = V bit exactly. The brightness is HDR only (the uint at byte "display_mode_offset" is 1):
+// SDR keeps o = V, vanilla's grade of the color its UNORM scene clipped.
 // G runs a copy of the tail, from the coordinate mad to the lerp, on renamed temps, before the original; the temps it reads before
 // writing (x, or the value x was scaled from) start as their original / m. Matched by structure (the coordinate mad's immediates, and
 // a cb4-weighted mad whose addend is that coordinate's source); null for any other shader.
-// k is scaled by the "Color Grading Intensity" float at byte "intensity_offset" of cb<intensity_slot> (Luma's settings, which the draw
+// k is scaled by the "Color Grading Intensity" float at byte "intensity_offset" of cb<settings_slot> (Luma's settings, which the draw
 // binds): 1 keeps k bit exactly, 0 leaves no grade (V = saturate(x), G = p).
-inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* size, uint32_t intensity_slot, uint32_t intensity_offset)
+inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* size, uint32_t settings_slot, uint32_t intensity_offset, uint32_t display_mode_offset)
 {
    if (*size % sizeof(uint32_t) != 0)
       return nullptr;
@@ -61,6 +62,8 @@ inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* s
       return i == end;
    };
    constexpr uint32_t temp_xyzw = DXBC::Source(D3D10_SB_OPERAND_TYPE_TEMP, 0, 1, 2, 3);
+   constexpr uint32_t x_mask = D3D10_SB_OPERAND_4_COMPONENT_MASK_X;
+   constexpr uint32_t xyz_mask = x_mask | D3D10_SB_OPERAND_4_COMPONENT_MASK_Y | D3D10_SB_OPERAND_4_COMPONENT_MASK_Z;
    // The temp register of a plain "rN.xyzw" source, or UINT32_MAX
    const auto temp_source = [&](size_t begin, size_t end)
    {
@@ -70,9 +73,13 @@ inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* s
    {
       // fxc also sets the (unused) swizzle bits on immediates, so match type and component count only
       const uint32_t token = tokens[begin];
+      const bool is_immediate4 = end - begin == 5 && DECODE_D3D10_SB_OPERAND_TYPE(token) == D3D10_SB_OPERAND_TYPE_IMMEDIATE32 &&
+                                 DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(token) == D3D10_SB_OPERAND_4_COMPONENT && !DECODE_IS_D3D10_SB_OPERAND_EXTENDED(token);
+      if (!is_immediate4)
+         return false;
       const uint32_t bits = std::bit_cast<uint32_t>(value);
-      return end - begin == 5 && DECODE_D3D10_SB_OPERAND_TYPE(token) == D3D10_SB_OPERAND_TYPE_IMMEDIATE32 && DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(token) == D3D10_SB_OPERAND_4_COMPONENT && !DECODE_IS_D3D10_SB_OPERAND_EXTENDED(token) && std::all_of(tokens.begin() + begin + 1, tokens.begin() + end, [bits](uint32_t token)
-                                                                                                                                                                                                                                                { return token == bits; });
+      return std::all_of(tokens.begin() + begin + 1, tokens.begin() + end, [bits](uint32_t component)
+         { return component == bits; });
    };
 
    uint32_t x = UINT32_MAX;
@@ -93,10 +100,9 @@ inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* s
          }
          continue;
       }
-      constexpr uint32_t mask_xyz = D3D10_SB_OPERAND_4_COMPONENT_MASK_X | D3D10_SB_OPERAND_4_COMPONENT_MASK_Y | D3D10_SB_OPERAND_4_COMPONENT_MASK_Z;
       const uint32_t destination = tokens[operands[0]];
       const uint32_t weight = tokens[operands[1]];
-      const bool lerp_shape = DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(destination) == D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE && DECODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(destination) == mask_xyz &&
+      const bool lerp_shape = DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(destination) == D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE && DECODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(destination) == xyz_mask &&
                               DECODE_D3D10_SB_OPERAND_TYPE(weight) == D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER && !DECODE_IS_D3D10_SB_OPERAND_EXTENDED(weight) &&
                               temp_source(operands[3], operands[4]) == x;
       if (!lerp_shape)
@@ -116,12 +122,16 @@ inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* s
    const auto read = [&](uint32_t temp)
    {
       if (!written.contains(temp) && renamed.try_emplace(temp, uint32_t(renamed.size())).second)
+      {
          live_ins.push_back(temp);
+      }
    };
    const auto visit_reads = [&](size_t token_position, size_t index_position)
    {
       if (DECODE_D3D10_SB_OPERAND_TYPE(tokens[token_position]) == D3D10_SB_OPERAND_TYPE_TEMP)
+      {
          read(tokens[index_position]);
+      }
       return true;
    };
    for (size_t i = coordinate; i < lerp; i++)
@@ -163,7 +173,7 @@ inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* s
    {
       if (instructions[i].opcode != D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER)
          continue;
-      if (instructions[i].length != 4 || tokens[instructions[i].begin + 2] == intensity_slot)
+      if (instructions[i].length != 4 || tokens[instructions[i].begin + 2] == settings_slot)
          return nullptr;
       last_constant_buffer = i;
    }
@@ -171,6 +181,8 @@ inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* s
       return nullptr;
    const uint32_t intensity_row = intensity_offset / 16;
    const uint32_t intensity_component = (intensity_offset % 16) / 4;
+   const uint32_t display_mode_row = display_mode_offset / 16;
+   const uint32_t display_mode_component = (display_mode_offset % 16) / 4;
    constexpr uint32_t constant_buffer_operand = ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER) |
                                                 ENCODE_D3D10_SB_OPERAND_INDEX_DIMENSION(D3D10_SB_OPERAND_INDEX_2D) | ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32) |
                                                 ENCODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, D3D10_SB_OPERAND_INDEX_IMMEDIATE32) | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE);
@@ -181,25 +193,27 @@ inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* s
          if (i != last_constant_buffer)
             return std::vector<uint32_t>();
          return std::vector<uint32_t>{DXBC::Opcode(D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER, 4) | ENCODE_D3D10_SB_D3D10_SB_CONSTANT_BUFFER_ACCESS_PATTERN(D3D10_SB_CONSTANT_BUFFER_IMMEDIATE_INDEXED),
-            constant_buffer_operand | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE(0, 1, 2, 3), intensity_slot, intensity_row + 1}; });
-   // m in .x, 1 / m in .y | V | scratch | G, then Y(decode(G * m)) in .x | k * intensity in .x
+            constant_buffer_operand | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE(0, 1, 2, 3), settings_slot, (std::max)(intensity_row, display_mode_row) + 1}; });
+   // m in .x, 1 / m in .y | V | scratch (the brightness ratio in .x, HDR in .y) | G, then Y(decode(G * m)) in .x | k * intensity in .x
    const uint32_t scale = first_added + uint32_t(renamed.size());
    const uint32_t graded = scale + 1;
    const uint32_t scratch = scale + 2;
    const uint32_t wrapped = scale + 3;
    const uint32_t scaled_weight = scale + 4;
 
-   constexpr uint32_t x_mask = D3D10_SB_OPERAND_4_COMPONENT_MASK_X;
-   constexpr uint32_t xyz_mask = x_mask | D3D10_SB_OPERAND_4_COMPONENT_MASK_Y | D3D10_SB_OPERAND_4_COMPONENT_MASK_Z;
    using Operand = std::vector<uint32_t>;
    const auto emit = [&](D3D10_SB_OPCODE_TYPE opcode, std::initializer_list<Operand> operands, bool saturate = false)
    {
       size_t length = 1;
       for (const Operand& operand : operands)
+      {
          length += operand.size();
+      }
       patched.push_back(DXBC::Opcode(opcode, uint32_t(length), saturate));
       for (const Operand& operand : operands)
+      {
          patched.append_range(operand);
+      }
    };
    const auto destination = [](uint32_t temp, uint32_t mask)
    {
@@ -227,6 +241,10 @@ inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* s
    {
       return immediate(value, value, value, value);
    };
+   const auto settings_component = [&](uint32_t row, uint32_t component)
+   {
+      return Operand{constant_buffer_operand | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE(component, component, component, component), settings_slot, row};
+   };
    const auto lerp_operand = [&](size_t operand)
    {
       return Operand(tokens.begin() + lerp_operands[operand], tokens.begin() + lerp_operands[operand + 1]);
@@ -241,7 +259,9 @@ inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* s
          i = DXBC::WalkOperand(tokens, i, end, [&](size_t token_position, size_t index_position)
             {
                if (DECODE_D3D10_SB_OPERAND_TYPE(tokens[token_position]) == D3D10_SB_OPERAND_TYPE_TEMP)
+               {
                   patched[base + index_position - begin] = first_added + renamed.at(tokens[index_position]);
+               }
                return true; });
       }
    };
@@ -262,8 +282,7 @@ inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* s
       const DXBC::Instruction& instruction = instructions[i];
       if (i == coordinate)
       {
-         emit(D3D10_SB_OPCODE_MUL, {destination(scaled_weight, x_mask), lerp_operand(1),
-                                      Operand{constant_buffer_operand | ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE(intensity_component, intensity_component, intensity_component, intensity_component), intensity_slot, intensity_row}});
+         emit(D3D10_SB_OPCODE_MUL, {destination(scaled_weight, x_mask), lerp_operand(1), settings_component(intensity_row, intensity_component)});
          // m = max(1, max3(x)), 1 / m
          emit(D3D10_SB_OPCODE_MAX, {destination(scale, x_mask), source(x, 0, 0, 0, 0), source(x, 1, 1, 1, 1)});
          emit(D3D10_SB_OPCODE_MAX, {destination(scale, x_mask), source(scale, 0, 0, 0, 0), source(x, 2, 2, 2, 2)});
@@ -278,8 +297,10 @@ inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* s
          {
             const size_t begin = instructions[j].begin;
             size_t operands = begin + 1;
-            for (uint32_t extended = tokens[begin]; DECODE_IS_D3D10_SB_OPCODE_EXTENDED(extended); extended = tokens[operands++])
+            uint32_t extended = tokens[begin];
+            while (DECODE_IS_D3D10_SB_OPCODE_EXTENDED(extended))
             {
+               extended = tokens[operands++];
             }
             append_renamed(begin, operands, begin + instructions[j].length);
          }
@@ -307,6 +328,12 @@ inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* s
       emit(D3D10_SB_OPCODE_LOG, {destination(scratch, x_mask), source(scratch, 0, 0, 0, 0)});
       emit(D3D10_SB_OPCODE_MUL, {destination(scratch, x_mask), source(scratch, 0, 0, 0, 0), splat(1.f / 2.2f)});
       emit(D3D10_SB_OPCODE_EXP, {destination(scratch, x_mask), source(scratch, 0, 0, 0, 0)});
+      // SDR: a ratio of 1 (o = V)
+      constexpr uint32_t hdr_display_mode = 1;
+      emit(D3D10_SB_OPCODE_IEQ, {destination(scratch, D3D10_SB_OPERAND_4_COMPONENT_MASK_Y), settings_component(display_mode_row, display_mode_component),
+                                   Operand{ENCODE_D3D10_SB_OPERAND_NUM_COMPONENTS(D3D10_SB_OPERAND_4_COMPONENT) | ENCODE_D3D10_SB_OPERAND_TYPE(D3D10_SB_OPERAND_TYPE_IMMEDIATE32),
+                                      hdr_display_mode, hdr_display_mode, hdr_display_mode, hdr_display_mode}});
+      emit(D3D10_SB_OPCODE_MOVC, {destination(scratch, x_mask), source(scratch, 1, 1, 1, 1), source(scratch, 0, 0, 0, 0), splat(1.f)});
       emit(D3D10_SB_OPCODE_MUL, {lerp_operand(0), xyzw(graded), source(scratch, 0, 0, 0, 0)});
    }
 
