@@ -92,7 +92,8 @@ namespace MotionVectorPatch
 
    // The previous frame's vertex positions for vertices the CPU rewrites every frame (a fixed world matrix, the motion is in the
    // vertices): a copy of last frame's vertex buffer as a raw buffer at t<slot>, from the draw's first vertex. The second run reads its
-   // POSITION input there, at SV_VertexID * stride + offset (3 or 4 floats; past the copy's end it keeps the current one). SM5 only.
+   // POSITION input there, at SV_VertexID * stride + offset (3 or 4 floats; past the copy's end it keeps the current one). An SM4
+   // shader is raised to SM5 for the raw load.
    struct PreviousVertices
    {
       uint32_t slot;
@@ -172,8 +173,8 @@ namespace MotionVectorPatch
       if (previous_vertices)
       {
          input_signature = FindChunk(&chunks, FourCC("ISGN"));
-         if (DECODE_D3D10_SB_TOKENIZED_PROGRAM_MAJOR_VERSION(tokens[0]) < 5 || !input_signature || !ReadSignature(input_signature->data, &inputs))
-            return (*error = "previous vertices: SM5 input signature", std::vector<uint8_t>());
+         if (!input_signature || !ReadSignature(input_signature->data, &inputs))
+            return (*error = "previous vertices: input signature", std::vector<uint8_t>());
          const auto position_element = std::ranges::find_if(inputs, [](const SignatureElement& element)
             { return element.system_value == 0 && element.semantic_index == 0 && _stricmp(element.name.c_str(), "POSITION") == 0; });
          if (position_element == inputs.end())
@@ -392,6 +393,13 @@ namespace MotionVectorPatch
       if (!projects)
          return (*error = "screen space (view projection unused)", std::vector<uint8_t>());
       declarations.insert(declarations.end(), body.begin(), body.end());
+      // The raw buffer load is SM5: an SM4 shader (dgVoodoo 2.81.3's vs_4_0) becomes vs_5_0, its instructions a subset of SM5's. Feature
+      // level 11_0 links it to the game's SM4 pixel shaders.
+      if (previous_vertices && DECODE_D3D10_SB_TOKENIZED_PROGRAM_MAJOR_VERSION(declarations[0]) < 5)
+      {
+         declarations[0] = ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(DECODE_D3D10_SB_TOKENIZED_PROGRAM_TYPE(declarations[0]), 5, 0);
+         program->fourcc = FourCC("SHEX");
+      }
       WriteProgram(&declarations, program);
 
       SignatureElement element = {semantic_name, 0, 0, 3 /* float */, layout.current_position_register, 0xF, 0};
