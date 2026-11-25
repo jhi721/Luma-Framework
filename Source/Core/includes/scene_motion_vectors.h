@@ -8,6 +8,7 @@
 #include <format>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -79,6 +80,11 @@ namespace SceneMotionVectors
       // The rows compared and swapped with the camera (VIEW_PROJECTION only): its matrix, and the rows after it that move with it
       // (UE3's camera position, which camera facing vertices read)
       uint32_t camera_rows = 4;
+      // The matrix' rows (both matrices' for the two matrix kinds) must feed SV_Position ("DXBC::GetPositionConstantDependencies"), and
+      // so must "also_position_row" (UINT32_MAX: none). For games whose packed scalar constants fill whole rows next to the matrices,
+      // so that reading 4 rows tells nothing (Dead Space 3).
+      bool position_rows = false;
+      uint32_t also_position_row = UINT32_MAX;
       constexpr bool operator==(const Camera&) const = default;
    };
    // The tie-break transform between the draws sharing a key: the 3x4 at "row" (a "relative" index: a bone palette's first bone), or
@@ -651,11 +657,33 @@ namespace SceneMotionVectors
                      }
                      return true;
                   };
+                  // What SV_Position depends on, computed for the first kind that asks for it
+                  std::optional<DXBC::PositionConstantDependencies> position_dependencies;
+                  const auto feeds_position = [&](uint32_t row, uint32_t rows)
+                  {
+                     if (!position_dependencies)
+                     {
+                        position_dependencies.emplace();
+                        if (!DXBC::GetPositionConstantDependencies(code, code_size, object_slot, &*position_dependencies))
+                        {
+                           position_dependencies->rows.reset();
+                        }
+                     }
+                     for (uint32_t i = 0; i < rows; i++)
+                     {
+                        if (row + i >= DXBC::PositionConstantDependencies::max_rows || !position_dependencies->rows.test(row + i))
+                           return false;
+                     }
+                     return true;
+                  };
                   // The first kind in the game's order that the shader reads
                   for (const Camera& camera : Game::cameras)
                   {
                      const bool two_matrices = camera.type == CameraType::VIEW_AND_PROJECTION || camera.type == CameraType::WORLD_VIEW_AND_PROJECTION;
                      if (!reads_matrix(camera.row, camera.rows_read) || (two_matrices && !reads_matrix(camera.projection_row, camera.rows_read)))
+                        continue;
+                     if (camera.position_rows && (!feeds_position(camera.row, camera.rows_read) || (two_matrices && !feeds_position(camera.projection_row, camera.rows_read)) ||
+                                                    (camera.also_position_row != UINT32_MAX && !feeds_position(camera.also_position_row, 1))))
                         continue;
                      record.camera_type = camera.type;
                      record.camera_row_vectors = camera.row_vectors;

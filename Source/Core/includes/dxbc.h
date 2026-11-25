@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <bitset>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
@@ -394,11 +395,25 @@ namespace DXBC
       return reads;
    }
 
-   // Whether the vertex shader's SV_Position depends on rows "first_row" to "last_row" of constant buffer "slot" and on no other row
-   // of it (e.g. projects through the view projection alone, its vertices already in camera space). Data flow through temps,
-   // each written component taking every source operand's dependencies (control flow ignored, so it errs on "other rows"). False
-   // if the bytecode can't be read.
-   inline bool PositionDependsOnlyOnConstantRows(const uint8_t* code, size_t size, uint32_t slot, uint32_t first_row, uint32_t last_row)
+   // What a vertex shader's SV_Position depends on in constant buffer "slot": the rows read by an immediate index, and whether it also
+   // depends on something untracked there (a relative index, an indexable temp). Data flow through temps, each written component
+   // taking every source operand's dependencies (control flow ignored, so it errs on more dependencies).
+   struct PositionConstantDependencies
+   {
+      static constexpr uint32_t max_rows = 4096; // D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT
+      std::bitset<max_rows> rows;
+      bool untracked = false;
+
+      PositionConstantDependencies& operator|=(const PositionConstantDependencies& other)
+      {
+         rows |= other.rows;
+         untracked |= other.untracked;
+         return *this;
+      }
+   };
+
+   // False if the bytecode can't be read or has no SV_Position
+   inline bool GetPositionConstantDependencies(const uint8_t* code, size_t size, uint32_t slot, PositionConstantDependencies* position_dependencies)
    {
       std::vector<Chunk> chunks;
       if (!ReadChunks(code, size, &chunks))
@@ -416,14 +431,13 @@ namespace DXBC
       if (position == outputs.end())
          return false;
 
-      // Per temp and output component: bit 0 the rows, bit 1 other rows of the buffer
-      constexpr uint8_t in_rows = 1, other_rows = 2;
-      std::unordered_map<uint64_t, std::array<uint8_t, 4>> dependencies;
+      // Per temp and output component
+      std::unordered_map<uint64_t, std::array<PositionConstantDependencies, 4>> dependencies;
       const auto key = [](D3D10_SB_OPERAND_TYPE type, uint32_t index)
       { return (uint64_t(type) << 32) | index; };
       for (size_t i = first_body; i < instructions.size(); i++)
       {
-         uint8_t sources = 0;
+         PositionConstantDependencies sources;
          std::vector<std::pair<uint64_t, uint32_t>> destinations; // Register and its written components mask
          bool readable = WalkOperands(tokens, instructions[i], [&](size_t token_position, size_t index_position)
             {
@@ -435,14 +449,21 @@ namespace DXBC
                   {
                      const bool immediate_row = DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(token) == D3D10_SB_OPERAND_INDEX_2D && DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, token) == D3D10_SB_OPERAND_INDEX_IMMEDIATE32;
                      const uint32_t row = tokens[index_position + 1];
-                     sources |= (immediate_row && row >= first_row && row <= last_row) ? in_rows : other_rows;
+                     if (immediate_row && row < PositionConstantDependencies::max_rows)
+                     {
+                        sources.rows.set(row);
+                     }
+                     else
+                     {
+                        sources.untracked = true;
+                     }
                   }
                   return true;
                }
                // Not tracked (indexable temps): they could hold anything
                if (type == D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP)
                {
-                  sources |= other_rows;
+                  sources.untracked = true;
                   return true;
                }
                if (type != D3D10_SB_OPERAND_TYPE_TEMP && type != D3D10_SB_OPERAND_TYPE_OUTPUT)
@@ -480,10 +501,26 @@ namespace DXBC
       const auto found = dependencies.find(key(D3D10_SB_OPERAND_TYPE_OUTPUT, position->reg));
       if (found == dependencies.end())
          return false;
-      uint8_t position_dependencies = 0;
-      for (const uint8_t component : found->second)
-         position_dependencies |= component;
-      return position_dependencies == in_rows;
+      *position_dependencies = {};
+      for (const PositionConstantDependencies& component : found->second)
+         *position_dependencies |= component;
+      return true;
+   }
+
+   // Whether the vertex shader's SV_Position depends on rows "first_row" to "last_row" of constant buffer "slot" and on no other row
+   // of it (e.g. projects through the view projection alone, its vertices already in camera space). False if the bytecode can't be
+   // read.
+   inline bool PositionDependsOnlyOnConstantRows(const uint8_t* code, size_t size, uint32_t slot, uint32_t first_row, uint32_t last_row)
+   {
+      PositionConstantDependencies dependencies;
+      if (!GetPositionConstantDependencies(code, size, slot, &dependencies) || dependencies.untracked)
+         return false;
+      std::bitset<PositionConstantDependencies::max_rows> range;
+      for (uint32_t row = first_row; row <= last_row && row < PositionConstantDependencies::max_rows; row++)
+      {
+         range.set(row);
+      }
+      return (dependencies.rows & range).any() && (dependencies.rows & ~range).none();
    }
 
    // The patched tokens as the program, with their length token set
