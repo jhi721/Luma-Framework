@@ -388,6 +388,22 @@ struct TraceDrawCallData
    // Free text game code attached to this entry during the capture (see "Mcp::Annotate")
    std::string note;
 
+#if DEVELOPMENT
+   // What changed after the entry was recorded, before the draw ran: the pixel shader the game mod's draw hook left bound instead of the recorded one or its variants
+   // (D3D11, 0 = unchanged, UINT32_MAX = not a known shader), whether it left another blend state or factor (D3D11), and whether Luma scaled the bound viewports
+   // to a scaled render target (the recorded ones are the game's on D3D12)
+   uint32_t override_ps_hash = 0;
+   bool override_blend = false;
+   bool viewport_scaled = false;
+   bool HasOverride() const
+   {
+      return override_ps_hash != 0 || override_blend || viewport_scaled;
+   }
+   // The order the command list recorded the entry in (from 1), and on D3D12 the order the list was executed in during the capture (from 1, 0 = not executed by then)
+   uint32_t record_seq = 0;
+   uint32_t submit_index = 0;
+#endif
+
    // TODO: these might not always be filled up!
    bool any_input_resources_format_upgraded = false;
    bool any_output_resources_format_upgraded = false;
@@ -518,6 +534,12 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
          ? it->second.handle
          : bound_pipeline.handle;
       if (handle == 0) return;
+#if DEVELOPMENT
+      if (variant == Shader::ShaderVariant::Patched)
+      {
+         trace_hook_patched_stages |= stages;
+      }
+#endif
 
       if ((stages & reshade::api::shader_stage::vertex) != 0)
          native_device_context->VSSetShader(reinterpret_cast<ID3D11VertexShader*>(handle), nullptr, 0);
@@ -681,6 +703,10 @@ struct __declspec(uuid("90d9d05b-fdf5-44ee-8650-3bfd0810667a")) CommandListData
    bool any_dispatch_done = false;
 
    ShaderCustomDepthStencilType temp_custom_depth_stencil = ShaderCustomDepthStencilType::None;
+
+   uint32_t trace_record_seq = 0; // The last "TraceDrawCallData::record_seq"
+   // The stages the game mod's draw hook drew with the patched variant ("UseShaderVariant()"), cleared before each hook
+   reshade::api::shader_stage trace_hook_patched_stages = {};
 #endif
 
 #if DX12
@@ -824,6 +850,7 @@ struct __declspec(uuid("cfebf6d4-d184-4e1a-ac14-09d088e560ca")) DeviceData
    D3D12State::LiveResources live_resources;
    // The frame capture, joined from the command lists in submission order (the queue's immediate command list is ReShade's own)
    CommandListData trace_command_list_data;
+   uint32_t trace_submit_count = 0; // The last "TraceDrawCallData::submit_index"
    D3D12Readback::State readback; // The dev MCP's GPU copies
 #if ENABLE_MINHOOK
    D3D12ResourceCreation::TextureKinds texture_kinds; // How the game created each live texture, for the dev MCP's "creation" (see "includes/d3d12_resource_creation.h")

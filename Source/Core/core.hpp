@@ -6855,7 +6855,7 @@ namespace
    // Command lists record their own capture entries, "OnExecuteCommandList()" joins them in submission order
    // A bundle records its draws whether a capture runs or not: it is often recorded once and executed every frame, and its entries join the capture of the list that executes it
    // ("OnExecuteSecondaryCommandList()"). They go with its next reset.
-   void TraceDrawOrDispatch(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data)
+   void TraceDrawOrDispatch(reshade::api::command_list* cmd_list, const DrawDispatchData& draw_dispatch_data, bool is_dispatch)
    {
       CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
       const auto lock_trace = LockTraceIfRunning();
@@ -6865,6 +6865,9 @@ namespace
       const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
       const std::lock_guard<std::recursive_mutex> lock_dumping(s_mutex_dumping);
       D3D12Trace::AddTraceDrawCallData(&cmd_list_data.trace_draw_calls_data, cmd_list->get_device()->get_private_data<DeviceData>(), cmd_list, cmd_list_data.d3d12_state, shader_cache, draw_dispatch_data);
+      TraceDrawCallData& entry = cmd_list_data.trace_draw_calls_data.back();
+      entry.record_seq = ++cmd_list_data.trace_record_seq;
+      entry.viewport_scaled = !is_dispatch && cmd_list_data.viewports_scaled; // Scaled natively before this ("OnDrawOrDispatchD3D12()"), "d3d12_state" keeps the game's
    }
 
    // Records a copy, resolve or clear on the command list's capture: "fill" sets the entry up ("D3D12Trace::FillCopy()" and "FillClear()") and
@@ -7745,7 +7748,7 @@ namespace
       }
 
 #if DEVELOPMENT
-      TraceDrawOrDispatch(cmd_list, draw_dispatch_data);
+      TraceDrawOrDispatch(cmd_list, draw_dispatch_data, is_dispatch);
       // TEMP diagnostic: the hashes the bind took against the pipeline cache's
       {
          DeviceData& diag_device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
@@ -7943,6 +7946,12 @@ namespace
       // ponytail: moved, so a list executed again without a reset is only captured once
       auto& entries = cmd_list_data->trace_draw_calls_data;
       D3D12Trace::ResolveTableDescriptors(&entries, &device_data);
+      // ReShade raises one event per list, not per "ExecuteCommandLists()" call: the lists of one call get consecutive indices
+      const uint32_t submit_index = ++device_data.trace_submit_count;
+      for (TraceDrawCallData& entry : entries)
+      {
+         entry.submit_index = submit_index;
+      }
       trace_cmd_list_data.trace_draw_calls_data.insert(trace_cmd_list_data.trace_draw_calls_data.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
       entries.clear();
 #endif // DEVELOPMENT
@@ -12232,6 +12241,11 @@ namespace
 
       // Frame capture: entries for this draw start here (stamped post-decision below).
       const size_t trace_start_index = cmd_list_data.trace_draw_calls_data.size();
+      cmd_list_data.trace_hook_patched_stages = {};
+      // What the game mod's draw hook could change, compared after it ("TraceDrawCallData::override_ps_hash" and "override_blend")
+      com_ptr<ID3D11PixelShader> trace_pre_hook_pixel_shader;
+      com_ptr<ID3D11BlendState> trace_pre_hook_blend_state;
+      FLOAT trace_pre_hook_blend_factor[4] = {};
 
       {
          // Do this before any custom code runs as the state might change
@@ -12254,6 +12268,12 @@ namespace
                {
                   AddTraceDrawCallData(cmd_list_data.trace_draw_calls_data, device_data, native_device_context, cmd_list_data.pipeline_state_original_pixel_shader.handle, shader_cache, last_draw_dispatch_data, device_data.resource_upgrades.original_resource_views_to_mirrored_upgraded_resource_views);
                }
+               native_device_context->PSGetShader(&trace_pre_hook_pixel_shader, nullptr, nullptr);
+               native_device_context->OMGetBlendState(&trace_pre_hook_blend_state, trace_pre_hook_blend_factor, nullptr);
+            }
+            for (size_t i = trace_start_index; i < cmd_list_data.trace_draw_calls_data.size(); ++i)
+            {
+               cmd_list_data.trace_draw_calls_data[i].record_seq = ++cmd_list_data.trace_record_seq;
             }
          }
       }
@@ -12875,32 +12895,78 @@ namespace
             const auto lock_trace = LockTraceIfRunning();
             if (lock_trace && trace_running)
             {
+               // The shaders and blend state the draw runs with, as the hook left them (a hook that swaps and restores them around its own draw leaves nothing to see)
+               com_ptr<ID3D11VertexShader> vertex_shader;
+               com_ptr<ID3D11PixelShader> pixel_shader;
+               com_ptr<ID3D11ComputeShader> compute_shader;
+               uint32_t override_ps_hash = 0;
+               bool override_blend = false;
+               if (is_dispatch)
+               {
+                  native_device_context->CSGetShader(&compute_shader, nullptr, nullptr);
+               }
+               else
+               {
+                  native_device_context->VSGetShader(&vertex_shader, nullptr, nullptr);
+                  native_device_context->PSGetShader(&pixel_shader, nullptr, nullptr);
+                  com_ptr<ID3D11BlendState> blend_state;
+                  FLOAT blend_factor[4] = {};
+                  native_device_context->OMGetBlendState(&blend_state, blend_factor, nullptr);
+                  // D3D11 hands out one object per blend desc, so comparing the objects compares the descs
+                  override_blend = blend_state != trace_pre_hook_blend_state || std::memcmp(blend_factor, trace_pre_hook_blend_factor, sizeof(blend_factor)) != 0;
+                  // Pipeline handles are the native shaders on D3D11. Another shader than the recorded one or its clone ("UseShaderVariant()" swaps those)
+                  const uint64_t pixel_shader_handle = reinterpret_cast<uint64_t>(pixel_shader.get());
+                  if (pixel_shader != trace_pre_hook_pixel_shader && pixel_shader_handle != cmd_list_data.pipeline_state_original_pixel_shader.handle)
+                  {
+                     const std::shared_lock lock_generic(s_mutex_generic);
+                     const auto clone_it = device_data.pipeline_cache_by_pipeline_clone_handle.find(pixel_shader_handle);
+                     if (clone_it == device_data.pipeline_cache_by_pipeline_clone_handle.end() || clone_it->second != cmd_list_data.bound_pixel_cached_pipeline)
+                     {
+                        const auto it = device_data.pipeline_cache_by_pipeline_handle.find(pixel_shader_handle);
+                        override_ps_hash = (it != device_data.pipeline_cache_by_pipeline_handle.end() && it->second && !it->second->shader_hashes.empty()) ? it->second->shader_hashes[0] : UINT32_MAX;
+                     }
+                  }
+               }
                const std::unique_lock lock_trace_2(cmd_list_data.mutex_trace);
                for (size_t i = trace_start_index; i < cmd_list_data.trace_draw_calls_data.size(); ++i)
                {
                   auto& entry = cmd_list_data.trace_draw_calls_data[i];
                   if (entry.type != TraceDrawCallData::TraceDrawCallType::Shader) continue;
-                  // Determine patch_enabled from shader hash, clone_variant from bound handle.
                   uint32_t shader_hash = 0;
+                  reshade::api::shader_stage stage = {};
+                  uint64_t bound_handle = 0;
                   if (entry.pipeline_handle == cmd_list_data.pipeline_state_original_vertex_shader.handle)
                   {
-                     entry.clone_variant = Shader::ShaderVariant::Original;
+                     stage = reshade::api::shader_stage::vertex;
+                     bound_handle = reinterpret_cast<uint64_t>(vertex_shader.get());
                      if (!cmd_list_data.pipeline_state_original_graphics_shader_hashes.vertex_shaders.empty())
                         shader_hash = *cmd_list_data.pipeline_state_original_graphics_shader_hashes.vertex_shaders.begin();
                   }
                   else if (entry.pipeline_handle == cmd_list_data.pipeline_state_original_pixel_shader.handle)
                   {
-                     entry.clone_variant = Shader::ShaderVariant::Original;
+                     stage = reshade::api::shader_stage::pixel;
+                     bound_handle = reinterpret_cast<uint64_t>(pixel_shader.get());
+                     entry.override_ps_hash = override_ps_hash;
                      if (!cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders.empty())
                         shader_hash = *cmd_list_data.pipeline_state_original_graphics_shader_hashes.pixel_shaders.begin();
                   }
                   else if (entry.pipeline_handle == cmd_list_data.pipeline_state_original_compute_shader.handle)
                   {
-                     entry.clone_variant = Shader::ShaderVariant::Original;
+                     stage = reshade::api::shader_stage::compute;
+                     bound_handle = reinterpret_cast<uint64_t>(compute_shader.get());
                      if (!cmd_list_data.pipeline_state_original_compute_shader_hashes.compute_shaders.empty())
                         shader_hash = *cmd_list_data.pipeline_state_original_compute_shader_hashes.compute_shaders.begin();
                   }
-                  entry.patch_enabled = !shader_hash ? false : cmd_list_data.patch_clone_handles.contains(shader_hash);
+                  if (!is_dispatch)
+                  {
+                     entry.override_blend = override_blend;
+                     entry.viewport_scaled = cmd_list_data.viewports_scaled; // Luma scaled them before the hook (or for an earlier draw)
+                  }
+                  const auto clone_it = (shader_hash ? cmd_list_data.patch_clone_handles.find(shader_hash) : cmd_list_data.patch_clone_handles.end());
+                  entry.patch_enabled = clone_it != cmd_list_data.patch_clone_handles.end();
+                  // The clone ran if the hook drew with it, or it's bound for the draw (by the bind for replaced shaders, or left by the hook)
+                  const bool clone_ran = (cmd_list_data.trace_hook_patched_stages & stage) != 0 || (entry.patch_enabled && clone_it->second.handle == bound_handle);
+                  entry.clone_variant = (clone_ran ? Shader::ShaderVariant::Patched : Shader::ShaderVariant::Original);
                }
                // Luma passes the game drew from its hook (SMAA, RCAS, bloom, SR), after the draw's own entries
                MoveInjectedPassTraces(&cmd_list_data.trace_draw_calls_data, native_device_context);
