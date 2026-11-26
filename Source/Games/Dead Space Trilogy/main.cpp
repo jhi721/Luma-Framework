@@ -1094,6 +1094,8 @@ protected:
       auto& gd = GetGameDeviceData(device_data);
       gd.mv.scene_open = false;
       gd.mv.scene_done = true;
+      // The scene rendered this frame, also when no post pass flags it (Core's SR tick reads it)
+      device_data.has_drawn_main_post_processing = true;
       DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
       DrawStateStack<DrawStateStackType::Compute> compute_state;
       graphics_state.Cache(native_device_context, device_data.uav_max_count);
@@ -1549,6 +1551,21 @@ protected:
 
    // The game's IDirect3DDevice9* (for "GammaRamp"): null on another exe build or before the device exists
    virtual IDirect3DDevice9* GetGameDevice() const = 0;
+
+   // The game's copy of the scene ends a scene no post pass ended (the fill and the upscaler run before the copy). The 2D draws between
+   // the scene and the copy go into the upscaler's input too (the reactive mask covers the blended ones).
+   static void EndSceneAtCopy(ID3D11Device* native_device, DeviceData& device_data, uint64_t src_resource, bool infinite_depth)
+   {
+      auto& gd = GetGameDeviceData(device_data);
+      if (!gd.mv.active || !gd.mv.scene_open || !gd.mv.scene_color || src_resource != reinterpret_cast<uintptr_t>(gd.mv.scene_color.get()))
+         return;
+#if DEVELOPMENT
+      gd.mv.stats.ended_by = 0;
+#endif
+      com_ptr<ID3D11DeviceContext> native_device_context;
+      native_device->GetImmediateContext(&native_device_context);
+      EndScene(native_device, native_device_context.get(), device_data, infinite_depth);
+   }
 
    // Copies the frame into "ui_bound", whose view is in "view_format" (the render target view's: the frame may be typeless)
    static void CaptureUiBound(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeadSpaceGameDeviceData* gd, ID3D11Resource* frame_resource, DXGI_FORMAT view_format)
@@ -2383,6 +2400,14 @@ namespace DS1
          LumaDisplayMapGame::OnInit(async);
       }
 
+      // Frames without any post pass (live 2026-11-26: gameplay with no uber, bloom or EdgeAA) end the scene at the game's copy of it
+      // into the back buffer (D3DXLoadSurfaceFromSurface)
+      bool OverrideCopyResource(ID3D11Device* native_device, DeviceData& device_data, uint64_t& dst_resource, uint64_t& src_resource) override
+      {
+         EndSceneAtCopy(native_device, device_data, src_resource, MotionVectorGame::infinite_depth);
+         return false;
+      }
+
       DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
       {
          const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
@@ -2410,8 +2435,8 @@ namespace DS1
          // resolution passes aren't the frame. DeadSpaceFixes' FXAA (the EdgeAA pass) and SSAA downsample (into the back buffer) are post
          // passes too. The first of them (live: the bloom downsample 0x962908C3, the first pass reading the canvas; else the uber, depth of
          // field, the EdgeAA pass or DeadSpaceFixes' FXAA) also ends the scene for the upscalers ("DrawSceneMotionVectors"): the fill and
-         // the upscaler run before it. The scene copy 0x6B413C5D doesn't: it's a draw that also runs mid-forward and for the menus' render
-         // to texture.
+         // the upscaler run before it; without one, the copy into the back buffer does ("OverrideCopyResource"). The scene copy 0x6B413C5D
+         // doesn't: it's a draw that also runs mid-forward and for the menus' render to texture.
          const bool post = uber || std::ranges::binary_search(post_pixel_shaders, pixel_shader_hash);
          if (is_immediate && post)
          {
@@ -2664,16 +2689,7 @@ namespace DS2
       // The game's copy of the scene (MarkerPatch's SMAA input, the copy to the UI canvas) ends a scene no post pass ended
       bool OverrideCopyResource(ID3D11Device* native_device, DeviceData& device_data, uint64_t& dst_resource, uint64_t& src_resource) override
       {
-         auto& gd = GetGameDeviceData(device_data);
-         if (gd.mv.active && gd.mv.scene_open && gd.mv.scene_color && src_resource == reinterpret_cast<uintptr_t>(gd.mv.scene_color.get()))
-         {
-#if DEVELOPMENT
-            gd.mv.stats.ended_by = 0;
-#endif
-            com_ptr<ID3D11DeviceContext> native_device_context;
-            native_device->GetImmediateContext(&native_device_context);
-            EndScene(native_device, native_device_context.get(), device_data, MotionVectorGame::infinite_depth);
-         }
+         EndSceneAtCopy(native_device, device_data, src_resource, MotionVectorGame::infinite_depth);
          return false;
       }
 
