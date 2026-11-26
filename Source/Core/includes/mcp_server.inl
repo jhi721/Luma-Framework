@@ -461,11 +461,67 @@ namespace Mcp
       return resource;
    }
 #endif // DX11
-   void Unregister(const void* owner)
+   // Game shader hash lists (e.g. "uber", "ui"), listed in the "tags" of the trace entries whose shaders they contain ("luma_trace_list tag=<name>")
+   struct ShaderTag
+   {
+      std::string name;
+      std::vector<uint32_t> hashes; // Sorted
+      const void* owner = nullptr;
+   };
+   std::shared_mutex s_mutex_shader_tags;
+   std::vector<ShaderTag> shader_tags; // Guarded by "s_mutex_shader_tags"
+
+   // Copies the hashes; registering a tag again replaces it
+   void RegisterShaderTags(std::string_view tag, std::span<const uint32_t> hashes, const void* owner = nullptr)
+   {
+      std::vector<uint32_t> sorted_hashes(hashes.begin(), hashes.end());
+      std::ranges::sort(sorted_hashes);
+      const std::unique_lock lock(s_mutex_shader_tags);
+      std::erase_if(shader_tags, [&](const ShaderTag& other)
+         { return other.name == tag; });
+      shader_tags.push_back({std::string(tag), std::move(sorted_hashes), owner});
+   }
+
+   // A game shader's outcome in a motion vector patch cache ("SceneMotionVectors::RegisterDevValues"), listed by "luma_mv_patches"
+   struct MotionVectorPatchRecord
+   {
+      uint32_t hash = 0;
+      std::string variant;    // A cache variant of the hash (previous vertices layout, replacement version), empty for none
+      const char* patch = ""; // "VS", or the pixel shader patch kind
+      bool patched = false;
+      std::string refusal;        // Why it wasn't patched
+      uint32_t camera_offset = 0; // Vertex shaders: the camera's vc4 byte offset (0 for none: no motion vectors)
+   };
+   using MotionVectorPatchLister = std::function<std::vector<MotionVectorPatchRecord>()>;
+   std::vector<std::pair<const void*, MotionVectorPatchLister>> motion_vector_patch_listers; // Guarded by "s_mutex_dev_values"
+
+   // "list" reads the owner's state: "Unregister(owner)" before that state goes
+   void RegisterMotionVectorPatches(const void* owner, MotionVectorPatchLister list)
    {
       const std::lock_guard lock(s_mutex_dev_values);
-      std::erase_if(dev_values, [&](const DevValue& dev_value)
-         { return dev_value.owner == owner; });
+      std::erase_if(motion_vector_patch_listers, [&](const auto& lister)
+         { return lister.first == owner; });
+      motion_vector_patch_listers.emplace_back(owner, std::move(list));
+   }
+
+   bool HasAnyShader(const std::vector<uint32_t>& sorted_hashes, const Shader::CachedPipeline& pipeline)
+   {
+      return std::ranges::any_of(pipeline.shader_hashes, [&](uint32_t shader_hash)
+         { return std::ranges::binary_search(sorted_hashes, shader_hash); });
+   }
+
+   void Unregister(const void* owner)
+   {
+      {
+         const std::lock_guard lock(s_mutex_dev_values);
+         std::erase_if(dev_values, [&](const DevValue& dev_value)
+            { return dev_value.owner == owner; });
+         std::erase_if(motion_vector_patch_listers, [&](const auto& lister)
+            { return lister.first == owner; });
+      }
+      const std::unique_lock lock(s_mutex_shader_tags);
+      std::erase_if(shader_tags, [&](const ShaderTag& shader_tag)
+         { return shader_tag.owner == owner; });
    }
 
    // Attaches a note to the draw being processed in the current capture (e.g. the game's motion vector decision), shown by "luma_trace_list".
@@ -569,6 +625,16 @@ namespace Mcp
 #endif
    }
 
+   // Whether a draw blends into RT0 (D3D12: its enable flag only, the blend helpers are D3D11's)
+   bool IsRT0Blended(const TraceDrawCallData& entry)
+   {
+#if DX11
+      return !IsRTBlendDisabled(entry.blend_desc.RenderTarget[0]);
+#else
+      return entry.blend_desc.RenderTarget[0].BlendEnable;
+#endif
+   }
+
    // Needs "s_mutex_generic" and "s_mutex_loading" (shared)
    void WriteTraceEntrySummary(JsonWriter* w, const DeviceData& device_data, const TraceDrawCallData& entry, size_t index)
    {
@@ -586,6 +652,21 @@ namespace Mcp
          {
             w->Field("stage", pipeline->StageName());
             w->Hash("hash", pipeline->shader_hashes[0]);
+            {
+               const std::shared_lock lock(s_mutex_shader_tags);
+               bool has_tags = false;
+               for (const ShaderTag& shader_tag : shader_tags)
+               {
+                  if (!HasAnyShader(shader_tag.hashes, *pipeline))
+                     continue;
+                  if (!has_tags)
+                     w->Key("tags").BeginArray();
+                  has_tags = true;
+                  w->Value(shader_tag.name);
+               }
+               if (has_tags)
+                  w->EndArray();
+            }
 #if DX12 // One entry per draw: every stage of the PSO
             w->Key("shaders").BeginObject();
             for (size_t i = 0; i < pipeline->shader_hashes.size(); i++)
@@ -636,7 +717,11 @@ namespace Mcp
       if (!flags.empty())
          w->Field("upgrade_flags", flags);
       if (entry.IsRTVValid(0))
+      {
          w->Field("rt0", std::format("{} {}x{}", GetFormatNameSafe(entry.rtv_format[0]), entry.rtv_size[0].x, entry.rtv_size[0].y));
+         if (entry.type == TraceDrawCallData::TraceDrawCallType::Shader)
+            w->Field("blend", IsRT0Blended(entry));
+      }
       else if (entry.type != TraceDrawCallData::TraceDrawCallType::Shader && !entry.rt_hash[0].empty()) // A whole resource target, see "WriteTraceEntryDetails"
          w->Field("rt0", std::format("{} {}x{}", GetFormatNameSafe(entry.rt_format[0]), entry.rt_size[0].x, entry.rt_size[0].y));
       if (entry.IsDSVValid() && entry.depth_state != TraceDrawCallData::DepthStateType::Disabled)
@@ -645,6 +730,26 @@ namespace Mcp
          w->Field("copy_kind", EnumName(copy_kind_names, size_t(entry.copy_info.kind)));
       if (!entry.note.empty())
          w->Field("note", entry.note);
+      if (entry.HasOverride())
+      {
+         w->Key("override").BeginObject();
+         if (entry.override_ps_hash == UINT32_MAX)
+            w->Field("ps", "unknown");
+         else if (entry.override_ps_hash != 0)
+            w->Hash("ps", entry.override_ps_hash);
+         if (entry.override_blend)
+            w->Field("blend", true);
+         if (entry.viewport_scaled)
+            w->Field("viewport_scaled", true);
+         w->EndObject();
+      }
+      if (entry.record_seq != 0)
+         w->Field("seq", entry.record_seq);
+#if DX12 // The lists record in parallel and join in their execution order
+      w->Field("thread", entry.thread_id._Get_underlying_id());
+      if (entry.submit_index != 0)
+         w->Field("submit", entry.submit_index);
+#endif
    }
 
    constexpr const char* comparison_func_names[] = {"", "NEVER", "LESS", "EQUAL", "LESS_EQUAL", "GREATER", "NOT_EQUAL", "GREATER_EQUAL", "ALWAYS"};
@@ -730,7 +835,9 @@ namespace Mcp
    void WriteTraceEntryDetails(JsonWriter* w, const DeviceData& device_data, const TraceDrawCallData& entry, size_t index)
    {
       WriteTraceEntrySummary(w, device_data, entry, index);
+#if DX11 // D3D12's is in the summary
       w->Field("thread", entry.thread_id._Get_underlying_id());
+#endif
       w->Field("patch_enabled", entry.patch_enabled);
 
       const auto* pipeline = entry.type == TraceDrawCallData::TraceDrawCallType::Shader ? FindPipeline(device_data, entry.pipeline_handle) : nullptr;
@@ -1008,14 +1115,34 @@ namespace Mcp
       bool include_bindings;
       bool include_buffer_writes;
       bool replaced_only;
+      bool overridden_only;
       const std::string* type;
       std::optional<uint32_t> hash;
       const std::string* stage;
       const std::string* resource;
+      const std::string* rt;
+      const std::string* note;
+      std::optional<bool> depth_test; // Pixel shader draws only, as "blend"
+      std::optional<bool> blend;
+      std::optional<std::vector<uint32_t>> tag_hashes; // A copy: an unknown tag matches nothing
 
       explicit TraceFilter(const Job& job)
-          : include_vs(job.BoolArg("include_vs", false)), include_bindings(job.BoolArg("include_bindings", false)), include_buffer_writes(job.BoolArg("include_buffer_writes", false)), replaced_only(job.BoolArg("replaced_only", false)), type(job.Arg("type")), hash(job.HashArg("hash")), stage(job.Arg("stage")), resource(job.Arg("resource"))
+          : include_vs(job.BoolArg("include_vs", false)), include_bindings(job.BoolArg("include_bindings", false)), include_buffer_writes(job.BoolArg("include_buffer_writes", false)), replaced_only(job.BoolArg("replaced_only", false)), overridden_only(job.BoolArg("overridden_only", false)), type(job.Arg("type")), hash(job.HashArg("hash")), stage(job.Arg("stage")), resource(job.Arg("resource")), rt(job.Arg("rt")), note(job.Arg("note"))
       {
+         const auto optional_bool_arg = [&](const char* key) -> std::optional<bool>
+         {
+            if (!job.Arg(key))
+               return std::nullopt;
+            return job.BoolArg(key, false);
+         };
+         depth_test = optional_bool_arg("depth_test");
+         blend = optional_bool_arg("blend");
+         if (const std::string* tag = job.Arg("tag"))
+         {
+            const std::shared_lock lock(s_mutex_shader_tags);
+            const auto it = std::ranges::find(shader_tags, *tag, &ShaderTag::name);
+            tag_hashes = it != shader_tags.end() ? it->hashes : std::vector<uint32_t>();
+         }
       }
 
       bool Matches(const DeviceData& device_data, const TraceDrawCallData& entry) const
@@ -1040,6 +1167,19 @@ namespace Mcp
          };
          if ((type && *type != EnumName(trace_type_names, size_t(entry.type))) || (hash && (!pipeline || std::ranges::find(pipeline->shader_hashes, *hash) == pipeline->shader_hashes.end())) || (stage && (!pipeline || !has_stage())) || (replaced_only && (!pipeline || !IsReplaced(*pipeline))))
             return false;
+         if (overridden_only && entry.clone_variant == Shader::ShaderVariant::Original && !entry.HasOverride())
+            return false;
+         if ((tag_hashes && (!pipeline || !HasAnyShader(*tag_hashes, *pipeline))) || (rt && !std::ranges::contains(entry.rt_hash, *rt)) || (note && entry.note.find(*note) == std::string::npos))
+            return false;
+         if (depth_test || blend)
+         {
+            if (!pipeline || !pipeline->HasPixelShader())
+               return false;
+            // No bound depth buffer tests nothing
+            const bool tests_depth = entry.IsDSVValid() && (entry.depth_state == TraceDrawCallData::DepthStateType::TestOnly || entry.depth_state == TraceDrawCallData::DepthStateType::TestAndWrite);
+            if ((depth_test && *depth_test != tests_depth) || (blend && *blend != IsRT0Blended(entry)))
+               return false;
+         }
          const auto has_resource = [&](const auto& hashes)
          { return std::ranges::find(hashes, *resource) != std::end(hashes); };
          return !resource || entry.ds_hash == *resource || has_resource(entry.rt_hash) || has_resource(entry.sr_hash) || has_resource(entry.ua_hash) || has_resource(entry.cb_hash);
@@ -1299,6 +1439,9 @@ namespace Mcp
       bool draw_succeeded;
       float jitter_x; // What this draw gave the upscaler: its readback lands some presents later, so the history can't be matched to the textures
       float jitter_y;
+      // "FrameIndex" at the draw (the readback file names have the later one of the readback), and the draw's own "DrawData::frame_index"
+      uint32_t luma_frame;
+      unsigned long long frame_index;
    };
    std::atomic<bool> sr_capture_armed = false;
    std::mutex s_mutex_sr_capture;
@@ -1398,6 +1541,10 @@ namespace Mcp
          captured.draw_succeeded = inner->Draw(data, command_list, draw_data);
          captured.jitter_x = draw_data.jitter_x;
          captured.jitter_y = draw_data.jitter_y;
+         captured.luma_frame = cb_luma_global_settings.FrameIndex;
+         captured.frame_index = draw_data.frame_index;
+         // The Halton phase "GetSRJitter()" gives this frame
+         const uint32_t jitter_phase = cb_luma_global_settings.FrameIndex % uint32_t(data ? (std::max)(inner->GetJitterPhases(data), 1) : SR::GetDefaultJitterPhases());
 #if DX11 // D3D12: the SR pass isn't a trace entry yet
          QueueInjectedPassTrace(command_list, "Luma Super Resolution", draw_data.output_color);
 #endif
@@ -1423,7 +1570,7 @@ namespace Mcp
 #endif
                }
             }
-            history[draw_count % sr_history_size] = {cb_luma_global_settings.FrameIndex, draw_data.frame_index, draw_data.jitter_x, draw_data.jitter_y, draw_data.pre_exposure, draw_data.vert_fov, draw_data.render_width, draw_data.render_height, draw_data.reset, captured.draw_succeeded};
+            history[draw_count % sr_history_size] = {cb_luma_global_settings.FrameIndex, draw_data.frame_index, jitter_phase, draw_data.jitter_x, draw_data.jitter_y, draw_data.pre_exposure, draw_data.vert_fov, draw_data.render_width, draw_data.render_height, draw_data.reset, captured.draw_succeeded};
             draw_count++;
             failures += captured.draw_succeeded ? 0 : 1;
             resets += draw_data.reset ? 1 : 0;
@@ -1498,11 +1645,11 @@ namespace Mcp
                consecutive_repeats += (previous.jitter_x == record.jitter_x && previous.jitter_y == record.jitter_y) ? 1 : 0;
             }
             unique_jitters.emplace(record.jitter_x, record.jitter_y);
-            w->BeginArray().Value(record.luma_frame).Value(record.frame_index).Value(record.jitter_x).Value(record.jitter_y).Value(record.pre_exposure).Value(record.vert_fov);
+            w->BeginArray().Value(record.luma_frame).Value(record.frame_index).Value(record.phase).Value(record.jitter_x).Value(record.jitter_y).Value(record.pre_exposure).Value(record.vert_fov);
             w->Value(record.render_width).Value(record.render_height).Value(record.reset).Value(record.succeeded).EndArray();
          }
          w->EndArray();
-         w->Field("history_columns", "luma_frame, frame_index, jitter_x, jitter_y, pre_exposure, vert_fov, render_width, render_height, reset, succeeded");
+         w->Field("history_columns", "luma_frame, frame_index, phase, jitter_x, jitter_y, pre_exposure, vert_fov, render_width, render_height, reset, succeeded");
          w->Field("unique_jitters", unique_jitters.size()).Field("consecutive_repeated_jitters", consecutive_repeats);
       }
 
@@ -1517,6 +1664,7 @@ namespace Mcp
       {
          uint32_t luma_frame = 0;
          unsigned long long frame_index = 0;
+         uint32_t phase = 0;
          float jitter_x = 0.f;
          float jitter_y = 0.f;
          float pre_exposure = 0.f;
@@ -2914,7 +3062,7 @@ namespace Mcp
       }
       auto& w = job->result;
 #if DX11
-      w.Field("draw_succeeded", captured->draw_succeeded).Field("jitter_x", captured->jitter_x).Field("jitter_y", captured->jitter_y).Key("textures").BeginArray();
+      w.Field("draw_succeeded", captured->draw_succeeded).Field("luma_frame", captured->luma_frame).Field("frame_index", captured->frame_index).Field("jitter_x", captured->jitter_x).Field("jitter_y", captured->jitter_y).Key("textures").BeginArray();
       for (const auto& [name, texture] : captured->textures)
       {
          w.BeginObject().Field("name", name);
@@ -2970,7 +3118,7 @@ namespace Mcp
       }
       if (pending && ++job->frames < readback_max_gpu_frames)
          return false;
-      w.Field("draw_succeeded", captured->draw_succeeded).Field("jitter_x", captured->jitter_x).Field("jitter_y", captured->jitter_y).Key("textures").BeginArray();
+      w.Field("draw_succeeded", captured->draw_succeeded).Field("luma_frame", captured->luma_frame).Field("frame_index", captured->frame_index).Field("jitter_x", captured->jitter_x).Field("jitter_y", captured->jitter_y).Key("textures").BeginArray();
       for (D3D12Readback::Capture& capture : readback.captures)
       {
          w.BeginObject().Field("name", capture.name);
@@ -3090,6 +3238,49 @@ namespace Mcp
 #if DX12
       w.Field("bindings_note", "A shader's bindings are read at its first frame capture (luma_trace_capture)");
 #endif
+      w.Field("matched", matched).Field("offset", offset).Field("returned", matched > offset ? (std::min)(matched - offset, limit) : 0);
+      return true;
+   }
+
+   bool RunMotionVectorPatches(Job* job)
+   {
+      const bool refused_only = job->BoolArg("refused_only", false);
+      const std::string* stage = job->Arg("stage"); // "VS" or "PS"
+      const size_t offset = size_t((std::max)(job->IntArg("offset", 0), int64_t(0)));
+      const size_t limit = size_t(job->IntArg("limit", 200, 1, 100000));
+      const std::lock_guard lock(s_mutex_dev_values); // Keeps the listed states alive
+      if (motion_vector_patch_listers.empty())
+      {
+         job->error = "No motion vector patch caches: the game doesn't use SceneMotionVectors (games calling MotionVectorPatch directly aren't listed)";
+         return true;
+      }
+      auto& w = job->result;
+      size_t matched = 0;
+      uint32_t totals[2][2] = {}; // [VS, PS][patched, refused]
+      w.Key("shaders").BeginArray();
+      for (const auto& [owner, list] : motion_vector_patch_listers)
+      {
+         for (const MotionVectorPatchRecord& record : list())
+         {
+            const bool vertex = std::string_view(record.patch) == "VS";
+            totals[vertex ? 0 : 1][record.patched ? 0 : 1]++;
+            if ((refused_only && record.patched) || (stage && _stricmp(stage->c_str(), vertex ? "VS" : "PS") != 0))
+               continue;
+            const size_t index = matched++;
+            if (index < offset || index >= offset + limit)
+               continue;
+            w.BeginObject().Hash("hash", record.hash).Field("stage", vertex ? "VS" : "PS").Field("patch", record.patch).Field("patched", record.patched);
+            if (!record.variant.empty())
+               w.Field("variant", record.variant);
+            if (!record.patched)
+               w.Field("refusal", record.refusal);
+            if (vertex && record.patched)
+               w.Field("camera_offset", record.camera_offset);
+            w.EndObject();
+         }
+      }
+      w.EndArray();
+      w.Key("totals").BeginObject().Field("vs_patched", totals[0][0]).Field("vs_refused", totals[0][1]).Field("ps_patched", totals[1][0]).Field("ps_refused", totals[1][1]).EndObject();
       w.Field("matched", matched).Field("offset", offset).Field("returned", matched > offset ? (std::min)(matched - offset, limit) : 0);
       return true;
    }
@@ -3526,6 +3717,8 @@ namespace Mcp
          return RunShaderList(job, device_data);
       if (tool == "dump_shader")
          return RunDumpShader(job);
+      if (tool == "mv_patches")
+         return RunMotionVectorPatches(job);
       job->error = "Unknown tool " + tool;
       return true;
    }

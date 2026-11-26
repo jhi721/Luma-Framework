@@ -121,12 +121,22 @@ TOOLS = [
     tool(
         "luma_trace_list",
         "List entries of the last capture (compact). Hides VS entries, bindings and buffer writes by default (like the dev UI). "
-        "Fields: index, type, stage, hash, replaced (none/file/patch_*), upgrade_flags (^ input upgraded, v output upgraded, \\ / scaled), rt0, depth, "
-        "copy_kind, note (the game's own per draw decision, e.g. mv / jitter / unpatched / mv_reject=N).",
+        "Fields: index, type, stage, hash, tags (the game's shader lists containing it, e.g. uber / post / ui), replaced (none/file/patch_*), "
+        "upgrade_flags (^ input upgraded, v output upgraded, \\ / scaled), rt0, blend (shader draws: RT0 blends), depth (depth/stencil state, with a depth buffer bound), "
+        "copy_kind, note (the game's own per draw decision, e.g. mv / jitter / unpatched / mv_reject=N), variant (patched: the clone ran), "
+        "override (what the draw ran with instead of the recorded state: ps = the pixel shader the game mod's draw hook left bound, blend = it left another blend state, "
+        "viewport_scaled = Luma scaled the viewports to a scaled target), seq (record order in its command list), thread and submit (D3D12: the recording thread, "
+        "and the order the capture executed the lists in, one per list of an ExecuteCommandLists call).",
         {"type": {"type": "string", "description": "shader, custom, copy, clear, present, cpu_read, cpu_write, ..."},
          "hash": {"type": "string", "description": "Only entries of this shader (0x12345678)"}, "stage": {"type": "string", "description": "PS, VS, CS, GS"},
          "resource": {"type": "string", "description": "Resource id (the 'resource' field of luma_trace_get) read or written by the entry"},
+         "rt": {"type": "string", "description": "Resource id written as a render target (or the target of a copy/clear) by the entry"},
+         "tag": {"type": "string", "description": "Only shaders in this game shader list (the 'tags' field, e.g. uber, post, ui); an unknown tag matches nothing"},
+         "note": {"type": "string", "description": "Only entries whose note contains this text (e.g. mv)"},
+         "depth_test": {"type": "boolean", "description": "Pixel shader draws that test depth (true: a depth buffer bound and a test-only or test-and-write state) or don't (false)"},
+         "blend": {"type": "boolean", "description": "Pixel shader draws that blend into RT0 (true) or overwrite it (false; D3D11 counts a no-op blend as off)"},
          "replaced_only": {"type": "boolean", "description": "Only entries whose shader Luma replaced or patched"},
+         "overridden_only": {"type": "boolean", "description": "Only entries that ran with something else than the recorded state (a patched variant or an 'override')"},
          "include_vs": {"type": "boolean", "description": "Also list vertex shader entries"},
          "include_bindings": {"type": "boolean", "description": "Also list resource binding entries"},
          "include_buffer_writes": {"type": "boolean", "description": "Also list buffer map/update entries"},
@@ -134,11 +144,12 @@ TOOLS = [
     ),
     tool(
         "luma_trace_get",
-        "Full state of one captured entry: RTV/SRV/UAV/DSV resource and view formats and sizes, blend per RT, depth/stencil (func, write, stencil ref/ops), "
+        "Full state of one captured entry (with the luma_trace_list fields, tags included): RTV/SRV/UAV/DSV resource and view formats and sizes, blend per RT, depth/stencil (func, write, stencil ref/ops), "
         "rasterizer (cull, scissor enable, depth clip/bias), all viewports and scissor rects, samplers (filter, address, mip bias), bound cbuffers (with D3D11.1 ranges), "
         "input layout, draw/dispatch arguments, copy kind/regions (copy, region, resolve, buffer), the source/target resources of copies, clears, CPU writes and Luma passes, clear values, custom shader file and compilation errors. "
-        "The state is recorded before the game mod's draw hook runs: a viewport it scales, a blend or shader it swaps in are not shown "
-        "(read the result with luma_read_resource instead).",
+        "The state is recorded before the game mod's draw hook runs; 'variant' and 'override' say what the draw ran with instead (D3D11: the patched variant the hook drew with "
+        "or left bound, a pixel shader or blend state it left bound; both APIs: viewports Luma scaled). A hook that swaps another shader, blend or viewport (or a D3D12 PSO) "
+        "and restores it around its own draw stays invisible: read the result with luma_read_resource.",
         {"index": {"type": "integer", "description": "Entry index from luma_trace_list"}}, ["index"],
     ),
     tool(
@@ -241,12 +252,13 @@ TOOLS = [
     tool(
         "luma_sr_state",
         "What the game feeds DLSS/FSR: settings (render/output size, hdr, inverted depth, MV scale, jittered MVs, auto exposure, preset), the last draw "
-        "(jitter, reset, pre-exposure, FOV, near/far, input formats/sizes), init/deinit/update counts, and per draw history (jitter sequence, resets, failures).",
+        "(jitter, reset, pre-exposure, FOV, near/far, input formats/sizes), init/deinit/update counts, and per draw history (jitter sequence with its Halton phase, Luma frame % jitter phases as GetSRJitter gives it, resets, failures).",
         {"history": {"type": "integer", "description": "History rows (default 32, max 256)"}},
     ),
     tool(
         "luma_sr_capture",
-        "Copy the next DLSS/FSR draw's inputs (color, motion vectors, depth, exposure, reactive/T&C masks) and output, and read them back with stats and previews.",
+        "Copy the next DLSS/FSR draw's inputs (color, motion vectors, depth, exposure, reactive/T&C masks) and output, and read them back with stats and previews. "
+        "luma_frame/frame_index are the draw's; the .bin file names carry the later frame of the readback.",
         {"max_frames": {"type": "integer", "description": "Frames to wait for an upscaler draw (default 30)"},
          **OUT_DIR, **ANALYSIS},
     ),
@@ -254,6 +266,13 @@ TOOLS = [
          {"stage": {"type": "string", "description": "VS, PS, CS, GS"},
           "replaced_only": {"type": "boolean", "description": "Only shaders Luma replaced or patched"},
           "include_unloaded": {"type": "boolean", "description": "Also shaders loaded earlier without a live pipeline now"},
+          "offset": {"type": "integer", "description": "First matched shader returned, for paging"}, "limit": {"type": "integer", "description": "Default 200, 'matched' vs 'returned' says more remain"}}),
+    tool("luma_mv_patches", "Core SceneMotionVectors patch caches (dgVoodoo D3D9 games: Dead Space, Mirror's Edge, MGR, Vanquish, Bayonetta): each game "
+         "shader the motion vector patch was tried on, by stage and patch kind, patched or refused with the reason (else only in ReShade.log), "
+         "a vertex shader's camera_offset (vc4 bytes) and the cache variant (previous vertices layout, replacement version), plus totals. "
+         "Find a hash's draws with luma_trace_list hash=<hash>. Games calling MotionVectorPatch directly (ME, Witcher, BL, SR4, P5S, MoHA, MELE) aren't covered.",
+         {"refused_only": {"type": "boolean", "description": "Only the refused shaders"},
+          "stage": {"type": "string", "description": "VS or PS"},
           "offset": {"type": "integer", "description": "First matched shader returned, for paging"}, "limit": {"type": "integer", "description": "Default 200, 'matched' vs 'returned' says more remain"}}),
     tool("luma_dump_shader", "Write a loaded shader's original bytecode (.cso) to Luma's dump folder, for offline disassembly (Scripts/dxbc.py).",
          {"hash": {"type": "string", "description": "Shader hash (0x12345678)"}}, ["hash"], annotations=LIVE_WRITE),

@@ -160,6 +160,9 @@ namespace SceneMotionVectors
       CameraType camera_type = CameraType::VIEW_PROJECTION;
       bool camera_row_vectors = false; // Its camera's "row_vectors"
       bool frame_camera = false;       // Of the game's "frame_camera" kind
+#if DEVELOPMENT
+      std::string refusal; // Why "shader" is null ("luma_mv_patches")
+#endif
    };
 
    // Motion vector draws by draw key (shaders, buffers, arguments), with their tie-break transform and vc4. A draw takes the previous
@@ -758,6 +761,12 @@ namespace SceneMotionVectors
             std::format("[{}] {} 0x{:08X} {}", Game::log_tag, (vertex ? (previous_vertices ? "MV VS (previous vertices)" : "MV VS") : Game::patch_names[size_t(patch)]), hash, status).c_str());
       }
       record.shader = shader;
+#if DEVELOPMENT
+      if (!shader)
+      {
+         record.refusal = std::move(error);
+      }
+#endif
       const std::unique_lock lock(state->mutex);
       const auto [entry, inserted] = shaders->try_emplace(key, std::move(record));
       return entry->second;
@@ -1528,9 +1537,38 @@ namespace SceneMotionVectors
    }
 
 #if DEVELOPMENT
-   // The last complete frame's counts for the MCP ("luma_dev_values"), as "<prefix>draws", "<prefix>rejected.<reason>" and so on
-   inline void RegisterDevValues(const State& state, const void* owner, const std::string& prefix = "mv.")
+   // The last complete frame's counts for the MCP ("luma_dev_values"), as "<prefix>draws", "<prefix>rejected.<reason>" and so on, and
+   // the patched shader caches ("luma_mv_patches")
+   inline void RegisterDevValues(State& state, const void* owner, const std::string& prefix = "mv.")
    {
+      Mcp::RegisterMotionVectorPatches(owner, [&state]
+         {
+            static constexpr const char* patch_names[size_t(PixelShaderPatch::COUNT)] = {"MOTION_VECTORS", "MASK_ALPHA", "MASK_ADDITIVE", "BLENDED", "GAME_0", "GAME_1", "GAME_2", "GAME_3"};
+            // The cache key's upper 32 bits (see "GetPatchedShader"): a vertex shader's previous vertices layout, a pixel shader's
+            // replacement version
+            const auto variant = [](uint64_t key, bool vertex)
+            {
+               const uint32_t upper = uint32_t(key >> 32);
+               if (upper == 0)
+                  return std::string();
+               if (vertex)
+                  return std::format("previous vertices stride={} offset={} components={}", (upper >> 1) & 0xFFF, (upper >> 13) & 0xFFF, ((upper >> 25) & 1) ? 4 : 3);
+               return std::format("replacement 0x{:08X}", upper);
+            };
+            std::vector<Mcp::MotionVectorPatchRecord> records;
+            const std::shared_lock lock(state.mutex);
+            for (const auto& [key, patched] : state.vertex_shaders)
+            {
+               records.push_back({.hash = uint32_t(key), .variant = variant(key, true), .patch = "VS", .patched = patched.shader != nullptr, .refusal = patched.refusal, .camera_offset = patched.camera_offset});
+            }
+            for (size_t patch = 0; patch < size_t(PixelShaderPatch::COUNT); patch++)
+            {
+               for (const auto& [key, patched] : state.patched_pixel_shaders[patch])
+               {
+                  records.push_back({.hash = uint32_t(key), .variant = variant(key, false), .patch = patch_names[patch], .patched = patched.shader != nullptr, .refusal = patched.refusal});
+               }
+            }
+            return records; });
       const MotionVectorStats& stats = state.last_stats;
       const std::pair<const char*, const uint32_t*> counters[] = {{"draws", &stats.motion_vector_draws}, {"jitter_draws", &stats.jitter_draws}, {"reactive_draws", &stats.reactive_draws}, {"matched", &stats.matched},
          {"camera_only", &stats.camera_only}, {"other_camera", &stats.other_camera}, {"uncopied", &stats.uncopied}, {"maps", &stats.maps}, {"updates", &stats.updates},
