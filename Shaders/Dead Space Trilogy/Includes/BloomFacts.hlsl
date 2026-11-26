@@ -1,5 +1,5 @@
-// Dead Space 2 and 3 (the same dgVoodoo translations): bloom.fx's passes that read the canvas (bb_texture, D3D9 CTAB "bloom_facts"), transcribed from their dgVoodoo
-// translations. Each tap is saturated first: the canvas was UNORM in vanilla, its fp16 mirror goes above 1, and these passes'
+// Dead Space 2 and 3: bloom.fx's passes that read the canvas (bb_texture, D3D9 CTAB "bloom_facts"), transcribed from their dgVoodoo
+// translations, which are the same in both games. Each tap is saturated first: the canvas was UNORM in vanilla, its fp16 mirror goes above 1, and these passes'
 // "sat(tap - bloom_dcolor)" then grew up to 1 / (1 - threshold) times stronger (bright, blotchy bloom). Variants:
 // BLOOM_LOW_HIGH: 0.5 + (highs - lows) * weight (the low/high pass, D3D9 c1 bloom_blackcolor), else highs * weight (the bright pass);
 // BLOOM_MODULATE: the weight is also scaled by modulate_sampler (s1) at bloom_facts.zw.

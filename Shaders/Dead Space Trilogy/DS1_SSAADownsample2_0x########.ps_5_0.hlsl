@@ -5,7 +5,7 @@
 #include "../Includes/DgVoodoo.hlsl"
 
 // Dead Space (2008): DeadSpaceFixes' SSAA downsample (SSAAScale above 1, dgVoodoo 2.87.6 -> ps_5_0 0xB10E5C9B 2x2 taps, 0x06CF49DC 3x3,
-// 0x5406A8BC 4x4), the supersampled frame box averaged into the back buffer (Dead Space 2's MarkerPatch SSAA replacement). Transcribed
+// 0x5406A8BC 4x4), the supersampled frame box averaged into the back buffer (as Dead Space 2's MarkerPatch SSAA replacement). Transcribed
 // from the translation: TAPS x TAPS bilinear taps spread evenly over the back buffer pixel's footprint. DeadSpaceFixes averages in
 // linear (SRGBTEXTURE in, SRGBWRITEENABLE out, where the device supports them): the fp16 mirrors dropped that pair, so the sRGB
 // decode and encode are done here.

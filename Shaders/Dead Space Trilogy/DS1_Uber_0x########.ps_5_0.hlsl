@@ -7,10 +7,10 @@
 // Dead Space (2008): the uber post PS_AABloomlutColor1 (lutcolor.fx, mask 0x4e: EdgeAA, bloom without blackcolor, 1 LUT; blob
 // 055fa7980d80, dgVoodoo 2.87.6 0xCC629DA4), the opening cutscene's. Transcribed from the translation for a DEVELOPMENT A/B of the
 // LUT tail above 1 (DevSetting01): < 1/3 "WrapUberLut" as shipped (UberLutPatch.h: vanilla ratios, the scaled-back grade's
-// brightness), < 2/3 the plain max-channel wrap (LUT(x / m) * m, RenoDX's lut default), else a suggested route: a max-channel
+// relative luminance), < 2/3 the plain max-channel wrap (LUT(x / m) * m, RenoDX's lut default), else a suggested route: a max-channel
 // Reinhard to the display peak (shoulder at 1, strength 2..16 by DevSetting02), then the LUTs on that compressed again from mid gray
-// with the luminance normalization (DevSetting03 > 0.5 turns it off) and a uniform brightness restore, output for the display (the
-// display map passes it through, Includes/DisplayMap.hlsl). Every route keeps the vanilla grade where max3(x) <= 1 except the last.
+// with the luma normalization (DevSetting03 > 0.5 turns it off) and the compression undone uniformly, output for the display (the
+// display map passes it through, Includes/DS_DisplayMap.hlsl). Every route keeps the vanilla grade where max3(x) <= 1 except the last.
 
 cbuffer cb3 : register(b3)
 {

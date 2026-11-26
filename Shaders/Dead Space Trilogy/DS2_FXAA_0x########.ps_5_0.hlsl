@@ -6,7 +6,7 @@
 #include "../Includes/DgVoodoo.hlsl"
 
 // Dead Space 2: MarkerPatch's FXAA (ImprovedAntiAliasingMode 1, in the game's EdgeAA slot: the frame's last pass before the UI; dgVoodoo
-// 2.87.6 -> ps_5_0 0x0A91885E), then the HDR display map (Includes/DisplayMap.hlsl), as the SMAA neighborhood replacement does. The
+// 2.87.6 -> ps_5_0 0x0A91885E), then the HDR display map (Includes/DS_DisplayMap.hlsl), as the SMAA neighborhood replacement does. The
 // translation is stock FXAA 3.11 Quality: preset 39, subpix 0.5, edge threshold 0.125, min 0.0312, luma = BT.601 weights on the
 // gamma encoded frame, posM half a texel off the texcoord. Re-expressed through the shared include with a sampler that applies dgVoodoo's
 // masks and puts that luma in alpha. With an upscaler or Luma's SMAA (LumaData.CustomData1 != 0) the frame is already antialiased:

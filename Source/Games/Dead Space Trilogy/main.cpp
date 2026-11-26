@@ -15,9 +15,9 @@
 // Optional sharpening of the upscaler's or SMAA's output (DLSS-Best-Practices SHP-2)
 #define ENABLE_RCAS 1
 // SMAA ULTRA (1x or T2x) in the game's own AA slot or at the scene's end (see "RunSMAA"); Core registers its 6 passes from
-// Luma_SMAA_impl.hlsl
+// "Luma_SMAA_impl.hlsl"
 #define ENABLE_SMAA 1
-// SMAA's area texture without the U-shape smoothing (see Luma_SMAA_impl.hlsl)
+// SMAA's area texture without the U-shape smoothing (see "Luma_SMAA_impl.hlsl")
 #define SMAA_SMOOTH_U_SHAPES 0
 
 #include "..\..\Core\core.hpp"
@@ -188,11 +188,11 @@ constexpr ShaderRedirect bloom_redirects[] = {
 struct DeadSpaceGameDeviceData final : public GameDeviceData
 {
    // The uber post drew this frame: its LUT tail ("WrapUberLut") already carries the vanilla clip's hue turn, so the display map then
-   // takes no hue from its reference (LumaData.CustomData2, Includes/DS_DisplayMap.hlsl). Dead Space 1/2: it also picks where the display
+   // takes no hue from its reference (LumaData.CustomData2, "DS_DisplayMap.hlsl"). Dead Space 1/2: it also picks where the display
    // map runs (see "scene_over"). Immediate context only.
    bool uber_drawn = false;
    // Dead Space 1/2: the HDR display map ran this frame, before the UI ("DrawDisplayMap", or Dead Space 2's AA slot). The present blit
-   // then doesn't map the frame again (Includes/DS_Present.hlsl). Immediate context only.
+   // then doesn't map the frame again ("DS_Present.hlsl"). Immediate context only.
    bool display_mapped = false;
    // Dead Space 1: a material apply draw ran this frame (the 3D scene): the screen space prims.fx (HUD 0xA5B366DB, 0x0CCDEEF3) also draw
    // inside its forward pass, so from then on only a post pass ends the scene ("scene_over"). Immediate context only.
@@ -203,7 +203,7 @@ struct DeadSpaceGameDeviceData final : public GameDeviceData
    com_ptr<ID3D11Texture2D> display_map_source;
    com_ptr<ID3D11ShaderResourceView> display_map_source_srv;
    // Dead Space 1/2: the frame right after the display map (and a video drawn after it): the present blit bounds what drew later by it,
-   // as the vanilla UNORM frame clamped those blends at 1 (Includes/DS_Present.hlsl). "ui_bound_pending" is the frame of a video drawn after we
+   // as the vanilla UNORM frame clamped those blends at 1 ("DS_Present.hlsl"). "ui_bound_pending" is the frame of a video drawn after we
    // return, copied at the next immediate draw. Immediate context only.
    com_ptr<ID3D11Texture2D> ui_bound;
    com_ptr<ID3D11ShaderResourceView> ui_bound_srv;
@@ -217,7 +217,7 @@ struct DeadSpaceGameDeviceData final : public GameDeviceData
    // HDR: the UI drawn on the canvas after the post chain (Dead Space 3: APT subtitles and prompts, the tutorial holograms, depth tested
    // or not; the menus' panels draw before it, in the scene) draws here instead, premultiplied over transparent black, so the final
    // display pass maps the scene alone and puts the UI over it at the UI paper white (Luma's UI_DRAW_TYPE 2 pre-scale). Its alpha is
-   // the coverage (see "ui_layer_blend"). Immediate context only. Not Core's UI separation (UI_DRAW_TYPE 3): the game composes in its
+   // the coverage (see "DS3::DeadSpace3::OnDrawOrDispatch"). Immediate context only. Not Core's UI separation (UI_DRAW_TYPE 3): the game composes in its
    // own final display pass, so this keeps UI_DRAW_TYPE 2 and rewrites the draws' alpha blend instead.
    com_ptr<ID3D11Texture2D> ui_layer;
    com_ptr<ID3D11RenderTargetView> ui_layer_rtv;
@@ -590,7 +590,7 @@ protected:
       if (size.x == 0 || size.y == 0)
          return false;
 
-      // "DrawSMAA" looks its passes up with ".at()": a shader reload must not release them mid-chain (Sunset Overdrive)
+      // "DrawSMAA" looks its passes up with ".at()": a shader reload must not release them mid-chain (seen in Sunset Overdrive)
       const std::shared_lock lock_shader_objects(s_mutex_shader_objects);
       auto* const copy_vs = FindShader(device_data.native_vertex_shaders, CompileTimeStringHash("Copy VS"));
       // All or nothing: skip SMAA this frame while any pass is missing (async load, live reload)
@@ -1538,7 +1538,7 @@ public:
 };
 
 // Dead Space 1 and 2: no game display pass, so the HDR display map runs where the scene ends, before what draws over it (each game's
-// "scene_over" rule, "DrawDisplayMapOverScene"), else in dgVoodoo's present blit (Includes/DS_Present.hlsl), which also bounds what
+// "scene_over" rule, "DrawDisplayMapOverScene"), else in dgVoodoo's present blit ("DS_Present.hlsl"), which also bounds what
 // drew after the map ("ui_bound"). The brightness slider is a D3D9 gamma ramp ("GammaRamp").
 class LumaDisplayMapGame : public DeadSpaceGame
 {
@@ -1693,7 +1693,7 @@ protected:
       }
    }
 
-   // The VP6 video (Includes/DS_VideoVP6.hlsl). LumaData.CustomData3: drawn over the mapped frame (UI side, pre-scaled for the UI paper
+   // The VP6 video ("DS_VideoVP6.hlsl"). LumaData.CustomData3: drawn over the mapped frame (UI side, pre-scaled for the UI paper
    // white); else an in-world screen mapped with the scene later. "updated_cbuffers" skips Core's own bind of the settings. A video over
    // the mapped frame raises the bound: its AutoHDR goes above 1 by design.
    static void BindVideoCBuffers(ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, bool* updated_cbuffers)
@@ -1838,11 +1838,11 @@ public:
 
 // Dead Space 3 (Steam): every hash is a dgVoodoo 2.87.6 ps_5_0 translation (mapped offline from the game's D3D9 shaders); the
 // arrays also hold the 2.81.3 (ps_4_0) twins, the passes keyed by one hash map them through "pixel_shader_hashes_from_v281".
-// HDR ("WrapUberLut" and the fp16 mirrors, as Dead Space 1/2): the light buffer is fp16 but the lit scene canvas and the post chain are RGBA8 with no tonemap. They get
-// fp16 mirrors, the uber post's LUT tail keeps what's above 1 ("WrapUberLut"), and the final display pass (the game's own last draw
-// into the swapchain, nothing draws after it) maps to the display (DS3_FinalDisplay).
-// DLAA / FSR / XeSS / Luma TAA and SMAA: "DeadSpaceGame"'s path (motion vectors from Core's DXBC patch, the frame camera from the engine's
-// globals, the upscaler at the scene's end), with the game's own SMAA or FXAA pass as SMAA's slot.
+// HDR: the light buffer is fp16, but the lit scene canvas and the post chain are RGBA8 with no tonemap. As in Dead Space 1/2 they get
+// fp16 mirrors and the uber post's LUT tail keeps what's above 1 ("WrapUberLut"); the final display pass (the game's own last draw
+// into the swapchain, nothing draws after it) maps to the display ("DS3_FinalDisplay").
+// DLAA, FSR, XeSS, Luma TAA and SMAA: "DeadSpaceGame"'s path (motion vectors from Core's DXBC patch, the frame camera from the
+// engine's globals, the upscaler at the scene's end), with the game's own SMAA or FXAA pass as SMAA's slot.
 namespace DS3
 {
    constexpr uint32_t FINAL_DISPLAY_PS = 0x9AF6BE17;
@@ -1856,13 +1856,13 @@ namespace DS3
    constexpr uint32_t SMAA_EDGES_PS = 0xC40BF6B4;
    constexpr uint32_t SMAA_WEIGHTS_PS = 0x6EB8F52A;
    constexpr uint32_t SMAA_NEIGHBORHOOD_PS = 0xB7F107B1; // t0 the frame, t1 the blend weights
-   // The Y'CbCr video passes (DS3_VideoYCbCr, DS3_VideoYUVVolume, DS3_VideoPacked: their hashes are registered in "DllMain", the same
-   // D3D9 video shaders exist in Dead Space 1/2)
+   // The Y'CbCr video passes ("DS3_VideoYCbCr", "DS3_VideoYUVVolume", "DS3_VideoPacked", registered in "ConfigureLoad"; the same D3D9
+   // video shaders exist in Dead Space 1/2)
    constexpr uint32_t VIDEO_YCBCR_PS = 0x94EDB896;
    constexpr uint32_t VIDEO_YUV_VOLUME_PS = 0xA4AEB579;
    constexpr uint32_t VIDEO_PACKED_PS = 0x8AE909CA;
    // dgVoodoo 2.81.3 (the Linux zip, ps_4_0) translations of the passes keyed by one hash above, read as their 2.87 hash (the same D3D9
-   // blob and alpha test, "hashgen\ds3_ps_hashes.tsv"). The named ones are also replaced or patched by their own hash.
+   // blob and alpha test). The named ones are also replaced or patched by their own hash.
    constexpr uint32_t FINAL_DISPLAY_V281_PS = 0xC60B589D;
    constexpr uint32_t POST_DOWNSAMPLE_V281_PS = 0xF8E50FA4;
    constexpr uint32_t VIDEO_YCBCR_V281_PS = 0xC747B9DD;
@@ -1898,11 +1898,11 @@ namespace DS3
          static constexpr bool ssaa_mods = false;
 
          // The frame camera: the engine's view projection (0x132c160 in the matrix stack's product block, row vectors in the layout the
-         // vertex shaders read, translation in the 4th row). Every camera apply (shadow views,
-         // render to texture) rewrites it, so it's read at the G-buffer's first draw. Found through the products' setter FUN_00b77df0
-         // (0xb77e0a: push 0x132c160; mov eax, 4; mov ecx, 0x132c220 (the view)); null on another build. The Steam exe (TimeDateStamp
-         // 0x511e9327) has no ASLR, and its .text is decrypted by the EA wrapper before the game creates its device. LH [0, ~0.99] depth
-         // (A < 1: an infinite far), x mirrored (_11 < 0) as Dead Space 1/2's.
+         // vertex shaders read, translation in the 4th row). Every camera apply (shadow views, render to texture) rewrites it, so it's
+         // read at the G-buffer's first draw. Found through the products' setter FUN_00b77df0 (0xb77e0a: push 0x132c160; mov eax, 4;
+         // mov ecx, 0x132c220, the view); null on another build. The Steam exe (TimeDateStamp 0x511e9327) has no ASLR, and its .text is
+         // decrypted by the EA wrapper before the game creates its device. LH [0, ~0.99] depth (A < 1: an infinite far), x mirrored
+         // (_11 < 0) as Dead Space 1/2's.
          static constexpr uintptr_t exe_code_address = 0xb77e0a;
          static constexpr uint8_t exe_code[] = {0x68, 0x60, 0xC1, 0x32, 0x01, 0xB8, 0x04, 0x00, 0x00, 0x00, 0xB9, 0x20, 0xC2, 0x32, 0x01};
          static constexpr uintptr_t view_projection_address = 0x132c160;
@@ -2170,7 +2170,7 @@ namespace DS3
             {
                blend_state->GetDesc(&blend_desc);
             }
-            // "ui_layer_blend": the alpha is the coverage, how much of the scene the draw's colour blend kept: over ("..., INV_SRC_ALPHA")
+            // The UI layer's alpha is the coverage, how much of the scene the draw's colour blend kept: over ("..., INV_SRC_ALPHA")
             // it scales by 1 - a, additive ("..., ONE") it keeps, an opaque draw (a full screen video, whose Y/Cb/Cr pass writes alpha 0)
             // replaces it (the blend factor's alpha 1). Other blends keep the game's alpha blend.
             FLOAT ui_blend_factor[4] = {blend_factor[0], blend_factor[1], blend_factor[2], blend_factor[3]};
@@ -2245,29 +2245,28 @@ namespace DS3
    };
 } // namespace DS3
 
-// Dead Space (2008, Steam) is x86 EA Redwood Shores engine: every hash is a dgVoodoo 2.87.6 ps_5_0 translation (mapped offline from the
-// game's D3D9 shaders). The Linux zip's 2.81.3 emits ps_4_0: its twins are keyed too (the arrays
-// hold both, see "pixel_shader_hashes_from_v281").
-// HDR ("LumaDisplayMapGame", as Dead Space 2): the game has no tonemap and every target is RGBA8. They get fp16 mirrors, the uber post's LUT tail keeps
-// what's above 1 ("WrapUberLut"), and the display map runs where the scene ends, before the UI.
+// Dead Space (2008, Steam) is x86 EA Redwood Shores engine: every hash is a dgVoodoo 2.87.6 ps_5_0 translation (mapped offline from
+// the game's D3D9 shaders). The Linux zip's 2.81.3 emits ps_4_0: its twins are keyed too (the arrays hold both, see
+// "pixel_shader_hashes_from_v281").
+// HDR ("LumaDisplayMapGame", as Dead Space 2): the game has no tonemap and every target is RGBA8. They get fp16 mirrors, the uber
+// post's LUT tail keeps what's above 1 ("WrapUberLut"), and the display map runs where the scene ends, before the UI.
 namespace DS1
 {
-   constexpr uint32_t VIDEO_PS = 0xD8BAFBCF; // VP6 videos (DS1_Video)
-   // dgVoodoo's present blit (DS1_Present), and its variant with the colour adjustment and gamma ramp (DS1_PresentRamp) it takes while
-   // the game's ramp isn't identity (before "GammaRamp::Install"). The same bytecode in 2.87.6 and 2.81.3; their hashes are registered in
-   // "DllMain".
+   constexpr uint32_t VIDEO_PS = 0xD8BAFBCF; // VP6 videos ("DS1_Video")
+   // dgVoodoo's present blit ("DS1_Present"), and its variant with the colour adjustment and gamma ramp ("DS1_PresentRamp") it takes
+   // while the game's ramp isn't identity (before "GammaRamp::Install"). The same bytecode in 2.87.6 and 2.81.3.
    constexpr uint32_t PRESENT_BLIT_PS = 0x880A17D3;
    constexpr uint32_t PRESENT_RAMP_BLIT_PS = 0x97C61073;
    constexpr uint32_t SCENE_COPY_PS = 0x6B413C5D; // The uber post's input
    // DeadSpaceFixes 1.8.0's replacements (UseFXAA: its FXAA in the standalone EdgeAA pass, one per EdgeAA table; SSAAScale above 1: the
-   // downsample into the back buffer, one per tap count). Luma replaces them (DS1_FXAA*, DS1_SSAADownsample*) and puts its SMAA in the
-   // FXAA slot.
-   constexpr uint32_t DSFIXES_FXAA_FAST_PS = 0x86AF7742;     // In place of EdgeAAFast (DS1_FXAAFast)
-   constexpr uint32_t DSFIXES_FXAA_DEFERRED_PS = 0x24FE53E9; // In place of DeferredEdgeAA (DS1_FXAADeferred)
+   // downsample into the back buffer, one per tap count). Luma replaces them ("DS1_FXAA*", "DS1_SSAADownsample*") and puts its SMAA in
+   // the FXAA slot.
+   constexpr uint32_t DSFIXES_FXAA_FAST_PS = 0x86AF7742;     // In place of EdgeAAFast ("DS1_FXAAFast")
+   constexpr uint32_t DSFIXES_FXAA_DEFERRED_PS = 0x24FE53E9; // In place of DeferredEdgeAA ("DS1_FXAADeferred")
    constexpr uint32_t DSFIXES_SSAA_DOWNSAMPLE_2_PS = 0xB10E5C9B;
    constexpr uint32_t DSFIXES_SSAA_DOWNSAMPLE_3_PS = 0x06CF49DC;
    constexpr uint32_t DSFIXES_SSAA_DOWNSAMPLE_4_PS = 0x5406A8BC;
-   constexpr uint32_t UBER_EDGEAA_BLOOM_LUT_PS = 0xCC629DA4; // DS1_Uber
+   constexpr uint32_t UBER_EDGEAA_BLOOM_LUT_PS = 0xCC629DA4; // "DS1_Uber"
    // dgVoodoo 2.81.3 (the Linux zip, ps_4_0) translations of the passes keyed by one hash above, read as their 2.87 hash (the same D3D9
    // blob and alpha test). The arrays hold both builds' hashes; the present blit is the same bytecode in both. The named ones are also
    // replaced by their own hash.
@@ -2350,7 +2349,8 @@ namespace DS1
          allow_disabling_gamma_ramp = true;
          // The light buffer and the canvas are mirrored at their first light or material apply draw
          AutoUpgradeWriters({light_pixel_shaders, apply_pixel_shaders});
-         // dgVoodoo's present blits: the same bytecode in every dgVoodoo game, and in 2.87.6 and 2.81.3
+         // dgVoodoo's present blits ("DS1_Present", "DS1_PresentRamp") have no 2.81.3 twin: the same bytecode in every dgVoodoo game, and
+         // in 2.87.6 and 2.81.3
          constexpr ShaderRedirect redirects[] = {
             {"DS1_FXAAFast", DSFIXES_FXAA_FAST_PS, DSFIXES_FXAA_FAST_V281_PS},
             {"DS1_FXAADeferred", DSFIXES_FXAA_DEFERRED_PS, DSFIXES_FXAA_DEFERRED_V281_PS},
@@ -2476,7 +2476,7 @@ namespace DS1
          if (DrawSceneMotionVectors<MotionVectorGame>(native_device, native_device_context, cmd_list_data, device_data, stages, original_shader_hashes, original_draw_dispatch_func, is_immediate, game_draw,
                 !gd.mv.scene_done && post, apply, pixel_shader_hash))
             return DrawOrDispatchOverrideType::Replaced;
-         // DeadSpaceFixes' FXAA (replaced, DS1_FXAA*): Luma's SMAA in its slot, from the game's copy of the graded frame (t0) into our
+         // DeadSpaceFixes' FXAA (replaced, "DS1_FXAA*"): Luma's SMAA in its slot, from the game's copy of the graded frame (t0) into our
          // output, which the replacement then copies instead. The display map runs later, after the last post pass ("scene_over").
          if ((pixel_shader_hash == DSFIXES_FXAA_FAST_PS || pixel_shader_hash == DSFIXES_FXAA_DEFERRED_PS) && is_immediate)
          {
@@ -2518,18 +2518,18 @@ namespace DS1
 } // namespace DS1
 
 // Dead Space 2 (Steam) is x86 Visceral engine: every hash is a dgVoodoo 2.87.6 ps_5_0 translation of the game's or MarkerPatch's D3D9
-// shaders (mapped offline); the arrays also hold the 2.81.3 (ps_4_0) twins, the passes keyed by one hash map them
-// through "pixel_shader_hashes_from_v281".
-// HDR: the game has no tonemap and every target is RGBA8. They get fp16 mirrors, the uber post's LUT tail keeps what's above 1
+// shaders (mapped offline); the arrays also hold the 2.81.3 (ps_4_0) twins, the passes keyed by one hash map them through
+// "pixel_shader_hashes_from_v281".
+// HDR ("LumaDisplayMapGame", as Dead Space 1): the game has no tonemap and every target is RGBA8. They get fp16 mirrors, the uber post's LUT tail keeps what's above 1
 // ("WrapUberLut"), and the display map runs where the scene ends, before the UI. MarkerPatch's SMAA or FXAA pass is SMAA's slot.
 namespace DS2
 {
    // The frame passes Luma replaces (or routes) by hash, see "OnDrawOrDispatch"
-   constexpr uint32_t VIDEO_PS = 0xD49CB77E;             // VP6 video logs and videos (DS2_VideoVP6, its hashes registered in "DllMain")
-   constexpr uint32_t MARKERPATCH_FXAA_PS = 0x0A91885E;  // MarkerPatch's FXAA (DS2_FXAA)
-   constexpr uint32_t SMAA_NEIGHBORHOOD_PS = 0xBE49E10A; // MarkerPatch's SMAA neighborhood blending (DS2_SMAANeighborhood)
-   constexpr uint32_t PRESENT_BLIT_PS = 0x880A17D3;      // dgVoodoo's present blit (DS2_Present, as DS1_Present)
-   constexpr uint32_t SSAA_DOWNSAMPLE_PS = 0x113CFB69;   // MarkerPatch's SSAA downsample (DS2_SSAADownsample)
+   constexpr uint32_t VIDEO_PS = 0xD49CB77E;             // VP6 video logs and videos ("DS2_VideoVP6")
+   constexpr uint32_t MARKERPATCH_FXAA_PS = 0x0A91885E;  // MarkerPatch's FXAA ("DS2_FXAA")
+   constexpr uint32_t SMAA_NEIGHBORHOOD_PS = 0xBE49E10A; // MarkerPatch's SMAA neighborhood blending ("DS2_SMAANeighborhood")
+   constexpr uint32_t PRESENT_BLIT_PS = 0x880A17D3;      // dgVoodoo's present blit ("DS2_Present", as "DS1_Present")
+   constexpr uint32_t SSAA_DOWNSAMPLE_PS = 0x113CFB69;   // MarkerPatch's SSAA downsample ("DS2_SSAADownsample")
    constexpr uint32_t MARKERPATCH_SMAA_EDGES_PS = 0x8736599C;
    constexpr uint32_t MARKERPATCH_SMAA_WEIGHTS_PS = 0x764C97BB;
    constexpr uint32_t SCENE_COPY_PS = 0x934360AD; // The uber post's input
@@ -2615,8 +2615,8 @@ namespace DS2
          // The light buffer and the scene are mirrored at their first light or material apply draw. Not the G-buffer, which shares their
          // RGBA8 desc: a mirror lets the gloss go past 1 (0x3A1AA0D5 scales it by a material constant, the light pass raises it to ~a^3).
          AutoUpgradeWriters({light_pixel_shaders, apply_pixel_shaders});
-         // dgVoodoo's present blit (the same bytecode in every dgVoodoo game, as DS1_Present, and in 2.87.6 and 2.81.3) and the VP6 video
-         // (the same dgVoodoo hash is in Dead Space 3's forward lists)
+         // dgVoodoo's present blit ("DS2_Present") has no 2.81.3 twin: the same bytecode in every dgVoodoo game, as "DS1_Present", and in
+         // 2.87.6 and 2.81.3. The VP6 video's dgVoodoo hash is also in Dead Space 3's forward lists.
          constexpr ShaderRedirect redirects[] = {
             {"DS2_FXAA", MARKERPATCH_FXAA_PS, MARKERPATCH_FXAA_V281_PS},
             {"DS2_SMAANeighborhood", SMAA_NEIGHBORHOOD_PS, SMAA_NEIGHBORHOOD_V281_PS},
@@ -2899,7 +2899,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
          // The upscalers' mip bias (see "OnPresent") reaches only upgraded samplers. AF16x, as in the other dgVoodoo mods;
          // "force_upgrade_linear_samplers" also gives the trilinear ones the bias (Core rewrites only anisotropic samplers otherwise, TW2).
-         enable_samplers_upgrade = true; // boot-time only (cannot be changed after device creation)
+         enable_samplers_upgrade = true; // Read at boot only: it can't change after device creation
          samplers_upgrade_mode = 4;
          force_upgrade_linear_samplers = true;
       }

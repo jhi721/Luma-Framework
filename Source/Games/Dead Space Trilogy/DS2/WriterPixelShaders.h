@@ -384,7 +384,7 @@ namespace DS2
       0xFE8ABD76,
    };
    // The light pre-pass' lights (every PS reading the G-buffer's normals "g_nBuffer" and writing "g_lightColor"; 194 D3D9 shaders, 582
-   // dgVoodoo specializations per build, offline map): they add into the light buffer, kept above 1 in its fp16 mirror (see "DllMain")
+   // dgVoodoo specializations per build, offline map): they add into the light buffer, kept above 1 in its fp16 mirror (see "ConfigureLoad")
    constexpr std::array<uint32_t, 1164> light_pixel_shaders = {
       0x001E7616,
       0x00269F38,

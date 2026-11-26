@@ -10,8 +10,8 @@ namespace DS1
    // "std::ranges::binary_search".
 
    // The 2D UI: llrender's Prim_*.fx (not the video, PS_YUVch2RGB) and the screen space prims.fx (HUD 0xA5B366DB; not those that
-   // read the scene depth, shadows, lights or normals). The first one on the frame starts "scene over" when no post pass drew;
-   // "Hide Gameplay UI" skips them
+   // read the scene depth, shadows, lights or normals). When neither a post pass nor the 3D scene drew, the first one on the frame
+   // starts "scene_over". "Hide Gameplay UI" skips them.
    constexpr std::array<uint32_t, 96> ui_pixel_shaders = {
       0x004E07B2,
       0x085BB9BF,

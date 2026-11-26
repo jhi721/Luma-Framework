@@ -5,11 +5,11 @@
 #include "../Includes/DgVoodoo.hlsl"
 
 // Dead Space (2008): DeadSpaceFixes' FXAA (UseFXAA, its replacement of the game's EdgeAAFast in the standalone EdgeAA pass that runs on a
-// copy of the graded frame; dgVoodoo 2.87.6 -> ps_5_0 0x86AF7742), Dead Space 2's MarkerPatch FXAA replacement. The translation is
+// copy of the graded frame; dgVoodoo 2.87.6 -> ps_5_0 0x86AF7742), the counterpart of Dead Space 2's MarkerPatch FXAA. The translation is
 // stock FXAA 3.11 Quality: preset 29, subpix 0.5, edge threshold 0.125, min 0.0625, luma = BT.601 weights on the gamma encoded frame,
 // posM half a texel off the texcoord ("g_halfPixelOffset".zw). Re-expressed through the shared include with a sampler that applies
 // dgVoodoo's masks and puts that luma in alpha. With an upscaler or Luma's SMAA (LumaData.CustomData1 != 0, t0 is then Luma's output
-// in this slot) the frame is already antialiased: the frame is copied. The display map runs after the post chain (main.cpp).
+// in this slot) the frame is already antialiased and is only copied. The display map runs after the post chain (main.cpp).
 
 #ifndef FXAA_HALF_PIXEL_OFFSET
 #define FXAA_HALF_PIXEL_OFFSET cb4[9] // c1 (EdgeAAFast's register)

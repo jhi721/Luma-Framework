@@ -1,6 +1,6 @@
 // The upscalers' depth and the camera motion of the texels no patched mesh draw wrote (Core's "SceneMotionVectors": the sky, the
 // unpatched draws), from the scene's hardware depth (D24) and the frame camera's reprojection. With "reactive_enabled", FSR's and Luma
-// TAA's masks from what the alpha blended draws wrote (see "Includes/MotionVectorFill.hlsl").
+// TAA's masks from what the alpha blended draws wrote (see "../Includes/MotionVectorFill.hlsl").
 
 #include "../Includes/MotionVectorFill.hlsl"
 #include "Includes/GameCBuffers.hlsl"

@@ -14,24 +14,25 @@
 
 #include "..\..\Core\includes\dxbc.h"
 
-// Every game's uber post LUT tail (Dead Space 1's AlchemyLUTShader, 2's uber, 3's lutcolor), checked offline on all its dgVoodoo
-// 2.87.6 and 2.81.3 translations (uberlut_check_ds{1,2,3}): Dead Space 1 43 LUT permutations (258 translations), 2 517 (1551), 3 229
-// (1374). "mad c, x, 0.96875, 0.015625" -> the 32^3 LUT(s) (1 to 6, weighted by gLUT_params) -> "mad o, k, (lut - x), x" with k a cb4
-// component (LUT amount, gLUT_params1.x). x is gamma encoded; the LUT's CLAMP addressing clips it to [0, 1], so vanilla lost
-// everything above 1. Dead Space 2's lerp writes o.xyz; Dead Space 1's writes o.xyzw, and Dead Space 3's may: the alpha lerps to the
-// LUT's. That alpha stays vanilla: the original lerp runs first, the patched one below then writes o.xyz.
-// Patched to MELE's max-channel wrap with a hard knee at 1:
+// Patches the uber post's LUT tail of all three games (the lutcolor.fx "AlchemyLUTShader" family) so HDR keeps what vanilla clipped.
+// The tail is "mad c, x, 0.96875, 0.015625", then the 32^3 LUTs (1 to 6, weighted by gLUT_params), then "mad o, k, (lut - x), x",
+// with k a cb4 component (the LUT amount, gLUT_params1.x). x is gamma encoded and the LUT's CLAMP addressing clips it to [0, 1], so
+// vanilla lost everything above 1. Dead Space 2's lerp writes o.xyz; Dead Space 1's writes o.xyzw and Dead Space 3's may, lerping the
+// alpha to the LUT's. That alpha stays vanilla: the original lerp runs first and the patched one below then writes o.xyz.
+// The patch is MELE's max-channel wrap with a hard knee at 1:
 //   V = saturate(x) + k * (LUT(saturate(x)) - saturate(x))   the vanilla grade of the clipped color
 //   m = max(1, max3(x)),  G = p + k * (LUT(p) - p) with p = x / m   the grade of the color scaled into the cube
 //   o = V * (Y(decode(G * m)) / Y(decode(V)))^(1/2.2)   decode = gamma 2.2, Y = BT.709 relative luminance
 // The output keeps the vanilla RGB ratios and takes the relative luminance of the scaled-back grade. Where max3(x) <= 1, G and V run
-// the same instructions on the same values, so o = V bit exactly. The luminance transfer is HDR only (the uint at byte
-// "display_mode_offset" is 1): SDR keeps o = V, vanilla's grade of the color its UNORM scene clipped.
-// G runs a copy of the tail, from the coordinate mad to the lerp, on renamed temps, before the original; the temps it reads before
-// writing (x, or the value x was scaled from) start as their original / m. Matched by structure (the coordinate mad's immediates, and
-// a cb4-weighted mad whose addend is that coordinate's source); null for any other shader.
-// k is scaled by the "Color Grading Intensity" float at byte "intensity_offset" of cb<settings_slot> (Luma's settings, which the draw
-// binds): 1 keeps k bit exactly, 0 leaves no grade (V = saturate(x), G = p).
+// the same instructions on the same values, so o = V bit exactly. The luminance transfer only runs in HDR (the uint at byte
+// "display_mode_offset" is 1); SDR keeps o = V, the vanilla grade of the color its UNORM scene clipped.
+// G runs a copy of the tail, from the coordinate mad to the lerp, on renamed temps before the original. The temps it reads before
+// writing them (x, or the value x was scaled from) start as their original / m. The tail is matched by structure (the coordinate
+// mad's immediates and a cb4 weighted mad whose addend is that coordinate's source); any other shader returns null.
+// k is scaled by the "Color Grading Intensity" float at byte "intensity_offset" of cb<settings_slot>, Luma's settings, which the draw
+// binds. 1 keeps k bit exactly, 0 removes the grade (V = saturate(x), G = p).
+// Checked offline on every dgVoodoo 2.87.6 and 2.81.3 translation ("uberlut_check_ds{1,2,3}"): 43 LUT permutations in Dead Space 1
+// (258 translations), 517 in Dead Space 2 (3102) and 229 in Dead Space 3 (1374).
 inline std::unique_ptr<std::byte[]> WrapUberLut(const std::byte* code, size_t* size, uint32_t settings_slot, uint32_t intensity_offset, uint32_t display_mode_offset)
 {
    if (*size % sizeof(uint32_t) != 0)

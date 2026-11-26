@@ -23,8 +23,7 @@ cbuffer cb4 : register(b4)
 Texture2D<float4> t0 : register(t0); // ColorTexture
 // Luma's UI layer (LumaData.CustomData3 != 0, HDR only): the UI drawn after the post chain, premultiplied over transparent black with
 // the coverage in alpha (see "ui_layer" in main.cpp). Put over the mapped and pre-scaled scene as its blends did, so it lands at the UI
-// paper white.
-// It skips the vanilla saturation, S-curve and brightness, as the UI paper white replaces the latter.
+// paper white. It skips the vanilla saturation, S-curve and brightness, as the UI paper white replaces the latter.
 Texture2D<float4> t1 : register(t1);
 SamplerState s0_s : register(s0);
 

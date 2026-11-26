@@ -1,6 +1,6 @@
 // Reference: https://github.com/iryoku/smaa
 
-// SMAA ULTRA with colour edge detection, 1x or T2x (below), Dead Space 2's file. main.cpp ("RunSMAA") runs it in one of two places:
+// SMAA ULTRA with colour edge detection, 1x or T2x (below), for all three games. main.cpp ("RunSMAA") runs it in one of two places:
 // the game's own AA slot (the input of its SMAA neighborhood blending or FXAA pass, the graded frame, or Dead Space 2's MarkerPatch
 // frame copy) or the scene's end. "smaa_metrics.predication.y" picks the encoding (0 gamma 2.2, 1 sRGB): edges are detected on the
 // encoded frame, while the neighborhood blend decodes it, filters in linear light and encodes it back. The predication mask comes from "Luma_DS_DepthEdges.hlsl".

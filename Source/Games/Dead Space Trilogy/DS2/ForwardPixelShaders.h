@@ -11,7 +11,7 @@ namespace DS2
 
    // APT, the 2D UI (D3D9 constants "apttexture", "AlphaTexture" or "ColorTexture" with an LOD bias, and blob 941d1ef63483's vertex
    // colour fill that dims the frame under the pause menu): saturated, as vanilla; the first one on the frame also ends the scene when
-   // no post pass drew (see "DrawDisplayMap")
+   // no post pass drew (see "scene_over")
    constexpr std::array<uint32_t, 72> apt_pixel_shaders = {
       0x02F744C4,
       0x0379CB8F,
